@@ -3,11 +3,12 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const { chromium } = require(process.env.LLMGW_PLAYWRIGHT_PATH || "playwright");
 const output = process.env.LLMGW_UI_OUTPUT || path.join(os.tmpdir(), "llm-gateway-ui");
 const baseUrl = process.env.LLMGW_UI_URL || "http://127.0.0.1:5173";
 
-async function fixture() {
+async function fixture({ empty = false, configFailure = false, providerFailure = false } = {}) {
   window.isTauri = true;
   const model = (id, context = 32768) => ({ alias: id, upstream: id, context_window: context, supports_tools: true, supports_vision: false, supports_stream: true });
   const provider = (id, name, dialect, url, models) => ({ id, name, dialect, base_url: url, api_key_masked: "已保存", models, enabled: true, priority: 10, rpm_limit: 0, intelligence: 70, note: null, is_active: false, health: { health: "healthy", success_rate: 1, avg_latency_ms: 100 } });
@@ -19,6 +20,8 @@ async function fixture() {
   ];
   window.__fixtureConfig = { bind: "127.0.0.1", port: 15721, allow_lan: false, unified_key: "fixture-only", routing_strategy: "balanced", custom_rules: [], max_fallback_attempts: 3, upstream_timeout_secs: 90, sticky_ttl_secs: 1800, compact_threshold_tokens: 60000, compact_keep_recent: 12, analytics_retention_days: 30, log_request_body: false, http_proxy: null, failover_enabled: true, catalog_auto_update: false, catalog_feed_url: null, remote_mode: { enabled: false, public_url: null }, takeover: { claude_code: false, codex: false, gemini_cli: false } };
   window.__fixtureSaved = [];
+  if (empty) window.__fixtureProviders = [];
+  window.__fixtureCalls = [];
   const session = (id, title, compactCount = 0) => ({ id, title, snapshot_id: compactCount ? "snapshot-fixture" : null, sticky_provider_id: "openrouter", sticky_model: "vendor/chat:free", sticky_expires_at: null, total_tokens: 24680, compact_count: compactCount, summary: compactCount ? "任务目标：完善通用网关的会话界面。\n已完成：保留上下文、工具交换与降级处理。\n下一步：验证长文本排版和快速切换。" : null, created_at: "2026-09-10T08:00:00Z", updated_at: "2026-09-10T08:30:00Z", message_count: 4 });
   window.__fixtureSessions = [session("session-slow", "通用网关长上下文与工具调用验收", 2), session("session-fast", "快速切换验证会话"), session("session-empty", "空会话")];
   const message = (id, role, content, compacted = false) => ({ id, session_id: "session-slow", role, content, tool_calls: null, tool_call_id: null, name: null, routed_provider: role === "assistant" ? "OpenRouter" : null, routed_model: role === "assistant" ? "vendor/chat:free" : null, compacted, prompt_tokens: 2000, completion_tokens: 500, created_at: "2026-09-10T08:10:00Z" });
@@ -29,9 +32,10 @@ async function fixture() {
     message(4, "assistant", "这里是最新的完整答复。\n\n" + "长文本应保留换行，在有限宽度内自然换行；工具调用记录可单独展开。\n".repeat(24)),
   ];
   window.__TAURI_INTERNALS__ = { invoke: async (cmd, args) => {
+    window.__fixtureCalls.push(cmd);
     switch (cmd) {
-      case "list_providers": return structuredClone(window.__fixtureProviders);
-      case "get_config": return structuredClone(window.__fixtureConfig);
+      case "list_providers": if (providerFailure) throw new Error("模拟供应商读取失败"); return structuredClone(window.__fixtureProviders);
+      case "get_config": if (configFailure) throw new Error("模拟配置读取失败"); return structuredClone(window.__fixtureConfig);
       case "discover_provider_models":
         if (args.input.base_url.includes("broken")) throw new Error("上游返回 HTTP 401，请检查密钥权限");
         return { base_url: "https://example.test/v1", warnings: [], models: [
@@ -201,11 +205,89 @@ async function fixture() {
     await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
     await page.getByRole("button", { name: "备份并写入配置", exact: true }).click();
     await page.getByText("C:/fixture/.codex/config.toml.backup-test", { exact: true }).waitFor();
+    // Existing configurations remain undisturbed, while help can be reopened explicitly.
+    assert.equal(await page.getByTestId("onboarding-dialog").count(), 0);
+    await page.getByTestId("help-menu-trigger").click();
+    await page.getByTestId("open-user-manual").click();
+    await page.getByTestId("user-manual-search").waitFor();
+    assert.equal(await page.getByTestId("user-manual-section").count(), 14);
+    await page.getByTestId("user-manual-search").fill("不会匹配的内容-xyz");
+    await page.getByTestId("user-manual-empty").waitFor();
+    await page.getByTestId("user-manual-search").fill("订阅");
+    assert(await page.getByTestId("user-manual-section").count() > 0);
+    assert(await page.getByTestId("user-manual-section").count() < 14);
+    await page.getByTestId("user-manual-search").fill("");
+    await page.getByTestId("user-manual-toc-item").filter({ hasText: "手动接入其他客户端" }).click();
+    await page.getByTestId("user-manual-code").scrollIntoViewIfNeeded();
+    assert((await page.getByTestId("user-manual-code").innerText()).includes("Read-Host"));
+    for (const width of [1180, 900, 390]) {
+      await page.setViewportSize({ width, height: 844 });
+      assert(await page.evaluate(() => document.querySelector('.user-manual-dialog').scrollWidth <= document.querySelector('.user-manual-dialog').clientWidth), `manual overflow at ${width}`);
+      await page.screenshot({ path: path.join(output, `user-manual-${width}.png`) });
+    }
+    await page.keyboard.press("Escape");
+    assert.equal(await page.locator(".user-manual-dialog").count(), 0);
+    const firstUse = await browser.newContext({ viewport: { width: 1180, height: 760 }, reducedMotion: "reduce" });
+    await firstUse.addInitScript(fixture, { empty: true });
+    const onboarding = await firstUse.newPage();
+    onboarding.on("pageerror", error => errors.push(error.message));
+    await onboarding.goto(baseUrl);
+    await onboarding.getByTestId("onboarding-dialog").waitFor();
+    assert(await onboarding.getByTestId("onboarding-previous").isDisabled());
+    await onboarding.getByTestId("onboarding-next").click();
+    await onboarding.getByTestId("onboarding-step-models").waitFor();
+    await onboarding.getByTestId("onboarding-previous").click();
+    await onboarding.getByTestId("onboarding-step-provider").waitFor();
+    for (const width of [1180, 900, 390]) {
+      await onboarding.setViewportSize({ width, height: 844 });
+      assert(await onboarding.evaluate(() => document.querySelector('.onboarding-dialog').scrollWidth <= document.querySelector('.onboarding-dialog').clientWidth), `onboarding overflow at ${width}`);
+      await onboarding.screenshot({ path: path.join(output, `onboarding-${width}.png`) });
+    }
+    await onboarding.getByTestId("onboarding-skip").click();
+    assert.equal(await onboarding.evaluate(() => localStorage.getItem("llm-gateway-onboarding-v1")), "skipped");
+    await onboarding.reload();
+    await onboarding.getByRole("button", { name: "添加第一个供应商", exact: true }).waitFor();
+    assert.equal(await onboarding.getByTestId("onboarding-dialog").count(), 0);
+    await onboarding.getByTestId("help-menu-trigger").click();
+    await onboarding.getByTestId("open-onboarding").click();
+    for (let step = 0; step < 4; step++) await onboarding.getByTestId("onboarding-next").click();
+    await onboarding.getByTestId("onboarding-complete").click();
+    assert.equal(await onboarding.evaluate(() => localStorage.getItem("llm-gateway-onboarding-v1")), "completed");
+    await onboarding.getByTestId("help-menu-trigger").click();
+    await onboarding.getByTestId("open-onboarding").click();
+    for (let step = 0; step < 3; step++) await onboarding.getByTestId("onboarding-next").click();
+    await onboarding.getByTestId("onboarding-navigate-settings").click();
+    await onboarding.getByRole("button", { name: "备份并写入配置", exact: true }).waitFor();
+    const guideCalls = await onboarding.evaluate(() => window.__fixtureCalls);
+    assert(!guideCalls.some(cmd => ["upsert_provider", "update_config", "apply_takeover", "test_provider", "discover_provider_models"].includes(cmd)));
+    await firstUse.close();
+    for (const failure of ["configFailure", "providerFailure"]) {
+      const failedContext = await browser.newContext();
+      await failedContext.addInitScript(fixture, { empty: true, [failure]: true });
+      const failedPage = await failedContext.newPage();
+      await failedPage.goto(baseUrl);
+      await failedPage.getByRole("alert").filter({ hasText: "加载失败" }).waitFor();
+      assert.equal(await failedPage.getByTestId("onboarding-dialog").count(), 0);
+      await failedContext.close();
+    }
+    const offlineManual = await browser.newPage();
+    const manualRequests = [];
+    offlineManual.on("request", request => { if (/^https?:/.test(request.url())) manualRequests.push(request.url()); });
+    await offlineManual.goto(pathToFileURL(path.resolve(__dirname, "../docs/使用手册.html")).href);
+    assert.equal(await offlineManual.locator("main > section").count(), 14);
+    await offlineManual.getByRole("link", { name: "查询额度、订阅与剩余时间", exact: true }).click();
+    assert(offlineManual.url().endsWith("#quota"));
+    for (const width of [900, 390]) {
+      await offlineManual.setViewportSize({ width, height: 844 });
+      assert(await offlineManual.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+      await offlineManual.screenshot({ path: path.join(output, `manual-html-${width}.png`) });
+    }
+    assert.deepEqual(manualRequests, []);
     assert.deepEqual(errors, []);
     const preview = await browser.newPage();
     await preview.goto(baseUrl);
     await preview.getByRole("heading", { name: "浏览器预览已隔离", exact: true }).waitFor();
     assert.equal(await preview.locator(".provider-card").count(), 0);
-    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, themes, responsive layouts and preview isolation; screenshots=${output}`);
+    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, first-use guidance, persisted skip/completion, manual search, offline HTML, themes, responsive layouts and preview isolation; screenshots=${output}`);
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

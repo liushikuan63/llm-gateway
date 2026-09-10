@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import "./styles.css";
 import "./shell.css";
 import { api, AppConfig } from "./api";
 import { Icon, IconName } from "./components/Icons";
+import Onboarding from "./components/Onboarding";
+import UserManual from "./components/UserManual";
 import ProvidersPage from "./pages/Providers";
 import SessionsPage from "./pages/Sessions";
 import StatsPage from "./pages/Stats";
@@ -21,6 +23,11 @@ type Theme = "light" | "dark";
 
 const THEME_STORAGE_KEY = "llm-gateway-theme";
 const NAVIGATION_STORAGE_KEY = "llm-gateway-navigation";
+// 只记录当前引导版本的完成状态，不包含供应商、地址或任何密钥。
+export const ONBOARDING_STORAGE_KEY = "llm-gateway-onboarding-v1";
+
+type OnboardingStatus = "completed" | "skipped";
+type ProviderLoadState = "loading" | "ready" | "unavailable" | "preview";
 
 function isTabId(value: string | null): value is TabId {
   return NAVIGATION.some((item) => item.id === value);
@@ -40,6 +47,23 @@ function readTab(): TabId {
     return isTabId(saved) ? saved : "providers";
   } catch {
     return "providers";
+  }
+}
+
+function readOnboardingStatus(): OnboardingStatus | null {
+  try {
+    const status = window.localStorage.getItem(ONBOARDING_STORAGE_KEY);
+    return status === "completed" || status === "skipped" ? status : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveOnboardingStatus(status: OnboardingStatus) {
+  try {
+    window.localStorage.setItem(ONBOARDING_STORAGE_KEY, status);
+  } catch {
+    // 受限 WebView 中不降低当前交互可用性；下次启动可能再次出现首次引导。
   }
 }
 
@@ -71,7 +95,15 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(readTheme);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [configState, setConfigState] = useState<"loading" | "ready" | "unavailable" | "preview">("loading");
+  const [providerLoadState, setProviderLoadState] = useState<ProviderLoadState>("loading");
+  const [providerCount, setProviderCount] = useState<number | null>(null);
   const [copyFeedback, setCopyFeedback] = useState<"copied" | "failed" | null>(null);
+  const [helpMenuOpen, setHelpMenuOpen] = useState(false);
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [firstUseChecked, setFirstUseChecked] = useState(false);
+  const helpMenuRef = useRef<HTMLDivElement>(null);
+  const helpTriggerRef = useRef<HTMLButtonElement>(null);
   const desktopRuntime = isTauri();
   const currentPage = NAVIGATION.find((item) => item.id === tab) ?? NAVIGATION[0];
   const endpoint = config ? configuredEndpoint(config) : null;
@@ -127,10 +159,65 @@ export default function App() {
   }, [desktopRuntime]);
 
   useEffect(() => {
+    if (!desktopRuntime) {
+      setProviderLoadState("preview");
+      setProviderCount(null);
+      return;
+    }
+
+    let disposed = false;
+    setProviderLoadState("loading");
+    setProviderCount(null);
+    void api.listProviders()
+      .then((providers) => {
+        if (disposed) return;
+        setProviderCount(providers.length);
+        setProviderLoadState("ready");
+      })
+      .catch(() => {
+        if (disposed) return;
+        // 失败不推断成“已有配置”或“没有配置”，避免在不可信状态误弹引导。
+        setProviderCount(null);
+        setProviderLoadState("unavailable");
+      });
+
+    return () => { disposed = true; };
+  }, [desktopRuntime]);
+
+  useEffect(() => {
+    if (firstUseChecked || !desktopRuntime) return;
+    if (configState === "loading" || providerLoadState === "loading") return;
+
+    setFirstUseChecked(true);
+    // 首次引导依赖两项真实 IPC 读取都成功；任意失败都不把用户误判为新用户。
+    if (configState !== "ready" || providerLoadState !== "ready" || providerCount !== 0) return;
+    if (!readOnboardingStatus()) setOnboardingOpen(true);
+  }, [configState, desktopRuntime, firstUseChecked, providerCount, providerLoadState]);
+
+  useEffect(() => {
     if (!copyFeedback) return;
     const timer = window.setTimeout(() => setCopyFeedback(null), 2200);
     return () => window.clearTimeout(timer);
   }, [copyFeedback]);
+
+  useEffect(() => {
+    if (!helpMenuOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!helpMenuRef.current?.contains(event.target as Node)) setHelpMenuOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setHelpMenuOpen(false);
+      helpTriggerRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [helpMenuOpen]);
 
   const copyEndpoint = async () => {
     if (!endpoint) return;
@@ -140,6 +227,18 @@ export default function App() {
     } catch {
       setCopyFeedback("failed");
     }
+  };
+
+  const navigateFromHelp = (target: TabId) => {
+    setTab(target);
+    // 前往实际页面表示用户暂时离开引导；仍可随时从帮助入口重新打开。
+    saveOnboardingStatus("skipped");
+    setOnboardingOpen(false);
+  };
+
+  const dismissOnboarding = (status: OnboardingStatus) => {
+    saveOnboardingStatus(status);
+    setOnboardingOpen(false);
   };
 
   return (
@@ -200,6 +299,48 @@ export default function App() {
           </div>
           <div className="workspace-actions">
             <span className={`runtime-indicator ${desktopRuntime ? "desktop" : "preview"}`}><Icon name={desktopRuntime ? "monitor" : "shield"} size={15} />{desktopRuntime ? "桌面应用" : "预览隔离"}</span>
+            <div className="help-menu" ref={helpMenuRef}>
+              <button
+                ref={helpTriggerRef}
+                type="button"
+                className="help-menu-trigger"
+                data-testid="help-menu-trigger"
+                aria-label="打开使用帮助"
+                aria-haspopup="menu"
+                aria-expanded={helpMenuOpen}
+                onClick={() => setHelpMenuOpen((open) => !open)}
+              >
+                使用帮助
+              </button>
+              {helpMenuOpen && (
+                <div className="help-menu-popover" role="menu" aria-label="使用帮助选项" data-testid="help-menu">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    data-testid="open-onboarding"
+                    onClick={() => {
+                      helpTriggerRef.current?.focus();
+                      setHelpMenuOpen(false);
+                      setOnboardingOpen(true);
+                    }}
+                  >
+                    首次使用引导
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    data-testid="open-user-manual"
+                    onClick={() => {
+                      helpTriggerRef.current?.focus();
+                      setHelpMenuOpen(false);
+                      setManualOpen(true);
+                    }}
+                  >
+                    使用手册
+                  </button>
+                </div>
+              )}
+            </div>
             <button type="button" className="theme-toggle" onClick={() => setTheme((current) => current === "light" ? "dark" : "light")} aria-label={theme === "light" ? "切换到深色主题" : "切换到浅色主题"} aria-pressed={theme === "dark"} title={theme === "light" ? "切换到深色主题" : "切换到浅色主题"}>
               <Icon name={theme === "light" ? "moon" : "sun"} size={18} />
             </button>
@@ -225,6 +366,13 @@ export default function App() {
           )}
         </section>
       </main>
+      <Onboarding
+        open={onboardingOpen}
+        onSkip={() => dismissOnboarding("skipped")}
+        onComplete={() => dismissOnboarding("completed")}
+        onNavigate={navigateFromHelp}
+      />
+      <UserManual open={manualOpen} onClose={() => setManualOpen(false)} />
     </div>
   );
 }

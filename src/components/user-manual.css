@@ -1,0 +1,157 @@
+.user-manual-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(3, 12, 10, 0.66);
+  backdrop-filter: blur(3px);
+}
+
+.user-manual-dialog {
+  display: grid;
+  width: min(1080px, 100%);
+  min-width: 0;
+  max-height: min(820px, calc(100dvh - 32px));
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.34);
+}
+
+.user-manual-header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 22px 17px;
+  border-bottom: 1px solid var(--border);
+}
+
+.user-manual-heading { min-width: 0; }
+.user-manual-eyebrow {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.user-manual-heading h2 { margin: 0; font-size: 20px; line-height: 1.25; overflow-wrap: anywhere; }
+.user-manual-version { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.4; }
+
+.user-manual-close {
+  display: inline-grid;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  font-size: 22px;
+  line-height: 1;
+  background: transparent;
+  border-color: var(--border);
+}
+.user-manual-close:hover:not(:disabled), .user-manual-close:focus-visible { color: var(--text); background: var(--panel-2); }
+
+.user-manual-layout {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: minmax(196px, 238px) minmax(0, 1fr);
+}
+
+.user-manual-sidebar {
+  min-width: 0;
+  padding: 17px 14px;
+  overflow-y: auto;
+  background: var(--panel-2);
+  border-right: 1px solid var(--border);
+  scrollbar-color: var(--border) transparent;
+}
+
+.user-manual-search-wrap { display: grid; gap: 6px; }
+.user-manual-search-wrap label { color: var(--muted); font-size: 11px; font-weight: 650; }
+.user-manual-search-wrap input { width: 100%; min-width: 0; }
+
+.user-manual-toc { display: grid; gap: 4px; margin-top: 16px; }
+.user-manual-toc button {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+}
+.user-manual-toc button > span { padding-top: 1px; color: var(--accent); font-size: 10px; font-variant-numeric: tabular-nums; }
+.user-manual-toc button strong { min-width: 0; font-weight: 580; line-height: 1.45; overflow-wrap: anywhere; }
+.user-manual-toc button:hover:not(:disabled), .user-manual-toc button:focus-visible { color: var(--text); background: var(--panel); border-color: var(--border); }
+.user-manual-toc button.active { color: var(--accent); background: var(--panel); border-color: var(--border); }
+
+.user-manual-content {
+  min-width: 0;
+  min-height: 0;
+  padding: 22px clamp(18px, 3vw, 34px) 36px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--border) transparent;
+}
+
+.user-manual-introduction {
+  margin: 0 0 22px;
+  padding: 12px 14px;
+  color: var(--text);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--accent-soft, var(--panel-2));
+  border-left: 3px solid var(--accent);
+}
+
+.user-manual-section { min-width: 0; scroll-margin-top: 16px; }
+.user-manual-section + .user-manual-section { margin-top: 26px; padding-top: 26px; border-top: 1px solid var(--border); }
+.user-manual-section h3 { margin: 0 0 12px; font-size: 17px; line-height: 1.35; overflow-wrap: anywhere; }
+.user-manual-section p { margin: 0 0 11px; color: var(--text); line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
+.user-manual-steps, .user-manual-notes { margin: 14px 0; padding-left: 23px; }
+.user-manual-steps li, .user-manual-notes li { margin: 7px 0; line-height: 1.65; overflow-wrap: anywhere; }
+.user-manual-notes { padding: 10px 14px 10px 33px; color: var(--muted); background: var(--bg); border-left: 2px solid var(--warn); }
+
+.user-manual-code { min-width: 0; margin-top: 15px; overflow: hidden; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
+.user-manual-code-label { padding: 6px 10px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; line-height: 1.4; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.user-manual-code pre { max-width: 100%; margin: 0; padding: 12px; overflow: hidden; color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.user-manual-code code { font-family: inherit; }
+
+.user-manual-empty { padding: 34px 12px; color: var(--muted); line-height: 1.7; text-align: center; border: 1px dashed var(--border); }
+
+@media (max-width: 700px) {
+  .user-manual-mask { align-items: end; padding: 0; }
+  .user-manual-dialog { max-height: min(860px, 100dvh); border-right: 0; border-bottom: 0; border-left: 0; border-radius: 8px 8px 0 0; }
+  .user-manual-header { padding: 17px 16px 14px; }
+  .user-manual-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .user-manual-sidebar { padding: 12px 14px; overflow: visible; border-right: 0; border-bottom: 1px solid var(--border); }
+  .user-manual-toc { display: flex; max-width: 100%; margin-top: 11px; overflow-x: auto; padding-bottom: 2px; }
+  .user-manual-toc button { width: auto; min-width: min(180px, 60vw); flex: 0 0 auto; }
+  .user-manual-content { padding: 18px 16px 28px; }
+}
+
+@media (max-width: 420px) {
+  .user-manual-heading h2 { font-size: 18px; }
+  .user-manual-content { padding: 16px 13px 24px; }
+  .user-manual-introduction { padding: 10px 11px; }
+  .user-manual-section h3 { font-size: 16px; }
+  .user-manual-toc button { min-width: min(164px, 70vw); }
+}

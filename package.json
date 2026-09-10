@@ -10,8 +10,10 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build --bundles nsis,msi",
-    "verify:release": "node scripts/verify-release.mjs",
-    "verify:ui": "node scripts/ui-smoke.cjs"
+    "verify:release": "node scripts/verify-release.mjs && npm run verify:manual",
+    "verify:ui": "node scripts/ui-smoke.cjs",
+    "docs:manual": "node scripts/generate-manual.mjs",
+    "verify:manual": "node scripts/generate-manual.mjs --check"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

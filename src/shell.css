@@ -71,6 +71,12 @@
 .runtime-indicator { display: inline-flex; min-height: 30px; align-items: center; gap: 6px; padding: 5px 9px; color: var(--muted); font-size: 11px; font-weight: 650; background: var(--panel); border: 1px solid var(--border); border-radius: 999px; }
 .runtime-indicator.desktop { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--border); }
 .runtime-indicator.preview { color: var(--warn); background: var(--warn-soft); border-color: var(--border); }
+.help-menu { position: relative; flex: 0 0 auto; }
+.help-menu-trigger { min-height: 32px; padding: 5px 10px; color: var(--text-soft); font-size: 12px; background: var(--panel); border-color: var(--border-strong); }
+.help-menu-trigger:hover:not(:disabled), .help-menu-trigger[aria-expanded="true"] { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--accent); }
+.help-menu-popover { position: absolute; z-index: 60; top: calc(100% + 7px); right: 0; display: grid; min-width: 152px; padding: 5px; background: var(--panel); border: 1px solid var(--border-strong); border-radius: 7px; box-shadow: var(--shadow-md); }
+.help-menu-popover button { justify-content: flex-start; min-height: 32px; padding: 6px 8px; color: var(--text-soft); font-size: 12px; text-align: left; background: transparent; border-color: transparent; }
+.help-menu-popover button:hover:not(:disabled), .help-menu-popover button:focus-visible { color: var(--accent-strong); background: var(--accent-soft); border-color: transparent; }
 .theme-toggle { color: var(--text-soft); background: var(--panel); border-color: var(--border-strong); }
 .theme-toggle:hover:not(:disabled) { color: var(--accent-strong); background: var(--accent-soft); }
 .workspace-content { min-width: 0; min-height: 0; padding: 22px 28px 52px; overflow: auto; scrollbar-color: var(--border-strong) transparent; }
@@ -112,6 +118,7 @@
   .workspace-heading h1 { font-size: 21px; }
   .workspace-heading p { font-size: 12px; }
   .workspace-actions { width: 100%; justify-content: space-between; }
+  .runtime-indicator { margin-right: auto; }
   .workspace-content { padding: 16px 12px 34px; }
   .runtime-preview { margin: 20px auto; padding: 22px 17px; }
 }

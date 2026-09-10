@@ -10,9 +10,11 @@
 | 想做什么 | 看这里 |
 | --- | --- |
 | 本地开发或使用应用 | 按下面的「快速开始」运行 Rust/Tauri 网关 |
+| 第一次安装与日常使用 | [完整使用手册](docs/使用手册.md)、[离线 HTML / 打印版](docs/使用手册.html)，或应用顶部「使用帮助」 |
 | 查看维护与回归边界 | [`docs/VibeCoding实现手册.md`](docs/VibeCoding实现手册.md) |
 | 查看架构与安全设计 | [`docs/统一LLM网关设计方案.md`](docs/统一LLM网关设计方案.md) |
-| 查看实际验收和外部服务边界 | [`docs/验证记录.md`](docs/验证记录.md) |
+| 查看实际验收和外部服务边界 | [`docs/0.1.1验证记录.md`](docs/0.1.1验证记录.md)，[0.1.0 历史记录](docs/验证记录.md) |
+| 配置模型、自动识别上下文和客户端备份 | [`docs/模型配置与界面使用指南.md`](docs/模型配置与界面使用指南.md) |
 
 > 根目录的 `CLAUDE.md` / `.cursorrules` 已写好项目背景与执行纪律，
 > AI 助手会自动读取，开箱即用。
@@ -28,6 +30,8 @@
 | 客户端协议各不相同 | 同时暴露 OpenAI / Anthropic / Responses / Ollama 四种面 |
 
 ## 快速开始
+
+首次启动且没有供应商配置时，应用会显示可跳过的使用引导。完成或跳过后不会反复弹出；随时可从顶部「使用帮助」重新打开引导或离线手册。引导只解释步骤并导航到相应页面，不会自动导入 Key 或修改客户端配置。
 
 ### 开发模式
 
@@ -56,8 +60,8 @@ npm run tauri:build
 
 | 平台 | 路径 |
 | --- | --- |
-| Windows NSIS | `src-tauri/target/release/bundle/nsis/LLM Gateway_0.1.0_x64-setup.exe` |
-| Windows MSI | `src-tauri/target/release/bundle/msi/LLM Gateway_0.1.0_x64_en-US.msi` |
+| Windows NSIS | `src-tauri/target/release/bundle/nsis/LLM Gateway_0.1.1_x64-setup.exe` |
+| Windows MSI | `src-tauri/target/release/bundle/msi/LLM Gateway_0.1.1_x64_en-US.msi` |
 
 安装包使用 WebView2 `downloadBootstrapper` 模式；目标机器未安装 WebView2 时，安装过程需要联网下载运行时。当前未配置代码签名，首次运行 Windows 可能弹 SmartScreen，选「更多信息 → 仍然运行」。
 
@@ -84,7 +88,13 @@ export ANTHROPIC_AUTH_TOKEN="lgw-xxxx"
 export ANTHROPIC_API_KEY=""
 ```
 
-或在设置页勾选要接管的 CLI，点「写入配置」，程序会自动改 `~/.claude/settings.json`、`~/.codex/config.toml`、`~/.gemini/.env`。
+或在设置页勾选 Claude Code / Codex CLI，点「备份并写入配置」。程序会先为已有的 `~/.claude/settings.json`、`~/.codex/config.toml` 创建并校验唯一备份，成功后再修改；操作结果显示每个文件的备份路径。原文件格式异常或备份失败时停止修改。Codex 使用独立 `llm_gateway` 供应商与 `auto` 模型。当前只有 Gemini 上游转换，尚无 Gemini 原生入站路由，因此暂不开放 Gemini CLI 自动接管。
+
+### 从服务目录选择模型
+
+供应商配置支持填写 API 地址和 Key 后获取模型目录，按名称搜索、筛选免费/工具/视觉能力并批量添加。上下文长度优先使用上游元数据；未知时默认 32,768 tokens 并明确标记待确认。再次获取目录不会覆盖已配置的长度与手工调整。目录可见不保证账户有调用权限或额度，保存后仍应测试连接。更多用法见[模型配置与界面使用指南](docs/模型配置与界面使用指南.md)。
+
+供应商更多菜单还提供「查询额度 / 有效期」：支持 OpenRouter Key 限额、DeepSeek 账户余额、New API Key 额度及兼容 Sub2API 的订阅用量和到期时间。界面明确区分账户、Key、模型和订阅范围；上游未提供的信息显示为「未提供」。这不是全平台官网爬取工具，不会把模型消费记录推算成免费模型剩余次数。
 
 ### 可选的真实上游烟测
 
@@ -102,6 +112,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --test live_provider_smoke -- --
 ```
 
 常规回归不需要上游凭据：在 `src-tauri` 目录运行 `cargo test --jobs 1`；前端与发布配置分别运行 `npm run build`、`npm run verify:release`。
+
+使用手册以 `src/content/user-manual.json` 为单一内容来源，内置阅读器直接使用它；执行 `npm run docs:manual` 生成 Markdown 与离线 HTML。提交前运行 `npm run verify:manual` 检查三个入口内容一致。
 
 ## 端点一览
 
@@ -140,7 +152,7 @@ src-tauri/src/
 
 - 上游 Key 经 **AES-256-GCM** 加密落库。主密钥优先读取 `LLMGW_MASTER_KEY`（Base64 编码的 32 字节值）；未设置时，Windows 会把应用数据目录中的 `master.key` 用当前登录用户的 **DPAPI** 封装，旧格式会在首次读取时保留原密钥并迁移。复制该文件到其他用户或设备后需要通过环境变量恢复；非 Windows 平台保持最小权限本地文件策略
 - 默认只监听 `127.0.0.1`；配置被改坏也会强制回写回环地址
-- 请求体默认不落盘（可在设置里开）
+- 用量审计不记录完整请求体；会话续接所需消息仍会持久化到本机 SQLite，两者不是同一种数据
 - 需要「用自己域名访问」的场景见方案书 §11，含 7 条强制加固清单
 
 ## 免责
