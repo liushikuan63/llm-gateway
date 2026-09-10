@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LLM Gateway",
+  "version": "0.1.0",
+  "identifier": "io.github.liushikuan63.llmgateway",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "LLM Gateway",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 940,
+        "minHeight": 600,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:15721"
+    },
+    "trayIcon": {
+      "id": "main",
+      "iconPath": "icons/tray.png",
+      "iconAsTemplate": true,
+      "menuOnLeftClick": false
+    },
+    "withGlobalTauri": false
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "useLocalToolsDir": true,
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
+    "category": "DeveloperTool",
+    "shortDescription": "统一 LLM 网关：多 Provider 聚合 / 协议转换 / 上下文持久化 / 失败降级",
+    "longDescription": "把 DeepSeek、GLM、Kimi、通义、OpenRouter、Gemini 等任意 OpenAI / Anthropic 兼容端点收进一个本地网关，支持 exe 启动、统一 URL、上下文保存、自动降级切换。",
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true
+      },
+      "wix": {
+        "upgradeCode": "b13d772d-d071-5e09-9818-495c2fdc944a"
+      }
+    }
+  },
+  "plugins": {}
+}

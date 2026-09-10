@@ -1,0 +1,30 @@
+# JavaScript dependencies and frontend build output
+node_modules/
+dist/
+
+# Rust and Tauri generated build output
+src-tauri/target/
+src-tauri/gen/
+
+# Local configuration, credentials, and application data
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+master.key
+
+# Runtime diagnostics and local editor state
+*.log
+*.pid
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

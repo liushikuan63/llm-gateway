@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "LLM Gateway 默认权限：仅本地资源，不放开任意文件系统与 shell",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:tray:default",
+    "core:menu:default",
+    "opener:default",
+    "dialog:default"
+  ]
+}

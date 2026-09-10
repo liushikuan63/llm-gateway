@@ -1,0 +1,151 @@
+# LLM Gateway · 统一大模型网关
+
+仿照 **CC Switch**（可视化切换 + 本地代理接管）与 **FreeLLMAPI**（多 Provider 聚合 + 自动降级）设计的本地优先 LLM 网关。
+把 DeepSeek、GLM、Kimi、通义、OpenRouter、Gemini、本地 Ollama / vLLM 等任意端点，收进**一个网址 + 一个 Key**。
+
+这是当前可构建、可打包的 Rust/Tauri 应用。设计与维护说明保留在 [`docs/VibeCoding实现手册.md`](docs/VibeCoding实现手册.md)，完整架构和安全边界见 [`docs/统一LLM网关设计方案.md`](docs/统一LLM网关设计方案.md)。它们是当前实现的参考与验收资料，不是运行本应用的前置依赖。
+
+## 三个入口
+
+| 想做什么 | 看这里 |
+| --- | --- |
+| 本地开发或使用应用 | 按下面的「快速开始」运行 Rust/Tauri 网关 |
+| 查看维护与回归边界 | [`docs/VibeCoding实现手册.md`](docs/VibeCoding实现手册.md) |
+| 查看架构与安全设计 | [`docs/统一LLM网关设计方案.md`](docs/统一LLM网关设计方案.md) |
+| 查看实际验收和外部服务边界 | [`docs/验证记录.md`](docs/验证记录.md) |
+
+> 根目录的 `CLAUDE.md` / `.cursorrules` 已写好项目背景与执行纪律，
+> AI 助手会自动读取，开箱即用。
+
+## 它解决什么
+
+| 痛点 | 本方案 |
+| --- | --- |
+| 每家模型一套 Key、一套地址、一套限速 | 一个网址一个 Key，其余全在网关里配 |
+| 换模型要改 JSON、重启终端 | 点一下切换，**热生效**，Claude Code 不重启 |
+| 主力厂商临时限流或故障 | 在首个流式字节前，对超时、408/409/429/5xx 自动尝试下一候选；401/403 不跨 Provider 重试 |
+| 关掉程序对话就断了 | 上下文落 SQLite；回传 `X-Session-Id` 后可跨请求、重启和成功降级续接，超长历史自动压缩 |
+| 客户端协议各不相同 | 同时暴露 OpenAI / Anthropic / Responses / Ollama 四种面 |
+
+## 快速开始
+
+### 开发模式
+
+```bash
+# 本次交付实测环境：Windows MSVC、Node v20.13.0、npm 10.5.1、Rust/Cargo 1.98.1。
+# 其他版本可能可用，但未作为本次交付基线验证。
+npm ci
+npm run tauri:dev
+```
+
+### 打包 Windows 安装包
+
+```powershell
+# Windows
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-win.ps1
+```
+
+脚本会在缺少依赖时安装前端依赖，随后校验 Tauri 的 Windows 交付配置、图标和 MSI 升级标识，再构建前端、Rust 二进制、NSIS 与 MSI 安装包，并输出本次安装包的 SHA-256。Tauri 配置启用 `useLocalToolsDir: true`，Windows 打包工具使用 `src-tauri/target/.tauri` 下的本地工具目录。也可以单独执行：
+
+```powershell
+npm run verify:release
+npm run tauri:build
+```
+
+成功构建后的产物：
+
+| 平台 | 路径 |
+| --- | --- |
+| Windows NSIS | `src-tauri/target/release/bundle/nsis/LLM Gateway_0.1.0_x64-setup.exe` |
+| Windows MSI | `src-tauri/target/release/bundle/msi/LLM Gateway_0.1.0_x64_en-US.msi` |
+
+安装包使用 WebView2 `downloadBootstrapper` 模式；目标机器未安装 WebView2 时，安装过程需要联网下载运行时。当前未配置代码签名，首次运行 Windows 可能弹 SmartScreen，选「更多信息 → 仍然运行」。
+
+## 接入客户端
+
+启动后在「设置」页复制统一 Key 和地址（默认 `http://127.0.0.1:15721`）。
+
+需要让网关在跨请求、重启和成功的 Provider 降级后继续恢复持久化上下文时，请让客户端保存并回传响应中的 `X-Session-Id`；也可以在 OpenAI 兼容请求中设置**每段会话唯一且稳定**的 `user` 值，不能让同一用户的所有独立会话共用一个 `user`。未携带任一标识的匿名首请求会获得新的 `a-UUID`，网关会通过响应 `X-Session-Id` 回传它。后续请求必须携带该值才能续接同一会话；未回传时始终创建新会话，避免相同首问意外串到另一段对话。
+
+### 上下文与降级边界
+
+- 自动压缩按“已有摘要 + 未压缩历史”的合计 token 预算触发，默认阈值为 60,000；不以压缩次数作为停止条件。摘要最多保留 12,000 个字符，超出时保留首尾各 6,000 个字符并标记中段截断。
+- `assistant.tool_calls` 与对应的工具结果是不可拆分的上下文单元。若一个完整工具轮次本身无法放入预算，网关返回明确的上下文超限错误，不会发送孤立的工具结果。
+- 只有超时、408、409、429 与 5xx 可在尚未输出流式首字节时触发候选切换。上游 401/403 会将该 Provider 标记为无效并立即返回，绝不跨 Provider 自动重试；首个流式字节输出后发生的错误同样不会换家。
+
+```bash
+# OpenAI SDK / LangChain / Cursor / Continue
+export OPENAI_BASE_URL="http://127.0.0.1:15721/v1"
+export OPENAI_API_KEY="lgw-xxxx"
+
+# Claude Code（推荐用 AUTH_TOKEN 固定为 Bearer；清空 API_KEY 以避免 CLI 改走另一种凭据方式）
+export ANTHROPIC_BASE_URL="http://127.0.0.1:15721"
+export ANTHROPIC_AUTH_TOKEN="lgw-xxxx"
+export ANTHROPIC_API_KEY=""
+```
+
+或在设置页勾选要接管的 CLI，点「写入配置」，程序会自动改 `~/.claude/settings.json`、`~/.codex/config.toml`、`~/.gemini/.env`。
+
+### 可选的真实上游烟测
+
+真实上游烟测默认以 ignored 测试跳过，只有用户在本机显式设置相应环境变量并主动执行该测试时才读取凭据。变量名称为 `LLMGW_LIVE_OPENROUTER_KEY`、`LLMGW_LIVE_SENSENOVA_KEY`、`LLMGW_LIVE_BIGMODEL_KEY` 与 `LLMGW_LIVE_AIR_OUTER_KEY`；README、源码、配置和发布产物均不包含这些变量的值。
+
+已记录的授权烟测结果不构成持续可用承诺：OpenRouter 与 SenseNova 通过；BigModel 返回 `success:false`，网关映射为 HTTP 502；Air Outer 返回 HTTP 401。因此后两者不能标记为已通过或可用。
+
+用户环境变量已设置时，可在 PowerShell 中将其载入当前进程并执行烟测，命令不会打印密钥：
+
+```powershell
+foreach ($llmgwKeyName in @('LLMGW_LIVE_OPENROUTER_KEY', 'LLMGW_LIVE_SENSENOVA_KEY', 'LLMGW_LIVE_BIGMODEL_KEY', 'LLMGW_LIVE_AIR_OUTER_KEY')) {
+    [Environment]::SetEnvironmentVariable($llmgwKeyName, [Environment]::GetEnvironmentVariable($llmgwKeyName, 'User'), 'Process')
+}
+cargo test --manifest-path src-tauri/Cargo.toml --test live_provider_smoke -- --ignored
+```
+
+常规回归不需要上游凭据：在 `src-tauri` 目录运行 `cargo test --jobs 1`；前端与发布配置分别运行 `npm run build`、`npm run verify:release`。
+
+## 端点一览
+
+| 方法 | 路径 | 客户端 |
+| --- | --- | --- |
+| POST | `/v1/chat/completions` | OpenAI SDK、LangChain、Cursor、Continue |
+| GET | `/v1/models` | 模型列表 |
+| POST | `/v1/responses` | Codex CLI |
+| POST | `/v1/messages` | Claude Code、Claude Desktop |
+| POST | `/api/chat` | Zed、JetBrains AI（Ollama 仿真） |
+| GET | `/healthz` | 健康检查（免鉴权） |
+
+## 虚拟模型名
+
+| 值 | 行为 |
+| --- | --- |
+| `auto` | 路由器按策略自动挑（默认） |
+| `fastest` / `smartest` / `reliable` / `balanced` | 临时覆盖路由策略 |
+| `deepseek-chat` | 精确匹配模型别名 |
+| `deepseek:deepseek-chat` | 限定到指定 Provider |
+
+## 目录结构
+
+```
+src-tauri/src/
+├── protocol/   协议转换：openai / anthropic / gemini / ollama ↔ 中间表示
+├── router/     路由打分、本地限流、降级执行链
+├── proxy/      axum 网关服务、上游转发、健康度
+├── context/    会话派生、上下文重建、自动压缩
+├── db/         SQLite 建表与访问
+├── domain/     领域模型
+└── commands.rs 前端 IPC 命令
+```
+
+## 安全
+
+- 上游 Key 经 **AES-256-GCM** 加密落库。主密钥优先读取 `LLMGW_MASTER_KEY`（Base64 编码的 32 字节值）；未设置时，Windows 会把应用数据目录中的 `master.key` 用当前登录用户的 **DPAPI** 封装，旧格式会在首次读取时保留原密钥并迁移。复制该文件到其他用户或设备后需要通过环境变量恢复；非 Windows 平台保持最小权限本地文件策略
+- 默认只监听 `127.0.0.1`；配置被改坏也会强制回写回环地址
+- 请求体默认不落盘（可在设置里开）
+- 需要「用自己域名访问」的场景见方案书 §11，含 7 条强制加固清单
+
+## 免责
+
+本工具是个人用途的本地代理。上游厂商的免费额度条款普遍禁止转售与多人共享，
+请只用于你自己名下的 Key 与设备。免费层无 SLA，生产场景请使用付费服务。
+
+MIT License.
