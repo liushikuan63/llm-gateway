@@ -49,6 +49,29 @@ fn router() -> (Router, Arc<RateLimiter>, Arc<HealthRegistry>) {
 }
 
 #[test]
+fn colon_model_ids_resolve_exactly_before_provider_qualification() {
+    let (router, _, _) = router();
+    let mut cloud = provider("openrouter", 10, 50);
+    cloud.models = vec![model("vendor/chat:free", "vendor/chat:free")];
+    let mut local = provider("local", 20, 50);
+    local.models = vec![model("qwen:latest", "qwen:latest")];
+    let providers = [cloud, local];
+    for (requested, provider_id) in [
+        ("vendor/chat:free", "openrouter"),
+        ("openrouter:vendor/chat:free", "openrouter"),
+        ("qwen:latest", "local"),
+        ("local:qwen:latest", "local"),
+    ] {
+        let candidates = router.resolve(requested, &providers).unwrap();
+        assert_eq!(candidates.len(), 1, "{requested}");
+        assert_eq!(candidates[0].provider.id, provider_id);
+    }
+    assert!(router
+        .resolve("other:vendor/chat:free", &providers)
+        .is_err());
+}
+
+#[test]
 fn rate_limit_preflight_is_idempotent_and_rpm_is_enforced() {
     let limiter = RateLimiter::new();
     let quota = Quota {

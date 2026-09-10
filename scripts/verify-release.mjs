@@ -60,6 +60,10 @@ function requirePngSize(relativePath, expectedSize) {
 
 const config = JSON.parse(readFileSync(resolve(tauriRoot, "tauri.conf.json"), "utf8"));
 const packageJson = JSON.parse(readFileSync(resolve(projectRoot, "package.json"), "utf8"));
+const cargoVersion = readFileSync(resolve(tauriRoot, "Cargo.toml"), "utf8").match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+if (config.version !== packageJson.version || config.version !== cargoVersion) {
+  fail("Tauri, package.json and Cargo.toml versions must agree");
+}
 const readme = readFileSync(resolve(projectRoot, "README.md"), "utf8");
 const targets = config.bundle?.targets;
 
@@ -95,11 +99,10 @@ for (const icon of config.bundle?.icon ?? []) {
 
 requirePngSize("icons/32x32.png", 32);
 requirePngSize("icons/128x128.png", 128);
-const trayIcon = config.app?.trayIcon?.iconPath;
-if (typeof trayIcon !== "string") {
-  fail("a tray icon path is required");
+if (config.app?.trayIcon != null) {
+  fail("app.trayIcon must be absent: Rust creates the single interactive tray icon");
 }
-requirePngSize(trayIcon, 64);
+requirePngSize("icons/tray.png", 64);
 
 const icoSizes = readIcoSizes("icons/icon.ico");
 for (const size of [32, 64, 128, 256]) {

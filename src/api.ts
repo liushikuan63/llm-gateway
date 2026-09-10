@@ -98,6 +98,37 @@ export interface ProviderTestResult {
   error?: string;
 }
 
+export interface DiscoverModelsInput {
+  provider_id?: string;
+  dialect: Dialect;
+  base_url: string;
+  api_key: string;
+}
+
+export interface DiscoveredModel {
+  id: string;
+  name: string;
+  context_window: number;
+  context_source: "provider" | "default";
+  supports_tools: boolean | null;
+  supports_vision: boolean | null;
+  supports_stream: boolean | null;
+  is_free: boolean | null;
+}
+
+export interface DiscoveredModels {
+  base_url: string;
+  models: DiscoveredModel[];
+  warnings: string[];
+}
+
+export interface TakeoverResult {
+  client: string;
+  path: string;
+  backup_path: string | null;
+  status: "updated" | "created";
+}
+
 // 远程访问 Key 的原始 secret 永不在列表接口中出现。
 export interface RemoteAccessKeyView {
   id: string;
@@ -122,6 +153,34 @@ export interface CreateRemoteAccessKeyResult {
   key: RemoteAccessKeyView;
   // 仅 create 命令返回；调用方不得把它写入 React state 或列表。
   secret: string;
+}
+
+export type QuotaAdapter = "auto" | "openrouter" | "deepseek" | "newapi" | "sub2api";
+export interface QuotaMetric {
+  label: string;
+  scope: "account" | "key" | "model" | "subscription";
+  unit: string;
+  used: number | null;
+  total: number | null;
+  remaining: number | null;
+  unlimited: boolean;
+  model: string | null;
+  resets_at: string | null;
+}
+export interface QuotaExpiration {
+  label: string;
+  scope: "key" | "subscription";
+  expires_at: string | null;
+  unlimited: boolean;
+}
+export interface ProviderQuota {
+  provider_id: string;
+  source: string;
+  checked_at: string;
+  status: "ok" | "unsupported";
+  metrics: QuotaMetric[];
+  expirations: QuotaExpiration[];
+  warnings: string[];
 }
 
 export interface Session {
@@ -216,6 +275,10 @@ export const api = {
   upsertProvider: (input: ProviderInput) => invoke<string>("upsert_provider", { input }),
   deleteProvider: (id: string) => invoke<void>("delete_provider", { id }),
   testProvider: (id: string) => invoke<ProviderTestResult>("test_provider", { id }),
+  discoverModels: (input: DiscoverModelsInput) =>
+    invoke<DiscoveredModels>("discover_provider_models", { input }),
+  getProviderQuota: (providerId: string, adapter: QuotaAdapter = "auto") =>
+    invoke<ProviderQuota>("get_provider_quota", { providerId, adapter }),
   setActive: (id: string) => invoke<void>("set_active_provider", { id }),
 
   getConfig: () => invoke<AppConfig>("get_config"),
@@ -246,7 +309,7 @@ export const api = {
   statsOverview: () => invoke<StatsOverview>("stats_overview"),
   recentRequests: (limit = 100) => invoke<RequestLog[]>("recent_requests", { limit }),
 
-  applyTakeover: () => invoke<string[]>("apply_takeover"),
+  applyTakeover: () => invoke<TakeoverResult[]>("apply_takeover"),
   exportBundle: (dest: string) => invoke<void>("export_bundle", { dest }),
 };
 

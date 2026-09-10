@@ -14,8 +14,8 @@ use crate::db::repo;
 use crate::domain::{
     Dialect, ModelRef, Provider, PublicModel, RemoteAccessKey, Session, SessionMessage,
 };
+use crate::model_catalog;
 use crate::proxy::server::GatewayState;
-use crate::proxy::upstream::validate_upstream_base_url;
 use crate::AppState;
 
 /* ------------------------------- Provider ------------------------------- */
@@ -105,27 +105,61 @@ pub async fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderVi
         .collect())
 }
 
+/// 读取当前 API 地址可用的模型目录。目录发现不会落库；前端明确选择模型并保存
+/// Provider 后才会更新数据库。空 Key 只会在当前目标与保存记录严格一致时复用。
+#[tauri::command]
+pub async fn discover_provider_models(
+    state: State<'_, AppState>,
+    input: model_catalog::DiscoveryInput,
+) -> Result<model_catalog::DiscoveryResponse, String> {
+    let saved_provider = if let Some(provider_id) = input.provider_id.as_deref() {
+        repo::list_providers(state.db.pool())
+            .await
+            .map_err(|_| "无法读取已保存的 Provider".to_string())?
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+    } else {
+        None
+    };
+    let proxy_url = state.config.read().http_proxy.clone();
+
+    model_catalog::discover(&input, saved_provider.as_ref(), proxy_url.as_deref()).await
+}
+
 #[tauri::command]
 pub async fn upsert_provider(
     state: State<'_, AppState>,
     input: ProviderInput,
 ) -> Result<String, String> {
-    // 保存期和出站期使用同一规则：公网 HTTP 绝不能携带上游 Key；本地
-    // Ollama/vLLM 与 RFC1918 LAN 服务仍可用 HTTP。
-    let base_url = validate_upstream_base_url(&input.base_url)
-        .map_err(|error| error.to_string())?
-        .as_str()
-        .trim_end_matches('/')
-        .to_string();
+    // 保存期和目录发现期使用同一规则：公网 HTTP 绝不能携带上游 Key；本地
+    // Ollama/vLLM 与 RFC1918 LAN 服务仍可用 HTTP。完整接口 URL 会在此收敛为
+    // 可由转发器安全追加路径的基础地址。
+    let base_url = model_catalog::normalize_base_url(input.dialect, &input.base_url)?;
     let enc = if input.api_key.trim().is_empty() {
-        // 未填密钥：保留原值（编辑场景下用户往往只改别的字段）
+        // 未填密钥只允许在协议和规范化基础地址均未改变时保留。否则旧 Key
+        // 可能被无意转发给另一个服务端，必须要求用户重新确认并提交。
         if let Some(id) = &input.id {
-            repo::list_providers(state.db.pool())
+            let existing = repo::list_providers(state.db.pool())
                 .await
-                .ok()
-                .and_then(|l| l.into_iter().find(|p| &p.id == id))
-                .map(|p| p.api_key_enc)
-                .unwrap_or_default()
+                .map_err(|_| "无法读取已保存的 Provider".to_string())?
+                .into_iter()
+                .find(|provider| &provider.id == id);
+            match existing {
+                Some(provider)
+                    if provider.api_key_enc.trim().is_empty()
+                        || model_catalog::matches_saved_provider_target(
+                            &provider,
+                            input.dialect,
+                            &base_url,
+                        ) =>
+                {
+                    provider.api_key_enc
+                }
+                Some(_) => {
+                    return Err("API 地址或协议已变更，请重新输入 API Key".into());
+                }
+                None => String::new(),
+            }
         } else {
             String::new()
         }
@@ -1099,123 +1133,664 @@ pub async fn recent_requests(
 
 /* --------------------------- CLI 工具接管（可选） --------------------------- */
 
-/// 把 Claude Code / Codex / Gemini CLI 的 base_url 指向本地网关。
-/// 这是 CC Switch "接管模式" 的实现：配置文件只写一次，
-/// 之后切换 provider 只改网关内部路由，客户端无感。
-#[tauri::command]
-pub async fn apply_takeover(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let cfg = state.config.read().clone();
-    let base = cfg.base_url();
-    let mut changed = Vec::new();
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    GetFileAttributesW, ReplaceFileW, FILE_ATTRIBUTE_ENCRYPTED, REPLACEFILE_WRITE_THROUGH,
+};
 
+/// 单个 CLI 配置写入的可审计结果。已有文件必定给出已验证的备份路径；
+/// 新建文件没有原始内容，因此 `backup_path` 为 `None`。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeoverStatus {
+    Updated,
+    Created,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TakeoverResult {
+    pub client: String,
+    pub path: String,
+    pub backup_path: Option<String>,
+    pub status: TakeoverStatus,
+}
+
+struct PreparedTakeover {
+    client: &'static str,
+    path: std::path::PathBuf,
+    original: Option<Vec<u8>>,
+    updated: Vec<u8>,
+    backup_path: Option<std::path::PathBuf>,
+}
+
+impl PreparedTakeover {
+    fn result(&self) -> TakeoverResult {
+        TakeoverResult {
+            client: self.client.to_string(),
+            path: self.path.display().to_string(),
+            backup_path: self
+                .backup_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            status: if self.original.is_some() {
+                TakeoverStatus::Updated
+            } else {
+                TakeoverStatus::Created
+            },
+        }
+    }
+}
+
+/// 将已支持的 CLI 指向本地网关；不支持的 CLI 会在读取任何配置前拒绝。
+/// 已有配置先创建并验证独立备份，失败时绝不改写原文件。
+#[tauri::command]
+pub async fn apply_takeover(state: State<'_, AppState>) -> Result<Vec<TakeoverResult>, String> {
+    let cfg = state.config.read().clone();
+    ensure_supported_takeover_selection(cfg.takeover.gemini_cli)?;
+    if !cfg.takeover.claude_code && !cfg.takeover.codex && !cfg.takeover.gemini_cli {
+        return Ok(Vec::new());
+    }
+
+    let base = cfg.base_url();
     let home = dirs::home_dir().ok_or_else(|| "找不到用户目录".to_string())?;
+    let mut prepared = Vec::new();
 
     if cfg.takeover.claude_code {
-        let dir = home.join(".claude");
-        std::fs::create_dir_all(&dir).ok();
-        let path = dir.join("settings.json");
-        let mut v: serde_json::Value = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-        v["env"]["ANTHROPIC_BASE_URL"] = serde_json::json!(base);
-        v["env"]["ANTHROPIC_AUTH_TOKEN"] = serde_json::json!(cfg.unified_key);
-        // 关键：置空 API_KEY，否则 Claude Code 会发 x-api-key 而非 Bearer，
-        // 自建网关普遍只认 Bearer，会直接 401
-        v["env"]["ANTHROPIC_API_KEY"] = serde_json::json!("");
-        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
-            .map_err(|e| e.to_string())?;
-        changed.push(path.display().to_string());
+        prepared.push(prepare_claude_takeover(
+            &home.join(".claude").join("settings.json"),
+            &base,
+            &cfg.unified_key,
+        )?);
     }
 
     if cfg.takeover.codex {
-        let dir = home.join(".codex");
-        std::fs::create_dir_all(&dir).ok();
-        let path = dir.join("config.toml");
-        let mut s = std::fs::read_to_string(&path).unwrap_or_default();
-        // 粗暴但可靠：整段替换 base_url 行
-        let lines: Vec<String> = s
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("base_url"))
-            .map(|l| l.to_string())
-            .collect();
-        s = lines.join("\n");
-        s.push_str(&format!("\nbase_url = \"{base}/v1\"\n"));
-        std::fs::write(&path, s).map_err(|e| e.to_string())?;
-        changed.push(path.display().to_string());
+        prepared.push(prepare_codex_takeover(
+            &home.join(".codex").join("config.toml"),
+            &base,
+            &cfg.unified_key,
+        )?);
     }
 
-    if cfg.takeover.gemini_cli {
-        let dir = home.join(".gemini");
-        let path = dir.join(".env");
-        let backup = write_gemini_takeover_env(&path, &base)?;
-        let display = match backup {
-            Some(backup) => format!("{}（已备份至 {}）", path.display(), backup.display()),
-            None => path.display().to_string(),
-        };
-        changed.push(display);
-    }
-
-    Ok(changed)
+    apply_prepared_takeovers(prepared)
 }
 
-/// 合并 Gemini CLI 的网关地址，避免覆盖用户的其它环境变量或注释。
-/// 已有文件会在写入前保留一份同目录的独立备份，以便用户手动恢复。
-fn write_gemini_takeover_env(
+fn ensure_supported_takeover_selection(gemini_cli: bool) -> Result<(), String> {
+    if gemini_cli {
+        return Err(
+            "Gemini CLI 接管暂不支持：网关尚未提供 Gemini 入站协议，未读取、备份或写入任何 Gemini 配置"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn prepare_claude_takeover(
     path: &std::path::Path,
     base_url: &str,
-) -> Result<Option<std::path::PathBuf>, String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("Gemini 配置路径无父目录: {}", path.display()))?;
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-
-    let existing = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(format!(
-                "读取 Gemini 配置失败（未写入，原文件保持不变）: {error}"
-            ));
-        }
-    };
-
-    let updated = replace_dotenv_value(&existing, "GOOGLE_GEMINI_BASE_URL", base_url);
-    let backup = backup_before_overwrite(path)?;
-    std::fs::write(path, updated).map_err(|error| {
-        format!(
-            "写入 Gemini 配置失败（可从备份恢复）: {}: {error}",
-            path.display()
-        )
-    })?;
-    Ok(backup)
+    unified_key: &str,
+) -> Result<PreparedTakeover, String> {
+    prepare_takeover_file("Claude Code", path, |contents| {
+        let mut value: serde_json::Value = match contents {
+            Some(contents) => serde_json::from_str(contents)
+                .map_err(|_| "Claude Code settings.json 不是有效 JSON；未改写原文件".to_string())?,
+            None => serde_json::json!({}),
+        };
+        let root = value.as_object_mut().ok_or_else(|| {
+            "Claude Code settings.json 根节点必须是对象；未改写原文件".to_string()
+        })?;
+        let env = root
+            .entry("env")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                "Claude Code settings.json 的 env 必须是对象；未改写原文件".to_string()
+            })?;
+        env.insert("ANTHROPIC_BASE_URL".into(), serde_json::json!(base_url));
+        env.insert(
+            "ANTHROPIC_AUTH_TOKEN".into(),
+            serde_json::json!(unified_key),
+        );
+        // 固定 Claude Code 使用 Bearer；网关仍会正常校验其它合法鉴权形式。
+        env.insert("ANTHROPIC_API_KEY".into(), serde_json::json!(""));
+        serde_json::to_string_pretty(&value)
+            .map_err(|_| "Claude Code settings.json 序列化失败；未改写原文件".to_string())
+    })
 }
 
-fn backup_before_overwrite(path: &std::path::Path) -> Result<Option<std::path::PathBuf>, String> {
-    if !path.exists() {
-        return Ok(None);
+fn prepare_codex_takeover(
+    path: &std::path::Path,
+    base_url: &str,
+    unified_key: &str,
+) -> Result<PreparedTakeover, String> {
+    prepare_takeover_file("Codex CLI", path, |contents| {
+        merge_codex_takeover_config(
+            contents.unwrap_or(""),
+            &format!("{base_url}/v1"),
+            unified_key,
+        )
+    })
+}
+
+/// 只改 Codex 选择的 provider 与 `llm_gateway` 专用表，保留其它 provider 的语义字段。
+fn merge_codex_takeover_config(
+    contents: &str,
+    gateway_url: &str,
+    unified_key: &str,
+) -> Result<String, String> {
+    let mut original: toml::Value = toml::from_str(contents)
+        .map_err(|_| "Codex config.toml 不是有效 TOML；未改写原文件".to_string())?;
+    let root = original
+        .as_table_mut()
+        .ok_or_else(|| "Codex config.toml 根节点必须是表；未改写原文件".to_string())?;
+    // 旧接管版本曾写过无效的顶层 base_url；自定义 provider 使用表内 base_url。
+    root.remove("base_url");
+    root.insert("model".into(), toml::Value::String("auto".into()));
+    root.insert(
+        "model_provider".into(),
+        toml::Value::String("llm_gateway".into()),
+    );
+    let providers = root
+        .entry("model_providers")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or_else(|| "Codex config.toml 的 model_providers 必须是表；未改写原文件".to_string())?;
+    let gateway = providers
+        .entry("llm_gateway")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            "Codex config.toml 的 model_providers.llm_gateway 必须是表；未改写原文件".to_string()
+        })?;
+    remove_codex_gateway_auth_conflicts(gateway)?;
+    gateway.insert("name".into(), toml::Value::String("LLM Gateway".into()));
+    gateway.insert("base_url".into(), toml::Value::String(gateway_url.into()));
+    gateway.insert("wire_api".into(), toml::Value::String("responses".into()));
+    gateway.insert(
+        "experimental_bearer_token".into(),
+        toml::Value::String(unified_key.into()),
+    );
+    gateway.insert("requires_openai_auth".into(), toml::Value::Boolean(false));
+
+    toml::to_string_pretty(&original)
+        .map_err(|_| "Codex config.toml 序列化失败；未改写原文件".to_string())
+}
+
+/// 本地统一 Key 与旧 provider 鉴权来源不能并存；只处理接管专用的表。
+fn remove_codex_gateway_auth_conflicts(gateway: &mut toml::Table) -> Result<(), String> {
+    gateway.remove("auth");
+    gateway.remove("env_key");
+    gateway.remove("env_key_instructions");
+
+    for header_table_name in ["http_headers", "env_http_headers"] {
+        let Some(headers) = gateway.get_mut(header_table_name) else {
+            continue;
+        };
+        let headers = headers.as_table_mut().ok_or_else(|| {
+            format!(
+                "Codex config.toml 的 model_providers.llm_gateway.{header_table_name} 必须是表；未改写原文件"
+            )
+        })?;
+        let authorization_keys: Vec<String> = headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("authorization"))
+            .cloned()
+            .collect();
+        for name in authorization_keys {
+            headers.remove(&name);
+        }
     }
-    if !path.is_file() {
-        return Err(format!("Gemini 配置路径不是普通文件: {}", path.display()));
+    Ok(())
+}
+
+#[cfg(test)]
+fn prepare_gemini_takeover(
+    path: &std::path::Path,
+    base_url: &str,
+) -> Result<PreparedTakeover, String> {
+    prepare_takeover_file("Gemini CLI", path, |contents| {
+        Ok(replace_dotenv_value(
+            contents.unwrap_or(""),
+            "GOOGLE_GEMINI_BASE_URL",
+            base_url,
+        ))
+    })
+}
+
+fn prepare_takeover_file<F>(
+    client: &'static str,
+    path: &std::path::Path,
+    transform: F,
+) -> Result<PreparedTakeover, String>
+where
+    F: FnOnce(Option<&str>) -> Result<String, String>,
+{
+    let original = read_takeover_source(path, client)?;
+    let contents = original
+        .as_deref()
+        .map(|bytes| {
+            std::str::from_utf8(bytes).map_err(|_| {
+                format!(
+                    "{client} 配置不是 UTF-8 文本；未改写原文件：{}",
+                    path.display()
+                )
+            })
+        })
+        .transpose()?;
+    let updated = transform(contents)?.into_bytes();
+    Ok(PreparedTakeover {
+        client,
+        path: path.to_path_buf(),
+        original,
+        updated,
+        backup_path: None,
+    })
+}
+
+fn read_takeover_source(path: &std::path::Path, client: &str) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "{client} 配置不是普通文件，未写入：{}",
+                    path.display()
+                ));
+            }
+            std::fs::read(path).map(Some).map_err(|error| {
+                format!(
+                    "读取 {client} 配置失败，未写入：{}: {error}",
+                    path.display()
+                )
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "检查 {client} 配置失败，未写入：{}: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// 先为所有已有文件建立并验证备份；只有全部成功后才开始写入。
+fn apply_prepared_takeovers(
+    mut prepared: Vec<PreparedTakeover>,
+) -> Result<Vec<TakeoverResult>, String> {
+    for index in 0..prepared.len() {
+        let (path, client, original) = {
+            let item = &prepared[index];
+            (item.path.clone(), item.client, item.original.clone())
+        };
+        if let Err(error) = ensure_takeover_parent(&path, client) {
+            return Err(with_takeover_backup_paths(&prepared, error));
+        }
+        if let Some(original) = original.as_deref() {
+            match create_verified_takeover_backup(&path, original, client) {
+                Ok(backup) => prepared[index].backup_path = Some(backup),
+                Err(error) => return Err(with_takeover_backup_paths(&prepared, error)),
+            }
+        }
+    }
+
+    let mut results = Vec::with_capacity(prepared.len());
+    for item in &prepared {
+        if let Err(error) = write_prepared_takeover(item) {
+            return Err(with_takeover_backup_paths(&prepared, error));
+        }
+        results.push(item.result());
+    }
+    Ok(results)
+}
+
+fn ensure_takeover_parent(path: &std::path::Path, client: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{client} 配置路径无父目录: {}", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "创建 {client} 配置目录失败，未写入：{}: {error}",
+            parent.display()
+        )
+    })
+}
+
+fn create_verified_takeover_backup(
+    path: &std::path::Path,
+    original: &[u8],
+    client: &str,
+) -> Result<std::path::PathBuf, String> {
+    create_verified_takeover_backup_with(path, original, client, write_new_synced_file)
+}
+
+fn create_verified_takeover_backup_with<F>(
+    path: &std::path::Path,
+    original: &[u8],
+    client: &str,
+    write_backup: F,
+) -> Result<std::path::PathBuf, String>
+where
+    F: FnOnce(&std::path::Path, &[u8]) -> std::io::Result<()>,
+{
+    let current = read_takeover_source(path, client)?
+        .ok_or_else(|| format!("{client} 配置在备份前消失，未写入：{}", path.display()))?;
+    if current != original {
+        return Err(format!(
+            "{client} 配置在备份前已被其它进程修改，未写入：{}",
+            path.display()
+        ));
     }
 
     let file_name = path
         .file_name()
-        .ok_or_else(|| format!("Gemini 配置路径没有文件名: {}", path.display()))?
+        .ok_or_else(|| format!("{client} 配置路径没有文件名: {}", path.display()))?
         .to_string_lossy();
     let backup = path.with_file_name(format!(
         "{file_name}.llm-gateway-backup-{}.bak",
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::copy(path, &backup).map_err(|error| {
-        format!(
-            "创建 Gemini 配置备份失败（未写入原文件）: {}: {error}",
+    if let Err(error) = write_backup(&backup, original) {
+        return Err(format!(
+            "创建 {client} 配置备份失败，未写入原文件：{}: {error}",
             backup.display()
-        )
-    })?;
-    Ok(Some(backup))
+        ));
+    }
+
+    match std::fs::read(&backup) {
+        Ok(contents) if contents == original => Ok(backup),
+        Ok(_) => {
+            let _ = std::fs::remove_file(&backup);
+            Err(format!(
+                "验证 {client} 配置备份失败，未写入原文件：{}",
+                backup.display()
+            ))
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&backup);
+            Err(format!(
+                "读取 {client} 配置备份失败，未写入原文件：{}: {error}",
+                backup.display()
+            ))
+        }
+    }
 }
 
+fn write_new_synced_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let result = file.write_all(contents).and_then(|()| file.sync_all());
+    drop(file);
+    if result.is_err() {
+        // 只有 `create_new` 成功后才会走到这里，因此不会删除别的进程已有文件。
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn write_prepared_takeover(item: &PreparedTakeover) -> Result<(), String> {
+    match item.original.as_deref() {
+        Some(original) => {
+            let backup = item.backup_path.as_deref().ok_or_else(|| {
+                format!(
+                    "{} 缺少已验证备份，拒绝改写：{}",
+                    item.client,
+                    item.path.display()
+                )
+            })?;
+            write_existing_takeover_file(&item.path, original, &item.updated, backup, item.client)
+        }
+        None => write_new_takeover_file(&item.path, &item.updated, item.client),
+    }
+}
+
+fn write_new_takeover_file(
+    path: &std::path::Path,
+    updated: &[u8],
+    client: &str,
+) -> Result<(), String> {
+    write_new_synced_file(path, updated).map_err(|error| {
+        format!(
+            "新建 {client} 配置失败，未覆盖已有文件：{}: {error}",
+            path.display()
+        )
+    })?;
+    verify_takeover_contents(path, updated, client, "新建")
+}
+
+fn write_existing_takeover_file(
+    path: &std::path::Path,
+    original: &[u8],
+    updated: &[u8],
+    backup_path: &std::path::Path,
+    client: &str,
+) -> Result<(), String> {
+    let current = read_takeover_source(path, client)?.ok_or_else(|| {
+        format!(
+            "{client} 配置在写入前消失，未改写；可用备份恢复：{}",
+            backup_path.display()
+        )
+    })?;
+    if current != original {
+        return Err(format!(
+            "{client} 配置在写入前已被其它进程修改，未改写；可用备份恢复：{}",
+            backup_path.display()
+        ));
+    }
+
+    let temp_path = write_takeover_temp_file(path, updated, client)?;
+    #[cfg(windows)]
+    {
+        let uses_efs = match takeover_file_uses_efs(path) {
+            Ok(uses_efs) => uses_efs,
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
+        if uses_efs {
+            let _ = std::fs::remove_file(&temp_path);
+            return write_efs_takeover_file_in_place(path, original, updated, backup_path, client);
+        }
+        if let Err(error) = replace_takeover_file_windows(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!(
+                "原子替换 {client} 配置失败，原文件保持不变；可用备份恢复：{}: {error}",
+                backup_path.display()
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (original, backup_path);
+        if let Err(error) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!(
+                "原子替换 {client} 配置失败，原文件保持不变；可用备份恢复：{}: {error}",
+                backup_path.display()
+            ));
+        }
+    }
+
+    verify_takeover_contents(path, updated, client, "写入")
+        .map_err(|error| format!("{error}；可用备份恢复：{}", backup_path.display()))
+}
+
+fn write_takeover_temp_file(
+    path: &std::path::Path,
+    updated: &[u8],
+    client: &str,
+) -> Result<std::path::PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("{client} 配置路径没有文件名: {}", path.display()))?
+        .to_string_lossy();
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.llm-gateway-takeover-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    write_new_synced_file(&temp_path, updated).map_err(|error| {
+        format!(
+            "写入 {client} 配置临时文件失败，未改写原文件：{}: {error}",
+            temp_path.display()
+        )
+    })?;
+    Ok(temp_path)
+}
+
+fn verify_takeover_contents(
+    path: &std::path::Path,
+    expected: &[u8],
+    client: &str,
+    action: &str,
+) -> Result<(), String> {
+    let actual = std::fs::read(path).map_err(|error| {
+        format!(
+            "{action}后读取 {client} 配置失败：{}: {error}",
+            path.display()
+        )
+    })?;
+    if actual != expected {
+        return Err(format!(
+            "{action}后校验 {client} 配置失败：{}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn with_takeover_backup_paths(prepared: &[PreparedTakeover], error: String) -> String {
+    let backups: Vec<String> = prepared
+        .iter()
+        .filter_map(|item| item.backup_path.as_ref())
+        .map(|path| path.display().to_string())
+        .collect();
+    if backups.is_empty() {
+        error
+    } else {
+        format!(
+            "{error}。本次已验证的备份路径：{}；请关闭对应 CLI 后再使用备份恢复。",
+            backups.join("；")
+        )
+    }
+}
+
+#[cfg(windows)]
+fn takeover_wide_path(path: &std::path::Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn takeover_file_uses_efs(path: &std::path::Path) -> Result<bool, String> {
+    let wide = takeover_wide_path(path);
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == u32::MAX {
+        return Err(format!(
+            "检查 EFS 属性失败，未改写原文件：{}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(attributes & FILE_ATTRIBUTE_ENCRYPTED != 0)
+}
+
+#[cfg(windows)]
+fn replace_takeover_file_windows(
+    temp_path: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let temp_wide = takeover_wide_path(temp_path);
+    let path_wide = takeover_wide_path(path);
+    let ok = unsafe {
+        ReplaceFileW(
+            path_wide.as_ptr(),
+            temp_wide.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_efs_takeover_file_in_place(
+    path: &std::path::Path,
+    original: &[u8],
+    updated: &[u8],
+    backup_path: &std::path::Path,
+    client: &str,
+) -> Result<(), String> {
+    match write_takeover_file_in_place(path, updated) {
+        Ok(()) => match verify_takeover_contents(path, updated, client, "EFS 写入") {
+            Ok(()) => Ok(()),
+            Err(error) => Err(format!(
+                "{error}；{}",
+                restore_efs_takeover_file(path, original, backup_path, client)
+            )),
+        },
+        Err(error) => Err(format!(
+            "EFS 原位写入 {client} 配置失败：{}: {error}；{}",
+            path.display(),
+            restore_efs_takeover_file(path, original, backup_path, client)
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn write_takeover_file_in_place(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+#[cfg(windows)]
+fn restore_efs_takeover_file(
+    path: &std::path::Path,
+    original: &[u8],
+    backup_path: &std::path::Path,
+    client: &str,
+) -> String {
+    let backup = match std::fs::read(backup_path) {
+        Ok(contents) if contents == original => contents,
+        Ok(_) => return format!("备份校验失败，请手动恢复：{}", backup_path.display()),
+        Err(error) => {
+            return format!(
+                "读取备份失败，请手动恢复：{}: {error}",
+                backup_path.display()
+            )
+        }
+    };
+    match write_takeover_file_in_place(path, &backup)
+        .and_then(|()| std::fs::read(path).map(|contents| contents == original))
+    {
+        Ok(true) => format!("已自动从已验证备份恢复 {client} 原文件"),
+        Ok(false) => format!(
+            "自动恢复 {client} 配置的校验失败，请手动恢复：{}",
+            backup_path.display()
+        ),
+        Err(error) => format!(
+            "自动恢复 {client} 配置失败，请手动恢复：{}: {error}",
+            backup_path.display()
+        ),
+    }
+}
+
+#[cfg(test)]
 fn replace_dotenv_value(contents: &str, key: &str, value: &str) -> String {
     let mut output = String::with_capacity(contents.len() + key.len() + value.len() + 2);
     let mut found = false;
@@ -1245,6 +1820,7 @@ fn replace_dotenv_value(contents: &str, key: &str, value: &str) -> String {
     output
 }
 
+#[cfg(test)]
 fn split_line_ending(chunk: &str) -> (&str, &str) {
     if let Some(line) = chunk.strip_suffix("\r\n") {
         (line, "\r\n")
@@ -1255,6 +1831,7 @@ fn split_line_ending(chunk: &str) -> (&str, &str) {
     }
 }
 
+#[cfg(test)]
 fn is_dotenv_assignment(line: &str, key: &str) -> bool {
     let trimmed = line.trim_start();
     let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
@@ -1265,8 +1842,12 @@ fn is_dotenv_assignment(line: &str, key: &str) -> bool {
 
 #[cfg(test)]
 mod takeover_tests {
-    use super::write_gemini_takeover_env;
-    use std::path::PathBuf;
+    use super::{
+        apply_prepared_takeovers, create_verified_takeover_backup_with,
+        ensure_supported_takeover_selection, prepare_claude_takeover, prepare_codex_takeover,
+        prepare_gemini_takeover, TakeoverStatus,
+    };
+    use std::{io, path::PathBuf};
 
     struct TempDir(PathBuf);
 
@@ -1289,42 +1870,339 @@ mod takeover_tests {
     }
 
     #[test]
-    fn gemini_takeover_preserves_existing_env_and_creates_recoverable_backup() {
+    fn gemini_takeover_is_rejected_before_any_file_operation() {
+        assert!(ensure_supported_takeover_selection(false).is_ok());
+        let error = ensure_supported_takeover_selection(true)
+            .expect_err("Gemini takeover must be rejected before configuration access");
+        assert!(error.contains("暂不支持"));
+        assert!(error.contains("未读取、备份或写入"));
+    }
+
+    #[test]
+    fn takeover_preserves_unrelated_settings_and_writes_codex_provider_contract() {
+        let temp = TempDir::new();
+        let claude_path = temp.0.join(".claude").join("settings.json");
+        let codex_path = temp.0.join(".codex").join("config.toml");
+        let gemini_path = temp.0.join(".gemini").join(".env");
+        for path in [&claude_path, &codex_path, &gemini_path] {
+            std::fs::create_dir_all(path.parent().expect("config parent"))
+                .expect("create config directory");
+        }
+
+        let claude_original = r#"{
+  "permissions": { "allow": ["Read"] },
+  "env": {
+    "KEEP_ME": "yes",
+    "ANTHROPIC_BASE_URL": "https://old.invalid"
+  },
+  "ui": { "theme": "dark" }
+}"#;
+        let codex_original = r#"# retain this comment
+model = "gpt-5"
+model_provider = "example"
+approval_policy = "on-request"
+base_url = "http://old-invalid-root.example/v1"
+
+[model_providers.example]
+name = "Example"
+base_url = "https://provider.invalid/v1"
+wire_api = "responses"
+experimental_bearer_token = "unrelated-token"
+requires_openai_auth = true
+
+[model_providers.example.http_headers]
+Authorization = "Bearer unrelated"
+X-Example-Header = "preserve-example-header"
+
+[model_providers.llm_gateway]
+custom_setting = "preserve-me"
+env_key = "LLM_GATEWAY_OLD_KEY"
+env_key_instructions = "use the old gateway key"
+
+[model_providers.llm_gateway.auth]
+command = "old-gateway-token-command"
+
+[model_providers.llm_gateway.http_headers]
+Authorization = "Bearer stale"
+X-Gateway-Header = "preserve-gateway-header"
+
+[model_providers.llm_gateway.env_http_headers]
+authorization = "LLM_GATEWAY_OLD_AUTHORIZATION"
+X-Gateway-Env-Header = "LLM_GATEWAY_PRESERVE_HEADER"
+"#;
+        let gemini_original = "# keep this comment\r\nGOOGLE_API_KEY=test-key\r\nGOOGLE_GEMINI_BASE_URL=https://old.invalid\r\nCUSTOM_VALUE=keep\r\n";
+        std::fs::write(&claude_path, claude_original).expect("write Claude config");
+        std::fs::write(&codex_path, codex_original).expect("write Codex config");
+        std::fs::write(&gemini_path, gemini_original).expect("write Gemini config");
+
+        let results = apply_prepared_takeovers(vec![
+            prepare_claude_takeover(&claude_path, "http://127.0.0.1:15721", "test-token")
+                .expect("prepare Claude"),
+            prepare_codex_takeover(&codex_path, "http://127.0.0.1:15721", "test-token")
+                .expect("prepare Codex"),
+            prepare_gemini_takeover(&gemini_path, "http://127.0.0.1:15721")
+                .expect("prepare Gemini"),
+        ])
+        .expect("apply takeover");
+
+        assert_eq!(results.len(), 3);
+        for result in &results {
+            assert_eq!(result.status, TakeoverStatus::Updated);
+            assert!(
+                result.backup_path.is_some(),
+                "{} needs a backup",
+                result.client
+            );
+        }
+        let claude_backup =
+            PathBuf::from(results[0].backup_path.as_ref().expect("Claude backup path"));
+        let codex_backup =
+            PathBuf::from(results[1].backup_path.as_ref().expect("Codex backup path"));
+        let gemini_backup =
+            PathBuf::from(results[2].backup_path.as_ref().expect("Gemini backup path"));
+        assert_eq!(
+            std::fs::read(&claude_backup).expect("read Claude backup"),
+            claude_original.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(&codex_backup).expect("read Codex backup"),
+            codex_original.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(&gemini_backup).expect("read Gemini backup"),
+            gemini_original.as_bytes()
+        );
+
+        let claude_updated: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_path).expect("read Claude config"),
+        )
+        .expect("parse updated Claude config");
+        assert_eq!(claude_updated["permissions"]["allow"][0], "Read");
+        assert_eq!(claude_updated["ui"]["theme"], "dark");
+        assert_eq!(claude_updated["env"]["KEEP_ME"], "yes");
+        assert_eq!(
+            claude_updated["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:15721"
+        );
+
+        let codex_updated: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&codex_path).expect("read Codex config"))
+                .expect("parse updated Codex config");
+        assert_eq!(codex_updated["model"].as_str(), Some("auto"));
+        assert_eq!(
+            codex_updated["model_provider"].as_str(),
+            Some("llm_gateway")
+        );
+        assert_eq!(
+            codex_updated["approval_policy"].as_str(),
+            Some("on-request")
+        );
+        assert_eq!(
+            codex_updated["model_providers"]["example"]["base_url"].as_str(),
+            Some("https://provider.invalid/v1")
+        );
+        assert_eq!(
+            codex_updated["model_providers"]["example"]["wire_api"].as_str(),
+            Some("responses")
+        );
+        assert_eq!(
+            codex_updated["model_providers"]["example"]["experimental_bearer_token"].as_str(),
+            Some("unrelated-token")
+        );
+        assert_eq!(
+            codex_updated["model_providers"]["example"]["requires_openai_auth"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            codex_updated["model_providers"]["example"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer unrelated")
+        );
+        assert_eq!(
+            codex_updated["model_providers"]["example"]["http_headers"]["X-Example-Header"]
+                .as_str(),
+            Some("preserve-example-header")
+        );
+        assert!(codex_updated.get("base_url").is_none());
+        let gateway = &codex_updated["model_providers"]["llm_gateway"];
+        assert_eq!(gateway["custom_setting"].as_str(), Some("preserve-me"));
+        assert_eq!(gateway["name"].as_str(), Some("LLM Gateway"));
+        assert_eq!(
+            gateway["base_url"].as_str(),
+            Some("http://127.0.0.1:15721/v1")
+        );
+        assert_eq!(gateway["wire_api"].as_str(), Some("responses"));
+        assert_eq!(
+            gateway["experimental_bearer_token"].as_str(),
+            Some("test-token")
+        );
+        assert_eq!(gateway["requires_openai_auth"].as_bool(), Some(false));
+        assert!(gateway.get("auth").is_none());
+        assert!(gateway.get("env_key").is_none());
+        assert!(gateway.get("env_key_instructions").is_none());
+        assert!(gateway["http_headers"].get("Authorization").is_none());
+        assert_eq!(
+            gateway["http_headers"]["X-Gateway-Header"].as_str(),
+            Some("preserve-gateway-header")
+        );
+        assert!(gateway["env_http_headers"].get("authorization").is_none());
+        assert_eq!(
+            gateway["env_http_headers"]["X-Gateway-Env-Header"].as_str(),
+            Some("LLM_GATEWAY_PRESERVE_HEADER")
+        );
+        assert_eq!(
+            codex_updated["model_providers"]["example"]["name"].as_str(),
+            Some("Example")
+        );
+
+        let gemini_updated = std::fs::read_to_string(&gemini_path).expect("read Gemini config");
+        assert!(gemini_updated.contains("# keep this comment\r\n"));
+        assert!(gemini_updated.contains("GOOGLE_API_KEY=test-key\r\n"));
+        assert!(gemini_updated.contains("CUSTOM_VALUE=keep\r\n"));
+        assert!(gemini_updated.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:15721\r\n"));
+    }
+
+    #[test]
+    fn takeover_creates_missing_files_without_unnecessary_backups() {
+        let temp = TempDir::new();
+        let claude_path = temp.0.join(".claude").join("settings.json");
+        let codex_path = temp.0.join(".codex").join("config.toml");
+        let gemini_path = temp.0.join(".gemini").join(".env");
+
+        let results = apply_prepared_takeovers(vec![
+            prepare_claude_takeover(&claude_path, "http://127.0.0.1:15721", "test-token")
+                .expect("prepare Claude"),
+            prepare_codex_takeover(&codex_path, "http://127.0.0.1:15721", "test-token")
+                .expect("prepare Codex"),
+            prepare_gemini_takeover(&gemini_path, "http://127.0.0.1:15721")
+                .expect("prepare Gemini"),
+        ])
+        .expect("apply takeover");
+
+        for result in &results {
+            assert_eq!(result.status, TakeoverStatus::Created);
+            assert!(
+                result.backup_path.is_none(),
+                "{} should be created",
+                result.client
+            );
+        }
+        assert!(std::fs::read_to_string(&claude_path)
+            .expect("read Claude config")
+            .contains("ANTHROPIC_BASE_URL"));
+        assert_eq!(
+            std::fs::read_to_string(&gemini_path).expect("read Gemini config"),
+            "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:15721\n"
+        );
+        let codex_updated: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&codex_path).expect("read Codex config"))
+                .expect("parse new Codex config");
+        assert_eq!(
+            codex_updated["model_provider"].as_str(),
+            Some("llm_gateway")
+        );
+        assert_eq!(
+            codex_updated["model_providers"]["llm_gateway"]["base_url"].as_str(),
+            Some("http://127.0.0.1:15721/v1")
+        );
+    }
+
+    #[test]
+    fn repeated_backups_are_unique_without_waiting_for_the_clock() {
         let temp = TempDir::new();
         let path = temp.0.join(".gemini").join(".env");
         std::fs::create_dir_all(path.parent().expect("Gemini config parent"))
             .expect("create Gemini config directory");
-        let original = "# keep this comment\r\nGOOGLE_API_KEY=user-key\r\nGOOGLE_GEMINI_BASE_URL=https://old.example\r\nCUSTOM_VALUE=keep\r\n";
+        let original = "CUSTOM_VALUE=keep\n";
         std::fs::write(&path, original).expect("write original Gemini config");
 
-        let backup = write_gemini_takeover_env(&path, "http://127.0.0.1:15721")
-            .expect("write takeover config")
-            .expect("existing config should be backed up");
+        let first = apply_prepared_takeovers(vec![prepare_gemini_takeover(
+            &path,
+            "http://127.0.0.1:15721",
+        )
+        .expect("prepare first")])
+        .expect("apply first");
+        let first_backup = PathBuf::from(first[0].backup_path.as_ref().expect("first backup path"));
+        let after_first = std::fs::read(&path).expect("read first update");
 
+        let second = apply_prepared_takeovers(vec![prepare_gemini_takeover(
+            &path,
+            "http://127.0.0.1:16721",
+        )
+        .expect("prepare second")])
+        .expect("apply second");
+        let second_backup =
+            PathBuf::from(second[0].backup_path.as_ref().expect("second backup path"));
+
+        assert_ne!(first_backup, second_backup);
         assert_eq!(
-            std::fs::read_to_string(&backup).expect("read backup"),
-            original
+            std::fs::read(&first_backup).expect("read first backup"),
+            original.as_bytes()
         );
-        let updated = std::fs::read_to_string(&path).expect("read updated config");
-        assert!(updated.contains("# keep this comment\r\n"));
-        assert!(updated.contains("GOOGLE_API_KEY=user-key\r\n"));
-        assert!(updated.contains("CUSTOM_VALUE=keep\r\n"));
-        assert!(updated.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:15721\r\n"));
-        assert!(!updated.contains("https://old.example"));
+        assert_eq!(
+            std::fs::read(&second_backup).expect("read second backup"),
+            after_first
+        );
     }
 
     #[test]
-    fn gemini_takeover_creates_new_env_without_unnecessary_backup() {
+    fn backup_failure_stops_before_the_original_file_is_changed() {
         let temp = TempDir::new();
         let path = temp.0.join(".gemini").join(".env");
+        std::fs::create_dir_all(path.parent().expect("Gemini config parent"))
+            .expect("create Gemini config directory");
+        let original = b"CUSTOM_VALUE=keep\n";
+        std::fs::write(&path, original).expect("write original Gemini config");
 
-        let backup = write_gemini_takeover_env(&path, "http://127.0.0.1:15721")
-            .expect("write new takeover config");
+        let error = create_verified_takeover_backup_with(
+            &path,
+            original,
+            "Gemini CLI",
+            |_backup, _contents| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated backup failure",
+                ))
+            },
+        )
+        .expect_err("backup failure should stop takeover");
 
-        assert!(backup.is_none());
+        assert!(error.contains("未写入原文件"));
+        assert_eq!(std::fs::read(&path).expect("read original"), original);
+    }
+
+    #[test]
+    fn malformed_json_or_toml_is_never_silently_replaced() {
+        let temp = TempDir::new();
+        let claude_path = temp.0.join(".claude").join("settings.json");
+        let codex_path = temp.0.join(".codex").join("config.toml");
+        std::fs::create_dir_all(claude_path.parent().expect("Claude config parent"))
+            .expect("create Claude config directory");
+        std::fs::create_dir_all(codex_path.parent().expect("Codex config parent"))
+            .expect("create Codex config directory");
+        let malformed_json = "{ not-json";
+        let malformed_toml = "base_url = [";
+        std::fs::write(&claude_path, malformed_json).expect("write malformed JSON");
+        std::fs::write(&codex_path, malformed_toml).expect("write malformed TOML");
+
+        assert!(
+            prepare_claude_takeover(&claude_path, "http://127.0.0.1:15721", "test-token")
+                .err()
+                .expect("malformed JSON must fail")
+                .contains("未改写原文件")
+        );
+        assert!(
+            prepare_codex_takeover(&codex_path, "http://127.0.0.1:15721", "test-token")
+                .err()
+                .expect("malformed TOML must fail")
+                .contains("未改写原文件")
+        );
         assert_eq!(
-            std::fs::read_to_string(&path).expect("read new config"),
-            "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:15721\n"
+            std::fs::read_to_string(&claude_path).expect("read malformed JSON"),
+            malformed_json
+        );
+        assert_eq!(
+            std::fs::read_to_string(&codex_path).expect("read malformed TOML"),
+            malformed_toml
         );
     }
 }

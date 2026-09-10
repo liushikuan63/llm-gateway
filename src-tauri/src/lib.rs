@@ -5,7 +5,9 @@ pub mod crypto;
 pub mod db;
 pub mod domain;
 pub mod error;
+pub mod model_catalog;
 pub mod protocol;
+pub mod provider_quota;
 pub mod proxy;
 pub mod router;
 
@@ -14,7 +16,7 @@ use crate::proxy::server::GatewayState;
 use std::sync::Arc;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
 
@@ -85,6 +87,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_providers,
+            provider_quota::get_provider_quota,
+            commands::discover_provider_models,
             commands::upsert_provider,
             commands::delete_provider,
             commands::test_provider,
@@ -142,12 +146,33 @@ fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
 
     let handle = app.clone();
     TrayIconBuilder::with_id("main")
+        .icon(tauri::image::Image::from_bytes(include_bytes!(
+            "../icons/tray.png"
+        ))?)
         .menu(&menu)
         .tooltip("LLM Gateway")
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                if let Some(window) = tray.app_handle().get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+        })
         .on_menu_event(move |_tray, ev| match ev.id().as_ref() {
             "show" => {
                 if let Some(w) = handle.get_webview_window("main") {
                     let _ = w.show();
+                    let _ = w.unminimize();
                     let _ = w.set_focus();
                 }
             }

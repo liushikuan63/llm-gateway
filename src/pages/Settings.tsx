@@ -10,6 +10,7 @@ import {
   RemoteAccessKeyView,
   SnapshotApplyResult,
   SnapshotView,
+  TakeoverResult,
 } from "../api";
 
 type Message = { kind: "ok" | "err"; text: string };
@@ -67,6 +68,7 @@ export default function SettingsPage() {
   const [remoteConfirmationOpen, setRemoteConfirmationOpen] = useState(false);
   const [oneTimeSecretLabel, setOneTimeSecretLabel] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [takeoverResults, setTakeoverResults] = useState<TakeoverResult[]>([]);
   // 原始远程 Key 不进入 React state，关闭一次性展示窗口后立即清除。
   const oneTimeSecretRef = useRef<string | null>(null);
 
@@ -790,14 +792,14 @@ ${keyInfo.ollama_endpoint}`}
       <div className="card">
         <strong>CLI 工具接管</strong>
         <div className="sub">
-          将已选择工具的本地配置写入网关地址。写入后请重新启动对应 CLI。
+          已有配置会先创建同目录的唯一备份并逐字节校验，备份失败不会改写原文件。Gemini CLI 暂不支持接管；已有旧选项可取消。写入后请重新启动对应 CLI。
         </div>
         <div className="row">
           <label className="row" style={{ gap: 6 }}>
             <input
               type="checkbox"
               checked={cfg.takeover.claude_code}
-              disabled={busy === "config"}
+              disabled={busy !== null}
               onChange={(event) => void patch({ takeover: { ...cfg.takeover, claude_code: event.target.checked } })}
             />
             Claude Code
@@ -806,7 +808,7 @@ ${keyInfo.ollama_endpoint}`}
             <input
               type="checkbox"
               checked={cfg.takeover.codex}
-              disabled={busy === "config"}
+              disabled={busy !== null}
               onChange={(event) => void patch({ takeover: { ...cfg.takeover, codex: event.target.checked } })}
             />
             Codex CLI
@@ -815,20 +817,26 @@ ${keyInfo.ollama_endpoint}`}
             <input
               type="checkbox"
               checked={cfg.takeover.gemini_cli}
-              disabled={busy === "config"}
+              disabled={busy !== null || !cfg.takeover.gemini_cli}
               onChange={(event) => void patch({ takeover: { ...cfg.takeover, gemini_cli: event.target.checked } })}
             />
-            Gemini CLI
+            Gemini CLI（暂不支持）
           </label>
           <button
             className="primary"
-            disabled={busy !== null}
+            disabled={busy !== null || cfg.takeover.gemini_cli}
+            title={cfg.takeover.gemini_cli ? "请先取消 Gemini CLI 的旧接管选项" : undefined}
             onClick={() => {
               void (async () => {
+                setTakeoverResults([]);
                 setBusy("takeover");
                 try {
-                  const changed = await api.applyTakeover();
-                  setMsg({ kind: "ok", text: changed.length ? `已写入：${changed.join(" / ")}` : "未选择任何工具" });
+                  const results = await api.applyTakeover();
+                  setTakeoverResults(results);
+                  setMsg({
+                    kind: "ok",
+                    text: results.length ? `已安全写入 ${results.length} 项 CLI 配置` : "未选择任何工具",
+                  });
                 } catch (error) {
                   setMsg({ kind: "err", text: `写入配置失败：${errorText(error)}` });
                 } finally {
@@ -837,9 +845,26 @@ ${keyInfo.ollama_endpoint}`}
               })();
             }}
           >
-            写入配置
+            备份并写入配置
           </button>
         </div>
+        {takeoverResults.length > 0 && (
+          <div style={{ marginTop: 12 }} aria-live="polite">
+            {takeoverResults.map((result) => (
+              <div key={`${result.client}:${result.path}`} className="sub" style={{ marginTop: 8 }}>
+                <strong>{result.client}</strong>：{result.status === "created" ? "已新建" : "已更新"}
+                <div className="mono" style={{ overflowWrap: "anywhere" }}>{result.path}</div>
+                {result.backup_path ? (
+                  <div style={{ overflowWrap: "anywhere" }}>
+                    已验证备份：<span className="mono">{result.backup_path}</span>
+                  </div>
+                ) : (
+                  <div>原文件不存在，本次新建，因此没有备份。</div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="card">

@@ -1,594 +1,100 @@
-import { useEffect, useState } from "react";
-import {
-  api,
-  AppConfig,
-  DIALECT_LABEL,
-  HEALTH_LABEL,
-  ModelRef,
-  ProviderInput,
-  ProviderView,
-} from "../api";
+import { useEffect, useRef, useState } from "react";
+import { api, AppConfig, DIALECT_LABEL, HEALTH_LABEL, ProviderInput, ProviderView } from "../api";
+import ProviderEditor from "./ProviderEditor";
+import ProviderQuota from "./ProviderQuota";
+import { blankForm, errorText, formatContext, ProviderForm } from "./providerPresets";
+import "./providers.css";
 
-function emptyModel(): ModelRef {
-  return {
-    alias: "",
-    upstream: "",
-    context_window: 128000,
-    supports_tools: true,
-    supports_vision: false,
-    supports_stream: true,
-  };
+function providerInput(p: ProviderView, overrides: Partial<ProviderInput> = {}): ProviderInput {
+  return { id: p.id, name: p.name, dialect: p.dialect, base_url: p.base_url, api_key: "", enabled: p.enabled,
+    priority: p.priority, models: p.models, rpm_limit: p.rpm_limit, intelligence: p.intelligence, note: p.note, ...overrides };
 }
-
-type Form = Omit<ProviderInput, "note"> & { note: string };
-
-function blankForm(): Form {
-  return {
-    name: "",
-    dialect: "openai",
-    base_url: "",
-    api_key: "",
-    enabled: true,
-    priority: 10,
-    models: [emptyModel()],
-    rpm_limit: 0,
-    intelligence: 60,
-    note: "",
-  };
-}
-
-function providerInput(
-  provider: ProviderView,
-  overrides: Partial<ProviderInput> = {},
-): ProviderInput {
-  return {
-    id: provider.id,
-    name: provider.name,
-    dialect: provider.dialect,
-    base_url: provider.base_url,
-    // 空值表示保留密文，不能也不需要把 Key 回传给前端。
-    api_key: "",
-    enabled: provider.enabled,
-    priority: provider.priority,
-    models: provider.models,
-    rpm_limit: provider.rpm_limit,
-    intelligence: provider.intelligence,
-    note: provider.note,
-    ...overrides,
-  };
-}
-
-function errorText(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/// 常见厂商预设。用户只填 Key，地址和方言自动带出。
-const PRESETS: Array<{ name: string; dialect: Form["dialect"]; base_url: string; models: string[] }> = [
-  { name: "DeepSeek", dialect: "openai", base_url: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"] },
-  { name: "智谱 GLM", dialect: "openai", base_url: "https://open.bigmodel.cn/api/paas/v4", models: ["glm-4.6", "glm-4.5-flash"] },
-  { name: "月之暗面 Kimi", dialect: "openai", base_url: "https://api.moonshot.cn/v1", models: ["kimi-k2-0905-preview"] },
-  { name: "通义千问", dialect: "openai", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-plus", "qwen-max"] },
-  { name: "豆包", dialect: "openai", base_url: "https://ark.cn-beijing.volces.com/api/v3", models: ["doubao-seed-1-6-250615"] },
-  { name: "OpenAI", dialect: "openai", base_url: "https://api.openai.com/v1", models: ["gpt-4o"] },
-  { name: "Anthropic 官方", dialect: "anthropic", base_url: "https://api.anthropic.com/v1", models: ["claude-sonnet-4-6"] },
-  { name: "Google Gemini", dialect: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta", models: ["gemini-2.5-flash"] },
-  { name: "OpenRouter 免费路由", dialect: "openai", base_url: "https://openrouter.ai/api/v1", models: ["openrouter/free"] },
-  {
-    name: "SenseNova 免费模型",
-    dialect: "openai",
-    base_url: "https://token.sensenova.cn/v1",
-    models: ["sensenova-6.8-flash-lite", "sensenova-u1.5-lite", "sensenova-u1-fast", "deepseek-v4-flash", "glm-5.2"],
-  },
-  {
-    name: "智谱 Anthropic 兼容",
-    dialect: "anthropic",
-    base_url: "https://open.bigmodel.cn/api/anthropic",
-    models: ["glm-4-flash-250414", "glm-4-flash", "glm-4.5-flash", "glm-4.7-flash"],
-  },
-  {
-    name: "Air Outer",
-    dialect: "openai",
-    base_url: "https://ps.air-outer.com/v1",
-    models: ["claude-opus-4-8", "claude-opus-5", "gpt-5.6-sol", "deepseek-v4-flash", "glm-5.3"],
-  },
-  { name: "本地 Ollama", dialect: "ollama", base_url: "http://localhost:11434", models: ["qwen2.5:14b"] },
-];
+const STRATEGIES = { priority: "手工优先级", balanced: "综合均衡", smartest: "能力优先", fastest: "速度优先", reliable: "稳定优先", custom: "自定义规则" };
 
 export default function ProvidersPage() {
   const [list, setList] = useState<ProviderView[]>([]);
-  const [open, setOpen] = useState(false);
-  const [form, setForm] = useState<Form>(blankForm());
-  const [testing, setTesting] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [cfg, setCfg] = useState<AppConfig | null>(null);
-
-  const load = async () => {
+  const [editor, setEditor] = useState<ProviderForm | null>(null);
+  const [quotaProvider, setQuotaProvider] = useState<ProviderView | null>(null);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [testResult, setTestResult] = useState<{ id: string; latency: number } | null>(null);
+  const loadVersion = useRef(0);
+  const load = async (propagateError = false) => {
+    const version = ++loadVersion.current;
+    setLoading(true);
     try {
       const [providers, config] = await Promise.all([api.listProviders(), api.getConfig()]);
-      setList(providers);
-      setCfg(config);
+      if (version !== loadVersion.current) return false;
+      setList(providers); setCfg(config); return true;
     } catch (error) {
-      setMsg({ kind: "err", text: `加载供应商失败：${errorText(error)}` });
-    }
+      if (version !== loadVersion.current) return false;
+      setMessage({ kind: "err", text: `加载失败：${errorText(error)}` });
+      if (propagateError) throw new Error(`操作已完成，但列表刷新失败：${errorText(error)}`);
+      return false;
+    } finally { if (version === loadVersion.current) setLoading(false); }
   };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const save = async () => {
-    if (!form.name.trim() || !form.base_url.trim()) {
-      setMsg({ kind: "err", text: "名称与 Base URL 必填" });
-      return;
-    }
-    const models = form.models.filter((model) => model.alias.trim() && model.upstream.trim());
-    if (models.length === 0) {
-      setMsg({ kind: "err", text: "至少配置一个模型" });
-      return;
-    }
-
-    setSaving(true);
-    try {
-      await api.upsertProvider({
-        ...form,
-        name: form.name.trim(),
-        base_url: form.base_url.trim(),
-        models,
-        note: form.note.trim() || null,
-      });
-      setOpen(false);
-      setForm(blankForm());
-      await load();
-      setMsg({ kind: "ok", text: "供应商已保存，路由缓存已刷新" });
-    } catch (error) {
-      setMsg({ kind: "err", text: `保存失败：${errorText(error)}` });
-    } finally {
-      setSaving(false);
-    }
+  useEffect(() => { void load(); return () => { loadVersion.current++; }; }, []);
+  const run = async (id: string, operation: () => Promise<unknown>, text: string) => {
+    setBusy(id); setMessage(null);
+    try { await operation(); if (await load(true)) setMessage({ kind: "ok", text }); }
+    catch (error) { setMessage({ kind: "err", text: errorText(error) }); }
+    finally { setBusy(null); }
   };
-
-  const test = async (provider: ProviderView) => {
-    setTesting(provider.id);
-    try {
-      const result = await api.testProvider(provider.id);
-      setMsg(
-        result.ok
-          ? { kind: "ok", text: `连通正常：${result.latency_ms}ms · ${result.model ?? "默认模型"}` }
-          : { kind: "err", text: `连接失败：${result.error ?? "上游未返回详情"}` },
-      );
-      await load();
-    } catch (error) {
-      setMsg({ kind: "err", text: `连接测试失败：${errorText(error)}` });
-    } finally {
-      setTesting(null);
-    }
-  };
-
-  const setEnabled = async (provider: ProviderView) => {
-    setBusy(provider.id);
-    try {
-      await api.upsertProvider(providerInput(provider, { enabled: !provider.enabled }));
-      await load();
-      setMsg({
-        kind: "ok",
-        text: provider.enabled ? `已停用 ${provider.name}` : `已启用 ${provider.name}`,
-      });
-    } catch (error) {
-      setMsg({ kind: "err", text: `更新状态失败：${errorText(error)}` });
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const setActive = async (provider: ProviderView) => {
-    setBusy(provider.id);
-    try {
-      await api.setActive(provider.id);
-      await load();
-      setMsg({ kind: "ok", text: `已将 ${provider.name} 设为主用，变更立即参与后续路由` });
-    } catch (error) {
-      setMsg({ kind: "err", text: `切换主用失败：${errorText(error)}` });
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const moveProvider = async (provider: ProviderView, direction: -1 | 1) => {
-    const ordered = list.slice().sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name));
-    const index = ordered.findIndex((item) => item.id === provider.id);
-    const target = index + direction;
-    if (index < 0 || target < 0 || target >= ordered.length) return;
-
-    const next = [...ordered];
-    [next[index], next[target]] = [next[target], next[index]];
-    setBusy(provider.id);
-    try {
-      // 统一重排以修复历史重复优先级，且不会读取或写回明文 Key。
-      for (const [position, item] of next.entries()) {
-        await api.upsertProvider(providerInput(item, { priority: (position + 1) * 10 }));
-      }
-      await load();
-      setMsg({ kind: "ok", text: `已调整 ${provider.name} 的优先级` });
-    } catch (error) {
-      setMsg({ kind: "err", text: `调整优先级失败：${errorText(error)}` });
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const remove = async (provider: ProviderView) => {
-    if (!window.confirm(`确定删除供应商“${provider.name}”吗？其模型映射也会一并删除。`)) {
-      return;
-    }
-    setBusy(provider.id);
-    try {
-      await api.deleteProvider(provider.id);
-      await load();
-      setMsg({ kind: "ok", text: `已删除 ${provider.name}` });
-    } catch (error) {
-      setMsg({ kind: "err", text: `删除失败：${errorText(error)}` });
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const usePreset = (name: string) => {
-    const preset = PRESETS.find((item) => item.name === name);
-    if (!preset) return;
-    setForm({
-      ...form,
-      name: preset.name,
-      dialect: preset.dialect,
-      base_url: preset.base_url,
-      models: preset.models.map((model) => ({ ...emptyModel(), alias: model, upstream: model })),
-    });
-  };
-
+  const test = (p: ProviderView) => run(p.id, async () => {
+    const result = await api.testProvider(p.id);
+    if (!result.ok) throw new Error(`连接失败：${result.error ?? "上游未返回详情"}`);
+    setTestResult({ id: p.id, latency: result.latency_ms });
+  }, `${p.name} 连接正常`);
   const ordered = list.slice().sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name));
-
-  return (
-    <div>
-      <div className="spread page-heading">
-        <div>
-          <h2>供应商</h2>
-          <div className="sub">
-            每家填一次 Key，网关按策略路由；优先级模式下，上下箭头决定首选与降级顺序。
-          </div>
-        </div>
-        <div className="row">
-          <button onClick={() => void load()}>刷新</button>
-          <button
-            className="primary"
-            onClick={() => {
-              setForm(blankForm());
-              setOpen(true);
-            }}
-          >
-            添加供应商
-          </button>
-        </div>
-      </div>
-
-      {msg && <div className={`msg ${msg.kind}`}>{msg.text}</div>}
-
-      <div className="card table-card">
-        {ordered.length === 0 ? (
-          <div className="empty">还没有供应商。添加一个预设并完成连接测试后即可开始路由。</div>
-        ) : (
-          <table className="provider-table">
-            <thead>
-              <tr>
-                <th style={{ width: 74 }}>优先级</th>
-                <th>名称与 Key</th>
-                <th>方言</th>
-                <th>Base URL</th>
-                <th>模型</th>
-                <th>状态</th>
-                <th style={{ width: 350 }}>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {ordered.map((provider, index) => (
-                <tr key={provider.id}>
-                  <td>
-                    <div className="priority-control">
-                      <span className="muted">{provider.priority}</span>
-                      <button
-                        className="icon-button"
-                        title="上移优先级"
-                        aria-label="上移优先级"
-                        disabled={index === 0 || busy !== null}
-                        onClick={() => void moveProvider(provider, -1)}
-                      >
-                        ↑
-                      </button>
-                      <button
-                        className="icon-button"
-                        title="下移优先级"
-                        aria-label="下移优先级"
-                        disabled={index === ordered.length - 1 || busy !== null}
-                        onClick={() => void moveProvider(provider, 1)}
-                      >
-                        ↓
-                      </button>
-                    </div>
-                  </td>
-                  <td>
-                    <div className="row" style={{ gap: 6 }}>
-                      <span>{provider.name}</span>
-                      {provider.is_active && <span className="tag purple">主用</span>}
-                    </div>
-                    <div className="muted mono" style={{ fontSize: 11, marginTop: 3 }}>
-                      {provider.api_key_masked || "未设置密钥"}
-                    </div>
-                  </td>
-                  <td><span className="tag">{DIALECT_LABEL[provider.dialect]}</span></td>
-                  <td className="mono muted breakable">{provider.base_url}</td>
-                  <td>
-                    {provider.models.slice(0, 3).map((model) => (
-                      <span key={model.alias} className="tag purple" style={{ marginRight: 4 }}>
-                        {model.alias}
-                      </span>
-                    ))}
-                    {provider.models.length > 3 && <span className="muted">+{provider.models.length - 3}</span>}
-                  </td>
-                  <td>
-                    {!provider.enabled ? (
-                      <span className="tag">已停用</span>
-                    ) : (
-                      <span
-                        className={`tag ${
-                          provider.health?.health === "healthy" || !provider.health
-                            ? "ok"
-                            : provider.health.health === "invalid"
-                              ? "err"
-                              : "warn"
-                        }`}
-                      >
-                        {provider.health ? HEALTH_LABEL[provider.health.health] ?? provider.health.health : "正常"}
-                      </span>
-                    )}
-                  </td>
-                  <td>
-                    <div className="row compact-actions">
-                      <button
-                        className="ghost"
-                        disabled={testing === provider.id || busy !== null}
-                        onClick={() => void test(provider)}
-                      >
-                        {testing === provider.id ? "测试中" : "测试"}
-                      </button>
-                      <button
-                        className="ghost"
-                        disabled={busy !== null}
-                        onClick={() => void setEnabled(provider)}
-                      >
-                        {provider.enabled ? "停用" : "启用"}
-                      </button>
-                      <button
-                        className="ghost"
-                        disabled={!provider.enabled || provider.is_active || busy !== null}
-                        onClick={() => void setActive(provider)}
-                      >
-                        {provider.is_active ? "已主用" : "设为主用"}
-                      </button>
-                      <button
-                        className="ghost"
-                        disabled={busy !== null}
-                        onClick={() => {
-                          setForm({
-                            id: provider.id,
-                            name: provider.name,
-                            dialect: provider.dialect,
-                            base_url: provider.base_url,
-                            api_key: "",
-                            enabled: provider.enabled,
-                            priority: provider.priority,
-                            models: provider.models.length ? provider.models : [emptyModel()],
-                            rpm_limit: provider.rpm_limit,
-                            intelligence: provider.intelligence,
-                            note: provider.note ?? "",
-                          });
-                          setOpen(true);
-                        }}
-                      >
-                        编辑
-                      </button>
-                      <button
-                        className="danger ghost"
-                        disabled={busy !== null}
-                        onClick={() => void remove(provider)}
-                      >
-                        删除
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {cfg && (
-        <div className="card">
-          <div className="spread">
-            <div>
-              <strong>路由策略</strong>
-              <div className="sub" style={{ marginBottom: 0 }}>
-                priority 使用上表顺序；其他策略仍会把手动主用 Provider 放在候选链首位。
-              </div>
-            </div>
-            <select
-              value={cfg.routing_strategy}
-              onChange={(event) => {
-                void (async () => {
-                  try {
-                    const result = await api.updateConfig({ ...cfg, routing_strategy: event.target.value });
-                    setCfg(result.config);
-                    setMsg({ kind: "ok", text: "路由策略已保存并热生效" });
-                  } catch (error) {
-                    setMsg({ kind: "err", text: `保存路由策略失败：${errorText(error)}` });
-                  }
-                })();
-              }}
-            >
-              <option value="priority">priority · 手工优先级</option>
-              <option value="balanced">balanced · 综合均衡</option>
-              <option value="smartest">smartest · 能力优先</option>
-              <option value="fastest">fastest · 速度优先</option>
-              <option value="reliable">reliable · 稳定优先</option>
-              <option value="custom">custom · 自定义规则</option>
-            </select>
-          </div>
-        </div>
-      )}
-
-      {open && (
-        <div className="modal-mask" onClick={() => !saving && setOpen(false)}>
-          <div className="modal" onClick={(event) => event.stopPropagation()}>
-            <h3>{form.id ? "编辑供应商" : "添加供应商"}</h3>
-
-            {!form.id && (
-              <div className="field">
-                <label>快速预设（选择后自动带出地址与模型）</label>
-                <select onChange={(event) => usePreset(event.target.value)} defaultValue="">
-                  <option value="" disabled>选择预设</option>
-                  {PRESETS.map((preset) => (
-                    <option key={preset.name} value={preset.name}>
-                      {preset.name} · {preset.base_url}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-
-            <div className="grid2">
-              <div className="field">
-                <label>名称</label>
-                <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="例如 DeepSeek" />
-              </div>
-              <div className="field">
-                <label>协议方言</label>
-                <select value={form.dialect} onChange={(event) => setForm({ ...form, dialect: event.target.value as Form["dialect"] })}>
-                  <option value="openai">OpenAI 兼容</option>
-                  <option value="anthropic">Anthropic 原生</option>
-                  <option value="gemini">Gemini 原生</option>
-                  <option value="ollama">Ollama 原生</option>
-                </select>
-              </div>
-            </div>
-
-            <div className="field">
-              <label>Base URL</label>
-              <input value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder="https://api.deepseek.com/v1" />
-            </div>
-
-            <div className="field">
-              <label>API Key（加密后落库，编辑时留空即可保留现有 Key）</label>
-              <input
-                type="password"
-                autoComplete="new-password"
-                value={form.api_key}
-                onChange={(event) => setForm({ ...form, api_key: event.target.value })}
-                placeholder={form.id ? "留空表示不修改" : "sk-..."}
-              />
-            </div>
-
-            <div className="field">
-              <label>模型映射（对外别名 → 上游真实模型名）</label>
-              {form.models.map((model, index) => (
-                <div className="model-row" key={index}>
-                  <input
-                    value={model.alias}
-                    onChange={(event) => {
-                      const models = [...form.models];
-                      models[index] = { ...models[index], alias: event.target.value };
-                      setForm({ ...form, models });
-                    }}
-                    placeholder="对外别名"
-                  />
-                  <input
-                    value={model.upstream}
-                    onChange={(event) => {
-                      const models = [...form.models];
-                      models[index] = { ...models[index], upstream: event.target.value };
-                      setForm({ ...form, models });
-                    }}
-                    placeholder="上游模型名"
-                  />
-                  <input
-                    type="number"
-                    value={model.context_window}
-                    title="上下文窗口"
-                    onChange={(event) => {
-                      const models = [...form.models];
-                      models[index] = { ...models[index], context_window: Number(event.target.value) };
-                      setForm({ ...form, models });
-                    }}
-                  />
-                  <label title="支持工具调用"><input type="checkbox" checked={model.supports_tools} onChange={(event) => {
-                    const models = [...form.models];
-                    models[index] = { ...models[index], supports_tools: event.target.checked };
-                    setForm({ ...form, models });
-                  }} />工具</label>
-                  <label title="支持视觉输入"><input type="checkbox" checked={model.supports_vision} onChange={(event) => {
-                    const models = [...form.models];
-                    models[index] = { ...models[index], supports_vision: event.target.checked };
-                    setForm({ ...form, models });
-                  }} />视觉</label>
-                  <label title="支持流式响应"><input type="checkbox" checked={model.supports_stream} onChange={(event) => {
-                    const models = [...form.models];
-                    models[index] = { ...models[index], supports_stream: event.target.checked };
-                    setForm({ ...form, models });
-                  }} />流式</label>
-                  <button
-                    className="danger ghost icon-button"
-                    title="移除模型"
-                    aria-label="移除模型"
-                    onClick={() => setForm({ ...form, models: form.models.filter((_, itemIndex) => itemIndex !== index) })}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-              <button className="ghost" onClick={() => setForm({ ...form, models: [...form.models, emptyModel()] })}>添加模型</button>
-            </div>
-
-            <div className="grid3">
-              <div className="field">
-                <label>优先级（越小越优先）</label>
-                <input type="number" value={form.priority} onChange={(event) => setForm({ ...form, priority: Number(event.target.value) })} />
-              </div>
-              <div className="field">
-                <label>本地 RPM 上限（0=不限制）</label>
-                <input type="number" value={form.rpm_limit} onChange={(event) => setForm({ ...form, rpm_limit: Number(event.target.value) })} />
-              </div>
-              <div className="field">
-                <label>能力分（0-100）</label>
-                <input type="number" value={form.intelligence} onChange={(event) => setForm({ ...form, intelligence: Number(event.target.value) })} />
-              </div>
-            </div>
-
-            <div className="field">
-              <label>备注</label>
-              <input value={form.note} onChange={(event) => setForm({ ...form, note: event.target.value })} placeholder="仅本机保存" />
-            </div>
-
-            <label className="row" style={{ gap: 6 }}>
-              <input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} />
-              启用（参与路由与降级）
-            </label>
-
-            <div className="row end" style={{ marginTop: 18 }}>
-              <button disabled={saving} onClick={() => setOpen(false)}>取消</button>
-              <button className="primary" disabled={saving} onClick={() => void save()}>{saving ? "保存中" : "保存"}</button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
+  const filtered = ordered.filter(p => `${p.name} ${p.base_url} ${p.models.map(m => `${m.alias} ${m.upstream}`).join(" ")}`.toLowerCase().includes(query.toLowerCase()) && (filter === "all" || filter === "enabled" && p.enabled || filter === "disabled" && !p.enabled))
+    .sort((a, b) => Number(b.is_active) - Number(a.is_active) || Number(b.enabled) - Number(a.enabled));
+  const active = list.find(p => p.is_active);
+  const move = (p: ProviderView, direction: -1 | 1) => {
+    const index = ordered.findIndex(item => item.id === p.id), target = index + direction;
+    if (target < 0 || target >= ordered.length) return;
+    const next = [...ordered]; [next[index], next[target]] = [next[target], next[index]];
+    void run(p.id, async () => { for (const [position, item] of next.entries()) await api.upsertProvider(providerInput(item, { priority: (position + 1) * 10 })); }, `已调整 ${p.name} 的优先级`);
+  };
+  return <div className="providers-page">
+    <section className="provider-overview" aria-label="供应商概况">
+      <div><span className="overview-label">已连接供应商</span><strong>{list.length}<small>个配置</small></strong></div>
+      <div><span className="overview-label">参与路由</span><strong>{list.filter(p => p.enabled).length}<small>已启用</small></strong></div>
+      <div><span className="overview-label">模型映射</span><strong>{list.reduce((n, p) => n + p.models.length, 0)}<small>个模型</small></strong></div>
+      <div className="overview-current"><span className="overview-label">当前主用</span><strong title={active?.name}>{active?.name ?? "自动选择"}</strong><small>{cfg ? STRATEGIES[cfg.routing_strategy as keyof typeof STRATEGIES] ?? cfg.routing_strategy : "读取配置中"}</small></div>
+    </section>
+    <div className="providers-toolbar"><div><h2>模型供应商 <span className="count-badge">{list.length}</span></h2><p>统一管理服务与模型，让每一次请求都有合适的去处。</p></div><div className="row"><button disabled={loading || busy !== null} onClick={() => void load()}>{loading ? "加载中…" : "刷新列表"}</button><button className="primary" onClick={() => setEditor(blankForm())}>＋ 添加供应商</button></div></div>
+    {message && <div className={`msg ${message.kind}`} role={message.kind === "err" ? "alert" : "status"}>{message.text}<button className="ghost icon-button" aria-label="关闭提示" onClick={() => setMessage(null)}>×</button></div>}
+    {list.length > 0 && <div className="provider-search-row"><input aria-label="搜索供应商" placeholder="搜索名称、地址或模型…" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="供应商状态筛选" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><span className="muted">{filtered.length} 个结果</span></div>}
+    {loading && !list.length ? <div className="provider-empty" role="status"><strong>正在加载供应商…</strong></div> : !list.length ? <section className="provider-empty">
+      <svg width="100" height="68" viewBox="0 0 100 68" fill="none" aria-hidden="true"><path d="M25 19L50 34L75 19M25 49L50 34L75 49" stroke="currentColor" strokeWidth="2"/><rect x="36" y="20" width="28" height="28" rx="9" fill="currentColor" opacity=".14"/><rect x="5" y="5" width="30" height="22" rx="6" stroke="currentColor"/><rect x="65" y="5" width="30" height="22" rx="6" stroke="currentColor"/><rect x="5" y="41" width="30" height="22" rx="6" stroke="currentColor"/><rect x="65" y="41" width="30" height="22" rx="6" stroke="currentColor"/><circle cx="50" cy="34" r="4" fill="currentColor"/></svg>
+      <h3>从连接第一个模型服务开始</h3><p>填写 API 地址和 Key，自动获取可选模型。<br />云端服务和本地 Ollama 都可以加入同一个网关。</p><button className="primary" onClick={() => setEditor(blankForm())}>添加第一个供应商</button><small>密钥仅在本机加密保存</small>
+    </section> : !filtered.length ? <div className="provider-empty"><h3>没有匹配的供应商</h3><button className="ghost" onClick={() => { setQuery(""); setFilter("all"); }}>清除筛选</button></div> : <div className="provider-grid">
+      {filtered.map(p => {
+        const index = ordered.findIndex(item => item.id === p.id), health = p.health?.health;
+        const stateClass = !p.enabled ? "" : health === "healthy" ? "ok" : health === "invalid" || health === "error" ? "err" : health ? "warn" : "";
+        const stateText = !p.enabled ? "已停用" : health ? HEALTH_LABEL[health] ?? health : "待测试";
+        return <article className={`provider-card ${p.is_active ? "active" : ""}`} key={p.id}>
+          <header><div className={`provider-avatar dialect-${p.dialect}`} aria-hidden="true">{p.name.slice(0, 2)}</div><div className="provider-card-name"><h3>{p.name}</h3><span>{DIALECT_LABEL[p.dialect]}</span></div>{p.is_active && <span className="tag primary-tag">主用</span>}<span className={`tag ${stateClass}`}>{stateText}</span></header>
+          <div className="provider-address mono" title={p.base_url}>{p.base_url}</div><div className="provider-secret"><span>API Key</span><span className="mono">{p.api_key_masked || "未设置"}</span></div>
+          <div className="provider-model-preview"><div><span>可用映射</span><strong>{p.models.length}</strong></div><div className="provider-model-tags">{p.models.slice(0, 4).map(m => <span className="tag" key={m.alias} title={`${m.upstream} · ${formatContext(m.context_window)} tokens`}>{m.alias}</span>)}{p.models.length > 4 && <span className="tag">+{p.models.length - 4}</span>}{!p.models.length && <span className="muted">未配置模型映射</span>}</div></div>
+          <div className="provider-meta"><span>{p.rpm_limit ? `${p.rpm_limit} RPM` : "RPM 不限"}</span><span>优先级 {p.priority}</span>{testResult?.id === p.id && <span className="test-latency">实测 {testResult.latency} ms</span>}</div>
+          <footer><div className="row"><button className="ghost" disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), note: p.note ?? "" })}>配置</button><button className="ghost" disabled={busy !== null} onClick={() => void test(p)}>{busy === p.id ? "处理中…" : "测试连接"}</button><button className="ghost" disabled={busy !== null || !p.enabled || p.is_active} onClick={() => void run(p.id, () => api.setActive(p.id), `${p.name} 已设为主用`)}>{p.is_active ? "已主用" : "设为主用"}</button></div>
+          <details className="provider-more"><summary aria-label={`${p.name} 更多操作`}>•••</summary><div className="provider-more-menu">
+            <button disabled={busy !== null} onClick={() => setQuotaProvider(p)}>查询额度 / 有效期</button>
+            <button disabled={busy !== null} onClick={() => void run(p.id, () => api.upsertProvider(providerInput(p, { enabled: !p.enabled })), p.enabled ? `已停用 ${p.name}` : `已启用 ${p.name}`)}>{p.enabled ? "停用供应商" : "启用供应商"}</button>
+            <button disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), id: undefined, name: `${p.name} 副本`, enabled: false, note: p.note ?? "" })}>复制配置（重新填写 Key）</button>
+            <button disabled={busy !== null || index === 0} onClick={() => move(p, -1)}>上移优先级</button><button disabled={busy !== null || index === ordered.length - 1} onClick={() => move(p, 1)}>下移优先级</button>
+            <button className="danger" disabled={busy !== null} onClick={() => { if (window.confirm(`确定删除供应商“${p.name}”及其模型映射吗？`)) void run(p.id, () => api.deleteProvider(p.id), `已删除 ${p.name}`); }}>删除供应商</button>
+          </div></details></footer>
+        </article>;
+      })}
+    </div>}
+    {cfg && <section className="route-strip"><div><strong>自动路由策略</strong><p>主用供应商优先；其余候选按策略与可用性排序。</p></div><select aria-label="路由策略" disabled={busy !== null} value={cfg.routing_strategy} onChange={e => { const strategy = e.target.value; void run("strategy", async () => { const result = await api.updateConfig({ ...cfg, routing_strategy: strategy }); setCfg(result.config); window.dispatchEvent(new CustomEvent("llm-gateway-config-changed", { detail: result.config })); }, "路由策略已更新，后续请求立即生效"); }}>{Object.entries(STRATEGIES).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></section>}
+    {editor && <ProviderEditor initial={editor} onClose={() => setEditor(null)} onSaved={async () => { if (await load()) setMessage({ kind: "ok", text: "供应商配置已保存；已启用的供应商将参与后续路由。" }); }} />}
+    {quotaProvider && <ProviderQuota provider={quotaProvider} onClose={() => setQuotaProvider(null)} />}
+  </div>;
 }

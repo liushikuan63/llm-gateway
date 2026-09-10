@@ -67,6 +67,13 @@ impl Router {
             "balanced" => Some(RoutingStrategy::Balanced),
             _ => None,
         };
+        // OpenRouter 的 :free、Ollama 的 :latest 等后缀属于完整模型名。
+        // 先查已配置的完整名称，只有未命中时才尝试 provider:model 限定语法。
+        let exact_name = providers.iter().filter(|p| p.enabled).any(|p| {
+            p.models
+                .iter()
+                .any(|m| m.alias == requested || m.upstream == requested)
+        });
 
         for p in providers.iter().filter(|p| p.enabled) {
             let default_model = ModelRef {
@@ -87,8 +94,9 @@ impl Router {
                 let hit = match requested {
                     "auto" | "fastest" | "smartest" | "reliable" | "balanced" => true,
                     name => {
-                        if name.contains(':') {
-                            let (pid, mid) = name.split_once(':').unwrap();
+                        if exact_name {
+                            m.alias == name || m.upstream == name
+                        } else if let Some((pid, mid)) = name.split_once(':') {
                             (p.id == pid || p.name == pid) && (m.alias == mid || m.upstream == mid)
                         } else {
                             m.alias == name || m.upstream == name

@@ -1,7 +1,7 @@
 {
   "name": "llm-gateway-ui",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build --bundles nsis,msi",
-    "verify:release": "node scripts/verify-release.mjs"
+    "verify:release": "node scripts/verify-release.mjs",
+    "verify:ui": "node scripts/ui-smoke.cjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
@@ -24,6 +25,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "playwright": "1.63.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
   }
