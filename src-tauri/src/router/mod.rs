@@ -19,7 +19,9 @@ use crate::domain::{Dialect, ModelRef, Provider, PublicModel};
 use crate::error::{GatewayError, Result};
 use crate::proxy::health::HealthRegistry;
 use crate::router::ratelimit::{Quota, RateLimiter};
-use crate::router::score::{satisfies_hard_constraints, Candidate, ScoreInput, Weights};
+use crate::router::score::{
+    satisfies_hard_constraints, Candidate, RequiredCapabilities, ScoreInput, Weights,
+};
 
 pub struct Router {
     limiter: Arc<RateLimiter>,
@@ -55,6 +57,7 @@ impl Router {
     /// 模型名解析规则（由宽松到严格）：
     ///   "auto"                    → 所有 enabled provider 的所有模型
     ///   "gpt-4o"                  → 精确匹配 alias/upstream
+    ///   "gpt-4*"                  → 通配符匹配 alias/upstream，精确匹配优先于通配符
     ///   "deepseek:deepseek-chat"  → 限定 provider
     ///   "fastest"、"smartest"     → 虚拟模型，按策略挑
     pub fn resolve(&self, requested: &str, providers: &[Provider]) -> Result<Vec<Candidate>> {
@@ -82,7 +85,11 @@ impl Router {
                 context_window: 128_000,
                 supports_tools: true,
                 supports_vision: false,
+                supports_audio: false,
+                supports_video: false,
                 supports_stream: true,
+                price: None,
+                overrides: None,
             };
             let models = if p.models.is_empty() {
                 std::slice::from_ref(&default_model)
@@ -97,9 +104,9 @@ impl Router {
                         if exact_name {
                             m.alias == name || m.upstream == name
                         } else if let Some((pid, mid)) = name.split_once(':') {
-                            (p.id == pid || p.name == pid) && (m.alias == mid || m.upstream == mid)
+                            (p.id == pid || p.name == pid) && model_name_matches(m, mid)
                         } else {
-                            m.alias == name || m.upstream == name
+                            model_name_matches(m, name)
                         }
                     }
                 };
@@ -126,12 +133,11 @@ impl Router {
         &self,
         mut candidates: Vec<Candidate>,
         cfg: &AppConfig,
-        needs_tools: bool,
-        needs_vision: bool,
+        required: RequiredCapabilities,
         sticky: Option<(&str, &str)>,
     ) -> Vec<Candidate> {
-        // 1) 硬约束：不支持工具调用/视觉的直接剔除
-        candidates.retain(|c| satisfies_hard_constraints(c, needs_tools, needs_vision));
+        // 1) 硬约束：缺少任一所需模态（工具/视觉/音频/视频）的直接剔除
+        candidates.retain(|c| satisfies_hard_constraints(c, &required));
 
         // 2) 健康 + 额度过滤（Invalid 直接出局；冷却中的看半开探测）
         candidates.retain(|c| {
@@ -254,6 +260,45 @@ impl Router {
 
 fn rate_key(p: &Provider, m: &ModelRef) -> String {
     format!("{}::{}", p.id, m.upstream)
+}
+
+/// 单个模型名是否匹配请求名。`*` 是唯一的通配符，匹配任意长度（含空串）；
+/// 不含 `*` 时退化为精确比较。只允许 `*`，避免正则带来的回溯与转义歧义。
+pub fn model_name_matches(model: &ModelRef, requested: &str) -> bool {
+    if !requested.contains('*') {
+        return model.alias == requested || model.upstream == requested;
+    }
+    wildcard_match(&model.alias, requested) || wildcard_match(&model.upstream, requested)
+}
+
+/// 线性时间的 `*` 通配匹配，不使用正则，避免恶意模式造成回溯开销。
+fn wildcard_match(value: &str, pattern: &str) -> bool {
+    let value = value.as_bytes();
+    let pattern = pattern.as_bytes();
+    let (mut vi, mut pi) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut retry_vi = 0usize;
+
+    while vi < value.len() {
+        if pi < pattern.len() && pattern[pi] == b'*' {
+            star = Some(pi);
+            retry_vi = vi;
+            pi += 1;
+        } else if pi < pattern.len() && pattern[pi] == value[vi] {
+            vi += 1;
+            pi += 1;
+        } else if let Some(star_index) = star {
+            retry_vi += 1;
+            vi = retry_vi;
+            pi = star_index + 1;
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 /// 从 provider 配置推导本地配额。UI 与数据模型都把 0 定义为“不限制”，

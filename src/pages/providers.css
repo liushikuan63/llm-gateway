@@ -125,6 +125,27 @@
 .context-line > button { font-size: 10px; padding: 3px 6px; margin-top: 8px; }
 .model-capabilities { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 5px; }
 .model-capabilities label { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
+.price-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.price-line .field { width: 150px; }
+.price-state { font-size: 10px; color: var(--accent); margin-top: 8px; }
+.price-state.unverified { color: var(--muted); }
+.price-block { margin-top: 2px; }
+.price-tiers { font-size: 10px; line-height: 1.6; margin: 4px 0 0; }
+.price-rules { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 8px; }
+.price-rules > summary { cursor: pointer; font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.price-rules > summary:hover { color: var(--accent); }
+.price-rule-row { display: grid; grid-template-columns: minmax(80px, 1fr) 74px 74px 80px 80px 30px; gap: 6px; margin-top: 6px; align-items: center; }
+.price-rule-row input { font-size: 11px; }
+.overrides-block { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px; }
+.overrides-block > summary { cursor: pointer; font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.overrides-block > summary:hover { color: var(--accent); }
+.overrides-help { font-size: 11px; color: var(--muted); line-height: 1.7; margin: 8px 0; }
+.overrides-block textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+.override-headers { margin-top: 4px; }
+.override-headers .spread { font-size: 11px; align-items: center; }
+.override-headers button { font-size: 10px; padding: 3px 6px; }
+.override-header-row { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(110px, 1.2fr) 30px; gap: 7px; margin-top: 6px; align-items: center; }
+.override-header-row input { font-size: 11px; }
 .model-help { font-size: 11px; color: var(--muted); line-height: 1.7; margin-bottom: 0; }
 .editor-footer { padding: 16px 28px; border-top: 1px solid var(--border); background: var(--panel); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .editor-footer > label { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }

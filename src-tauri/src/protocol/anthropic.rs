@@ -521,9 +521,10 @@ fn tool_result_to_anthropic_message(message: &Message) -> serde_json::Value {
                         }))
                     }
                 }
-                // Anthropic tool_result 不支持 OpenAI 的 input_audio 块；这里
-                // 不伪造为文本，保持现有协议层对该非目标能力的处理边界。
+                // Anthropic tool_result 不支持 OpenAI 的 input_audio / video_url 块；
+                // 路由层已按方言承载能力拦截这类请求，这里只保留协议边界标记。
                 crate::domain::Part::InputAudio { .. } => None,
+                crate::domain::Part::VideoUrl { .. } => None,
             })
             .collect::<Vec<_>>()),
     };

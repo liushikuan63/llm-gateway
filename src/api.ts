@@ -1,6 +1,49 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type Dialect = "openai" | "anthropic" | "gemini" | "ollama";
+export type Currency = "usd" | "cny";
+// manual：用户手填，刷新定价时永不被覆盖；catalog：由目录/定价源带出，可被刷新。
+export type PriceSource = "manual" | "catalog";
+
+// 按输入 token 数分档的单价（目录提供）。
+export interface PriceTier {
+  min_prompt_tokens: number;
+  prompt: number;
+  completion: number;
+}
+
+// 时段价（峰谷价/忙闲价）。时间为 UTC 当日分钟数；起止相同表示全天生效，
+// 起点大于终点表示跨午夜。
+export interface PriceRule {
+  label: string;
+  start_minute: number;
+  end_minute: number;
+  prompt_multiplier: number;
+  completion_multiplier: number;
+}
+
+// 每 100 万 token 的价格；null 表示未配置，界面不得显示为 0。
+export interface ModelPrice {
+  prompt: number;
+  completion: number;
+  currency: Currency;
+  tiers: PriceTier[];
+  rules: PriceRule[];
+  source: PriceSource;
+}
+
+export interface HeaderPair {
+  name: string;
+  value: string;
+}
+
+// 模型级参数覆盖；null 表示不改变请求。extra_body 以 JSON 对象形式在界面编辑。
+export interface ModelOverrides {
+  temperature: number | null;
+  max_tokens: number | null;
+  extra_body: Record<string, unknown> | null;
+  extra_headers: HeaderPair[] | null;
+}
 
 export interface ModelRef {
   alias: string;
@@ -8,7 +51,11 @@ export interface ModelRef {
   context_window: number;
   supports_tools: boolean;
   supports_vision: boolean;
+  supports_audio: boolean;
+  supports_video: boolean;
   supports_stream: boolean;
+  price: ModelPrice | null;
+  overrides: ModelOverrides | null;
 }
 
 export interface ProviderView {
@@ -112,8 +159,11 @@ export interface DiscoveredModel {
   context_source: "provider" | "default";
   supports_tools: boolean | null;
   supports_vision: boolean | null;
+  supports_audio: boolean | null;
+  supports_video: boolean | null;
   supports_stream: boolean | null;
   is_free: boolean | null;
+  price: ModelPrice | null;
 }
 
 export interface DiscoveredModels {
@@ -127,6 +177,21 @@ export interface TakeoverResult {
   path: string;
   backup_path: string | null;
   status: "updated" | "created";
+}
+
+export interface ImportBundleResult {
+  providers_imported: number;
+  models_imported: number;
+  // 当前设备主密钥无法解密的 Provider；它们保留配置但必须重新填写 Key。
+  providers_missing_key: string[];
+  config_imported: boolean;
+  // 本机安全边界字段，导入时不会被包内值覆盖。
+  preserved_security_fields: string[];
+}
+
+export interface ImportBundleOutcome {
+  result: ImportBundleResult;
+  backup_dir: string;
 }
 
 // 远程访问 Key 的原始 secret 永不在列表接口中出现。
@@ -253,6 +318,54 @@ export interface StatsOverview {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   provider_distribution: ProviderUsage[];
+  spend: SpendOverview;
+}
+
+export interface SpendBucket {
+  currency: string;
+  cost: number;
+  requests: number;
+}
+
+export interface SpendDaily {
+  day: string;
+  currency: string;
+  cost: number;
+  requests: number;
+}
+
+export interface SpendByDimension {
+  provider_id: string;
+  provider: string;
+  model: string | null;
+  currency: string;
+  cost: number;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+export interface SpendOverview {
+  today: SpendBucket[];
+  days7: SpendBucket[];
+  days30: SpendBucket[];
+  unpriced_requests_30d: number;
+  daily: SpendDaily[];
+  by_provider: SpendByDimension[];
+  by_model: SpendByDimension[];
+  note: string;
+}
+
+// 一次降级尝试；由网关在请求结束时写入审计。
+export interface AttemptRecord {
+  provider_id: string;
+  provider: string;
+  model: string;
+  status: number | null;
+  reason: string | null;
+  latency_ms: number;
+  ok: boolean;
+  retryable: boolean;
 }
 
 export interface RequestLog {
@@ -267,6 +380,74 @@ export interface RequestLog {
   prompt_tokens: number;
   completion_tokens: number;
   fallback_attempts: number;
+  error: string | null;
+  // 花费仅在模型配置了价格时返回；null 表示未计价。
+  cost: number | null;
+  currency: string | null;
+  // 生效的计价档位（时段价 / 输入长度分档），未命中非默认档时为 null。
+  rate_label: string | null;
+  // 本地估算的输入 token，与上游实际用量对照即可看出估算偏差。
+  estimated_prompt_tokens: number | null;
+  attempts: AttemptRecord[] | null;
+}
+
+// 定价刷新结果：逐项报告，避免只说成功。
+export interface PricingRefreshOutcome {
+  feed_models: number;
+  updated: Array<{
+    provider_id: string;
+    provider: string;
+    alias: string;
+    prompt: number;
+    completion: number;
+    currency: string;
+    tiers: number;
+  }>;
+  skipped_manual: number;
+  unmatched: Array<{ provider_id: string; provider: string; alias: string }>;
+  feed_url: string;
+}
+
+export interface PricingStatus {
+  at: string;
+  manual: boolean;
+  feed_url: string;
+  feed_models: number;
+  updated: number;
+  skipped_manual: number;
+  unmatched: number;
+}
+
+export interface TokenCalibration {
+  provider_id: string;
+  model: string;
+  samples: number;
+  ratio: number;
+  updated_at: string;
+}
+
+// 本机 CLI 工具的检测结果；update_available 仅在成功查到最新版本时才有意义。
+export interface CliToolStatus {
+  id: string;
+  label: string;
+  npm_package: string;
+  installed: boolean;
+  path: string | null;
+  version: string | null;
+  install_command: string;
+}
+
+export interface CliToolReport extends CliToolStatus {
+  latest_version: string | null;
+  update_available: boolean;
+  check_error: string | null;
+}
+
+export interface SelfCheckResult {
+  healthy: boolean;
+  base_url: string;
+  routed_via: string | null;
+  latency_ms: number;
   error: string | null;
 }
 
@@ -311,6 +492,20 @@ export const api = {
 
   applyTakeover: () => invoke<TakeoverResult[]>("apply_takeover"),
   exportBundle: (dest: string) => invoke<void>("export_bundle", { dest }),
+  importBundle: (src: string) => invoke<ImportBundleOutcome>("import_bundle", { src }),
+
+  refreshPricing: () => invoke<PricingRefreshOutcome>("refresh_pricing"),
+  pricingStatus: () => invoke<PricingStatus | null>("pricing_status"),
+  listTokenCalibrations: () =>
+    invoke<TokenCalibration[]>("list_token_calibrations"),
+  clearTokenCalibrations: () => invoke<number>("clear_token_calibrations"),
+
+  detectCliTools: () => invoke<CliToolReport[]>("detect_cli_tools"),
+  detectCliToolsWithUpdates: () =>
+    invoke<CliToolReport[]>("detect_cli_tools_with_updates"),
+  updateCliTool: (id: string) => invoke<string>("update_cli_tool", { id }),
+  runGatewaySelfCheck: () =>
+    invoke<SelfCheckResult>("run_gateway_self_check"),
 };
 
 export const DIALECT_LABEL: Record<Dialect, string> = {
@@ -319,6 +514,55 @@ export const DIALECT_LABEL: Record<Dialect, string> = {
   gemini: "Gemini",
   ollama: "Ollama",
 };
+
+export const CURRENCY_LABEL: Record<string, string> = {
+  usd: "美元",
+  cny: "人民币",
+};
+
+const CURRENCY_SYMBOL: Record<string, string> = { usd: "$", cny: "¥" };
+
+/** 金额展示：小额费用不能用两位小数掩盖成 0，必须让「近似零」与「真的零」可区分。 */
+export function formatMoney(cost: number, currency: string | null): string {
+  const symbol = currency ? CURRENCY_SYMBOL[currency] ?? "" : "";
+  const suffix = currency ? ` ${currency.toUpperCase()}` : "";
+  const absolute = Math.abs(cost);
+  if (absolute === 0) return `${symbol}0.00${suffix}`;
+  if (absolute < 1) {
+    const fixed = absolute.toFixed(4);
+    return `${symbol}${cost < 0 ? "-" : ""}${fixed === "0.0000" ? "<0.0001" : fixed}${suffix}`;
+  }
+  return `${symbol}${cost.toFixed(2)}${suffix}`;
+}
+
+/** 单 token 单价换算到「每 100 万 token」后的紧凑展示，用于模型目录。 */
+export function formatPricePerMillion(price: { prompt: number; completion: number; currency: string }): string {
+  const symbol = CURRENCY_SYMBOL[price.currency] ?? "";
+  const compact = (value: number) => {
+    if (value === 0) return "0";
+    if (value >= 1) return value.toFixed(2);
+    const fixed = value.toFixed(4);
+    return fixed.replace(/0+$/, "").replace(/\.$/, "");
+  };
+  return `${symbol}${compact(price.prompt)}/${compact(price.completion)} 每 100 万`;
+}
+
+/** UTC 分钟数 ↔ HH:MM 文本。界面统一用 UTC，避免与厂商公告的时区对不上。 */
+export function minutesToClock(minutes: number): string {
+  const normalized = ((minutes % 1440) + 1440) % 1440;
+  const hours = Math.floor(normalized / 60);
+  const rest = normalized % 60;
+  return `${String(hours).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+}
+
+export function clockToMinutes(clock: string): number | null {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(clock.trim());
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return null;
+  return hours * 60 + minutes;
+}
 
 export const HEALTH_LABEL: Record<string, string> = {
   healthy: "正常",

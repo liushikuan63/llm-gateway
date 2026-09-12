@@ -20,6 +20,10 @@ pub struct Session {
     pub total_tokens: i64,
     /// 已执行的压缩次数
     pub compact_count: i32,
+    /// 该会话最近一次「上游实际 prompt token / 本地估算」比值；用于按真实口径
+    /// 校准压缩阈值。`None` 表示还没有可用于校准的样本。
+    #[serde(default)]
+    pub token_ratio: Option<f64>,
     /// 摘要消息（压缩后的历史浓缩），会作为 system 消息注入
     pub summary: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,

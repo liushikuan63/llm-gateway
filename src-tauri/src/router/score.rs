@@ -140,14 +140,27 @@ fn latency_score(ms: u32) -> f32 {
     }
 }
 
-/// 任务类型感知：带 tools 的请求必须挑支持 function calling 的模型，
-/// 否则不是「慢一点」，而是直接失败。这类硬约束在打分前先过滤。
-pub fn satisfies_hard_constraints(c: &Candidate, needs_tools: bool, needs_vision: bool) -> bool {
-    if needs_tools && !c.model.supports_tools {
-        return false;
+/// 请求对模型能力的硬性要求。带 tools 的请求必须挑支持 function calling 的模型，
+/// 带图片/音频/视频的请求必须挑确实接受该模态的模型——否则不是「慢一点」，
+/// 而是直接失败或静默丢内容。这类硬约束在打分前先过滤。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequiredCapabilities {
+    pub tools: bool,
+    pub vision: bool,
+    pub audio: bool,
+    pub video: bool,
+}
+
+impl RequiredCapabilities {
+    /// 需要的能力是否都具备。空需求（纯文本）永远满足。
+    pub fn satisfied_by(&self, model: &ModelRef) -> bool {
+        (!self.tools || model.supports_tools)
+            && (!self.vision || model.supports_vision)
+            && (!self.audio || model.supports_audio)
+            && (!self.video || model.supports_video)
     }
-    if needs_vision && !c.model.supports_vision {
-        return false;
-    }
-    true
+}
+
+pub fn satisfies_hard_constraints(c: &Candidate, required: &RequiredCapabilities) -> bool {
+    required.satisfied_by(&c.model)
 }

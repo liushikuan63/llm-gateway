@@ -4,7 +4,8 @@ export const DEFAULT_CONTEXT_WINDOW = 32768;
 export type ProviderForm = Omit<ProviderInput, "note"> & { note: string };
 export const emptyModel = (context = DEFAULT_CONTEXT_WINDOW): ModelRef => ({
   alias: "", upstream: "", context_window: context,
-  supports_tools: false, supports_vision: false, supports_stream: true,
+  supports_tools: false, supports_vision: false, supports_audio: false, supports_video: false, supports_stream: true,
+  price: null, overrides: null,
 });
 export const blankForm = (): ProviderForm => ({
   name: "", dialect: "openai", base_url: "", api_key: "", enabled: true,

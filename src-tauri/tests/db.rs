@@ -30,7 +30,11 @@ fn provider() -> Provider {
             context_window: 32_768,
             supports_tools: true,
             supports_vision: false,
+            supports_audio: false,
+            supports_video: false,
             supports_stream: true,
+            price: None,
+            overrides: None,
         }],
         rpm_limit: 60,
         intelligence: 80,
@@ -98,6 +102,76 @@ async fn file_database_uses_wal_and_creates_all_storage_tables() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = fs::remove_file(PathBuf::from(format!("{}{suffix}", path.display())));
     }
+}
+
+#[tokio::test]
+async fn session_listing_reads_every_field_the_management_view_needs() {
+    // 真机启动时发现过：命令层自己写 SQL，新增 token_ratio 列后漏改 SELECT，
+    // sqlx 在运行时才报 ColumnNotFound，而进程 panic=abort 会直接退出应用。
+    // 这里把该查询固定在 repo 层并用真实数据库覆盖，避免同类事故复发。
+    let db = Db::connect_in_memory()
+        .await
+        .expect("内存数据库初始化应成功");
+    repo::upsert_provider(db.pool(), &provider())
+        .await
+        .expect("provider 应写入");
+    let session = repo::get_or_create_session(db.pool(), "session-view")
+        .await
+        .expect("session 应创建");
+    repo::append_message(
+        db.pool(),
+        &session.id,
+        "user",
+        "列表页需要读的消息",
+        None,
+        None,
+        None,
+        4,
+        0,
+    )
+    .await
+    .expect("消息应写入");
+    repo::update_sticky(db.pool(), &session.id, "provider-a", "model-a", 9_999)
+        .await
+        .expect("粘性应写入");
+    repo::update_session_token_ratio(db.pool(), &session.id, 1.75)
+        .await
+        .expect("校准比值应写入");
+
+    let rows = repo::list_sessions_with_counts(db.pool(), 10)
+        .await
+        .expect("会话列表查询必须与 Session 结构体字段保持一致");
+    assert_eq!(rows.len(), 1);
+    let (session, message_count) = &rows[0];
+    assert_eq!(session.id, "session-view");
+    assert_eq!(session.sticky_provider_id.as_deref(), Some("provider-a"));
+    assert_eq!(session.sticky_model.as_deref(), Some("model-a"));
+    assert_eq!(session.sticky_expires_at, Some(9_999));
+    assert_eq!(session.token_ratio, Some(1.75));
+    assert_eq!(*message_count, 1, "消息数必须来自 JOIN 统计");
+
+    // 无消息的会话也要出现在列表里，且计数为 0（LEFT JOIN 不能把空会话丢掉）。
+    repo::get_or_create_session(db.pool(), "session-empty")
+        .await
+        .expect("空会话应创建");
+    let rows = repo::list_sessions_with_counts(db.pool(), 10)
+        .await
+        .expect("空会话列表应可读");
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .any(|(session, count)| session.id == "session-empty" && *count == 0));
+
+    let all = repo::list_sessions(db.pool(), 10)
+        .await
+        .expect("repo 的会话列表同样要能读出新增列");
+    assert_eq!(all.len(), 2);
+    assert_eq!(
+        all.iter()
+            .find(|item| item.id == "session-view")
+            .and_then(|item| item.token_ratio),
+        Some(1.75)
+    );
 }
 
 #[tokio::test]

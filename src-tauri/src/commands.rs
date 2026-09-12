@@ -174,6 +174,26 @@ pub async fn upsert_provider(
     let enabled = input.enabled;
     let now = chrono::Utc::now();
 
+    // 价格只用于本地花费估算。非法值必须在这里拒绝，而不是落库后再被静默忽略。
+    for model in &input.models {
+        if let Some(price) = &model.price {
+            if !price.is_valid() {
+                return Err(format!(
+                    "模型 {} 的价格必须是 0 或更大的有限数值",
+                    model.alias.trim()
+                ));
+            }
+        }
+    }
+    // 模型级覆盖会直接改写发往上游的请求，必须在保存期整体校验。
+    for model in &input.models {
+        if let Some(overrides) = &model.overrides {
+            overrides
+                .validate()
+                .map_err(|error| format!("模型 {} 的参数覆盖无效：{error}", model.alias.trim()))?;
+        }
+    }
+
     let p = Provider {
         id: id.clone(),
         name: input.name,
@@ -591,38 +611,17 @@ pub async fn list_sessions(
     state: State<'_, AppState>,
     limit: Option<i64>,
 ) -> Result<Vec<SessionView>, String> {
-    let rows = sqlx::query(
-        r#"SELECT s.id, s.snapshot_id, s.title, s.sticky_provider_id, s.sticky_model,
-                  s.sticky_expires_at, s.total_tokens, s.compact_count, s.summary,
-                  s.created_at, s.updated_at, COUNT(m.id) AS message_count
-           FROM sessions s
-           LEFT JOIN session_messages m ON m.session_id = s.id
-           GROUP BY s.id
-           ORDER BY s.updated_at DESC
-           LIMIT ?"#,
-    )
-    .bind(limit.unwrap_or(50).clamp(1, 200))
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(|e| e.to_string())?;
-
+    // 会话列表 SQL 收敛在 repo 层：那里有真实数据库的集成测试，能挡住
+    // 「新增列后漏改 SELECT」这类只在运行时才炸的错。本进程 panic=abort，
+    // 一次列名不匹配就会让整个应用退出，因此这个查询必须有测试覆盖。
+    let rows = repo::list_sessions_with_counts(state.db.pool(), limit.unwrap_or(50).clamp(1, 200))
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(rows
-        .iter()
-        .map(|r| SessionView {
-            session: Session {
-                id: r.get("id"),
-                snapshot_id: r.get("snapshot_id"),
-                title: r.get("title"),
-                sticky_provider_id: r.get("sticky_provider_id"),
-                sticky_model: r.get("sticky_model"),
-                sticky_expires_at: r.get("sticky_expires_at"),
-                total_tokens: r.get("total_tokens"),
-                compact_count: r.get("compact_count"),
-                summary: r.get("summary"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            },
-            message_count: r.get("message_count"),
+        .into_iter()
+        .map(|(session, message_count)| SessionView {
+            session,
+            message_count,
         })
         .collect())
 }
@@ -829,11 +828,22 @@ async fn replace_snapshot_providers(
         .map_err(|e| e.to_string())?;
 
         for model in &provider.models {
+            let price = model
+                .price
+                .as_ref()
+                .filter(|price| price.is_valid())
+                .and_then(|price| serde_json::to_string(price).ok());
+            let overrides = model
+                .overrides
+                .as_ref()
+                .filter(|overrides| !overrides.is_empty())
+                .and_then(|overrides| serde_json::to_string(overrides).ok());
             sqlx::query(
                 r#"INSERT INTO models
                      (id, provider_id, alias, upstream, context_window, supports_tools,
-                      supports_vision, supports_stream)
-                   VALUES (?,?,?,?,?,?,?,?)"#,
+                      supports_vision, supports_audio, supports_video, supports_stream,
+                      price_json, overrides_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"#,
             )
             .bind(format!("{}:{}", provider.id, model.alias))
             .bind(&provider.id)
@@ -842,7 +852,11 @@ async fn replace_snapshot_providers(
             .bind(model.context_window)
             .bind(model.supports_tools as i64)
             .bind(model.supports_vision as i64)
+            .bind(model.supports_audio as i64)
+            .bind(model.supports_video as i64)
             .bind(model.supports_stream as i64)
+            .bind(price)
+            .bind(overrides)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
@@ -1023,6 +1037,86 @@ pub struct StatsOverview {
     pub total_prompt_tokens: i64,
     pub total_completion_tokens: i64,
     pub provider_distribution: Vec<ProviderUsage>,
+    pub spend: SpendOverview,
+}
+
+/// 本地花费估算。数据来自 `usage_daily`（按 UTC 自然日聚合），只统计配置了价格的
+/// 模型；未配置价格的请求单独计数，不折算成 0 混进合计。
+#[derive(Debug, Clone, Serialize)]
+pub struct SpendOverview {
+    pub today: Vec<SpendBucketView>,
+    pub days7: Vec<SpendBucketView>,
+    pub days30: Vec<SpendBucketView>,
+    /// 近 30 天有 token 消耗但没有价格的请求数
+    pub unpriced_requests_30d: i64,
+    /// 近 14 天逐日花费
+    pub daily: Vec<serde_json::Value>,
+    /// 近 30 天按供应商
+    pub by_provider: Vec<serde_json::Value>,
+    /// 近 30 天按模型
+    pub by_model: Vec<serde_json::Value>,
+    /// 统计口径说明，供界面原样展示，避免把估算说成账单。
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpendBucketView {
+    pub currency: String,
+    pub cost: f64,
+    pub requests: i64,
+}
+
+/// UTC 自然日粒度，与 `usage_daily` 的按天聚合一致。
+fn utc_day_cutoff(days_ago: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::days(days_ago))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+async fn spend_overview(pool: &sqlx::SqlitePool) -> Result<SpendOverview, String> {
+    let bucket_view = |buckets: Vec<repo::SpendBucket>| {
+        buckets
+            .into_iter()
+            .map(|bucket| SpendBucketView {
+                currency: bucket.currency,
+                cost: bucket.cost,
+                requests: bucket.requests,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let today = repo::spend_buckets(pool, &utc_day_cutoff(0))
+        .await
+        .map_err(|e| e.to_string())?;
+    let days7 = repo::spend_buckets(pool, &utc_day_cutoff(6))
+        .await
+        .map_err(|e| e.to_string())?;
+    let days30 = repo::spend_buckets(pool, &utc_day_cutoff(29))
+        .await
+        .map_err(|e| e.to_string())?;
+    let unpriced_requests_30d = repo::unpriced_request_count(pool, &utc_day_cutoff(29))
+        .await
+        .map_err(|e| e.to_string())?;
+    let daily = repo::spend_daily(pool, &utc_day_cutoff(13))
+        .await
+        .map_err(|e| e.to_string())?;
+    let by_provider = repo::spend_by_dimension(pool, &utc_day_cutoff(29), false)
+        .await
+        .map_err(|e| e.to_string())?;
+    let by_model = repo::spend_by_dimension(pool, &utc_day_cutoff(29), true)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(SpendOverview {
+        today: bucket_view(today),
+        days7: bucket_view(days7),
+        days30: bucket_view(days30),
+        unpriced_requests_30d,
+        daily,
+        by_provider,
+        by_model,
+        note: "按模型配置的价格 × 实际 token 本地估算，按 UTC 自然日聚合；不是上游账单，请以厂商账单为准。".into(),
+    })
 }
 
 #[tauri::command]
@@ -1118,6 +1212,7 @@ pub async fn stats_overview(state: State<'_, AppState>) -> Result<StatsOverview,
             .get::<Option<i64>, _>("total_completion_tokens")
             .unwrap_or(0),
         provider_distribution,
+        spend: spend_overview(state.db.pool()).await?,
     })
 }
 
@@ -1180,6 +1275,183 @@ impl PreparedTakeover {
                 TakeoverStatus::Created
             },
         }
+    }
+}
+
+/* --------------------------- CLI 工具检测与更新 --------------------------- */
+
+/// 一次检测结果 + 最新版本信息。界面只消费这一种结构，检测与查更新共用。
+#[derive(Debug, Clone, Serialize)]
+pub struct CliToolReport {
+    #[serde(flatten)]
+    pub tool: crate::cli_tools::CliToolStatus,
+    pub latest_version: Option<String>,
+    /// 已安装且版本与 latest 不同（含预发布），界面据此提示「可更新」。
+    pub update_available: bool,
+    /// 查询最新版本失败时的原因；不影响已检测到的本机信息。
+    pub check_error: Option<String>,
+}
+
+/// 检测本机 CLI。只读，不修改任何文件；`None` 表示不联网查询最新版本。
+#[tauri::command]
+pub async fn detect_cli_tools() -> Result<Vec<CliToolReport>, String> {
+    Ok(detect_reports(None).await)
+}
+
+/// 检测 + 查询最新版本。registry 查询失败只记录原因，不把整个检测判为失败。
+#[tauri::command]
+pub async fn detect_cli_tools_with_updates(
+    state: State<'_, AppState>,
+) -> Result<Vec<CliToolReport>, String> {
+    let proxy = state.config.read().http_proxy.clone();
+    Ok(detect_reports(Some(proxy.as_deref())).await)
+}
+
+/// `updates` 为 `None` 时只做本机检测（不发起任何网络请求）；为 `Some` 时按给定的
+/// 代理设置查询 npm registry。两个按钮的行为必须与标签一致：真机验证时发现
+/// 「检测本机 CLI」也会联网，那属于标签与行为不符。
+async fn detect_reports(updates: Option<Option<&str>>) -> Vec<CliToolReport> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let extra = crate::cli_tools::well_known_dirs();
+    let mut reports = Vec::new();
+    for spec in crate::cli_tools::TOOLS {
+        let tool = crate::cli_tools::detect(spec, &path_env, &extra).await;
+        let (latest_version, check_error) = match (updates, tool.installed) {
+            (Some(proxy), true) => {
+                match crate::cli_tools::latest_version(spec.npm_package, proxy).await {
+                    Ok(version) => (Some(version), None),
+                    Err(error) => (None, Some(error)),
+                }
+            }
+            _ => (None, None),
+        };
+        let update_available = match (&tool.version, &latest_version) {
+            (Some(current), Some(latest)) => current != latest,
+            _ => false,
+        };
+        reports.push(CliToolReport {
+            tool,
+            latest_version,
+            update_available,
+            check_error,
+        });
+    }
+    reports
+}
+
+/// 更新指定的 CLI。命令来自内置常量（不接受用户输入），执行前界面会展示确切命令。
+#[tauri::command]
+pub async fn update_cli_tool(id: String) -> Result<String, String> {
+    let spec = crate::cli_tools::TOOLS
+        .iter()
+        .find(|spec| spec.id == id)
+        .ok_or_else(|| format!("不支持更新 {id}"))?;
+    crate::cli_tools::update(spec).await
+}
+
+/// 网关连通性自检：确认服务在监听，并用统一 Key 发一次最小请求走通端到端链路。
+/// 结果用于「一键配置后确保可用」，因此失败必须给出可操作的原因。
+#[derive(Debug, Clone, Serialize)]
+pub struct SelfCheckResult {
+    pub healthy: bool,
+    pub base_url: String,
+    pub routed_via: Option<String>,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn run_gateway_self_check(state: State<'_, AppState>) -> Result<SelfCheckResult, String> {
+    let cfg = state.config.read().clone();
+    let base_url = cfg.base_url();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let health = client.get(format!("{base_url}/healthz")).send().await;
+    match health {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            return Ok(SelfCheckResult {
+                healthy: false,
+                base_url,
+                routed_via: None,
+                latency_ms: 0,
+                error: Some(format!("健康检查返回 HTTP {}", response.status().as_u16())),
+            })
+        }
+        Err(error) => {
+            return Ok(SelfCheckResult {
+                healthy: false,
+                base_url,
+                routed_via: None,
+                latency_ms: 0,
+                error: Some(format!("无法连接网关服务：{error}")),
+            })
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let body = serde_json::json!({
+        "model": "auto",
+        "messages": [{ "role": "user", "content": "回复「ok」即可，不要展开。" }],
+        "max_tokens": 8,
+        "stream": false,
+    });
+    let response = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&cfg.unified_key)
+        .json(&body)
+        .send()
+        .await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match response {
+        Ok(response) => {
+            let routed_via = response
+                .headers()
+                .get("x-routed-via")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            if response.status().is_success() {
+                Ok(SelfCheckResult {
+                    healthy: true,
+                    base_url,
+                    routed_via,
+                    latency_ms,
+                    error: None,
+                })
+            } else {
+                let status = response.status().as_u16();
+                let detail = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "上游未返回错误详情".into());
+                Ok(SelfCheckResult {
+                    healthy: false,
+                    base_url,
+                    routed_via,
+                    latency_ms,
+                    error: Some(format!("网关返回 HTTP {status}：{detail}")),
+                })
+            }
+        }
+        Err(error) => Ok(SelfCheckResult {
+            healthy: false,
+            base_url,
+            routed_via: None,
+            latency_ms,
+            error: Some(format!("请求网关失败：{error}")),
+        }),
     }
 }
 
@@ -2207,14 +2479,137 @@ X-Gateway-Env-Header = "LLM_GATEWAY_PRESERVE_HEADER"
     }
 }
 
+/* --------------------------- 定价与校准 --------------------------- */
+
+/// 立即刷新定价。手工填写的价格永不被覆盖；结果逐项返回，便于界面解释。
+#[tauri::command]
+pub async fn refresh_pricing(
+    state: State<'_, AppState>,
+) -> Result<crate::pricing::RefreshOutcome, String> {
+    crate::pricing_refresh::refresh(&state.gateway, true).await
+}
+
+/// 最近一次定价刷新摘要；从未刷新过时为 null。
+#[tauri::command]
+pub async fn pricing_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    crate::pricing_refresh::status(&state.gateway).await
+}
+
+/// token 估算校准表。ratio 是「上游实际 / 本地估算」的 EWMA 比值。
+#[tauri::command]
+pub async fn list_token_calibrations(
+    state: State<'_, AppState>,
+) -> Result<Vec<repo::Calibration>, String> {
+    repo::list_calibrations(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 清空校准样本。只影响本机估算口径，不改动任何请求或会话数据。
+#[tauri::command]
+pub async fn clear_token_calibrations(state: State<'_, AppState>) -> Result<u64, String> {
+    repo::clear_calibrations(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 导出/导入整个数据目录（多设备同步用，等价于 CC Switch 的配置目录同步）
 #[tauri::command]
 pub async fn export_bundle(_state: State<'_, AppState>, dest: String) -> Result<(), String> {
-    let src = crate::config::app_data_dir();
-    let dest = std::path::PathBuf::from(dest);
-    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-    for name in ["config.toml", "gateway.db"] {
-        let _ = std::fs::copy(src.join(name), dest.join(name));
+    crate::bundle::export_bundle(&crate::config::app_data_dir(), std::path::Path::new(&dest)).await
+}
+
+/// 导入结果。逐项报告，避免把「部分成功」说成整体成功。
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportBundleResult {
+    pub providers_imported: usize,
+    pub models_imported: usize,
+    /// 需要用当前设备的主密钥才能解密的条目数；密钥不匹配时该 Provider 会保留
+    /// 但必须重新填写 Key，绝不静默把无法解密的密文当成可用凭据。
+    pub providers_missing_key: Vec<String>,
+    pub config_imported: bool,
+    /// 统一 Key 与远程模式属于本机安全边界，不随包覆盖。
+    pub preserved_security_fields: Vec<String>,
+}
+
+/// 导入之前的数据目录备份路径，便于用户回退。
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportBundleOutcome {
+    pub result: ImportBundleResult,
+    pub backup_dir: String,
+}
+
+/// 从导出目录读取配置包并应用到本机。
+///
+/// 与 `export_bundle` 对称：读取同目录的 `config.toml` 与 `gateway.db`。为避免
+/// 在运行中替换 SQLite 文件本身，这里打开源库只读、把 Provider/模型读出来后在
+/// 本机库的单个事务内替换；配置同样经过与「设置页」相同的校验再落盘。统一 Key
+/// 与远程模式属于本机安全边界，永远不从包里覆盖。
+#[tauri::command]
+pub async fn import_bundle(
+    state: State<'_, AppState>,
+    src: String,
+) -> Result<ImportBundleOutcome, String> {
+    let src_dir = std::path::Path::new(&src);
+    // 1) 先只读解析，任何一步失败都在改动本机数据之前返回。
+    let contents = crate::bundle::read_bundle(src_dir).await?;
+    let imported_config = match contents.config_toml {
+        Some(raw) => Some(
+            toml::from_str::<AppConfig>(&raw).map_err(|e| format!("config.toml 解析失败：{e}"))?,
+        ),
+        None => None,
+    };
+    let usable = contents.providers;
+
+    // 2) 备份现有数据目录，备份失败就中止，避免「改了但无法回退」。
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let backup = crate::bundle::backup_data_dir(&crate::config::app_data_dir(), &timestamp)
+        .await
+        .map_err(|e| format!("备份当前数据目录失败，未导入：{e}"))?;
+
+    let models_imported = usable.iter().map(|provider| provider.models.len()).sum();
+    let providers_imported = usable.len();
+    if !usable.is_empty() {
+        replace_snapshot_providers(state.db.pool(), &usable).await?;
+        state
+            .gateway
+            .reload_providers()
+            .await
+            .map_err(|e| e.to_string())?;
+        *state.gateway.active.write() = None;
     }
-    Ok(())
+
+    let mut preserved_security_fields = Vec::new();
+    let mut config_imported = false;
+    if let Some(mut cfg) = imported_config {
+        let previous = state.config.read().clone();
+        // 统一 Key 与远程模式属于本机安全边界，永远不从包里覆盖。
+        preserved_security_fields.push("统一访问 Key".to_string());
+        preserved_security_fields.push("远程 HTTPS 模式".to_string());
+        cfg.unified_key = previous.unified_key.clone();
+        cfg.remote_mode = previous.remote_mode.clone();
+        cfg.normalize_custom_rules();
+        cfg.validate_custom_rules().map_err(|e| e.to_string())?;
+        cfg.normalize_listener();
+        cfg.validate_remote_mode().map_err(|e| e.to_string())?;
+        cfg.save().map_err(|e| e.to_string())?;
+        *state.config.write() = cfg.clone();
+        *state.gateway.cfg.write() = cfg.clone();
+        state
+            .gateway
+            .router
+            .set_custom_rules(cfg.custom_rules.clone());
+        config_imported = true;
+    }
+
+    Ok(ImportBundleOutcome {
+        result: ImportBundleResult {
+            providers_imported,
+            models_imported,
+            providers_missing_key: contents.providers_missing_key,
+            config_imported,
+            preserved_security_fields,
+        },
+        backup_dir: backup.display().to_string(),
+    })
 }

@@ -15,7 +15,11 @@ fn model(alias: &str, upstream: &str) -> ModelRef {
         context_window: 128_000,
         supports_tools: true,
         supports_vision: false,
+        supports_audio: false,
+        supports_video: false,
         supports_stream: true,
+        price: None,
+        overrides: None,
     }
 }
 
@@ -129,8 +133,7 @@ fn provider_rpm_zero_means_unlimited_not_a_hidden_dialect_default() {
     let ranked = router.rank(
         router.resolve("auto", &[provider]).unwrap(),
         &AppConfig::default(),
-        false,
-        false,
+        Default::default(),
         None,
     );
     assert_eq!(ranked.len(), 1);
@@ -306,8 +309,10 @@ fn rank_applies_hard_constraints_priority_and_virtual_strategy() {
             .resolve("auto", &[low_priority.clone(), high_priority.clone()])
             .unwrap(),
         &cfg,
-        true,
-        false,
+        llm_gateway_lib::router::score::RequiredCapabilities {
+            tools: true,
+            ..Default::default()
+        },
         None,
     );
     assert_eq!(ranked.len(), 1);
@@ -318,8 +323,7 @@ fn rank_applies_hard_constraints_priority_and_virtual_strategy() {
             .resolve("auto", &[low_priority.clone(), high_priority.clone()])
             .unwrap(),
         &cfg,
-        false,
-        false,
+        Default::default(),
         None,
     );
     assert_eq!(priority[0].provider.id, "low-priority");
@@ -331,8 +335,7 @@ fn rank_applies_hard_constraints_priority_and_virtual_strategy() {
             .resolve("fastest", &[low_priority, high_priority])
             .unwrap(),
         &cfg,
-        false,
-        false,
+        Default::default(),
         None,
     );
     assert_eq!(fastest[0].provider.id, "high-priority");
@@ -362,8 +365,7 @@ fn custom_prefix_rules_filter_and_boost_the_ranked_chain() {
     let baseline = router.rank(
         router.resolve("claude-route", &providers).unwrap(),
         &cfg,
-        false,
-        false,
+        Default::default(),
         None,
     );
     let balanced = router.rank(
@@ -372,8 +374,7 @@ fn custom_prefix_rules_filter_and_boost_the_ranked_chain() {
             routing_strategy: RoutingStrategy::Balanced,
             ..AppConfig::default()
         },
-        false,
-        false,
+        Default::default(),
         None,
     );
     assert_eq!(
@@ -406,8 +407,7 @@ fn custom_prefix_rules_filter_and_boost_the_ranked_chain() {
     let routed = router.rank(
         router.resolve("claude-route", &providers).unwrap(),
         &cfg,
-        false,
-        false,
+        Default::default(),
         None,
     );
     assert_eq!(
@@ -422,8 +422,7 @@ fn custom_prefix_rules_filter_and_boost_the_ranked_chain() {
     let sticky = router.rank(
         router.resolve("claude-route", &providers).unwrap(),
         &cfg,
-        false,
-        false,
+        Default::default(),
         Some(("fallback", "claude-route")),
     );
     assert_eq!(sticky[0].provider.id, "fallback");
@@ -442,8 +441,7 @@ fn custom_prefix_rules_filter_and_boost_the_ranked_chain() {
     let after_failure = router.rank(
         router.resolve("claude-route", &providers).unwrap(),
         &cfg,
-        false,
-        false,
+        Default::default(),
         None,
     );
     assert_eq!(after_failure.len(), 1);
@@ -472,8 +470,7 @@ fn custom_prefix_exclude_provider_is_only_active_in_custom_strategy() {
     let custom_ranked = router.rank(
         router.resolve("mock-route", &providers).unwrap(),
         &custom,
-        false,
-        false,
+        Default::default(),
         None,
     );
     assert_eq!(custom_ranked.len(), 1);
@@ -482,8 +479,7 @@ fn custom_prefix_exclude_provider_is_only_active_in_custom_strategy() {
     let priority_ranked = router.rank(
         router.resolve("mock-route", &providers).unwrap(),
         &AppConfig::default(),
-        false,
-        false,
+        Default::default(),
         None,
     );
     assert_eq!(priority_ranked.len(), 2);
@@ -527,8 +523,7 @@ fn sticky_candidate_is_promoted_only_while_healthy() {
             .resolve("auto", &[first.clone(), second.clone()])
             .unwrap(),
         &cfg,
-        false,
-        false,
+        Default::default(),
         Some(("second", "mock-model")),
     );
     assert_eq!(sticky[0].provider.id, "second");
@@ -543,8 +538,7 @@ fn sticky_candidate_is_promoted_only_while_healthy() {
     let healthy_only = router.rank(
         router.resolve("auto", &[first, second]).unwrap(),
         &cfg,
-        false,
-        false,
+        Default::default(),
         Some(("second", "mock-model")),
     );
     assert_eq!(healthy_only.len(), 1);
@@ -568,4 +562,60 @@ fn public_models_are_aggregated_by_alias() {
     assert_eq!(models[0].backed_by, 2);
     assert_eq!(models[0].context_window, 200_000);
     assert!(models[0].supports_vision);
+}
+
+#[test]
+fn wildcard_model_aliases_resolve_but_exact_names_still_win() {
+    let (router, _, _) = router();
+    let mut cloud = provider("cloud", 10, 50);
+    cloud.models = vec![
+        model("gpt-4o", "gpt-4o"),
+        model("gpt-4o-mini", "gpt-4o-mini"),
+        model("gpt-4o-preview", "gpt-4o-preview"),
+    ];
+    let mut local = provider("local", 20, 50);
+    local.models = vec![model("qwen2.5:7b", "qwen2.5:7b")];
+    let providers = [cloud, local];
+
+    // 通配符命中同 Provider 下所有前缀匹配的模型。
+    let candidates = router.resolve("gpt-4o*", &providers).unwrap();
+    assert_eq!(candidates.len(), 3);
+    assert!(candidates
+        .iter()
+        .all(|candidate| candidate.provider.id == "cloud"));
+
+    // 精确名存在时绝不被通配符扩大：请求 gpt-4o 只返回它自己。
+    let exact = router.resolve("gpt-4o", &providers).unwrap();
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].model.alias, "gpt-4o");
+
+    // provider:通配符 只在指定 Provider 内展开。
+    let scoped = router.resolve("cloud:gpt-4o-m*", &providers).unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].model.alias, "gpt-4o-mini");
+
+    // 连通配符也未命中时仍然是明确的「模型不存在」，而不是空候选链。
+    let error = router.resolve("gpt-5*", &providers).unwrap_err();
+    assert!(matches!(error, GatewayError::ModelNotFound(_)));
+}
+
+#[test]
+fn wildcard_matching_handles_star_positions_without_regex_semantics() {
+    use llm_gateway_lib::router::model_name_matches;
+
+    let target = model("vendor/chat-3.5:free", "vendor/chat-3.5:free");
+    for pattern in [
+        "*",
+        "vendor/*",
+        "*:free",
+        "vendor/chat-3*",
+        "*chat*",
+        "*3.5*",
+        "vendor/chat-3.5:free",
+    ] {
+        assert!(model_name_matches(&target, pattern), "应命中：{pattern}");
+    }
+    for pattern in ["gpt*", "vendor/chat-4*", "*:paid", "vendor?chat*"] {
+        assert!(!model_name_matches(&target, pattern), "不应命中：{pattern}");
+    }
 }

@@ -38,6 +38,7 @@ pub fn to_gemini_body(req: &ChatRequest) -> serde_json::Value {
         if !text.is_empty() {
             parts.push(json!({ "text": text }));
         }
+        append_media_parts(&m.content, &mut parts);
 
         if matches!(m.role, Role::Tool) {
             let response = serde_json::from_str::<serde_json::Value>(&text)
@@ -105,6 +106,83 @@ fn content_text(content: &Content) -> String {
             .collect::<Vec<_>>()
             .join(""),
     }
+}
+
+/// 把图片/音频/视频追加为 Gemini 的多模态 parts。
+///
+/// Gemini 原生只接受 base64 内联数据（`inline_data`）或 Google 系文件 URI
+/// （`file_data`，支持 gs:// 与 YouTube）。路由层已经按这个边界过滤过候选，
+/// 因此这里遇到不支持的形态只记录告警——那意味着承载判断出现遗漏。
+fn append_media_parts(content: &Content, parts: &mut Vec<serde_json::Value>) {
+    let Content::Parts(items) = content else {
+        return;
+    };
+    for part in items {
+        match part {
+            crate::domain::Part::Text { .. } => {}
+            crate::domain::Part::ImageUrl { image_url } => match inline_data(&image_url.url) {
+                Some(data) => parts.push(data),
+                None => warn_unsupported("图片", &image_url.url),
+            },
+            crate::domain::Part::InputAudio { input_audio } => {
+                let raw = input_audio
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|data| {
+                        let format = input_audio
+                            .get("format")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("wav");
+                        format!("data:audio/{format};base64,{data}")
+                    });
+                match raw.as_deref().and_then(inline_data) {
+                    Some(data) => parts.push(data),
+                    None => warn_unsupported("音频", raw.as_deref().unwrap_or("input_audio")),
+                }
+            }
+            crate::domain::Part::VideoUrl { video_url } => {
+                match crate::media::gemini_video_source(&video_url.url) {
+                    Some(("inline", rest)) => {
+                        parts.push(json!({
+                            "inline_data": { "mime_type": mime_of(&rest), "data": rest }
+                        }));
+                    }
+                    Some((_, uri)) => {
+                        parts.push(json!({
+                            "file_data": { "file_uri": uri }
+                        }));
+                    }
+                    None => warn_unsupported("视频", &video_url.url),
+                }
+            }
+        }
+    }
+}
+
+fn warn_unsupported(kind: &str, source: &str) {
+    let source = if source.len() > 60 {
+        &source[..60]
+    } else {
+        source
+    };
+    tracing::warn!("Gemini 链路丢弃不支持的{kind}输入（路由层应已拦截）: {source}");
+}
+
+/// `data:<mime>;base64,<payload>` → Gemini 的 inline_data 块。
+fn inline_data(url: &str) -> Option<serde_json::Value> {
+    let rest = url.strip_prefix("data:")?;
+    let (mime, data) = rest.split_once(";base64,")?;
+    if mime.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some(json!({ "inline_data": { "mime_type": mime, "data": data } }))
+}
+
+fn mime_of(data_url_rest: &str) -> String {
+    data_url_rest
+        .split_once(';')
+        .map(|(mime, _)| mime.to_owned())
+        .unwrap_or_else(|| "video/mp4".to_owned())
 }
 
 fn gemini_function_declarations(tools: &serde_json::Value) -> Vec<serde_json::Value> {

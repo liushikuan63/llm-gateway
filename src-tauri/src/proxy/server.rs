@@ -156,9 +156,12 @@ impl GatewayState {
         Ok(compacted.is_some())
     }
 
-    /// 后台任务：日志清理 + 健康快照
+    /// 后台任务：日志清理 + Provider 快照 + 定价自动刷新
     pub async fn background_loop(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(300));
+        // 定价自动刷新按「天」节流：后台每 5 分钟醒一次，但只在距上次尝试超过
+        // 24 小时后才真正发起网络请求，避免频繁打扰公共目录。
+        let mut last_pricing_refresh: Option<std::time::Instant> = None;
         loop {
             tick.tick().await;
             let cfg = self.cfg_snapshot();
@@ -169,6 +172,20 @@ impl GatewayState {
             }
             if let Err(e) = self.reload_providers().await {
                 tracing::warn!("刷新 provider 失败: {e}");
+            }
+            if cfg.catalog_auto_update {
+                let due = last_pricing_refresh
+                    .map(|last| last.elapsed() >= Duration::from_secs(24 * 3600))
+                    .unwrap_or(true);
+                if due {
+                    // 失败也要等下一个周期再试，避免目录不可用时反复重试。
+                    last_pricing_refresh = Some(std::time::Instant::now());
+                    if let Err(error) = crate::pricing_refresh::refresh(&self, false).await {
+                        tracing::warn!("自动刷新定价失败: {error}");
+                    }
+                }
+            } else {
+                last_pricing_refresh = None;
             }
         }
     }
@@ -1376,9 +1393,15 @@ async fn dispatch(
     // 路由前按候选窗口扣除输出、工具 schema 和协议余量。先强制压缩可压缩的
     // 持久化历史，再在必要时按完整工具交换裁剪；仍放不下时明确报错，绝不把
     // 超窗 payload 交给小窗口备选 Provider。
-    let fixed_reserve = fixed_context_reserve(&req);
+    //
+    // 估算校准：本地按字符估算，与上游真实 token 之间存在系统性偏差。用日志里
+    // 「实际 / 估算」的 EWMA 比值保守换算，避免把超窗 payload 送进窗口。
+    let calibration = state.calibration_snapshot().await;
+    let fixed_reserve = fixed_context_reserve(&req, &candidates);
     if let Some(max_message_budget) = max_message_budget(&candidates, fixed_reserve) {
-        if estimate_message_tokens(&req.messages) > max_message_budget {
+        let conservative_ratio = conservative_ratio(&candidates, &calibration);
+        let scaled_budget = (max_message_budget as f64 / conservative_ratio).floor() as u32;
+        if scaled(estimate_message_tokens(&req.messages), conservative_ratio) > max_message_budget {
             match state.compact_session_if_needed(&session_id, true).await {
                 Ok(true) => {
                     session = match repo::get_or_create_session(state.db.pool(), &session_id).await
@@ -1406,12 +1429,12 @@ async fn dispatch(
         }
 
         let before_trim = estimate_message_tokens(&req.messages);
-        if before_trim > max_message_budget {
-            req.messages = trim_to_budget(req.messages, max_message_budget);
+        if scaled(before_trim, conservative_ratio) > max_message_budget {
+            req.messages = trim_to_budget(req.messages, scaled_budget);
             let after_trim = estimate_message_tokens(&req.messages);
-            if after_trim > max_message_budget {
+            if scaled(after_trim, conservative_ratio) > max_message_budget {
                 return error_response(&GatewayError::ContextLengthExceeded {
-                    required: before_trim.saturating_add(fixed_reserve),
+                    required: scaled(before_trim, conservative_ratio).saturating_add(fixed_reserve),
                     available: max_message_budget.saturating_add(fixed_reserve),
                 });
             }
@@ -1424,23 +1447,37 @@ async fn dispatch(
         }
     }
 
-    let needs_tools = req.tools.is_some();
-    let needs_vision = req
-        .messages
-        .iter()
-        .any(|m| matches!(&m.content, crate::domain::Content::Parts(ps) if ps.iter().any(|p| matches!(p, crate::domain::Part::ImageUrl { .. }))));
+    // 多模态需求：带图片/音频/视频的请求只能交给确实接受该模态、且协议链路能真正
+    // 承载该媒体的模型，否则不是「慢一点」，而是内容被上游静默丢弃。
+    let required = required_capabilities(&req);
+    let media = crate::media::Media::of(&req);
 
     let mut ranked = state.router.rank(
         candidates,
         &cfg,
-        needs_tools,
-        needs_vision,
+        required,
         sticky.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
     );
+    // 方言承载过滤要看到被剔除前的候选，才能区分「模型没勾选能力」与
+    // 「该方言承载不了这种媒体」两种情况，给出可操作的错误。
+    let media_rejections = filter_by_media_carry(&mut ranked, &media);
     let request_message_tokens = estimate_message_tokens(&req.messages);
     ranked.retain(|candidate| {
-        candidate_supports_context(candidate, request_message_tokens, fixed_reserve)
+        candidate_supports_context(
+            candidate,
+            request_message_tokens,
+            fixed_reserve,
+            &calibration,
+        )
     });
+
+    if ranked.is_empty() {
+        return error_response(&missing_capability_error(
+            &required,
+            &media,
+            &media_rejections,
+        ));
+    }
 
     // UI 的“热切换”不应只是写一份状态。把用户指定的 provider 提到候选链首位，
     // 仍保留其余健康候选作为故障转移后备。
@@ -1449,10 +1486,6 @@ async fn dispatch(
             let active = ranked.remove(pos);
             ranked.insert(0, active);
         }
-    }
-
-    if ranked.is_empty() {
-        return error_response(&GatewayError::AllProvidersFailed { attempts: 0 });
     }
 
     // 5) 执行（区分流式/非流式）
@@ -1477,15 +1510,129 @@ const CONTEXT_HISTORY_LIMIT: usize = 1_000;
 const DEFAULT_OUTPUT_RESERVE: u32 = 1_024;
 const PROTOCOL_CONTEXT_RESERVE: u32 = 256;
 
-fn fixed_context_reserve(req: &ChatRequest) -> u32 {
+/// 请求实际包含的模态需求。检测对象是重建后的完整上下文——历史里带过的图片
+/// 同样要求后续模型能看懂，否则上下文与客户端所见会分叉。
+fn required_capabilities(req: &ChatRequest) -> crate::router::score::RequiredCapabilities {
+    let media = crate::media::Media::of(req);
+    crate::router::score::RequiredCapabilities {
+        tools: req.tools.is_some(),
+        vision: media.image,
+        audio: media.audio,
+        video: media.video,
+    }
+}
+
+/// 没有任何候选能满足需求时的错误。优先级：先报「模型缺能力」（用户可自行勾选），
+/// 再报「方言承载不了」（需要换上游或改客户端），最后回落到通用失败。
+fn missing_capability_error(
+    required: &crate::router::score::RequiredCapabilities,
+    media: &crate::media::Media,
+    rejections: &[String],
+) -> GatewayError {
+    let missing: Vec<&str> = [
+        (required.vision, "图片输入（视觉）"),
+        (required.audio, "音频输入"),
+        (required.video, "视频输入"),
+    ]
+    .iter()
+    .filter_map(|(needed, label)| needed.then_some(*label))
+    .collect();
+    if missing.is_empty() {
+        return GatewayError::AllProvidersFailed { attempts: 0 };
+    }
+    let mut kind = missing.join("、");
+    if required.tools {
+        kind = format!("{kind}（含工具调用）");
+    }
+    if media.any() && !rejections.is_empty() {
+        // 能力都勾了但链路承载不了：把第一条具体原因带上，避免用户反复试错。
+        kind = format!("{kind}；{}", rejections[0]);
+    }
+    GatewayError::CapabilityUnavailable { kind }
+}
+
+/// 按方言的实际承载能力剔除候选，收集原因文本用于错误提示。
+fn filter_by_media_carry(
+    ranked: &mut Vec<crate::router::score::Candidate>,
+    media: &crate::media::Media,
+) -> Vec<String> {
+    if !media.any() {
+        return Vec::new();
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    ranked.retain(
+        |candidate| match crate::media::carry(candidate.provider.dialect, media) {
+            Ok(()) => true,
+            Err(reason) => {
+                let text = format!(
+                    "{}（{}）无法承载：{}",
+                    candidate.provider.name, candidate.model.upstream, reason
+                );
+                if !reasons.contains(&text) {
+                    reasons.push(text);
+                }
+                false
+            }
+        },
+    );
+    reasons
+}
+
+/// 估算校准快照：provider::model → 「实际/估算」EWMA 比值。表很小（每个配置模型
+/// 一行），每请求读取一次比维护带失效逻辑的内存缓存更不容易出错。
+type CalibrationMap = std::collections::HashMap<String, f64>;
+
+/// 保守取候选中的最大比值：宁可多裁一点，也不能把真实超窗的 payload 发出去。
+fn conservative_ratio(
+    candidates: &[crate::router::score::Candidate],
+    calibration: &CalibrationMap,
+) -> f64 {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            calibration
+                .get(&calibration_key(
+                    &candidate.provider.id,
+                    &candidate.model.upstream,
+                ))
+                .copied()
+        })
+        .fold(1.0_f64, f64::max)
+        .clamp(0.5, 3.0)
+}
+
+fn calibration_key(provider_id: &str, model: &str) -> String {
+    format!("{provider_id}::{model}")
+}
+
+/// 把本地估算换算成上游口径的保守值。
+fn scaled(estimated: u32, ratio: f64) -> u32 {
+    (estimated as f64 * ratio).ceil().min(u32::MAX as f64) as u32
+}
+
+fn fixed_context_reserve(req: &ChatRequest, candidates: &[crate::router::score::Candidate]) -> u32 {
     let tool_schema_tokens = req
         .tools
         .as_ref()
         .and_then(|tools| serde_json::to_string(tools).ok())
         .map(|json| (json.chars().count() as u32).div_ceil(3))
         .unwrap_or(0);
-    req.max_tokens
-        .unwrap_or(DEFAULT_OUTPUT_RESERVE)
+    // 模型级 max_tokens 覆盖会改变真实输出上限，预留必须按可能的最大值计算，
+    // 否则请求本身放得下、输出却把窗口顶爆。
+    let requested = req.max_tokens.unwrap_or(DEFAULT_OUTPUT_RESERVE);
+    let override_max = candidates
+        .iter()
+        .filter_map(|candidate| {
+            candidate
+                .model
+                .overrides
+                .as_ref()
+                .and_then(|overrides| overrides.max_tokens)
+        })
+        .max()
+        .unwrap_or(0);
+    requested
+        .max(override_max)
         .saturating_add(tool_schema_tokens)
         .saturating_add(PROTOCOL_CONTEXT_RESERVE)
 }
@@ -1507,9 +1654,21 @@ fn candidate_supports_context(
     candidate: &crate::router::score::Candidate,
     message_tokens: u32,
     fixed_reserve: u32,
+    calibration: &CalibrationMap,
 ) -> bool {
-    candidate.model.context_window <= 0
-        || message_tokens.saturating_add(fixed_reserve) <= candidate.model.context_window as u32
+    if candidate.model.context_window <= 0 {
+        return true;
+    }
+    let ratio = calibration
+        .get(&calibration_key(
+            &candidate.provider.id,
+            &candidate.model.upstream,
+        ))
+        .copied()
+        .unwrap_or(1.0)
+        .clamp(0.5, 3.0);
+    scaled(message_tokens, ratio).saturating_add(fixed_reserve)
+        <= candidate.model.context_window as u32
 }
 
 fn schedule_compaction(state: Arc<GatewayState>, session_id: String) {
@@ -1548,8 +1707,10 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let health = state.health.clone();
     let router = state.router.clone();
 
+    let mut attempt_records = Vec::new();
     let outcome = chain
         .run(
+            &mut attempt_records,
             |provider, model| {
                 let up = upstream.clone();
                 let r = req_arc.clone();
@@ -1630,6 +1791,29 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
             // exchange 已持久化后再触发后台压缩。若下一请求先到达，它会通过请求
             // 前的同一把锁同步完成压缩，不会读到尚未压缩的陈旧上下文。
+            //
+            // 校准写入必须在触发压缩之前完成：压缩阈值要按同一份「实际/估算」口径
+            // 判断，否则刚观测到的偏差要等到下一轮才生效。
+            let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
+            if let Ok(calibration) = repo::record_token_calibration(
+                state.db.pool(),
+                &pid,
+                &mid,
+                estimated_prompt,
+                pt as i64,
+            )
+            .await
+            {
+                if let Err(error) = repo::update_session_token_ratio(
+                    state.db.pool(),
+                    &session_id,
+                    calibration.ratio,
+                )
+                .await
+                {
+                    tracing::warn!("更新会话校准比值失败: {error}");
+                }
+            }
             schedule_compaction(state.clone(), session_id.clone());
 
             let audit_state = state.clone();
@@ -1639,6 +1823,14 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             let audit_pid = pid.clone();
             let audit_mid = mid.clone();
             let audit_fallback_attempts = fallback_count(o.attempts);
+            let audit_price = ranked
+                .iter()
+                .find(|c| c.provider.id == pid && c.model.upstream == mid)
+                .and_then(|c| c.model.price.as_ref());
+            let (audit_cost, audit_currency, audit_rate_label) =
+                price_charge(audit_price, pt as i64, ct as i64);
+            let audit_attempts = attempts_json(&attempt_records);
+            let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
             tokio::spawn(async move {
                 let _ = repo::log_request(
                     audit_state.db.pool(),
@@ -1654,6 +1846,11 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         completion_tokens: ct as i64,
                         fallback_attempts: audit_fallback_attempts,
                         error: None,
+                        cost: audit_cost,
+                        currency: audit_currency,
+                        rate_label: audit_rate_label.as_deref(),
+                        estimated_prompt_tokens: Some(estimated_prompt),
+                        attempts_json: audit_attempts.as_deref(),
                     },
                 )
                 .await;
@@ -1678,6 +1875,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             let requested_model = req.model.clone();
             let audit_client = client.clone();
             let audit_fallback_attempts = fallback_count(attempt_count_from_error(&e));
+            let audit_attempts = attempts_json(&attempt_records);
             tokio::spawn(async move {
                 let _ = repo::log_request(
                     st.db.pool(),
@@ -1693,6 +1891,11 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         completion_tokens: 0,
                         fallback_attempts: audit_fallback_attempts,
                         error: Some(kind),
+                        cost: None,
+                        currency: None,
+                        rate_label: None,
+                        estimated_prompt_tokens: None,
+                        attempts_json: audit_attempts.as_deref(),
                     },
                 )
                 .await;
@@ -1732,9 +1935,11 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let mut attempts = 0usize;
     let mut last_error: Option<GatewayError> = None;
     let mut selected = None;
+    let mut attempt_records: Vec<crate::router::failover::AttemptRecord> = Vec::new();
 
     'select: for candidate in ranked.iter().take(max_attempts) {
         attempts += 1;
+        let attempt_started = Instant::now();
         let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
         let mut upstream_stream = match state
             .upstream
@@ -1749,6 +1954,12 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             Ok(stream) => stream,
             Err(error) => {
                 record_candidate_failure(&state, candidate, &error);
+                attempt_records.push(crate::router::failover::AttemptRecord::failure(
+                    &candidate.provider,
+                    &candidate.model.upstream,
+                    &error,
+                    attempt_started.elapsed().as_millis() as u64,
+                ));
                 let retryable = error.retryable();
                 last_error = Some(error);
                 if !retryable {
@@ -1774,6 +1985,11 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     continue;
                 }
                 Some(Ok(event)) => {
+                    attempt_records.push(crate::router::failover::AttemptRecord::success(
+                        &candidate.provider,
+                        &candidate.model.upstream,
+                        attempt_started.elapsed().as_millis() as u64,
+                    ));
                     selected = Some((
                         candidate.clone(),
                         upstream_stream,
@@ -1785,6 +2001,12 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 }
                 Some(Err(error)) => {
                     record_candidate_failure(&state, candidate, &error);
+                    attempt_records.push(crate::router::failover::AttemptRecord::failure(
+                        &candidate.provider,
+                        &candidate.model.upstream,
+                        &error,
+                        attempt_started.elapsed().as_millis() as u64,
+                    ));
                     let retryable = error.retryable();
                     last_error = Some(error);
                     if !retryable {
@@ -1798,6 +2020,12 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         candidate.provider.name, candidate.model.upstream
                     ));
                     record_candidate_failure(&state, candidate, &error);
+                    attempt_records.push(crate::router::failover::AttemptRecord::failure(
+                        &candidate.provider,
+                        &candidate.model.upstream,
+                        &error,
+                        attempt_started.elapsed().as_millis() as u64,
+                    ));
                     last_error = Some(error);
                     break;
                 }
@@ -1812,12 +2040,15 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 let error = last_error.unwrap_or(GatewayError::AllProvidersFailed { attempts });
                 spawn_failed_stream_audit(
                     state,
-                    &session_id,
-                    &req.model,
-                    client.as_deref(),
-                    attempts,
-                    started,
-                    &error,
+                    FailedStreamAudit {
+                        session_id: &session_id,
+                        requested_model: &req.model,
+                        client: client.as_deref(),
+                        attempts,
+                        started,
+                        error: &error,
+                        records: &attempt_records,
+                    },
                 );
                 return error_response(&error);
             }
@@ -1962,12 +2193,15 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     schedule_compaction(stream_state.clone(), stream_session_id.clone());
                     spawn_failed_stream_audit(
                         stream_state.clone(),
-                        &stream_session_id,
-                        &requested_model,
-                        stream_client.as_deref(),
-                        stream_attempts,
-                        started,
-                        &error,
+                        FailedStreamAudit {
+                            session_id: &stream_session_id,
+                            requested_model: &requested_model,
+                            client: stream_client.as_deref(),
+                            attempts: stream_attempts,
+                            started,
+                            error: &error,
+                            records: &attempt_records,
+                        },
                     );
                     yield Ok::<String, std::convert::Infallible>(encode_error_chunk(&req_id, &error, exit));
                     return;
@@ -1996,12 +2230,15 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     schedule_compaction(stream_state.clone(), stream_session_id.clone());
                     spawn_failed_stream_audit(
                         stream_state.clone(),
-                        &stream_session_id,
-                        &requested_model,
-                        stream_client.as_deref(),
-                        stream_attempts,
-                        started,
-                        &error,
+                        FailedStreamAudit {
+                            session_id: &stream_session_id,
+                            requested_model: &requested_model,
+                            client: stream_client.as_deref(),
+                            attempts: stream_attempts,
+                            started,
+                            error: &error,
+                            records: &attempt_records,
+                        },
                     );
                     yield Ok::<String, std::convert::Infallible>(encode_error_chunk(&req_id, &error, exit));
                     return;
@@ -2092,6 +2329,13 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         let audit_model = model.clone();
         let audit_client = stream_client.clone();
         let audit_requested_model = requested_model.clone();
+        let (audit_cost, audit_currency, audit_rate_label) = price_charge(
+            candidate.model.price.as_ref(),
+            prompt_tokens as i64,
+            completion_tokens as i64,
+        );
+        let audit_attempts = attempts_json(&attempt_records);
+        let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
         tokio::spawn(async move {
             let _ = repo::log_request(
                 audit_state.db.pool(),
@@ -2107,6 +2351,11 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     completion_tokens: completion_tokens as i64,
                     fallback_attempts: fallback_count(stream_attempts),
                     error: None,
+                    cost: audit_cost,
+                    currency: audit_currency,
+                    rate_label: audit_rate_label.as_deref(),
+                    estimated_prompt_tokens: Some(estimated_prompt),
+                    attempts_json: audit_attempts.as_deref(),
                 },
             )
             .await;
@@ -2267,6 +2516,40 @@ fn fallback_count(upstream_attempts: usize) -> i64 {
     upstream_attempts.saturating_sub(1) as i64
 }
 
+/// UTC 当日分钟数，用于匹配时段价规则。
+fn utc_minute_of_day() -> u16 {
+    use chrono::Timelike;
+    let now = chrono::Utc::now();
+    (now.hour() * 60 + now.minute()) as u16
+}
+
+/// 按「实际路由到的模型价格」计价：先按输入长度选档，再乘时段倍率。
+/// 缺价格时必须保持 `None`，不能写成 0；档位说明一并返回供审计对账。
+fn price_charge(
+    price: Option<&crate::domain::ModelPrice>,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+) -> (Option<f64>, Option<&'static str>, Option<String>) {
+    match price {
+        Some(price) => {
+            let charge = price.charge(prompt_tokens, completion_tokens, utc_minute_of_day());
+            (
+                Some(charge.cost),
+                Some(charge.currency.code()),
+                charge.label,
+            )
+        }
+        None => (None, None, None),
+    }
+}
+
+fn attempts_json(records: &[crate::router::failover::AttemptRecord]) -> Option<String> {
+    if records.is_empty() {
+        return None;
+    }
+    serde_json::to_string(records).ok()
+}
+
 fn attempt_count_from_error(error: &GatewayError) -> usize {
     match error {
         GatewayError::AllProvidersFailed { attempts } => *attempts,
@@ -2274,20 +2557,33 @@ fn attempt_count_from_error(error: &GatewayError) -> usize {
     }
 }
 
-fn spawn_failed_stream_audit(
-    state: Arc<GatewayState>,
-    session_id: &str,
-    requested_model: &str,
-    client: Option<&str>,
+/// 首个流式事件之前整体失败的请求（所有候选都试过或不可重试）的审计上下文。
+struct FailedStreamAudit<'a> {
+    session_id: &'a str,
+    requested_model: &'a str,
+    client: Option<&'a str>,
     attempts: usize,
     started: Instant,
-    error: &GatewayError,
-) {
+    error: &'a GatewayError,
+    records: &'a [crate::router::failover::AttemptRecord],
+}
+
+fn spawn_failed_stream_audit(state: Arc<GatewayState>, audit: FailedStreamAudit<'_>) {
+    let FailedStreamAudit {
+        session_id,
+        requested_model,
+        client,
+        attempts,
+        started,
+        error,
+        records,
+    } = audit;
     let session_id = session_id.to_string();
     let requested_model = requested_model.to_string();
     let client = client.map(str::to_owned);
     let status = error.http_status().as_u16() as i64;
     let kind = classify(error);
+    let attempts_json = attempts_json(records);
     tokio::spawn(async move {
         let _ = repo::log_request(
             state.db.pool(),
@@ -2303,6 +2599,11 @@ fn spawn_failed_stream_audit(
                 completion_tokens: 0,
                 fallback_attempts: fallback_count(attempts),
                 error: Some(kind),
+                cost: None,
+                currency: None,
+                rate_label: None,
+                estimated_prompt_tokens: None,
+                attempts_json: attempts_json.as_deref(),
             },
         )
         .await;
@@ -2692,6 +2993,21 @@ fn now_secs() -> i64 {
 }
 
 impl GatewayState {
+    /// 估算校准快照。表很小（每个配置模型一行），每请求读取一次比维护带失效
+    /// 逻辑的内存缓存更不容易出错；读取失败时按「未校准」处理，绝不因此拦请求。
+    pub async fn calibration_snapshot(&self) -> CalibrationMap {
+        match repo::list_calibrations(self.db.pool()).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| (calibration_key(&row.provider_id, &row.model), row.ratio))
+                .collect(),
+            Err(error) => {
+                tracing::warn!("读取 token 校准表失败，本次按未校准处理: {error}");
+                CalibrationMap::new()
+            }
+        }
+    }
+
     /// 用最便宜的可用模型生成摘要（压缩上下文时调用）
     pub async fn summarize(&self, msgs: Vec<Message>, prev: &str) -> Result<String> {
         use crate::context::summarization_prompt;
@@ -2718,7 +3034,8 @@ impl GatewayState {
         let mut cfg = self.cfg_snapshot();
         // 摘要任务挑便宜快的：用 Fastest 策略，且只需要 2 次尝试
         cfg.routing_strategy = RoutingStrategy::Fastest;
-        let ranked = self.router.rank(candidates, &cfg, false, false, None);
+        // 摘要调用是纯文本任务，不需要任何模态能力。
+        let ranked = self.router.rank(candidates, &cfg, Default::default(), None);
 
         let flag = AtomicFlag::new();
         let chain = FailoverChain::new(&ranked, 2, &flag);
@@ -2726,8 +3043,11 @@ impl GatewayState {
         let timeout = Duration::from_secs(60);
         let r = Arc::new(req);
 
+        // 摘要调用同样走候选链，但它的尝试明细不写审计：这不是用户请求。
+        let mut records = Vec::new();
         let o = chain
             .run(
+                &mut records,
                 |p, m| {
                     let up = up.clone();
                     let r = r.clone();

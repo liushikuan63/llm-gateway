@@ -2,12 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import {
   api,
   AppConfig,
+  CliToolReport,
   ConfigUpdateResult,
   CustomRouteRule,
   CustomRouteRuleAction,
   Dialect,
   ProviderView,
   RemoteAccessKeyView,
+  SelfCheckResult,
   SnapshotApplyResult,
   SnapshotView,
   TakeoverResult,
@@ -69,6 +71,8 @@ export default function SettingsPage() {
   const [oneTimeSecretLabel, setOneTimeSecretLabel] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [takeoverResults, setTakeoverResults] = useState<TakeoverResult[]>([]);
+  const [cliTools, setCliTools] = useState<CliToolReport[]>([]);
+  const [selfCheck, setSelfCheck] = useState<SelfCheckResult | null>(null);
   // 原始远程 Key 不进入 React state，关闭一次性展示窗口后立即清除。
   const oneTimeSecretRef = useRef<string | null>(null);
 
@@ -316,7 +320,7 @@ export default function SettingsPage() {
         {cfg.remote_mode.enabled ? " 远程 HTTPS 反代模式已配置，网关仅监听本机回环地址。" : " 默认仅监听本机回环地址。"}
       </div>
 
-      {msg && <div className={`msg ${msg.kind}`}>{msg.text}</div>}
+      {msg && <div role={msg.kind === "err" ? "alert" : "status"} className={`msg ${msg.kind}`}>{msg.text}</div>}
 
       <div className="card">
         <strong>统一接入地址</strong>
@@ -790,6 +794,131 @@ ${keyInfo.ollama_endpoint}`}
       )}
 
       <div className="card">
+        <strong>本机 CLI 工具</strong>
+        <div className="sub">
+          检测本机是否安装了 Claude Code / Codex / Gemini CLI，显示实际路径与版本，并可在确认后一键更新。
+          「检测本机 CLI」只读取 PATH 与常见安装目录、不联网；「检测并检查更新」会再查询 npm 最新版本。
+          更新通过 npm 全局安装执行，执行前会展示确切命令。
+        </div>
+        <div className="row">
+          <button
+            disabled={busy !== null}
+            onClick={() => {
+              void (async () => {
+                setBusy("cli-detect");
+                try {
+                  const reports = await api.detectCliTools();
+                  setCliTools(reports);
+                  setMsg({ kind: "ok", text: `已检测 ${reports.length} 个工具` });
+                } catch (error) {
+                  setMsg({ kind: "err", text: `检测失败：${errorText(error)}` });
+                } finally {
+                  setBusy(null);
+                }
+              })();
+            }}
+          >
+            {busy === "cli-detect" ? "检测中…" : "检测本机 CLI"}
+          </button>
+          <button
+            disabled={busy !== null}
+            onClick={() => {
+              void (async () => {
+                setBusy("cli-check");
+                try {
+                  const reports = await api.detectCliToolsWithUpdates();
+                  setCliTools(reports);
+                  const updatable = reports.filter((report) => report.update_available).length;
+                  const failed = reports.filter((report) => report.check_error).length;
+                  setMsg({
+                    kind: failed && !reports.some((report) => report.latest_version) ? "err" : "ok",
+                    text: `已检测并查询最新版本；可更新 ${updatable} 个${
+                      failed ? `；${failed} 个工具未能查询到最新版本（不影响本机检测结果）` : ""
+                    }`,
+                  });
+                } catch (error) {
+                  setMsg({ kind: "err", text: `检查更新失败：${errorText(error)}` });
+                } finally {
+                  setBusy(null);
+                }
+              })();
+            }}
+          >
+            {busy === "cli-check" ? "查询中…" : "检测并检查更新"}
+          </button>
+        </div>
+        {cliTools.length > 0 && (
+          <div style={{ marginTop: 12 }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>工具</th>
+                  <th>状态</th>
+                  <th>版本</th>
+                  <th>最新</th>
+                  <th style={{ width: 150 }}>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {cliTools.map((report) => (
+                  <tr key={report.id}>
+                    <td>
+                      <strong>{report.label}</strong>
+                      <div className="muted mono" style={{ fontSize: 10, overflowWrap: "anywhere" }}>
+                        {report.path ?? report.npm_package}
+                      </div>
+                    </td>
+                    <td>
+                      {report.installed
+                        ? <span className="tag ok">已安装</span>
+                        : <span className="tag warn">未检测到</span>}
+                    </td>
+                    <td className="mono">{report.version ?? "-"}</td>
+                    <td className="mono">
+                      {report.latest_version ?? "-"}
+                      {report.update_available && <span className="tag warn" style={{ marginLeft: 6 }}>可更新</span>}
+                      {report.check_error && (
+                        <div className="muted" style={{ fontSize: 10 }}>{report.check_error}</div>
+                      )}
+                    </td>
+                    <td>
+                      {report.installed ? (
+                        <button
+                          className="ghost"
+                          disabled={busy !== null || !report.update_available}
+                          title={report.update_available ? report.install_command : "已是最新版本（或尚未查询最新版本）"}
+                          onClick={() => {
+                            if (!window.confirm(`将执行：\n${report.install_command}\n\n这会更新全局安装的 ${report.label}。确定继续吗？`)) return;
+                            void (async () => {
+                              setBusy(`cli-update-${report.id}`);
+                              try {
+                                const output = await api.updateCliTool(report.id);
+                                const refreshed = await api.detectCliTools();
+                                setCliTools(refreshed);
+                                setMsg({ kind: "ok", text: `${report.label} 更新命令已执行。输出：${output.slice(0, 300) || "（无输出）"}` });
+                              } catch (error) {
+                                setMsg({ kind: "err", text: `${report.label} 更新失败：${errorText(error)}` });
+                              } finally {
+                                setBusy(null);
+                              }
+                            })();
+                          }}
+                        >
+                          {busy === `cli-update-${report.id}` ? "更新中…" : "更新"}
+                        </button>
+                      ) : (
+                        <span className="muted" style={{ fontSize: 11 }}>未安装，无法更新</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="card">
         <strong>CLI 工具接管</strong>
         <div className="sub">
           已有配置会先创建同目录的唯一备份并逐字节校验，备份失败不会改写原文件。Gemini CLI 暂不支持接管；已有旧选项可取消。写入后请重新启动对应 CLI。
@@ -863,6 +992,46 @@ ${keyInfo.ollama_endpoint}`}
                 )}
               </div>
             ))}
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <strong>网关连通性自检</strong>
+        <div className="sub">
+          用统一 Key 向本机网关发出一次最小请求（约 1 个 token），确认监听、鉴权与上游链路端到端真的可用，并显示实际路由到的上游。它不依赖是否已写入客户端配置。
+        </div>
+        <div className="row">
+          <button
+            disabled={busy !== null}
+            onClick={() => {
+              void (async () => {
+                setBusy("self-check");
+                try {
+                  const result = await api.runGatewaySelfCheck();
+                  setSelfCheck(result);
+                  setMsg(result.healthy
+                    ? { kind: "ok", text: `自检通过：网关 ${result.base_url} 正常，实际路由到 ${result.routed_via ?? "未知上游"}（${result.latency_ms}ms）` }
+                    : { kind: "err", text: `自检未通过：${result.error ?? "未知原因"}` });
+                } catch (error) {
+                  setMsg({ kind: "err", text: `自检失败：${errorText(error)}` });
+                } finally {
+                  setBusy(null);
+                }
+              })();
+            }}
+          >
+            {busy === "self-check" ? "自检中…" : "运行连通性自检"}
+          </button>
+          <span className="muted" style={{ fontSize: 11 }}>
+            未配置供应商时，自检会明确报告「所有候选 Provider 均不可用」，这属于预期结果。
+          </span>
+        </div>
+        {selfCheck && (
+          <div className={selfCheck.healthy ? "msg ok" : "msg err"} style={{ marginTop: 8 }}>
+            {selfCheck.healthy
+              ? `健康检查通过；端到端路由到 ${selfCheck.routed_via ?? "未知上游"}，耗时 ${selfCheck.latency_ms}ms。`
+              : `未通过：${selfCheck.error ?? "未知原因"}`}
           </div>
         )}
       </div>
@@ -951,6 +1120,71 @@ ${keyInfo.ollama_endpoint}`}
               </tbody>
             </table>
           )}
+        </div>
+      </div>
+
+      <div className="card">
+        <strong>配置包导入 / 导出</strong>
+        <div className="sub">
+          把本机的 config.toml 与 gateway.db 导出到指定目录，或在另一台设备上导入。
+          导入时会完整替换 Provider 与模型配置，并在导入前把当前数据目录备份一份；统一访问 Key 与远程 HTTPS 模式属于本机安全边界，不会被包内值覆盖。
+          从其他设备导出的包中的 API Key 由那台设备的主密钥加密，本机无法解密，导入后会列为「需要重新填写 Key」。
+        </div>
+        <div className="row">
+          <button
+            disabled={busy !== null}
+            onClick={() => {
+              void (async () => {
+                try {
+                  const { open } = await import("@tauri-apps/plugin-dialog");
+                  const dir = await open({ directory: true, multiple: false, title: "选择导出目录" });
+                  if (typeof dir !== "string") return;
+                  setBusy("bundle-export");
+                  await api.exportBundle(dir);
+                  setMsg({ kind: "ok", text: `已导出到 ${dir}` });
+                } catch (error) {
+                  setMsg({ kind: "err", text: `导出失败：${errorText(error)}` });
+                } finally {
+                  setBusy(null);
+                }
+              })();
+            }}
+          >
+            导出配置包
+          </button>
+          <button
+            disabled={busy !== null}
+            onClick={() => {
+              void (async () => {
+                try {
+                  const { open } = await import("@tauri-apps/plugin-dialog");
+                  const dir = await open({ directory: true, multiple: false, title: "选择包含 config.toml 与 gateway.db 的目录" });
+                  if (typeof dir !== "string") return;
+                  if (!window.confirm(`导入会用 ${dir} 中的配置替换当前 Provider 与模型配置。导入前会自动备份当前数据目录。确定继续吗？`)) return;
+                  setBusy("bundle-import");
+                  const outcome = await api.importBundle(dir);
+                  const imported = await api.getConfig();
+                  setCfg(imported);
+                  notifyConfigChanged(imported);
+                  await load();
+                  const { result } = outcome;
+                  const missing = result.providers_missing_key.length
+                    ? `。以下 Provider 的 Key 需要用本机主密钥重新填写：${result.providers_missing_key.join("、")}`
+                    : "";
+                  setMsg({
+                    kind: result.providers_missing_key.length ? "err" : "ok",
+                    text: `已导入 ${result.providers_imported} 个 Provider、${result.models_imported} 个模型；配置${result.config_imported ? "已应用" : "未包含"}。导入前备份：${outcome.backup_dir}${missing}`,
+                  });
+                } catch (error) {
+                  setMsg({ kind: "err", text: `导入失败：${errorText(error)}` });
+                } finally {
+                  setBusy(null);
+                }
+              })();
+            }}
+          >
+            导入配置包
+          </button>
         </div>
       </div>
 

@@ -1,3 +1,5 @@
+pub mod bundle;
+pub mod cli_tools;
 mod commands;
 pub mod config;
 pub mod context;
@@ -5,7 +7,10 @@ pub mod crypto;
 pub mod db;
 pub mod domain;
 pub mod error;
+pub mod media;
 pub mod model_catalog;
+pub mod pricing;
+pub mod pricing_refresh;
 pub mod protocol;
 pub mod provider_quota;
 pub mod proxy;
@@ -113,6 +118,15 @@ pub fn run() {
             commands::recent_requests,
             commands::apply_takeover,
             commands::export_bundle,
+            commands::import_bundle,
+            commands::detect_cli_tools,
+            commands::detect_cli_tools_with_updates,
+            commands::update_cli_tool,
+            commands::run_gateway_self_check,
+            commands::refresh_pricing,
+            commands::pricing_status,
+            commands::list_token_calibrations,
+            commands::clear_token_calibrations,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

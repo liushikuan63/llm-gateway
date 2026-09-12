@@ -24,7 +24,7 @@ pub enum Role {
     Tool,
 }
 
-/// 多模态内容：文本 + 图片/音频。FreeLLMAPI 早期只支持纯文本，本方案一开始就留好位。
+/// 多模态内容：文本 + 图片/音频/视频。FreeLLMAPI 早期只支持纯文本，本方案一开始就留好位。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum Content {
@@ -35,9 +35,19 @@ pub enum Content {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Part {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrl },
-    InputAudio { input_audio: serde_json::Value },
+    Text {
+        text: String,
+    },
+    ImageUrl {
+        image_url: ImageUrl,
+    },
+    InputAudio {
+        input_audio: serde_json::Value,
+    },
+    /// 视频输入。OpenAI 兼容阵营用 `video_url` 表达，结构同图片。
+    VideoUrl {
+        video_url: ImageUrl,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -108,6 +118,7 @@ impl Message {
 
     /// 粗略 token 估算。真计费用上游返回的 usage；
     /// 这里只用于「是否触发压缩」的判定，误差可接受。
+    /// 图片/音频/视频按保守的固定值计入，避免把多模态上下文当纯文本低估。
     pub fn approx_tokens(&self) -> u32 {
         let n = match &self.content {
             Content::Text(t) => t.chars().count(),
@@ -115,7 +126,9 @@ impl Message {
                 .iter()
                 .map(|p| match p {
                     Part::Text { text } => text.chars().count(),
-                    _ => 800,
+                    Part::ImageUrl { .. } | Part::VideoUrl { .. } => 800,
+                    // 音频按 1 秒 ≈ 32 token 的保守口径计，base64 数据不按字符数算。
+                    Part::InputAudio { .. } => 3_200,
                 })
                 .sum(),
         };

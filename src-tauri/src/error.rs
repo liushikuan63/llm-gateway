@@ -27,6 +27,9 @@ pub enum GatewayError {
     #[error("请求上下文过长：需要至少 {required} tokens，可用上限为 {available} tokens")]
     ContextLengthExceeded { required: u32, available: u32 },
 
+    #[error("没有可处理该请求的模型：需要 {kind}，请为相应模型勾选对应能力后重试")]
+    CapabilityUnavailable { kind: String },
+
     #[error("协议转换失败: {0}")]
     Protocol(String),
 
@@ -51,6 +54,8 @@ impl GatewayError {
             GatewayError::Protocol(_) => false, // 转换失败换家也没用
             GatewayError::Unauthorized(_) => false,
             GatewayError::ContextLengthExceeded { .. } => false,
+            // 候选链已按模态过滤过，换家不会有别的结果。
+            GatewayError::CapabilityUnavailable { .. } => false,
             _ => true,
         }
     }
@@ -62,6 +67,8 @@ impl GatewayError {
             GatewayError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             GatewayError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             GatewayError::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
+            // 请求本身无法被任何已配置模型处理，属于调用方需要调整的请求/配置问题。
+            GatewayError::CapabilityUnavailable { .. } => StatusCode::BAD_REQUEST,
             GatewayError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             GatewayError::AllProvidersFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::Upstream { status, .. } => {
@@ -94,6 +101,7 @@ impl GatewayError {
                 "type": match self {
                     GatewayError::Unauthorized(_) => "invalid_api_key",
                     GatewayError::ContextLengthExceeded { .. } => "context_length_exceeded",
+                    GatewayError::CapabilityUnavailable { .. } => "model_capability_unavailable",
                     GatewayError::Timeout(_) | GatewayError::AllProvidersFailed{..} => "server_error",
                     _ => "upstream_error",
                 },

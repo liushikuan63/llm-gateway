@@ -51,7 +51,11 @@ fn provider(id: &str, base_url: String, dialect: Dialect, priority: i32) -> Prov
             context_window: 16_384,
             supports_tools: true,
             supports_vision: false,
+            supports_audio: false,
+            supports_video: false,
             supports_stream: true,
+            price: None,
+            overrides: None,
         }],
         rpm_limit: 0,
         intelligence: 50,
@@ -508,4 +512,423 @@ async fn responses_non_streaming_string_input_uses_responses_output_contract() {
 
     gateway_task.abort();
     upstream_task.abort();
+}
+
+#[tokio::test]
+async fn priced_requests_record_cost_and_attempt_chain_while_unpriced_requests_do_not() {
+    use llm_gateway_lib::domain::{Currency, ModelPrice};
+
+    let (bad_url, bad_state, bad_task) =
+        spawn_openai_upstream(OpenAiBehavior::Status(StatusCode::TOO_MANY_REQUESTS)).await;
+    let (good_url, good_state, good_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("priced reply")).await;
+
+    let mut primary = provider("priced-primary", bad_url, Dialect::OpenAI, 1);
+    primary.models[0].price = Some(ModelPrice {
+        prompt: 1_000_000.0,
+        completion: 2_000_000.0,
+        currency: Currency::Usd,
+        tiers: Vec::new(),
+        rules: Vec::new(),
+        source: llm_gateway_lib::domain::PriceSource::Manual,
+    });
+    let mut backup = provider("priced-backup", good_url, Dialect::OpenAI, 2);
+    backup.models[0].price = Some(ModelPrice {
+        prompt: 0.5,
+        completion: 1.5,
+        currency: Currency::Cny,
+        tiers: Vec::new(),
+        rules: Vec::new(),
+        source: llm_gateway_lib::domain::PriceSource::Manual,
+    });
+
+    let (db, config, gateway_task, base_url) = spawn_gateway(vec![primary, backup]).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&config.unified_key)
+        .json(&openai_body("integration-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-routed-via"],
+        "priced-backup/integration-model"
+    );
+    assert_eq!(bad_state.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(good_state.hits.load(Ordering::SeqCst), 1);
+
+    // 审计写入是异步的；轮询等待目标记录出现。
+    let mut logged = None;
+    for _ in 0..80 {
+        let rows = repo::recent_requests(db.pool(), 10).await.unwrap();
+        if let Some(row) = rows
+            .into_iter()
+            .find(|row| row["routed_provider"] == "priced-backup")
+        {
+            logged = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let logged = logged.expect("实际路由到备用的请求必须写入审计");
+
+    // 计价使用被真正路由到的模型价格（备份：人民币 0.5 / 1.5 每 100 万）。
+    assert_eq!(logged["currency"], "cny");
+    let expected = 3.0 / 1_000_000.0 * 0.5 + 2.0 / 1_000_000.0 * 1.5;
+    let cost = logged["cost"].as_f64().expect("配置了价格就必须记录花费");
+    assert!(
+        (cost - expected).abs() < 1e-12,
+        "花费应等于按 token 计算的 {expected}，实际 {cost}"
+    );
+
+    // 降级链逐跳：第一跳 429，第二跳成功。
+    let attempts = logged["attempts"]
+        .as_array()
+        .expect("有降级的请求必须记录逐跳明细");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["provider_id"], "priced-primary");
+    assert_eq!(attempts[0]["ok"], false);
+    assert_eq!(attempts[0]["status"], 429);
+    assert!(attempts[0]["reason"].as_str().unwrap().contains("429"));
+    assert_eq!(attempts[1]["provider_id"], "priced-backup");
+    assert_eq!(attempts[1]["ok"], true);
+
+    // 未配置价格的模型不得伪造出 0 花费。
+    let (plain_url, _plain_state, plain_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("unpriced reply")).await;
+    let (_db2, config2, gateway_task2, base_url2) =
+        spawn_gateway(vec![provider("unpriced", plain_url, Dialect::OpenAI, 1)]).await;
+    let unpriced = reqwest::Client::new()
+        .post(format!("{base_url2}/v1/chat/completions"))
+        .bearer_auth(&config2.unified_key)
+        .json(&openai_body("integration-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unpriced.status(), StatusCode::OK);
+
+    gateway_task.abort();
+    bad_task.abort();
+    good_task.abort();
+    gateway_task2.abort();
+    plain_task.abort();
+}
+
+#[tokio::test]
+async fn spend_tables_separate_currencies_and_report_unpriced_requests() {
+    use llm_gateway_lib::db::repo::RequestLog;
+
+    let db = db::Db::connect_in_memory().await.unwrap();
+    for (provider, model, currency, cost, tokens) in [
+        ("prov-a", "model-a", Some("usd"), Some(0.5), 10),
+        ("prov-a", "model-a", Some("usd"), Some(0.25), 5),
+        ("prov-b", "model-b", Some("cny"), Some(1.5), 20),
+        ("prov-c", "model-c", None, None, 7),
+    ] {
+        repo::log_request(
+            db.pool(),
+            RequestLog {
+                session_id: None,
+                client: Some("local-unified-key"),
+                requested_model: "auto",
+                routed_provider: Some(provider),
+                routed_model: Some(model),
+                status: Some(200),
+                latency_ms: 10,
+                prompt_tokens: tokens,
+                completion_tokens: 0,
+                fallback_attempts: 0,
+                error: None,
+                cost,
+                currency,
+                rate_label: None,
+                estimated_prompt_tokens: None,
+                attempts_json: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let buckets = repo::spend_buckets(db.pool(), &day).await.unwrap();
+    let usd = buckets
+        .iter()
+        .find(|bucket| bucket.currency == "usd")
+        .unwrap();
+    let cny = buckets
+        .iter()
+        .find(|bucket| bucket.currency == "cny")
+        .unwrap();
+    assert_eq!(buckets.len(), 2, "币种必须分开汇总，不能相加");
+    assert!((usd.cost - 0.75).abs() < 1e-9);
+    assert_eq!(usd.requests, 2);
+    assert!((cny.cost - 1.5).abs() < 1e-9);
+    assert_eq!(cny.requests, 1);
+
+    // 有 token 但没有价格的请求单独计数：它是「未知」，不是 0。
+    assert_eq!(
+        repo::unpriced_request_count(db.pool(), &day).await.unwrap(),
+        1
+    );
+
+    let by_provider = repo::spend_by_dimension(db.pool(), &day, false)
+        .await
+        .unwrap();
+    assert!(
+        by_provider.iter().all(|row| row["provider_id"] != "prov-c"),
+        "未计价供应商不得出现在花费表里"
+    );
+    let by_model = repo::spend_by_dimension(db.pool(), &day, true)
+        .await
+        .unwrap();
+    assert_eq!(by_model.len(), 2);
+}
+
+#[tokio::test]
+async fn time_rules_and_input_tiers_shape_the_recorded_cost_and_rate_label() {
+    use llm_gateway_lib::domain::{Currency, ModelPrice, PriceRule, PriceTier};
+
+    let (upstream_url, _state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("peak reply")).await;
+    let mut primary = provider("peak-priced", upstream_url, Dialect::OpenAI, 1);
+    primary.models[0].price = Some(ModelPrice {
+        prompt: 2.0,
+        completion: 8.0,
+        currency: Currency::Usd,
+        tiers: vec![PriceTier {
+            // 阈值 0 与基础档重复，不参与档位选择，也不应污染 rate_label。
+            min_prompt_tokens: 0,
+            prompt: 2.0,
+            completion: 8.0,
+        }],
+        // 起止相同的规则按「全天生效」处理：断言不依赖运行时刻。
+        rules: vec![PriceRule {
+            label: "谷时".into(),
+            start_minute: 30,
+            end_minute: 30,
+            prompt_multiplier: 0.5,
+            completion_multiplier: 0.25,
+        }],
+        source: llm_gateway_lib::domain::PriceSource::Manual,
+    });
+
+    let (db, config, gateway_task, base_url) = spawn_gateway(vec![primary]).await;
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&config.unified_key)
+        .json(&openai_body("integration-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut logged = None;
+    for _ in 0..80 {
+        let rows = repo::recent_requests(db.pool(), 10).await.unwrap();
+        if let Some(row) = rows
+            .into_iter()
+            .find(|row| row["routed_provider"] == "peak-priced")
+        {
+            logged = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let logged = logged.expect("成功请求必须写入审计");
+
+    // 上游 mock 返回 prompt=3 / completion=2；基础档 2.0 / 8.0 再乘时段倍率。
+    let expected = 3.0 / 1_000_000.0 * 2.0 * 0.5 + 2.0 / 1_000_000.0 * 8.0 * 0.25;
+    let cost = logged["cost"].as_f64().expect("配置了价格必须记录花费");
+    assert!(
+        (cost - expected).abs() < 1e-12,
+        "时段价计算错误：期望 {expected}，实际 {cost}"
+    );
+    assert_eq!(logged["rate_label"], "谷时");
+    // 估算值必须落库，否则无法从日志做校准。
+    assert!(logged["estimated_prompt_tokens"].as_i64().unwrap_or(0) > 0);
+
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn successful_requests_calibrate_the_local_estimate_and_session_ratio() {
+    let (upstream_url, _state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("calibrated reply")).await;
+    let (db, config, gateway_task, base_url) = spawn_gateway(vec![provider(
+        "calibrating",
+        upstream_url,
+        Dialect::OpenAI,
+        1,
+    )])
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&config.unified_key)
+        .json(&openai_body("integration-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session_id = response.headers()["x-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let mut calibration = None;
+    for _ in 0..80 {
+        let rows = repo::list_calibrations(db.pool()).await.unwrap();
+        if let Some(row) = rows
+            .into_iter()
+            .find(|row| row.model == "integration-model")
+        {
+            calibration = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let calibration = calibration.expect("成功请求必须留下校准样本");
+    assert_eq!(calibration.provider_id, "calibrating");
+    assert_eq!(calibration.samples, 1);
+    // 上游 mock 只报告 3 个 prompt token，估算值明显更大，比值会被截断到区间下界。
+    assert!(
+        (0.5..=3.0).contains(&calibration.ratio),
+        "校准比值必须在合理区间内，实际 {}",
+        calibration.ratio
+    );
+
+    let session = repo::get_or_create_session(db.pool(), &session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.token_ratio,
+        Some(calibration.ratio),
+        "会话必须记录本次校准比值，供压缩阈值换算"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn multimodal_requests_route_only_to_capable_models() {
+    let (upstream_url, state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("vision reply")).await;
+    let mut text_only = provider(
+        "text-only",
+        "http://127.0.0.1:1/v1".to_string(),
+        Dialect::OpenAI,
+        1,
+    );
+    text_only.models[0].supports_vision = false;
+    let mut vision = provider("vision-capable", upstream_url, Dialect::OpenAI, 2);
+    vision.models[0].supports_vision = true;
+
+    let (_db, config, gateway_task, base_url) = spawn_gateway(vec![text_only, vision]).await;
+    let client = reqwest::Client::new();
+    let image_body = serde_json::json!({
+        "model": "integration-model",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "这张图里是什么？" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+            ],
+        }],
+    });
+
+    let routed = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&config.unified_key)
+        .json(&image_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(routed.status(), StatusCode::OK);
+    assert_eq!(
+        routed.headers()["x-routed-via"],
+        "vision-capable/integration-model",
+        "带图片的请求必须绕开纯文本模型"
+    );
+    // 视觉模型确实收到了图片内容，而不是被丢掉的空消息。
+    let upstream_request = state.requests.lock().unwrap().last().cloned().unwrap();
+    let parts = upstream_request["messages"][0]["content"]
+        .as_array()
+        .expect("多模态消息应保持 parts 结构");
+    assert!(parts.iter().any(|part| part["type"] == "image_url"));
+
+    // Gemini 方言承载不了远程图片：候选必须被剔除，并给出可操作的原因。
+    let (gemini_url, gemini_state, gemini_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("must not be used")).await;
+    let mut gemini = provider("gemini-native", gemini_url, Dialect::Gemini, 1);
+    gemini.models[0].supports_vision = true;
+    let (_db2, config2, gateway_task2, base_url2) = spawn_gateway(vec![gemini]).await;
+    let remote_image = serde_json::json!({
+        "model": "integration-model",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "看图" },
+                { "type": "image_url", "image_url": { "url": "https://example.test/a.png" } },
+            ],
+        }],
+    });
+    let blocked = reqwest::Client::new()
+        .post(format!("{base_url2}/v1/chat/completions"))
+        .bearer_auth(&config2.unified_key)
+        .json(&remote_image)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
+    let blocked: serde_json::Value = blocked.json().await.unwrap();
+    assert_eq!(blocked["error"]["type"], "model_capability_unavailable");
+    let message = blocked["error"]["message"].as_str().unwrap();
+    assert!(message.contains("base64"), "错误必须说明原因：{message}");
+    assert_eq!(
+        gemini_state.hits.load(Ordering::SeqCst),
+        0,
+        "承载不了的请求不得发给上游"
+    );
+
+    // 音频请求没有任何支持音频的候选时，同样是明确的能力错误而不是静默丢弃。
+    let mut audio_model = provider(
+        "no-audio",
+        "http://127.0.0.1:1/v1".to_string(),
+        Dialect::OpenAI,
+        1,
+    );
+    audio_model.models[0].supports_audio = false;
+    let (_db3, config3, gateway_task3, base_url3) = spawn_gateway(vec![audio_model]).await;
+    let audio_body = serde_json::json!({
+        "model": "integration-model",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "转写" },
+                { "type": "input_audio", "input_audio": { "data": "AAAA", "format": "wav" } },
+            ],
+        }],
+    });
+    let audio = reqwest::Client::new()
+        .post(format!("{base_url3}/v1/chat/completions"))
+        .bearer_auth(&config3.unified_key)
+        .json(&audio_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(audio.status(), StatusCode::BAD_REQUEST);
+    let audio: serde_json::Value = audio.json().await.unwrap();
+    assert_eq!(audio["error"]["type"], "model_capability_unavailable");
+    assert!(audio["error"]["message"].as_str().unwrap().contains("音频"));
+
+    gateway_task.abort();
+    upstream_task.abort();
+    gemini_task.abort();
+    gateway_task2.abort();
+    gateway_task3.abort();
 }

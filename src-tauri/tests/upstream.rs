@@ -9,7 +9,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::Router;
+use axum::{Json, Router};
 use futures_util::StreamExt;
 use llm_gateway_lib::domain::{ChatRequest, Dialect, Message, Provider};
 use llm_gateway_lib::error::GatewayError;
@@ -489,4 +489,200 @@ async fn upstream_redirects_are_not_followed() {
         "redirect target was contacted"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn model_overrides_apply_after_gateway_normalization_and_skip_protected_fields() {
+    use axum::http::HeaderMap as AxumHeaderMap;
+    use llm_gateway_lib::domain::{HeaderPair, ModelOverrides};
+
+    async fn echo_request(
+        headers: AxumHeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let header = headers
+            .get("x-tenant")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        Json(json!({
+            "id": "chatcmpl-override",
+            "object": "chat.completion",
+            "model": "local-model",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": header }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            "echo_body": body,
+        }))
+    }
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo_request))
+        .with_state(());
+    let (base_url, server) = spawn_axum(app).await;
+
+    let mut provider = local_provider(Dialect::OpenAI, format!("{base_url}/v1"));
+    provider.models = vec![llm_gateway_lib::domain::ModelRef {
+        alias: "local-model".into(),
+        upstream: "local-model".into(),
+        context_window: 8192,
+        supports_tools: true,
+        supports_vision: false,
+        supports_audio: false,
+        supports_video: false,
+        supports_stream: true,
+        price: None,
+        overrides: Some(ModelOverrides {
+            temperature: Some(0.25),
+            max_tokens: Some(77),
+            extra_body: Some(json!({ "top_k": 12, "seed": 7 })),
+            extra_headers: Some(vec![HeaderPair {
+                name: "X-Tenant".into(),
+                value: "tenant-42".into(),
+            }]),
+        }),
+    }];
+
+    let mut req = chat_request();
+    req.temperature = Some(0.9);
+
+    let client = UpstreamClient::new();
+    let response = client
+        .call(&provider, &req, "local-model", Duration::from_secs(5))
+        .await
+        .expect("带覆盖配置的请求应成功");
+
+    // extra_headers 生效（大小写不敏感），应答内容确认服务端确实收到了该头。
+    assert_eq!(response.content, "tenant-42");
+
+    // 再捕获一次完整请求体，确认参数覆盖发生在网关整流之后。
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let sink = captured.clone();
+    let app2 = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |headers: AxumHeaderMap, Json(body): Json<serde_json::Value>| {
+                let sink = sink.clone();
+                async move {
+                    *sink.lock().unwrap() = Some((headers, body));
+                    Json(json!({
+                        "id": "chatcmpl-override-2",
+                        "object": "chat.completion",
+                        "model": "local-model",
+                        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+                    }))
+                }
+            }),
+        )
+        .with_state(());
+    let (base_url2, server2) = spawn_axum(app2).await;
+    let mut provider2 = local_provider(Dialect::OpenAI, format!("{base_url2}/v1"));
+    provider2.models = provider.models.clone();
+
+    let mut req2 = chat_request();
+    req2.temperature = Some(0.9);
+    req2.max_tokens = Some(1000);
+    let _ = client
+        .call(&provider2, &req2, "local-model", Duration::from_secs(5))
+        .await
+        .expect("第二次覆盖请求应成功");
+
+    let (headers, body) = captured.lock().unwrap().clone().expect("应捕获上游请求");
+    assert_eq!(body["temperature"], 0.25, "模型级温度覆盖必须覆盖客户端值");
+    assert_eq!(body["max_tokens"], 77, "模型级 max_tokens 覆盖必须生效");
+    assert_eq!(body["top_k"], 12, "额外请求体字段必须合并进上游请求");
+    assert_eq!(body["seed"], 7);
+    assert_eq!(
+        headers
+            .get("x-tenant")
+            .and_then(|value| value.to_str().ok()),
+        Some("tenant-42")
+    );
+
+    server.abort();
+    server2.abort();
+}
+
+#[test]
+fn model_override_validation_rejects_protected_and_malformed_values() {
+    use llm_gateway_lib::domain::{HeaderPair, ModelOverrides};
+
+    let ok = ModelOverrides {
+        temperature: Some(1.0),
+        max_tokens: Some(64),
+        extra_body: Some(json!({ "top_k": 5 })),
+        extra_headers: Some(vec![HeaderPair {
+            name: "X-Ok".into(),
+            value: "v".into(),
+        }]),
+    };
+    assert!(ok.validate().is_ok());
+
+    let cases: Vec<(ModelOverrides, &str)> = vec![
+        (
+            ModelOverrides {
+                temperature: Some(2.5),
+                ..Default::default()
+            },
+            "温度",
+        ),
+        (
+            ModelOverrides {
+                max_tokens: Some(0),
+                ..Default::default()
+            },
+            "max_tokens",
+        ),
+        (
+            ModelOverrides {
+                extra_body: Some(json!(["not-an-object"])),
+                ..Default::default()
+            },
+            "JSON 对象",
+        ),
+        (
+            ModelOverrides {
+                extra_body: Some(json!({ "messages": [] })),
+                ..Default::default()
+            },
+            "messages",
+        ),
+        (
+            ModelOverrides {
+                extra_body: Some(json!({ "model": "hijack" })),
+                ..Default::default()
+            },
+            "model",
+        ),
+        (
+            ModelOverrides {
+                extra_headers: Some(vec![HeaderPair {
+                    name: "Authorization".into(),
+                    value: "Bearer attacker".into(),
+                }]),
+                ..Default::default()
+            },
+            "Authorization",
+        ),
+        (
+            ModelOverrides {
+                extra_headers: Some(vec![HeaderPair {
+                    name: "X-Bad Name".into(),
+                    value: "v".into(),
+                }]),
+                ..Default::default()
+            },
+            "合法的 HTTP 头名称",
+        ),
+    ];
+
+    for (overrides, expected) in cases {
+        let error = overrides
+            .validate()
+            .expect_err(&format!("必须拒绝：{expected}"));
+        assert!(
+            error.contains(expected),
+            "拒绝原因应包含 {expected}，实际为 {error}"
+        );
+    }
 }

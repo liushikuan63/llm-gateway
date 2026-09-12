@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, AppConfig, DIALECT_LABEL, HEALTH_LABEL, ProviderInput, ProviderView } from "../api";
+import { api, AppConfig, DIALECT_LABEL, HEALTH_LABEL, PricingRefreshOutcome, PricingStatus, ProviderInput, ProviderView } from "../api";
 import ProviderEditor from "./ProviderEditor";
 import ProviderQuota from "./ProviderQuota";
 import { blankForm, errorText, formatContext, ProviderForm } from "./providerPresets";
@@ -10,6 +10,16 @@ function providerInput(p: ProviderView, overrides: Partial<ProviderInput> = {}):
     priority: p.priority, models: p.models, rpm_limit: p.rpm_limit, intelligence: p.intelligence, note: p.note, ...overrides };
 }
 const STRATEGIES = { priority: "手工优先级", balanced: "综合均衡", smartest: "能力优先", fastest: "速度优先", reliable: "稳定优先", custom: "自定义规则" };
+
+/** 刷新结果的完整说明：更新了几条、跳过几条手工价、哪些模型目录里没有。 */
+function refreshSummary(outcome: PricingRefreshOutcome) {
+  const parts = [`定价源返回 ${outcome.feed_models} 个模型`, `更新 ${outcome.updated.length} 个`];
+  if (outcome.skipped_manual > 0) parts.push(`跳过 ${outcome.skipped_manual} 个手工定价`);
+  const suffix = outcome.unmatched.length > 0
+    ? `；${outcome.unmatched.length} 个模型未在定价源中找到（仍保持未计价）：${outcome.unmatched.slice(0, 3).map(item => item.alias).join("、")}${outcome.unmatched.length > 3 ? " 等" : ""}`
+    : "";
+  return `${parts.join("，")}${suffix}`;
+}
 
 export default function ProvidersPage() {
   const [list, setList] = useState<ProviderView[]>([]);
@@ -22,14 +32,15 @@ export default function ProvidersPage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [testResult, setTestResult] = useState<{ id: string; latency: number } | null>(null);
+  const [pricing, setPricing] = useState<PricingStatus | null>(null);
   const loadVersion = useRef(0);
   const load = async (propagateError = false) => {
     const version = ++loadVersion.current;
     setLoading(true);
     try {
-      const [providers, config] = await Promise.all([api.listProviders(), api.getConfig()]);
+      const [providers, config, pricingStatus] = await Promise.all([api.listProviders(), api.getConfig(), api.pricingStatus()]);
       if (version !== loadVersion.current) return false;
-      setList(providers); setCfg(config); return true;
+      setList(providers); setCfg(config); setPricing(pricingStatus); return true;
     } catch (error) {
       if (version !== loadVersion.current) return false;
       setMessage({ kind: "err", text: `加载失败：${errorText(error)}` });
@@ -43,6 +54,16 @@ export default function ProvidersPage() {
     try { await operation(); if (await load(true)) setMessage({ kind: "ok", text }); }
     catch (error) { setMessage({ kind: "err", text: errorText(error) }); }
     finally { setBusy(null); }
+  };
+  const refreshPrices = async () => {
+    setBusy("pricing"); setMessage(null);
+    try {
+      const outcome = await api.refreshPricing();
+      await load();
+      setMessage({ kind: outcome.unmatched.length ? "err" : "ok", text: refreshSummary(outcome) });
+    } catch (error) {
+      setMessage({ kind: "err", text: `刷新定价失败：${errorText(error)}` });
+    } finally { setBusy(null); }
   };
   const test = (p: ProviderView) => run(p.id, async () => {
     const result = await api.testProvider(p.id);
@@ -66,7 +87,7 @@ export default function ProvidersPage() {
       <div><span className="overview-label">模型映射</span><strong>{list.reduce((n, p) => n + p.models.length, 0)}<small>个模型</small></strong></div>
       <div className="overview-current"><span className="overview-label">当前主用</span><strong title={active?.name}>{active?.name ?? "自动选择"}</strong><small>{cfg ? STRATEGIES[cfg.routing_strategy as keyof typeof STRATEGIES] ?? cfg.routing_strategy : "读取配置中"}</small></div>
     </section>
-    <div className="providers-toolbar"><div><h2>模型供应商 <span className="count-badge">{list.length}</span></h2><p>统一管理服务与模型，让每一次请求都有合适的去处。</p></div><div className="row"><button disabled={loading || busy !== null} onClick={() => void load()}>{loading ? "加载中…" : "刷新列表"}</button><button className="primary" onClick={() => setEditor(blankForm())}>＋ 添加供应商</button></div></div>
+    <div className="providers-toolbar"><div><h2>模型供应商 <span className="count-badge">{list.length}</span></h2><p>统一管理服务与模型，让每一次请求都有合适的去处。{pricing && <span className="muted"> 定价上次刷新：{new Date(pricing.at).toLocaleString()}（更新 {pricing.updated} 个，跳过手工价 {pricing.skipped_manual} 个）</span>}</p></div><div className="row"><button disabled={loading || busy !== null} onClick={() => void load()}>{loading ? "加载中…" : "刷新列表"}</button><button disabled={loading || busy !== null || !list.length} onClick={() => void refreshPrices()} title="从公开定价源获取最新单价；手工填写的价格不会被覆盖">{busy === "pricing" ? "刷新定价中…" : "刷新定价"}</button><button className="primary" onClick={() => setEditor(blankForm())}>＋ 添加供应商</button></div></div>
     {message && <div className={`msg ${message.kind}`} role={message.kind === "err" ? "alert" : "status"}>{message.text}<button className="ghost icon-button" aria-label="关闭提示" onClick={() => setMessage(null)}>×</button></div>}
     {list.length > 0 && <div className="provider-search-row"><input aria-label="搜索供应商" placeholder="搜索名称、地址或模型…" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="供应商状态筛选" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><span className="muted">{filtered.length} 个结果</span></div>}
     {loading && !list.length ? <div className="provider-empty" role="status"><strong>正在加载供应商…</strong></div> : !list.length ? <section className="provider-empty">

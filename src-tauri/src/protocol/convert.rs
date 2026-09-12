@@ -33,6 +33,15 @@ pub fn message_to_openai(m: &Message) -> serde_json::Value {
                     Part::InputAudio { input_audio } => {
                         json!({ "type": "input_audio", "input_audio": input_audio })
                     }
+                    Part::VideoUrl {
+                        video_url: ImageUrl { url, detail },
+                    } => {
+                        let mut v = json!({ "type": "video_url", "video_url": { "url": url } });
+                        if let Some(d) = detail {
+                            v["video_url"]["detail"] = json!(d);
+                        }
+                        v
+                    }
                 })
                 .collect::<Vec<_>>())
         }
@@ -191,7 +200,16 @@ pub fn message_to_anthropic(m: &Message) -> serde_json::Value {
                             }));
                         }
                     }
-                    Part::InputAudio { .. } => {}
+                    Part::VideoUrl { .. } => {
+                        // Anthropic Messages API 没有视频块；到这一层说明路由过滤
+                        // 没生效，记录告警而不是假装发送成功。
+                        tracing::warn!("Anthropic 链路丢弃视频输入（路由层应已拦截）");
+                    }
+                    Part::InputAudio { .. } => {
+                        // 路由层已按方言承载能力过滤；这里再丢弃说明出现了未覆盖的
+                        // 组合，必须留下可查的痕迹而不是静默篡改请求。
+                        tracing::warn!("Anthropic 链路丢弃音频输入（路由层应已拦截）");
+                    }
                 }
             }
         }

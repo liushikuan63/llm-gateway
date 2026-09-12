@@ -15,8 +15,17 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::crypto;
-use crate::domain::{ChatRequest, ChatResponse, Dialect, Provider, Usage};
+use crate::domain::{ChatRequest, ChatResponse, Dialect, ModelOverrides, Provider, Usage};
 use crate::error::{GatewayError, Result};
+
+/// 取该 provider 下指定 upstream 模型的覆盖配置。模型未配置覆盖时返回 `None`。
+fn overrides(model: &str, p: &Provider) -> Option<ModelOverrides> {
+    p.models
+        .iter()
+        .find(|candidate| candidate.upstream == model)
+        .and_then(|candidate| candidate.overrides.clone())
+        .filter(|overrides| !overrides.is_empty())
+}
 
 pub struct UpstreamClient {
     http: reqwest::Client,
@@ -76,6 +85,43 @@ impl UpstreamClient {
         Ok(h)
     }
 
+    /// 在鉴权头之后叠加模型级额外请求头。受保护的头在保存期已被拒绝，
+    /// 这里再校验一次解析结果，坏值只影响该请求而不会 panic。
+    fn apply_extra_headers(h: &mut HeaderMap, overrides: Option<&ModelOverrides>) -> Result<()> {
+        let Some(headers) = overrides.and_then(|overrides| overrides.extra_headers.as_ref()) else {
+            return Ok(());
+        };
+        for header in headers {
+            let name = reqwest::header::HeaderName::from_bytes(header.name.trim().as_bytes())
+                .map_err(|_| GatewayError::Protocol("bad extra header name".into()))?;
+            let value = reqwest::header::HeaderValue::from_str(&header.value)
+                .map_err(|_| GatewayError::Protocol("bad extra header value".into()))?;
+            h.insert(name, value);
+        }
+        Ok(())
+    }
+
+    /// 在协议整流之后应用模型级覆盖：先覆盖采样参数，再合并额外请求体。
+    /// 额外请求体在保存期已校验为对象且不含受保护键，这里的合并是浅合并。
+    fn apply_overrides(body: &mut serde_json::Value, overrides: Option<&ModelOverrides>) {
+        let Some(overrides) = overrides else {
+            return;
+        };
+        if let Some(temperature) = overrides.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+        if let Some(max_tokens) = overrides.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        if let (Some(serde_json::Value::Object(extra)), Some(target)) =
+            (&overrides.extra_body, body.as_object_mut())
+        {
+            for (key, value) in extra {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
     fn build_url(p: &Provider, model: &str, stream: bool) -> Result<Url> {
         let mut url = validate_upstream_base_url(&p.base_url)?;
         match p.dialect {
@@ -126,14 +172,18 @@ impl UpstreamClient {
         }
         // 上游不支持 thinking 时剥掉，否则 DeepSeek/GLM 直接 400
         crate::protocol::convert::strip_thinking(&mut body);
+        Self::apply_overrides(&mut body, overrides(model, p).as_ref());
 
         let url = with_gemini_key(url, p.dialect, &key)?;
+
+        let mut headers = Self::headers_for(p, &key)?;
+        Self::apply_extra_headers(&mut headers, overrides(model, p).as_ref())?;
 
         let resp = self
             .http
             .post(url)
             .timeout(timeout)
-            .headers(Self::headers_for(p, &key)?)
+            .headers(headers)
             .json(&body)
             .send()
             .await
@@ -186,14 +236,18 @@ impl UpstreamClient {
         let mut body = Self::build_body(p, req, model);
         body["stream"] = serde_json::Value::Bool(true);
         crate::protocol::convert::strip_thinking(&mut body);
+        Self::apply_overrides(&mut body, overrides(model, p).as_ref());
 
         let url = with_gemini_key(url, p.dialect, &key)?;
+
+        let mut headers = Self::headers_for(p, &key)?;
+        Self::apply_extra_headers(&mut headers, overrides(model, p).as_ref())?;
 
         let resp = self
             .http
             .post(url)
             .timeout(timeout)
-            .headers(Self::headers_for(p, &key)?)
+            .headers(headers)
             .json(&body)
             .send()
             .await

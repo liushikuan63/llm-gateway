@@ -34,8 +34,12 @@ CREATE TABLE IF NOT EXISTS models (
     context_window   INTEGER NOT NULL DEFAULT 8192,
     supports_tools   INTEGER NOT NULL DEFAULT 0,
     supports_vision  INTEGER NOT NULL DEFAULT 0,
+    supports_audio   INTEGER NOT NULL DEFAULT 0,
+    supports_video   INTEGER NOT NULL DEFAULT 0,
     supports_stream  INTEGER NOT NULL DEFAULT 1,
-    enabled          INTEGER NOT NULL DEFAULT 1
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    price_json       TEXT,
+    overrides_json   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_models_alias ON models(alias);
 "#,
@@ -52,6 +56,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     sticky_expires_at  INTEGER,
     total_tokens       INTEGER NOT NULL DEFAULT 0,
     compact_count      INTEGER NOT NULL DEFAULT 0,
+    token_ratio        REAL,
     summary            TEXT,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
@@ -97,7 +102,12 @@ CREATE TABLE IF NOT EXISTS requests (
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     fallback_attempts INTEGER NOT NULL DEFAULT 0,
-    error             TEXT
+    error             TEXT,
+    cost              REAL,
+    currency          TEXT,
+    rate_label        TEXT,
+    estimated_prompt_tokens INTEGER,
+    attempts_json     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_req_ts ON requests(ts DESC);
 "#,
@@ -109,11 +119,13 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     day               TEXT NOT NULL,
     provider_id       TEXT NOT NULL,
     model             TEXT NOT NULL,
+    currency          TEXT NOT NULL DEFAULT '',
     requests          INTEGER NOT NULL DEFAULT 0,
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     errors            INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (day, provider_id, model)
+    cost              REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, provider_id, model, currency)
 );
 "#,
     ),
@@ -143,6 +155,29 @@ CREATE TABLE IF NOT EXISTS remote_access_keys (
 CREATE INDEX IF NOT EXISTS idx_remote_access_keys_enabled ON remote_access_keys(enabled);
 "#,
     ),
+    (
+        "token_calibration",
+        r#"
+CREATE TABLE IF NOT EXISTS token_calibration (
+    provider_id TEXT NOT NULL,
+    model       TEXT NOT NULL,
+    samples     INTEGER NOT NULL DEFAULT 0,
+    ratio       REAL NOT NULL DEFAULT 1.0,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (provider_id, model)
+);
+"#,
+    ),
+    (
+        "meta",
+        r#"
+CREATE TABLE IF NOT EXISTS meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#,
+    ),
 ];
 
 pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -152,32 +187,105 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("migration `{name}` failed: {e}"))?;
     }
-    // `CREATE TABLE IF NOT EXISTS` 不会给已存在的用户数据库补列。工具续轮
-    // 需要保存 tool_call_id/name，因此这里采用可重入的列级迁移。
-    ensure_session_message_column(pool, "tool_call_id", "TEXT").await?;
-    ensure_session_message_column(pool, "name", "TEXT").await?;
-    ensure_session_message_column(pool, "content_json", "TEXT").await?;
+    // `CREATE TABLE IF NOT EXISTS` 不会给已存在的用户数据库补列。以下迁移必须可重入：
+    // 旧库补列、新库无操作，且不依赖任何一次性的版本标记。
+    ensure_column(pool, "session_messages", "tool_call_id", "TEXT").await?;
+    ensure_column(pool, "session_messages", "name", "TEXT").await?;
+    ensure_column(pool, "session_messages", "content_json", "TEXT").await?;
+    ensure_column(pool, "models", "price_json", "TEXT").await?;
+    ensure_column(pool, "models", "overrides_json", "TEXT").await?;
+    ensure_column(
+        pool,
+        "models",
+        "supports_audio",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "models",
+        "supports_video",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(pool, "requests", "cost", "REAL").await?;
+    ensure_column(pool, "requests", "currency", "TEXT").await?;
+    ensure_column(pool, "requests", "rate_label", "TEXT").await?;
+    ensure_column(pool, "requests", "estimated_prompt_tokens", "INTEGER").await?;
+    ensure_column(pool, "requests", "attempts_json", "TEXT").await?;
+    ensure_column(pool, "sessions", "token_ratio", "REAL").await?;
+    migrate_usage_daily_currency(pool).await?;
     Ok(())
 }
 
-async fn ensure_session_message_column(
+async fn table_columns(pool: &SqlitePool, table: &str) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            use sqlx::Row;
+            row.get::<String, _>("name")
+        })
+        .collect())
+}
+
+async fn ensure_column(
     pool: &SqlitePool,
+    table: &str,
     column: &str,
     definition: &str,
 ) -> anyhow::Result<()> {
-    let columns = sqlx::query("PRAGMA table_info(session_messages)")
-        .fetch_all(pool)
-        .await?;
-    let exists = columns.iter().any(|row| {
-        use sqlx::Row;
-        row.get::<String, _>("name") == column
-    });
-    if !exists {
-        sqlx::query(&format!(
-            "ALTER TABLE session_messages ADD COLUMN {column} {definition}"
-        ))
-        .execute(pool)
-        .await?;
+    if table_columns(pool, table)
+        .await?
+        .iter()
+        .any(|c| c == column)
+    {
+        return Ok(());
     }
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `usage_daily` 的旧主键是 (day, provider_id, model)，不含币种。SQLite 不能直接
+/// 修改主键，只能重建；旧行没有计价币种与花费，保留 token 计数并写明币种未知。
+async fn migrate_usage_daily_currency(pool: &SqlitePool) -> anyhow::Result<()> {
+    if table_columns(pool, "usage_daily")
+        .await?
+        .iter()
+        .any(|c| c == "currency")
+    {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(
+        r#"
+ALTER TABLE usage_daily RENAME TO usage_daily_legacy;
+CREATE TABLE usage_daily (
+    day               TEXT NOT NULL,
+    provider_id       TEXT NOT NULL,
+    model             TEXT NOT NULL,
+    currency          TEXT NOT NULL DEFAULT '',
+    requests          INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    errors            INTEGER NOT NULL DEFAULT 0,
+    cost              REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, provider_id, model, currency)
+);
+INSERT INTO usage_daily (day, provider_id, model, currency, requests, prompt_tokens, completion_tokens, errors, cost)
+    SELECT day, provider_id, model, '', requests, prompt_tokens, completion_tokens, errors, 0
+    FROM usage_daily_legacy;
+DROP TABLE usage_daily_legacy;
+"#,
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }

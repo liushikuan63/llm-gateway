@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use crate::crypto;
-use crate::domain::{Dialect, Provider};
+use crate::domain::{Currency, Dialect, ModelPrice, PriceSource, PriceTier, Provider};
 use crate::proxy::upstream::validate_upstream_base_url;
 
 pub const DEFAULT_CONTEXT_WINDOW: i32 = 32_768;
@@ -44,7 +44,7 @@ pub enum ContextSource {
 
 /// 从上游目录读取的一条模型记录。没有可靠元数据时，能力字段保持 `None`，
 /// 上下文窗口使用明确标记过的保守默认值，而不是从名称推断。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiscoveredModel {
     pub id: String,
     pub name: String,
@@ -52,11 +52,15 @@ pub struct DiscoveredModel {
     pub context_source: ContextSource,
     pub supports_tools: Option<bool>,
     pub supports_vision: Option<bool>,
+    pub supports_audio: Option<bool>,
+    pub supports_video: Option<bool>,
     pub supports_stream: Option<bool>,
     pub is_free: Option<bool>,
+    /// 仅当目录提供可辨识的定价结构时填写；缺失表示未知。
+    pub price: Option<ModelPrice>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiscoveryResponse {
     pub base_url: String,
     pub models: Vec<DiscoveredModel>,
@@ -72,8 +76,11 @@ impl DiscoveredModel {
             context_source: ContextSource::Default,
             supports_tools: None,
             supports_vision: None,
+            supports_audio: None,
+            supports_video: None,
             supports_stream: None,
             is_free: None,
+            price: None,
         }
     }
 
@@ -499,13 +506,17 @@ fn openai_model(entry: &Value) -> Option<DiscoveredModel> {
         .and_then(|architecture| architecture.get("input_modalities"))
         .and_then(string_list)
     {
-        model.supports_vision = Some(
+        let accepts = |name: &str| {
             modalities
                 .iter()
-                .any(|modality| modality.eq_ignore_ascii_case("image")),
-        );
+                .any(|modality| modality.eq_ignore_ascii_case(name))
+        };
+        model.supports_vision = Some(accepts("image"));
+        model.supports_audio = Some(accepts("audio"));
+        model.supports_video = Some(accepts("video"));
     }
     model.is_free = pricing_is_free(entry.get("pricing"));
+    model.price = openrouter_price(entry.get("pricing"));
     Some(model)
 }
 
@@ -610,6 +621,46 @@ fn pricing_is_free(pricing: Option<&Value>) -> Option<bool> {
     Some(values.into_iter().all(|value| value == 0.0))
 }
 
+/// OpenRouter 的 `pricing` 以「每 token、美元」的字符串给出，这里统一换算成
+/// 每 100 万 token；`overrides` 里的输入长度分档价一并带出。其他方言的目录不返回
+/// 该结构，缺失时保持 `None`，不猜测价格。来源标记为 `catalog`，允许后续刷新。
+fn openrouter_price(pricing: Option<&Value>) -> Option<ModelPrice> {
+    let pricing = pricing?.as_object()?;
+    let prompt = nonnegative_price(pricing.get("prompt")?)?;
+    let completion = nonnegative_price(pricing.get("completion")?)?;
+    let price = ModelPrice {
+        prompt: prompt * 1_000_000.0,
+        completion: completion * 1_000_000.0,
+        currency: Currency::Usd,
+        tiers: openrouter_tiers(pricing.get("overrides")),
+        rules: Vec::new(),
+        source: PriceSource::Catalog,
+    };
+    price.is_valid().then_some(price)
+}
+
+fn openrouter_tiers(value: Option<&Value>) -> Vec<PriceTier> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut tiers: Vec<PriceTier> = entries
+        .iter()
+        .filter_map(|entry| {
+            let min = entry.get("min_prompt_tokens")?.as_i64()?;
+            let prompt = nonnegative_price(entry.get("prompt")?)? * 1_000_000.0;
+            let completion = nonnegative_price(entry.get("completion")?)? * 1_000_000.0;
+            Some(PriceTier {
+                min_prompt_tokens: min.max(0),
+                prompt,
+                completion,
+            })
+        })
+        .collect();
+    tiers.sort_by_key(|tier| tier.min_prompt_tokens);
+    tiers.dedup_by_key(|tier| tier.min_prompt_tokens);
+    tiers
+}
+
 fn nonnegative_price(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64(),
@@ -695,11 +746,20 @@ fn merge_model(existing: &mut DiscoveredModel, incoming: &DiscoveredModel) {
     if existing.supports_vision.is_none() {
         existing.supports_vision = incoming.supports_vision;
     }
+    if existing.supports_audio.is_none() {
+        existing.supports_audio = incoming.supports_audio;
+    }
+    if existing.supports_video.is_none() {
+        existing.supports_video = incoming.supports_video;
+    }
     if existing.supports_stream.is_none() {
         existing.supports_stream = incoming.supports_stream;
     }
     if existing.is_free.is_none() {
         existing.is_free = incoming.is_free;
+    }
+    if existing.price.is_none() {
+        existing.price = incoming.price.clone();
     }
 }
 

@@ -12,6 +12,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use serde::Serialize;
+
 use crate::domain::{Provider, ProviderHealth};
 use crate::error::{GatewayError, Result};
 use crate::router::score::Candidate;
@@ -23,6 +25,74 @@ pub struct AttemptOutcome<T> {
     pub model: String,
     pub attempts: usize,
     pub latency_ms: u64,
+}
+
+/// 逐跳降级明细。只记录排查所需的最小信息：谁被尝试、结果、耗时与归类原因。
+/// 上游响应体不进入该结构，避免把可能回显请求内容的数据写进审计。
+#[derive(Debug, Clone, Serialize)]
+pub struct AttemptRecord {
+    pub provider_id: String,
+    pub provider: String,
+    pub model: String,
+    /// 上游 HTTP 状态码；网络层失败时为 `None`。
+    pub status: Option<u16>,
+    /// 失败归类（如 `rate_limited`）；成功时为 `None`。
+    pub reason: Option<String>,
+    pub latency_ms: u64,
+    pub ok: bool,
+    /// 该次失败是否允许继续降级；成功时为 `false`。
+    pub retryable: bool,
+}
+
+const MAX_ATTEMPT_ERROR_CHARS: usize = 300;
+
+impl AttemptRecord {
+    pub fn failure(
+        provider: &Provider,
+        model: &str,
+        error: &GatewayError,
+        latency_ms: u64,
+    ) -> Self {
+        Self {
+            provider_id: provider.id.clone(),
+            provider: provider.name.clone(),
+            model: model.to_owned(),
+            status: match error {
+                GatewayError::Upstream { status, .. } => Some(*status),
+                _ => None,
+            },
+            reason: Some(truncate_reason(&error.to_string(), classify(error))),
+            latency_ms,
+            ok: false,
+            retryable: error.retryable(),
+        }
+    }
+
+    pub fn success(provider: &Provider, model: &str, latency_ms: u64) -> Self {
+        Self {
+            provider_id: provider.id.clone(),
+            provider: provider.name.clone(),
+            model: model.to_owned(),
+            status: None,
+            reason: None,
+            latency_ms,
+            ok: true,
+            retryable: false,
+        }
+    }
+}
+
+/// 记录原因时保留归类前缀，便于 UI 同时展示「哪一类」与「具体是什么」。
+fn truncate_reason(message: &str, kind: &str) -> String {
+    let text = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return kind.to_string();
+    }
+    if text.chars().count() <= MAX_ATTEMPT_ERROR_CHARS {
+        return text;
+    }
+    let head: String = text.chars().take(MAX_ATTEMPT_ERROR_CHARS).collect();
+    format!("{head}…")
 }
 
 /// 执行上下文：每个候选尝试一次，返回 Err 则换下一个
@@ -70,7 +140,13 @@ impl<'a> FailoverChain<'a> {
     /// 逐个候选尝试。`f` 拿到 (provider, model)，返回业务结果。
     ///
     /// `on_failure` 用于让上层记录健康度/冷却，保持本结构不依赖 HealthRegistry。
-    pub async fn run<T, F, Fut, E>(&self, mut f: F, mut on_failure: E) -> Result<AttemptOutcome<T>>
+    /// `records` 由调用方提供，函数把每次尝试追加进去供审计，成功与失败都记录。
+    pub async fn run<T, F, Fut, E>(
+        &self,
+        records: &mut Vec<AttemptRecord>,
+        mut f: F,
+        mut on_failure: E,
+    ) -> Result<AttemptOutcome<T>>
     where
         F: FnMut(Provider, String) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -92,12 +168,18 @@ impl<'a> FailoverChain<'a> {
 
             match f(c.provider.clone(), c.model.upstream.clone()).await {
                 Ok(v) => {
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    records.push(AttemptRecord::success(
+                        &c.provider,
+                        &c.model.upstream,
+                        latency_ms,
+                    ));
                     return Ok(AttemptOutcome {
                         value: v,
                         provider_id: c.provider.id.clone(),
                         model: c.model.upstream.clone(),
                         attempts,
-                        latency_ms: started.elapsed().as_millis() as u64,
+                        latency_ms,
                     });
                 }
                 Err(e) => {
@@ -109,6 +191,12 @@ impl<'a> FailoverChain<'a> {
                         c.model.upstream,
                         e
                     );
+                    records.push(AttemptRecord::failure(
+                        &c.provider,
+                        &c.model.upstream,
+                        &e,
+                        started.elapsed().as_millis() as u64,
+                    ));
                     on_failure(&c.provider, &c.model.upstream, &e);
 
                     // 已经吐出字节的流式请求，不能再换家

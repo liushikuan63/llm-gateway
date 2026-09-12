@@ -1,6 +1,7 @@
 //! 数据访问。所有 SQL 集中在此，便于后续替换存储后端。
 
 use chrono::Utc;
+use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 
 use crate::domain::*;
@@ -60,7 +61,9 @@ fn dialect_str(d: Dialect) -> &'static str {
 
 pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<ModelRef>> {
     let rows = sqlx::query(
-        r#"SELECT alias, upstream, context_window, supports_tools, supports_vision, supports_stream
+        r#"SELECT alias, upstream, context_window, supports_tools, supports_vision,
+                  supports_audio, supports_video, supports_stream,
+                  price_json, overrides_json
            FROM models WHERE provider_id = ? AND enabled = 1"#,
     )
     .bind(provider_id)
@@ -74,9 +77,29 @@ pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<
             context_window: r.get("context_window"),
             supports_tools: r.get::<i64, _>("supports_tools") == 1,
             supports_vision: r.get::<i64, _>("supports_vision") == 1,
+            supports_audio: r.get::<i64, _>("supports_audio") == 1,
+            supports_video: r.get::<i64, _>("supports_video") == 1,
             supports_stream: r.get::<i64, _>("supports_stream") == 1,
+            price: read_model_price(&r),
+            overrides: read_model_overrides(&r),
         })
         .collect())
+}
+
+/// 价格整包存 JSON：档位与时段规则是可变结构，拆成定宽列会让两处定义漂移。
+/// 解析失败或数值非法时返回 `None`，绝不让坏数据参与计价。
+fn read_model_price(row: &sqlx::sqlite::SqliteRow) -> Option<ModelPrice> {
+    let raw = row.get::<Option<String>, _>("price_json")?;
+    let price: ModelPrice = serde_json::from_str(&raw).ok()?;
+    price.is_valid().then_some(price)
+}
+
+/// 覆盖配置解析失败时返回 `None`，绝不让坏 JSON 影响请求路由；保存期已经拒绝过
+/// 非法值，能到这里的大多是手工改库。
+fn read_model_overrides(row: &sqlx::sqlite::SqliteRow) -> Option<ModelOverrides> {
+    let raw = row.get::<Option<String>, _>("overrides_json")?;
+    let parsed: ModelOverrides = serde_json::from_str(&raw).ok()?;
+    (!parsed.is_empty()).then_some(parsed)
 }
 
 pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
@@ -112,10 +135,21 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
         .execute(pool)
         .await?;
     for m in &p.models {
+        let price = m
+            .price
+            .as_ref()
+            .filter(|price| price.is_valid())
+            .and_then(|price| serde_json::to_string(price).ok());
+        let overrides = m
+            .overrides
+            .as_ref()
+            .filter(|overrides| !overrides.is_empty())
+            .and_then(|overrides| serde_json::to_string(overrides).ok());
         sqlx::query(
             r#"INSERT OR REPLACE INTO models
-                 (id, provider_id, alias, upstream, context_window, supports_tools, supports_vision, supports_stream)
-               VALUES (?,?,?,?,?,?,?,?)"#,
+                 (id, provider_id, alias, upstream, context_window, supports_tools, supports_vision,
+                  supports_audio, supports_video, supports_stream, price_json, overrides_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"#,
         )
         .bind(format!("{}:{}", p.id, m.alias))
         .bind(&p.id)
@@ -124,11 +158,34 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
         .bind(m.context_window)
         .bind(m.supports_tools as i64)
         .bind(m.supports_vision as i64)
+        .bind(m.supports_audio as i64)
+        .bind(m.supports_video as i64)
         .bind(m.supports_stream as i64)
+        .bind(price)
+        .bind(overrides)
         .execute(pool)
         .await?;
     }
     Ok(())
+}
+
+/// 仅更新一个模型的价格 JSON，供「自动获取最新定价」使用。返回是否命中了记录。
+pub async fn update_model_price(
+    pool: &SqlitePool,
+    provider_id: &str,
+    alias: &str,
+    price: &ModelPrice,
+) -> Result<bool> {
+    let encoded =
+        serde_json::to_string(price).map_err(|e| crate::error::GatewayError::Other(e.into()))?;
+    let result =
+        sqlx::query("UPDATE models SET price_json = ? WHERE provider_id = ? AND alias = ?")
+            .bind(encoded)
+            .bind(provider_id)
+            .bind(alias)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn delete_provider(pool: &SqlitePool, id: &str) -> Result<()> {
@@ -273,6 +330,7 @@ fn row_to_session(r: &sqlx::sqlite::SqliteRow) -> Session {
         sticky_expires_at: r.get("sticky_expires_at"),
         total_tokens: r.get("total_tokens"),
         compact_count: r.get("compact_count"),
+        token_ratio: r.get("token_ratio"),
         summary: r.get("summary"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
@@ -293,7 +351,7 @@ pub async fn get_or_create_session(pool: &SqlitePool, id: &str) -> Result<Sessio
 
     let row = sqlx::query(
         "SELECT id, snapshot_id, title, sticky_provider_id, sticky_model, sticky_expires_at,
-                total_tokens, compact_count, summary, created_at, updated_at
+                total_tokens, compact_count, token_ratio, summary, created_at, updated_at
          FROM sessions WHERE id = ?",
     )
     .bind(id)
@@ -731,28 +789,53 @@ pub async fn apply_compaction(
 pub async fn list_sessions(pool: &SqlitePool, limit: i64) -> Result<Vec<Session>> {
     let rows = sqlx::query(
         "SELECT id, snapshot_id, title, sticky_provider_id, sticky_model, sticky_expires_at,
-                total_tokens, compact_count, summary, created_at, updated_at
+                total_tokens, compact_count, token_ratio, summary, created_at, updated_at
          FROM sessions ORDER BY updated_at DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_session).collect())
+}
+
+/// 会话列表 + 每条会话的消息数（管理页用）。查询集中在这里而不是命令层，
+/// 是为了让它落进真实数据库的集成测试覆盖范围：本进程 `panic = "abort"`，
+/// 一旦 SELECT 与结构体的字段不同步，应用会直接退出而不是返回错误。
+pub async fn list_sessions_with_counts(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<(Session, i64)>> {
+    let rows = sqlx::query(
+        r#"SELECT s.id, s.snapshot_id, s.title, s.sticky_provider_id, s.sticky_model,
+                  s.sticky_expires_at, s.total_tokens, s.compact_count, s.token_ratio, s.summary,
+                  s.created_at, s.updated_at, COUNT(m.id) AS message_count
+           FROM sessions s
+           LEFT JOIN session_messages m ON m.session_id = s.id
+           GROUP BY s.id
+           ORDER BY s.updated_at DESC
+           LIMIT ?"#,
     )
     .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .iter()
-        .map(|r| Session {
-            id: r.get("id"),
-            snapshot_id: r.get("snapshot_id"),
-            title: r.get("title"),
-            sticky_provider_id: r.get("sticky_provider_id"),
-            sticky_model: r.get("sticky_model"),
-            sticky_expires_at: r.get("sticky_expires_at"),
-            total_tokens: r.get("total_tokens"),
-            compact_count: r.get("compact_count"),
-            summary: r.get("summary"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        })
+        .map(|row| (row_to_session(row), row.get("message_count")))
         .collect())
+}
+
+/// 记录该会话最近一次「实际 / 估算」token 比值，供压缩阈值按真实口径换算。
+pub async fn update_session_token_ratio(
+    pool: &SqlitePool,
+    session_id: &str,
+    ratio: f64,
+) -> Result<()> {
+    sqlx::query("UPDATE sessions SET token_ratio = ? WHERE id = ?")
+        .bind(ratio)
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn delete_session(pool: &SqlitePool, id: &str) -> Result<()> {
@@ -777,6 +860,15 @@ pub struct RequestLog<'a> {
     pub completion_tokens: i64,
     pub fallback_attempts: i64,
     pub error: Option<&'a str>,
+    /// 按模型价格估算的花费；未配置价格时为 `None`。
+    pub cost: Option<f64>,
+    pub currency: Option<&'a str>,
+    /// 生效的计价档位说明（时段价 / 输入长度分档）；全是默认档时为 `None`。
+    pub rate_label: Option<&'a str>,
+    /// 本地估算的输入 token；用于与上游实际用量对照做校准。
+    pub estimated_prompt_tokens: Option<i64>,
+    /// 逐跳降级明细（JSON 数组）。没有尝试明细时为 `None`。
+    pub attempts_json: Option<&'a str>,
 }
 
 pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
@@ -784,8 +876,9 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO requests
              (ts, session_id, client, requested_model, routed_provider, routed_model, status,
-              latency_ms, prompt_tokens, completion_tokens, fallback_attempts, error)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"#,
+              latency_ms, prompt_tokens, completion_tokens, fallback_attempts, error,
+              cost, currency, rate_label, estimated_prompt_tokens, attempts_json)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
     )
     .bind(ts)
     .bind(log.session_id)
@@ -799,6 +892,11 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
     .bind(log.completion_tokens)
     .bind(log.fallback_attempts)
     .bind(log.error)
+    .bind(log.cost)
+    .bind(log.currency)
+    .bind(log.rate_label)
+    .bind(log.estimated_prompt_tokens)
+    .bind(log.attempts_json)
     .execute(pool)
     .await?;
 
@@ -806,21 +904,25 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
     let day = Utc::now().format("%Y-%m-%d").to_string();
     let pid = log.routed_provider.unwrap_or("unknown");
     let mid = log.routed_model.unwrap_or("unknown");
+    let currency = log.currency.unwrap_or("");
     sqlx::query(
-        r#"INSERT INTO usage_daily (day, provider_id, model, requests, prompt_tokens, completion_tokens, errors)
-           VALUES (?,?,?,1,?,?,?)
-           ON CONFLICT(day, provider_id, model) DO UPDATE SET
+        r#"INSERT INTO usage_daily (day, provider_id, model, currency, requests, prompt_tokens, completion_tokens, errors, cost)
+           VALUES (?,?,?,?,1,?,?,?,?)
+           ON CONFLICT(day, provider_id, model, currency) DO UPDATE SET
              requests = requests + 1,
              prompt_tokens = prompt_tokens + excluded.prompt_tokens,
              completion_tokens = completion_tokens + excluded.completion_tokens,
-             errors = errors + excluded.errors"#,
+             errors = errors + excluded.errors,
+             cost = cost + excluded.cost"#,
     )
     .bind(day)
     .bind(pid)
     .bind(mid)
+    .bind(currency)
     .bind(log.prompt_tokens)
     .bind(log.completion_tokens)
     .bind(if log.status.unwrap_or(200) >= 400 { 1 } else { 0 })
+    .bind(log.cost.unwrap_or(0.0))
     .execute(pool)
     .await?;
 
@@ -856,7 +958,8 @@ pub async fn stats_overview(pool: &SqlitePool) -> Result<serde_json::Value> {
 pub async fn recent_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<serde_json::Value>> {
     let rows = sqlx::query(
         r#"SELECT ts, client, requested_model, routed_provider, routed_model, status, latency_ms,
-                  prompt_tokens, completion_tokens, fallback_attempts, error
+                  prompt_tokens, completion_tokens, fallback_attempts, error,
+                  cost, currency, rate_label, estimated_prompt_tokens, attempts_json
            FROM requests ORDER BY id DESC LIMIT ?"#,
     )
     .bind(limit)
@@ -877,9 +980,121 @@ pub async fn recent_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<serde_
                 "completion_tokens": r.get::<i64, _>("completion_tokens"),
                 "fallback_attempts": r.get::<i64, _>("fallback_attempts"),
                 "error": r.get::<Option<String>, _>("error"),
+                "cost": r.get::<Option<f64>, _>("cost"),
+                "currency": r.get::<Option<String>, _>("currency"),
+                "rate_label": r.get::<Option<String>, _>("rate_label"),
+                "estimated_prompt_tokens": r.get::<Option<i64>, _>("estimated_prompt_tokens"),
+                "attempts": r
+                    .get::<Option<String>, _>("attempts_json")
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()),
             })
         })
         .collect())
+}
+
+/// 分币种花费汇总。`currency = ''` 表示没有配置价格，这些请求只计 token 不计花费。
+pub async fn spend_buckets(pool: &SqlitePool, since_day: &str) -> Result<Vec<SpendBucket>> {
+    let rows = sqlx::query(
+        r#"SELECT currency, SUM(cost) AS cost, SUM(requests) AS requests
+           FROM usage_daily WHERE day >= ? AND currency <> ''
+           GROUP BY currency ORDER BY cost DESC, currency ASC"#,
+    )
+    .bind(since_day)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| SpendBucket {
+            currency: r.get("currency"),
+            cost: r.get::<Option<f64>, _>("cost").unwrap_or(0.0),
+            requests: r.get::<Option<i64>, _>("requests").unwrap_or(0),
+        })
+        .collect())
+}
+
+/// 有 token 消耗但没有价格的请求数。没有 token 的失败请求不计入，避免把
+/// 「没花钱」误报成「价格缺失」。
+pub async fn unpriced_request_count(pool: &SqlitePool, since_day: &str) -> Result<i64> {
+    let row = sqlx::query(
+        r#"SELECT COALESCE(SUM(requests), 0) AS total FROM usage_daily
+           WHERE day >= ? AND currency = '' AND (prompt_tokens + completion_tokens) > 0"#,
+    )
+    .bind(since_day)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<Option<i64>, _>("total").unwrap_or(0))
+}
+
+/// 近 N 天按天分币种花费，供趋势表使用。
+pub async fn spend_daily(pool: &SqlitePool, since_day: &str) -> Result<Vec<serde_json::Value>> {
+    let rows = sqlx::query(
+        r#"SELECT day, currency, SUM(cost) AS cost, SUM(requests) AS requests
+           FROM usage_daily WHERE day >= ? AND currency <> ''
+           GROUP BY day, currency ORDER BY day DESC, currency ASC"#,
+    )
+    .bind(since_day)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "day": r.get::<String, _>("day"),
+                "currency": r.get::<String, _>("currency"),
+                "cost": r.get::<Option<f64>, _>("cost").unwrap_or(0.0),
+                "requests": r.get::<Option<i64>, _>("requests").unwrap_or(0),
+            })
+        })
+        .collect())
+}
+
+/// 近 N 天按供应商 / 模型分币种花费。`dimension` 只接受内部固定的两个值。
+pub async fn spend_by_dimension(
+    pool: &SqlitePool,
+    since_day: &str,
+    by_model: bool,
+) -> Result<Vec<serde_json::Value>> {
+    let dimension = if by_model { "u.model" } else { "u.provider_id" };
+    let rows = sqlx::query(&format!(
+        r#"SELECT u.provider_id,
+                  COALESCE(p.name, u.provider_id) AS provider,
+                  {dimension} AS dimension,
+                  u.currency AS currency,
+                  SUM(u.cost) AS cost,
+                  SUM(u.requests) AS requests,
+                  SUM(u.prompt_tokens) AS prompt_tokens,
+                  SUM(u.completion_tokens) AS completion_tokens
+           FROM usage_daily u
+           LEFT JOIN providers p ON p.id = u.provider_id
+           WHERE u.day >= ? AND u.currency <> ''
+           GROUP BY u.provider_id, provider, dimension, u.currency
+           ORDER BY cost DESC, requests DESC"#
+    ))
+    .bind(since_day)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "provider_id": r.get::<String, _>("provider_id"),
+                "provider": r.get::<String, _>("provider"),
+                "model": r.get::<Option<String>, _>("dimension"),
+                "currency": r.get::<String, _>("currency"),
+                "cost": r.get::<Option<f64>, _>("cost").unwrap_or(0.0),
+                "requests": r.get::<Option<i64>, _>("requests").unwrap_or(0),
+                "prompt_tokens": r.get::<Option<i64>, _>("prompt_tokens").unwrap_or(0),
+                "completion_tokens": r.get::<Option<i64>, _>("completion_tokens").unwrap_or(0),
+            })
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpendBucket {
+    pub currency: String,
+    pub cost: f64,
+    pub requests: i64,
 }
 
 pub async fn purge_old_requests(pool: &SqlitePool, retention_days: i64) -> Result<()> {
@@ -938,4 +1153,131 @@ pub async fn get_snapshot(pool: &SqlitePool, id: &str) -> Result<Option<Snapshot
             .unwrap_or(serde_json::Value::Null),
         created_at: r.get("created_at"),
     }))
+}
+
+/* ---------------------- Token calibration / Meta KV ---------------------- */
+
+/// 每个 provider+model 的估算校准记录。比值 = 上游实际 prompt token / 本地估算。
+#[derive(Debug, Clone, Serialize)]
+pub struct Calibration {
+    pub provider_id: String,
+    pub model: String,
+    pub samples: i64,
+    pub ratio: f64,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+/// 单次观测的权重：样本越多越稳定，避免一次异常请求把系数带偏。
+const CALIBRATION_MIN_RATIO: f64 = 0.5;
+const CALIBRATION_MAX_RATIO: f64 = 3.0;
+
+/// 用一次「实际 / 估算」观测更新 EWMA 校准系数，并返回更新后的记录。
+/// 比值超出合理区间时按边界截断；样本数为 0 时直接采用首个观测值。
+pub async fn record_token_calibration(
+    pool: &SqlitePool,
+    provider_id: &str,
+    model: &str,
+    estimated_prompt_tokens: i64,
+    actual_prompt_tokens: i64,
+) -> Result<Calibration> {
+    // 估算或实际任一侧为 0 都说明这次观测不可用于校准（例如上游未回传用量）。
+    let observed = if estimated_prompt_tokens <= 0 || actual_prompt_tokens <= 0 {
+        None
+    } else {
+        Some(
+            (actual_prompt_tokens as f64 / estimated_prompt_tokens as f64)
+                .clamp(CALIBRATION_MIN_RATIO, CALIBRATION_MAX_RATIO),
+        )
+    };
+
+    let existing = sqlx::query(
+        "SELECT samples, ratio FROM token_calibration WHERE provider_id = ? AND model = ?",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .fetch_optional(pool)
+    .await?;
+
+    let (samples, ratio) = match (&existing, observed) {
+        (Some(row), Some(observed)) => {
+            let samples: i64 = row.get("samples");
+            let previous: f64 = row.get("ratio");
+            let weight = 1.0 / (samples as f64 + 1.0).min(20.0);
+            (samples + 1, previous * (1.0 - weight) + observed * weight)
+        }
+        (Some(row), None) => (row.get("samples"), row.get("ratio")),
+        (None, Some(observed)) => (1, observed),
+        (None, None) => (0, 1.0),
+    };
+
+    let now = Utc::now();
+    sqlx::query(
+        r#"INSERT INTO token_calibration (provider_id, model, samples, ratio, updated_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(provider_id, model) DO UPDATE SET
+             samples = excluded.samples, ratio = excluded.ratio, updated_at = excluded.updated_at"#,
+    )
+    .bind(provider_id)
+    .bind(model)
+    .bind(samples)
+    .bind(ratio)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    Ok(Calibration {
+        provider_id: provider_id.to_owned(),
+        model: model.to_owned(),
+        samples,
+        ratio,
+        updated_at: now,
+    })
+}
+
+pub async fn list_calibrations(pool: &SqlitePool) -> Result<Vec<Calibration>> {
+    let rows = sqlx::query(
+        "SELECT provider_id, model, samples, ratio, updated_at FROM token_calibration
+         ORDER BY samples DESC, provider_id ASC, model ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| Calibration {
+            provider_id: row.get("provider_id"),
+            model: row.get("model"),
+            samples: row.get("samples"),
+            ratio: row.get("ratio"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect())
+}
+
+/// 清空校准样本，回到未校准状态。只影响本机统计口径，不影响任何请求数据。
+pub async fn clear_calibrations(pool: &SqlitePool) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM token_calibration")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn meta_get(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT value FROM meta WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| row.get("value")))
+}
+
+pub async fn meta_set(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO meta (key, value, updated_at) VALUES (?,?,?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"#,
+    )
+    .bind(key)
+    .bind(value)
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
