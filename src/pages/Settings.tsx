@@ -796,9 +796,11 @@ ${keyInfo.ollama_endpoint}`}
       <div className="card">
         <strong>本机 CLI 工具</strong>
         <div className="sub">
-          检测本机是否安装了 Claude Code / Codex / Gemini CLI，显示实际路径与版本，并可在确认后一键更新。
-          「检测本机 CLI」只读取 PATH 与常见安装目录、不联网；「检测并检查更新」会再查询 npm 最新版本。
-          更新通过 npm 全局安装执行，执行前会展示确切命令。
+          管理本机安装的 AI 编码 CLI：检测路径与版本，未安装的也能直接下载安装，并支持一键更新。覆盖 Claude Code、Codex、Gemini CLI、Qoder CLI（国际/国内版）、
+          OpenCode、OpenClaw、Pi、DeepSeek Harness、WorkBuddy、Cline、Amp、Auggie、Continue CLI、Crush、Factory Droid、iFlow CLI、
+          Grok Build、Cursor CLI、TRAE CLI、Hermes Agent。
+          「检测本机 CLI」只读取 PATH 与常见安装目录、不联网；「检测并检查更新」会查询 npm 最新版本（官方脚本类工具除外，脚本始终安装最新版）。
+          安装命令全部来自内置常量，执行前会展示确切命令；npm 类通过 npm 全局安装，脚本类执行官方 PowerShell 安装脚本。
         </div>
         <div className="row">
           <button
@@ -849,6 +851,12 @@ ${keyInfo.ollama_endpoint}`}
         </div>
         {cliTools.length > 0 && (
           <div style={{ marginTop: 12 }}>
+            {cliTools.some((tool) => tool.source === "npm" && !tool.can_install) && (
+              <div className="msg" role="status">未检测到 npm：npm 类工具无法一键安装或更新，请先安装 Node.js。</div>
+            )}
+            {cliTools.some((tool) => tool.source === "script" && !tool.can_install) && (
+              <div className="msg" role="status">当前平台没有可用的 PowerShell：官方脚本类工具请按各自官方文档手动安装，其余工具不受影响。</div>
+            )}
             <table>
               <thead>
                 <tr>
@@ -860,58 +868,74 @@ ${keyInfo.ollama_endpoint}`}
                 </tr>
               </thead>
               <tbody>
-                {cliTools.map((report) => (
+                {cliTools.map((report) => {
+                  const installing = busy === `cli-install-${report.id}`;
+                  const isScript = report.source === "script";
+                  // 每个按钮都必须能完成它声称的事：未安装 → 安装；查到新版本 → 更新；
+                  // 其余（已是最新、尚未查询、官方脚本）→ 重新安装，同样装到最新版。
+                  const hasUpdate = !isScript && report.installed && report.update_available;
+                  const actionLabel = !report.installed ? "安装" : hasUpdate ? "更新" : "重新安装";
+                  const actionEnabled = report.can_install;
+                  const actionTitle = !report.can_install
+                    ? (isScript ? "当前平台没有可用的 PowerShell，请按官方文档手动安装" : "未检测到 npm，请先安装 Node.js 后再一键安装")
+                    : `将执行：${report.install_command}`;
+                  return (
                   <tr key={report.id}>
                     <td>
                       <strong>{report.label}</strong>
                       <div className="muted mono" style={{ fontSize: 10, overflowWrap: "anywhere" }}>
-                        {report.path ?? report.npm_package}
+                        {report.path ?? report.install_target}
                       </div>
                     </td>
                     <td>
                       {report.installed
                         ? <span className="tag ok">已安装</span>
                         : <span className="tag warn">未检测到</span>}
+                      <span className="tag" style={{ marginLeft: 4 }}>{isScript ? "官方脚本" : "npm"}</span>
                     </td>
                     <td className="mono">{report.version ?? "-"}</td>
                     <td className="mono">
-                      {report.latest_version ?? "-"}
-                      {report.update_available && <span className="tag warn" style={{ marginLeft: 6 }}>可更新</span>}
+                      {report.latest_version ?? (isScript ? "以脚本为准" : "-")}
+                      {report.update_available && !isScript && <span className="tag warn" style={{ marginLeft: 6 }}>可更新</span>}
                       {report.check_error && (
                         <div className="muted" style={{ fontSize: 10 }}>{report.check_error}</div>
                       )}
                     </td>
                     <td>
-                      {report.installed ? (
-                        <button
-                          className="ghost"
-                          disabled={busy !== null || !report.update_available}
-                          title={report.update_available ? report.install_command : "已是最新版本（或尚未查询最新版本）"}
-                          onClick={() => {
-                            if (!window.confirm(`将执行：\n${report.install_command}\n\n这会更新全局安装的 ${report.label}。确定继续吗？`)) return;
-                            void (async () => {
-                              setBusy(`cli-update-${report.id}`);
-                              try {
-                                const output = await api.updateCliTool(report.id);
-                                const refreshed = await api.detectCliTools();
-                                setCliTools(refreshed);
-                                setMsg({ kind: "ok", text: `${report.label} 更新命令已执行。输出：${output.slice(0, 300) || "（无输出）"}` });
-                              } catch (error) {
-                                setMsg({ kind: "err", text: `${report.label} 更新失败：${errorText(error)}` });
-                              } finally {
-                                setBusy(null);
-                              }
-                            })();
-                          }}
-                        >
-                          {busy === `cli-update-${report.id}` ? "更新中…" : "更新"}
-                        </button>
-                      ) : (
-                        <span className="muted" style={{ fontSize: 11 }}>未安装，无法更新</span>
-                      )}
+                      <button
+                        className="ghost"
+                        disabled={busy !== null || !actionEnabled}
+                        title={actionTitle}
+                        onClick={() => {
+                          const lead = isScript
+                            ? `将执行官方安装脚本：\n${report.install_command}\n\n这会从官方地址下载并执行 ${report.label} 的安装脚本（始终安装最新版）。确定继续吗？`
+                            : `将执行：\n${report.install_command}\n\n这会通过 npm 全局${actionLabel} ${report.label}。确定继续吗？`;
+                          if (!window.confirm(lead)) return;
+                          void (async () => {
+                            setBusy(`cli-install-${report.id}`);
+                            try {
+                              const output = await api.installCliTool(report.id);
+                              const refreshed = await api.detectCliTools();
+                              setCliTools(refreshed);
+                              const stillMissing = !refreshed.find((item) => item.id === report.id)?.installed;
+                              setMsg({
+                                kind: stillMissing ? "err" : "ok",
+                                text: `${report.label} 安装命令已执行${stillMissing ? "，但本机仍未检测到该命令；请按下方输出或官方文档检查 PATH" : ""}。输出：${output.slice(0, 300) || "（无输出）"}`,
+                              });
+                            } catch (error) {
+                              setMsg({ kind: "err", text: `${report.label} 安装失败：${errorText(error)}` });
+                            } finally {
+                              setBusy(null);
+                            }
+                          })();
+                        }}
+                      >
+                        {installing ? "执行中…" : actionLabel}
+                      </button>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

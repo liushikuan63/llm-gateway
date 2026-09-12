@@ -13,7 +13,8 @@
     "verify:release": "node scripts/verify-release.mjs && npm run verify:manual",
     "verify:ui": "node scripts/ui-smoke.cjs",
     "docs:manual": "node scripts/generate-manual.mjs",
-    "verify:manual": "node scripts/generate-manual.mjs --check"
+    "verify:manual": "node scripts/generate-manual.mjs --check",
+    "icons": "node scripts/generate-icons.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

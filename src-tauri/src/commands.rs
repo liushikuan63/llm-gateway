@@ -1310,15 +1310,18 @@ pub async fn detect_cli_tools_with_updates(
 /// `updates` 为 `None` 时只做本机检测（不发起任何网络请求）；为 `Some` 时按给定的
 /// 代理设置查询 npm registry。两个按钮的行为必须与标签一致：真机验证时发现
 /// 「检测本机 CLI」也会联网，那属于标签与行为不符。
+///
+/// npm 类工具无论本机是否已安装都查询最新版本：未安装时要让用户看到「将安装哪个版本」，
+/// 已安装时用于提示可更新。官方脚本始终安装最新版，因此不查询、不臆断版本。
 async fn detect_reports(updates: Option<Option<&str>>) -> Vec<CliToolReport> {
     let path_env = std::env::var("PATH").unwrap_or_default();
     let extra = crate::cli_tools::well_known_dirs();
     let mut reports = Vec::new();
     for spec in crate::cli_tools::TOOLS {
         let tool = crate::cli_tools::detect(spec, &path_env, &extra).await;
-        let (latest_version, check_error) = match (updates, tool.installed) {
-            (Some(proxy), true) => {
-                match crate::cli_tools::latest_version(spec.npm_package, proxy).await {
+        let (latest_version, check_error) = match (updates, spec.source.package()) {
+            (Some(proxy), Some(package)) => {
+                match crate::cli_tools::latest_version(package, proxy).await {
                     Ok(version) => (Some(version), None),
                     Err(error) => (None, Some(error)),
                 }
@@ -1339,14 +1342,14 @@ async fn detect_reports(updates: Option<Option<&str>>) -> Vec<CliToolReport> {
     reports
 }
 
-/// 更新指定的 CLI。命令来自内置常量（不接受用户输入），执行前界面会展示确切命令。
+/// 安装或更新指定的 CLI。命令来自内置常量（不接受用户输入），执行前界面会展示确切命令。
 #[tauri::command]
-pub async fn update_cli_tool(id: String) -> Result<String, String> {
+pub async fn install_cli_tool(id: String) -> Result<String, String> {
     let spec = crate::cli_tools::TOOLS
         .iter()
         .find(|spec| spec.id == id)
-        .ok_or_else(|| format!("不支持更新 {id}"))?;
-    crate::cli_tools::update(spec).await
+        .ok_or_else(|| format!("不支持安装 {id}"))?;
+    crate::cli_tools::install(spec).await
 }
 
 /// 网关连通性自检：确认服务在监听，并用统一 Key 发一次最小请求走通端到端链路。

@@ -398,6 +398,10 @@ h3 { color: var(--text); font-size: 16px; font-weight: 650; }
 .grid4 { gap: 12px; }
 
 button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
   min-height: 34px;
   padding: 7px 12px;
   color: var(--text-soft);
@@ -407,6 +411,9 @@ button {
   border-radius: 6px;
   transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
 }
+
+/* 图标不参与伸缩，否则长文案会把图标压扁或挤出按钮。 */
+button > svg { flex: 0 0 auto; }
 
 button:hover:not(:disabled) {
   color: var(--accent-strong);
@@ -443,13 +450,14 @@ textarea:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3
 input[type="checkbox"] { width: 16px; height: 16px; min-height: 16px; padding: 0; border-radius: 4px; }
 
 th,
-td { padding: 10px; border-bottom-color: var(--border); }
+td { padding: 10px; border-bottom-color: var(--border); vertical-align: middle; }
 th { color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: 0.02em; background: var(--panel-2); }
 tbody tr { transition: background-color 120ms ease; }
 tbody tr:hover { background: var(--accent-soft); }
 .table-card { scrollbar-color: var(--border-strong) transparent; }
 
-.tag { color: var(--muted); font-weight: 600; background: var(--panel-2); border-color: var(--border); }
+/* 胶囊标签与同行文字（含 mono 版本号）需要按中线对齐，否则会随字号漂移。 */
+.tag { vertical-align: middle; color: var(--muted); font-weight: 600; background: var(--panel-2); border-color: var(--border); }
 .tag.ok { color: var(--ok); background: var(--ok-soft); border-color: #9ac9b4; }
 .tag.warn { color: var(--warn); background: var(--warn-soft); border-color: #e2bf7a; }
 .tag.err { color: var(--err); background: var(--err-soft); border-color: #d9a1a3; }

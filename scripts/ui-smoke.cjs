@@ -7,6 +7,9 @@ const { pathToFileURL } = require("node:url");
 const { chromium } = require(process.env.LLMGW_PLAYWRIGHT_PATH || "playwright");
 const output = process.env.LLMGW_UI_OUTPUT || path.join(os.tmpdir(), "llm-gateway-ui");
 const baseUrl = process.env.LLMGW_UI_URL || "http://127.0.0.1:5173";
+// 手册章节数从单一内容来源读取：增删章节时这里自动跟随，不需要同步修改断言。
+const manualSections = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../src/content/user-manual.json"), "utf8")).sections;
+assert(manualSections.length >= 10, `手册章节只有 ${manualSections.length} 个，内容来源可能已损坏`);
 
 async function fixture({ empty = false, configFailure = false, providerFailure = false } = {}) {
   window.isTauri = true;
@@ -27,24 +30,35 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
   window.__fixtureSaved = [];
   if (empty) window.__fixtureProviders = [];
   window.__fixtureCalls = [];
-  // CLI 检测夹具：一个已安装且可更新、一个已安装且最新、一个未安装。
-  const cliTool = (id, label, npmPackage, installed, version, latest) => ({
-    id, label, npm_package: npmPackage, installed,
+  // CLI 检测夹具：覆盖 npm 与官方脚本两类来源，以及已安装 / 未安装 / 可更新 / 缺前置条件等分支。
+  const cliTool = (id, label, source, installTarget, installed, version, latest, canInstall = true) => ({
+    id, label, installed,
     path: installed ? `C:/Users/fixture/AppData/Roaming/npm/${id}.cmd` : null,
-    version, install_command: `npm install -g ${npmPackage}@latest`,
-    latest_version: latest, update_available: installed && version !== null && latest !== null && version !== latest,
+    version, source, install_target: installTarget,
+    docs_url: `https://fixture.test/${id}`,
+    can_install: canInstall,
+    install_command: source === "npm"
+      ? `npm install -g ${installTarget}@latest`
+      : `irm https://fixture.test/${id}/install.ps1 | iex`,
+    latest_version: latest,
+    update_available: installed && version !== null && latest !== null && version !== latest,
     check_error: null,
   });
   window.__fixtureCliTools = [
-    cliTool("claude_code", "Claude Code", "@anthropic-ai/claude-code", true, "2.0.0", null),
-    cliTool("codex", "Codex CLI", "@openai/codex", true, "0.44.0", null),
-    cliTool("gemini_cli", "Gemini CLI", "@google/gemini-cli", false, null, null),
+    cliTool("claude_code", "Claude Code", "npm", "@anthropic-ai/claude-code", true, "2.0.0", null),
+    cliTool("codex", "Codex CLI", "npm", "@openai/codex", true, "0.44.0", null),
+    cliTool("gemini_cli", "Gemini CLI", "npm", "@google/gemini-cli", false, null, null),
+    // 缺前置条件（例如本机没有 npm）时必须禁用按钮并在卡片上说明原因。
+    cliTool("continue_cli", "Continue CLI", "npm", "@continuedev/cli", false, null, null, false),
+    cliTool("grok_build", "Grok Build", "script", "官方安装脚本", false, null, null),
+    cliTool("cursor_cli", "Cursor CLI", "script", "官方安装脚本", true, "2026.9.1", null),
   ];
-  window.__fixtureCliToolsWithUpdates = [
-    { ...cliTool("claude_code", "Claude Code", "@anthropic-ai/claude-code", true, "2.0.0", "2.1.97"), update_available: true },
-    { ...cliTool("codex", "Codex CLI", "@openai/codex", true, "0.44.0", "0.44.0"), update_available: false },
-    { ...cliTool("gemini_cli", "Gemini CLI", "@google/gemini-cli", false, null, null), check_error: null },
-  ];
+  // 未安装的 npm 工具也要能看到将安装的版本；脚本类没有可比的版本。
+  const latestByTool = { claude_code: "2.1.97", codex: "0.44.0", gemini_cli: "0.59.0" };
+  window.__fixtureCliToolsWithUpdates = window.__fixtureCliTools.map(item => {
+    const latest = latestByTool[item.id] ?? null;
+    return { ...item, latest_version: latest, update_available: item.installed && item.version !== null && latest !== null && item.version !== latest };
+  });
   // 用量页夹具：一条含两次降级尝试的成功请求，一条 429 全败请求，一条未计价请求。
   // 金额刻意不同币种，验证界面分币种展示而不是相加。
   window.__fixtureStats = {
@@ -135,16 +149,22 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         { provider_id: "ollama", model: "qwen-local", samples: 3, ratio: 0.92, updated_at: "2026-09-11T22:10:00Z" },
       ];
       case "clear_token_calibrations": window.__fixtureCalibrationsCleared = true; return 2;
-      case "detect_cli_tools":
-        if (window.__fixtureUpdatedTool === "claude_code") {
-          // 更新后重新检测必须反映新版本，否则界面会显示"更新成功但仍提示可更新"。
-          return structuredClone(window.__fixtureCliTools).map(item => item.id === "claude_code"
-            ? { ...item, version: "2.1.97", latest_version: "2.1.97", update_available: false }
-            : item);
-        }
-        return structuredClone(window.__fixtureCliTools);
+      case "detect_cli_tools": {
+        // 安装动作之后重新检测必须反映新状态，否则界面会显示"已安装但仍提示可更新"。
+        const afterInstall = window.__fixtureCliAfterInstall ?? {};
+        return structuredClone(window.__fixtureCliTools)
+          .map(item => afterInstall[item.id] ? { ...item, ...afterInstall[item.id] } : item)
+          .map(item => ({ ...item, update_available: item.installed && item.version !== null && item.latest_version !== null && item.version !== item.latest_version }));
+      }
       case "detect_cli_tools_with_updates": return structuredClone(window.__fixtureCliToolsWithUpdates);
-      case "update_cli_tool": window.__fixtureUpdatedTool = args.id; return "added 1 package in 2s";
+      case "install_cli_tool": {
+        window.__fixtureInstalledCli = args.id;
+        const current = window.__fixtureCliTools.find(item => item.id === args.id);
+        // npm 类装出可查询到的最新版；脚本类没有版本可比，给一个具体版本表示装成功了。
+        const version = current?.latest_version ?? (args.id === "claude_code" ? "2.1.97" : "1.2.3");
+        window.__fixtureCliAfterInstall = { ...(window.__fixtureCliAfterInstall ?? {}), [args.id]: { installed: true, version, latest_version: null, path: current?.path ?? `C:/Users/fixture/.local/bin/${args.id}` } };
+        return "added 1 package in 2s";
+      }
       case "run_gateway_self_check": if (window.__fixtureSelfCheckFails) return { healthy: false, base_url: "http://127.0.0.1:15721", routed_via: null, latency_ms: 12, error: "网关返回 HTTP 503：所有候选 Provider 均不可用（尝试 2 次）" };
         return { healthy: true, base_url: "http://127.0.0.1:15721", routed_via: "openrouter/vendor/chat:free", latency_ms: 321, error: null };
       case "list_sessions": return structuredClone(window.__fixtureSessions);
@@ -410,29 +430,64 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
     await page.getByRole("button", { name: "备份并写入配置", exact: true }).click();
     await page.getByText("C:/fixture/.codex/config.toml.backup-test", { exact: true }).waitFor();
-    // CLI 检测：先只读检测（未安装的工具不得伪造成已安装），再查最新版本并更新。
+    // CLI 检测：先只读检测（未安装的工具不得伪造成已安装），再查最新版本并更新与安装。
     await page.getByRole("button", { name: "检测本机 CLI", exact: true }).click();
     const cliCard = page.locator(".card").filter({ hasText: "本机 CLI 工具" });
     await cliCard.locator("table").waitFor();
     let cliText = await cliCard.innerText();
     assert(cliText.includes("Claude Code") && cliText.includes("2.0.0"), cliText);
     assert(cliText.includes("未检测到"), cliText);
-    // 未查询最新版本时「更新」按钮存在但必须不可点，避免用户以为随便就能升级。
-    for (const button of await cliCard.getByRole("button", { name: "更新", exact: true }).all()) {
-      assert.equal(await button.isDisabled(), true, "未查询最新版本时更新按钮必须禁用");
-    }
+    // 两类安装来源都要在界面上标出来，用户才能判断安装方式。
+    assert(cliText.includes("官方脚本"), `脚本类工具必须标注来源：${cliText}`);
+    // 未安装（没有本机路径可显示）时必须显示安装目标，而不是留空。
+    assert((await cliCard.locator("tr").filter({ hasText: "Gemini CLI" }).innerText()).includes("@google/gemini-cli"), "未安装的 npm 工具要显示包名");
+    assert((await cliCard.locator("tr").filter({ hasText: "Grok Build" }).innerText()).includes("官方安装脚本"), "未安装的脚本类工具要显示安装目标");
+    // 逻辑自洽：每个按钮都能完成它声称的事。未查询最新版本时已安装工具显示「重新安装」（装到最新版），不是禁用的「更新」。
+    const codexRow = cliCard.locator("tr").filter({ hasText: "Codex CLI" });
+    assert.equal(await codexRow.getByRole("button", { name: "重新安装", exact: true }).isEnabled(), true, "未查询最新版本时也应能重新安装到最新版");
+    assert.equal(await cliCard.getByRole("button", { name: "更新", exact: true }).count(), 0, "没有查到新版本时不应出现「更新」按钮");
+    // 缺前置条件的分支：按钮禁用且卡片上必须给出原因。
+    const continueRow = cliCard.locator("tr").filter({ hasText: "Continue CLI" });
+    assert.equal(await continueRow.getByRole("button", { name: "安装", exact: true }).isDisabled(), true, "缺前置条件时必须禁用按钮");
+    assert(cliText.includes("无法一键安装或更新"), `禁用原因必须显示在卡片上：${cliText}`);
+    // 未安装的 npm 工具可以直接下载安装；脚本类已安装的提供「重新安装」且不比对版本。
+    const geminiRow = cliCard.locator("tr").filter({ hasText: "Gemini CLI" });
+    assert.equal(await geminiRow.getByRole("button", { name: "安装", exact: true }).isEnabled(), true, "未安装的 npm 工具必须可安装");
+    const grokRow = cliCard.locator("tr").filter({ hasText: "Grok Build" });
+    assert.equal(await grokRow.getByRole("button", { name: "安装", exact: true }).isEnabled(), true, "未安装的脚本类工具必须可安装");
+    const cursorRow = cliCard.locator("tr").filter({ hasText: "Cursor CLI" });
+    assert.equal(await cursorRow.getByRole("button", { name: "重新安装", exact: true }).isEnabled(), true, "脚本类已安装工具必须可重新安装");
+    assert((await cursorRow.innerText()).includes("以脚本为准"), "脚本类不比对版本，必须说明以脚本为准");
+    assert.equal(await page.evaluate(() => window.__fixtureInstalledCli ?? null), null, "检测阶段不得触发安装");
     await page.getByRole("button", { name: "检测并检查更新", exact: true }).click();
     await page.getByRole("status").filter({ hasText: "可更新 1 个" }).waitFor();
     cliText = await cliCard.innerText();
     assert(cliText.includes("2.1.97"), cliText);
     assert(cliText.includes("可更新"), cliText);
+    // 未安装的工具也要能看到将安装的版本，用户才知道点「安装」会装什么。
+    assert((await geminiRow.innerText()).includes("0.59.0"), `未安装工具应显示可安装版本：${await geminiRow.innerText()}`);
+    // 已安装且已是最新的工具不能提示「可更新」。
+    const codexQueried = await codexRow.innerText();
+    assert(codexQueried.includes("0.44.0"), codexQueried);
+    assert(!codexQueried.includes("可更新"), `最新版本不应提示可更新：${codexQueried}`);
     await cliCard.locator("tr").filter({ hasText: "Claude Code" }).getByRole("button", { name: "更新", exact: true }).click();
-    await page.getByRole("status").filter({ hasText: "更新命令已执行" }).waitFor();
-    assert.equal(await page.evaluate(() => window.__fixtureUpdatedTool), "claude_code");
+    await page.getByRole("status").filter({ hasText: "安装命令已执行" }).waitFor();
+    assert.equal(await page.evaluate(() => window.__fixtureInstalledCli), "claude_code");
     // 更新后必须重新检测：版本刷新为新值，且不再提示可更新。
     const updatedRow = await cliCard.locator("tr").filter({ hasText: "Claude Code" }).innerText();
     assert(updatedRow.includes("2.1.97"), `更新后应重新检测出版本：${updatedRow}`);
     assert(!updatedRow.includes("可更新"), `更新后不应再提示可更新：${updatedRow}`);
+    // 下载安装：未安装的 npm 工具点「安装」后，重新检测必须显示已安装。
+    await geminiRow.getByRole("button", { name: "安装", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "Gemini CLI 安装命令已执行" }).waitFor();
+    assert.equal(await page.evaluate(() => window.__fixtureInstalledCli), "gemini_cli");
+    const geminiAfter = await cliCard.locator("tr").filter({ hasText: "Gemini CLI" }).innerText();
+    assert(geminiAfter.includes("已安装"), `安装后应重新检测出新状态：${geminiAfter}`);
+    assert(!geminiAfter.includes("未检测到"), `安装后不应仍显示未检测到：${geminiAfter}`);
+    // 脚本类：确认弹窗自动接受后执行官方安装脚本命令，并回显输出。
+    await grokRow.getByRole("button", { name: "安装", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "Grok Build 安装命令已执行" }).waitFor();
+    assert.equal(await page.evaluate(() => window.__fixtureInstalledCli), "grok_build");
     await page.screenshot({ path: path.join(output, "cli-tools-desktop.png"), fullPage: true });
     for (const width of [900, 390]) {
       await page.setViewportSize({ width, height: 844 });
@@ -467,12 +522,15 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.getByTestId("help-menu-trigger").click();
     await page.getByTestId("open-user-manual").click();
     await page.getByTestId("user-manual-search").waitFor();
-    assert.equal(await page.getByTestId("user-manual-section").count(), 14);
+    assert.equal(await page.getByTestId("user-manual-section").count(), manualSections.length);
     await page.getByTestId("user-manual-search").fill("不会匹配的内容-xyz");
     await page.getByTestId("user-manual-empty").waitFor();
     await page.getByTestId("user-manual-search").fill("订阅");
     assert(await page.getByTestId("user-manual-section").count() > 0);
-    assert(await page.getByTestId("user-manual-section").count() < 14);
+    assert(await page.getByTestId("user-manual-section").count() < manualSections.length);
+    // 新增章节必须真的可被检索到，否则等于没写进手册。
+    await page.getByTestId("user-manual-search").fill("重新安装");
+    assert.equal(await page.getByTestId("user-manual-section").count(), 1, "CLI 工具章节必须能被检索");
     await page.getByTestId("user-manual-search").fill("");
     await page.getByTestId("user-manual-toc-item").filter({ hasText: "手动接入其他客户端" }).click();
     await page.getByTestId("user-manual-code").scrollIntoViewIfNeeded();
@@ -531,7 +589,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     const manualRequests = [];
     offlineManual.on("request", request => { if (/^https?:/.test(request.url())) manualRequests.push(request.url()); });
     await offlineManual.goto(pathToFileURL(path.resolve(__dirname, "../docs/使用手册.html")).href);
-    assert.equal(await offlineManual.locator("main > section").count(), 14);
+    assert.equal(await offlineManual.locator("main > section").count(), manualSections.length);
     await offlineManual.getByRole("link", { name: "查询额度、订阅与剩余时间", exact: true }).click();
     assert(offlineManual.url().endsWith("#quota"));
     for (const width of [900, 390]) {

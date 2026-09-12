@@ -30,7 +30,7 @@
 | 客户端协议各不相同 | 同时暴露 OpenAI / Anthropic / Responses / Ollama 四种面 |
 | 不知道花了多少钱、峰谷价算不清 | 按模型配置价格（目录自动带出、可手工覆盖），支持输入长度分档与 UTC 时段价（峰谷/忙闲），用量页分币种统计并显示每次请求命中的档位 |
 | 带图片/音频/视频的请求被发给了看不懂的模型 | 按内容做能力硬约束路由：只有勾选了对应模态的模型才会被选中；承载不了的组合明确报错，不静默丢内容 |
-| 不知道本机 CLI 装没装、是不是旧版 | 检测 Claude Code / Codex / Gemini CLI 的路径与版本，比对 npm 最新版本，展示确切命令后再更新，并可用最小请求做端到端自检 |
+| 不知道本机 CLI 装没装、是不是旧版 | 检测 21 个主流 AI 编码 CLI，比对 npm 最新版本，展示确切命令后再一键安装或更新，并可用最小请求做端到端自检 |
 
 ## 快速开始
 
@@ -108,9 +108,16 @@ export ANTHROPIC_API_KEY=""
 - 花费是本地估算，按你配置的价格 × 上游返回的实际 token 计算，不是厂商账单；未配置价格的请求显示「未计价」，不折算成 0。
 - Token 计数校准：网关用本地字符估算做上下文预算，请求成功后把「上游实际 prompt token / 本地估算」的比值按 provider+model 做 EWMA 累积。候选窗口判断按该比值保守换算，会话级比值用于压缩阈值；「用量与审计」页可查看样本与比值，并可随时重置。
 
-### 本机 CLI 检测与更新
+### 本机 CLI 安装、检测与更新
 
-「设置 → 本机 CLI 工具」可以检测 Claude Code / Codex / Gemini CLI 是否安装、实际路径与版本，并查询 npm 最新版本提示可更新项。更新前会展示将执行的确切命令（`npm install -g <package>@latest`），确认后才执行并回显输出。检测只读取 PATH 与常见安装目录，不修改任何文件；未安装 npm 时更新会明确提示改用官方安装方式。
+「设置 → 本机 CLI 工具」集中管理 21 个主流 AI 编码 CLI：Claude Code、Codex CLI、Gemini CLI、Qoder CLI（国际版/国内版）、OpenCode、OpenClaw、Pi Coding Agent、DeepSeek Harness、WorkBuddy、Cline、Amp、Auggie、Continue CLI、Crush、Factory Droid、iFlow CLI，以及以官方脚本安装的 Grok Build、Cursor CLI、TRAE CLI、Hermes Agent。检测只读取 PATH 与常见安装目录、不修改任何文件；安装与更新都会先展示确切命令，确认后才执行并回显输出。未安装的工具同样会查询并显示将安装的版本，可直接一键下载安装。
+
+安装来源分两类，界面在状态列标出：
+
+- **npm 类**：`npm install -g <package>@latest`，可查询 npm registry 最新版本并提示「可更新」。
+- **官方脚本类**（Grok Build、Cursor CLI、TRAE CLI、Hermes Agent）：执行厂商提供的 PowerShell 安装脚本原文（仅 Windows 可用）。脚本始终安装最新版，因此不比对版本，界面提供「安装 / 重新安装」并显示「以脚本为准」。
+
+每个操作按钮都能完成它声称的事：未安装→「安装」、查到新版本→「更新」、其余（已是最新 / 暂未查询 / 官方脚本）→「重新安装」。缺少前置条件（未安装 npm、非 Windows 无 PowerShell）时按钮禁用，并在表格上方说明原因。
 
 写入客户端接管配置后，「运行连通性自检」会检查 `/healthz` 并用统一 Key 发一次最小请求（约 1 个 token），确认网关与上游链路端到端可用，并显示实际路由到的上游。
 

@@ -1,11 +1,15 @@
-//! 本机 CLI 工具检测：是否存在、装在哪、什么版本、能不能升级。
+//! 本机 CLI 工具检测与安装：是否存在、装在哪、什么版本、能不能升级。
 //!
-//! 只做三件事，且都不修改用户环境：
+//! 只做四件事，且都不修改用户环境以外的任何数据：
 //!  1) 在 PATH 与常见安装目录里定位可执行文件（Windows 需要处理 .cmd/.exe 等）；
 //!  2) 运行 `<tool> --version` 读取版本（带超时，避免卡住界面）；
-//!  3) 查询 npm registry 的 latest 版本，供界面提示「可更新」。
+//!  3) 查询 npm registry 的 latest 版本，供界面提示「可更新」；
+//!  4) 在界面显式确认后执行安装 / 更新（命令全部来自内置常量，不接受用户输入）。
 //!
-//! 更新动作本身由界面显式触发，并展示确切命令后才执行。
+//! 安装来源分两类：
+//!  - [`InstallSource::Npm`]：npm 全局安装，可查询 latest 版本并提示更新；
+//!  - [`InstallSource::PowerShellScript`]：官方安装脚本（仅 Windows 可用）。
+//!    脚本本身始终安装最新版，因此这类工具不做版本比对，界面只提供「安装 / 重新安装」。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,36 +19,246 @@ use serde::Serialize;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(600);
+/// 安装脚本要从网络下载运行时，给它比 npm 命令更宽的窗口。
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(900);
 const MAX_OUTPUT_CHARS: usize = 4_000;
+
+/// 一个工具的安装来源。两类都来自内置常量，界面原样展示后才执行。
+pub enum InstallSource {
+    /// npm 全局安装；`package` 同时用于查询 latest 版本。
+    Npm { package: &'static str },
+    /// 官方安装脚本的 PowerShell 命令原文（仅 Windows 可用）。
+    PowerShellScript { command: &'static str },
+}
+
+impl InstallSource {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            InstallSource::Npm { .. } => "npm",
+            InstallSource::PowerShellScript { .. } => "script",
+        }
+    }
+
+    /// 界面展示与执行使用的确切命令。
+    pub fn command(&self) -> String {
+        match self {
+            InstallSource::Npm { package } => format!("npm install -g {package}@latest"),
+            InstallSource::PowerShellScript { command } => (*command).to_owned(),
+        }
+    }
+
+    /// 供界面在未安装（没有路径可显示）时展示的安装目标。
+    pub fn target(&self) -> &'static str {
+        match self {
+            InstallSource::Npm { package } => package,
+            InstallSource::PowerShellScript { .. } => "官方安装脚本",
+        }
+    }
+
+    pub fn package(&self) -> Option<&'static str> {
+        match self {
+            InstallSource::Npm { package } => Some(package),
+            InstallSource::PowerShellScript { .. } => None,
+        }
+    }
+}
 
 /// 一个受支持的 CLI 工具。
 pub struct ToolSpec {
     pub id: &'static str,
     pub label: &'static str,
-    /// npm 包名；也是更新命令里使用的名称
-    pub npm_package: &'static str,
+    pub source: InstallSource,
     /// 可能出现在 PATH 中的可执行文件名（不含扩展名）
     pub binaries: &'static [&'static str],
+    /// 官方安装说明地址，供用户核对来源。
+    pub docs_url: &'static str,
 }
 
 pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         id: "claude_code",
         label: "Claude Code",
-        npm_package: "@anthropic-ai/claude-code",
+        source: InstallSource::Npm {
+            package: "@anthropic-ai/claude-code",
+        },
         binaries: &["claude"],
+        docs_url: "https://docs.claude.com/en/docs/claude-code/setup",
     },
     ToolSpec {
         id: "codex",
         label: "Codex CLI",
-        npm_package: "@openai/codex",
+        source: InstallSource::Npm {
+            package: "@openai/codex",
+        },
         binaries: &["codex"],
+        docs_url: "https://github.com/openai/codex",
     },
     ToolSpec {
         id: "gemini_cli",
         label: "Gemini CLI",
-        npm_package: "@google/gemini-cli",
+        source: InstallSource::Npm {
+            package: "@google/gemini-cli",
+        },
         binaries: &["gemini"],
+        docs_url: "https://github.com/google-gemini/gemini-cli",
+    },
+    ToolSpec {
+        id: "qoder",
+        label: "Qoder CLI",
+        source: InstallSource::Npm {
+            package: "@qoder-ai/qodercli",
+        },
+        binaries: &["qoder", "qodercli"],
+        docs_url: "https://docs.qoder.com/zh/cli/installation",
+    },
+    ToolSpec {
+        id: "opencode",
+        label: "OpenCode",
+        source: InstallSource::Npm {
+            package: "opencode-ai",
+        },
+        binaries: &["opencode"],
+        docs_url: "https://opencode.ai/docs/",
+    },
+    ToolSpec {
+        id: "openclaw",
+        label: "OpenClaw",
+        source: InstallSource::Npm {
+            package: "openclaw",
+        },
+        binaries: &["openclaw"],
+        docs_url: "https://docs.openclaw.ai/",
+    },
+    ToolSpec {
+        id: "pi",
+        label: "Pi Coding Agent",
+        source: InstallSource::Npm {
+            package: "@earendil-works/pi-coding-agent",
+        },
+        binaries: &["pi"],
+        docs_url: "https://pi.dev",
+    },
+    ToolSpec {
+        id: "deepseek_harness",
+        label: "DeepSeek Harness",
+        source: InstallSource::Npm {
+            package: "@deepseek-ai/dsh",
+        },
+        binaries: &["dsh"],
+        docs_url: "https://github.com/deepseek-ai/deepseek-harness",
+    },
+    ToolSpec {
+        id: "workbuddy",
+        label: "WorkBuddy",
+        source: InstallSource::Npm {
+            package: "@tencent-ai/codebuddy-code",
+        },
+        binaries: &["codebuddy", "cbc"],
+        docs_url: "https://www.workbuddy.ai/",
+    },
+    ToolSpec {
+        id: "qoder_cn",
+        label: "Qoder CLI 国内版",
+        source: InstallSource::Npm {
+            package: "@qodercn-ai/qoderclicn",
+        },
+        binaries: &["qodercn", "qoderclicn"],
+        docs_url: "https://qoder.com/cli",
+    },
+    ToolSpec {
+        id: "cline",
+        label: "Cline",
+        source: InstallSource::Npm { package: "cline" },
+        binaries: &["cline"],
+        docs_url: "https://cline.bot",
+    },
+    ToolSpec {
+        id: "amp",
+        label: "Amp",
+        source: InstallSource::Npm {
+            package: "@ampcode/cli",
+        },
+        binaries: &["amp"],
+        docs_url: "https://ampcode.com/",
+    },
+    ToolSpec {
+        id: "auggie",
+        label: "Auggie",
+        source: InstallSource::Npm {
+            package: "@augmentcode/auggie",
+        },
+        binaries: &["auggie"],
+        docs_url: "https://augmentcode.com",
+    },
+    ToolSpec {
+        id: "continue_cli",
+        label: "Continue CLI",
+        source: InstallSource::Npm {
+            package: "@continuedev/cli",
+        },
+        binaries: &["cn"],
+        docs_url: "https://continue.dev",
+    },
+    ToolSpec {
+        id: "crush",
+        label: "Crush",
+        source: InstallSource::Npm {
+            package: "@charmland/crush",
+        },
+        binaries: &["crush"],
+        docs_url: "https://charm.sh/crush",
+    },
+    ToolSpec {
+        id: "droid",
+        label: "Factory Droid",
+        source: InstallSource::Npm { package: "droid" },
+        binaries: &["droid"],
+        docs_url: "https://github.com/Factory-AI/factory",
+    },
+    ToolSpec {
+        id: "iflow_cli",
+        label: "iFlow CLI",
+        source: InstallSource::Npm {
+            package: "@iflow-ai/iflow-cli",
+        },
+        binaries: &["iflow"],
+        docs_url: "https://github.com/iflow-ai/iflow-cli",
+    },
+    ToolSpec {
+        id: "grok_build",
+        label: "Grok Build",
+        source: InstallSource::PowerShellScript {
+            command: "irm https://x.ai/cli/install.ps1 | iex",
+        },
+        binaries: &["grok"],
+        docs_url: "https://github.com/xai-org/grok-build",
+    },
+    ToolSpec {
+        id: "cursor_cli",
+        label: "Cursor CLI",
+        source: InstallSource::PowerShellScript {
+            command: "irm 'https://cursor.com/install?win32=true' | iex",
+        },
+        binaries: &["cursor-agent"],
+        docs_url: "https://cursor.com/docs/cli/installation",
+    },
+    ToolSpec {
+        id: "trae_cli",
+        label: "TRAE CLI",
+        source: InstallSource::PowerShellScript {
+            command: "irm https://trae.cn/trae-cli/install.ps1 | iex",
+        },
+        binaries: &["traecli"],
+        docs_url: "https://docs.trae.cn/cli_get-started-with-trae-cli",
+    },
+    ToolSpec {
+        id: "hermes",
+        label: "Hermes Agent",
+        source: InstallSource::PowerShellScript {
+            command: "iex (irm https://hermes-agent.nousresearch.com/install.ps1)",
+        },
+        binaries: &["hermes"],
+        docs_url: "https://hermes-agent.nousresearch.com",
     },
 ];
 
@@ -52,12 +266,19 @@ pub const TOOLS: &[ToolSpec] = &[
 pub struct CliToolStatus {
     pub id: String,
     pub label: String,
-    pub npm_package: String,
     pub installed: bool,
     /// 解析到的可执行文件路径
     pub path: Option<String>,
     pub version: Option<String>,
-    /// 更新时使用的确切命令（供界面原样展示）
+    /// 安装来源类型："npm" 或 "script"。
+    pub source: String,
+    /// 未安装时供界面展示的安装目标：npm 包名或「官方安装脚本」。
+    pub install_target: String,
+    /// 官方安装说明地址。
+    pub docs_url: String,
+    /// 当前平台是否具备执行该安装方式的条件（npm 可用 / Windows 有 PowerShell）。
+    pub can_install: bool,
+    /// 安装或更新时使用的确切命令（供界面原样展示）
     pub install_command: String,
 }
 
@@ -110,6 +331,9 @@ pub fn well_known_dirs() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(".local").join("bin"));
         dirs.push(home.join("bin"));
+        // 官方安装脚本（Grok Build / Hermes）默认写入的用户级目录。
+        dirs.push(home.join(".grok").join("bin"));
+        dirs.push(home.join(".hermes").join("bin"));
     }
     dirs
 }
@@ -219,11 +443,23 @@ pub async fn detect(spec: &ToolSpec, path_env: &str, extra_dirs: &[PathBuf]) -> 
     CliToolStatus {
         id: spec.id.to_owned(),
         label: spec.label.to_owned(),
-        npm_package: spec.npm_package.to_owned(),
         installed: path.is_some(),
         path: path.map(|path| path.display().to_string()),
         version,
-        install_command: format!("npm install -g {}@latest", spec.npm_package),
+        source: spec.source.kind().to_owned(),
+        install_target: spec.source.target().to_owned(),
+        docs_url: spec.docs_url.to_owned(),
+        can_install: install_tool_available(&spec.source),
+        install_command: spec.source.command(),
+    }
+}
+
+/// 当前平台是否具备执行该安装方式的条件。npm 来源需要 npm，脚本来源需要
+/// Windows 与 PowerShell；两者都不满足时界面禁用按钮并说明原因。
+pub fn install_tool_available(source: &InstallSource) -> bool {
+    match source {
+        InstallSource::Npm { .. } => resolve_npm().is_some(),
+        InstallSource::PowerShellScript { .. } => resolve_powershell().is_some(),
     }
 }
 
@@ -261,21 +497,52 @@ pub async fn latest_version(package: &str, proxy: Option<&str>) -> Result<String
         .ok_or_else(|| format!("{package} 的版本信息缺少 version 字段"))
 }
 
-/// 执行一次更新。命令与参数全部来自内置常量，不接受任何用户输入。
-/// 返回合并后的输出，供界面展示结果。
-pub async fn update(spec: &ToolSpec) -> Result<String, String> {
-    let npm = resolve_npm().ok_or_else(|| {
-        "未找到 npm。请先安装 Node.js，或改用官方安装方式升级该 CLI。".to_string()
-    })?;
-    let args = ["install", "-g", &format!("{}@latest", spec.npm_package)];
-    let (stdout, stderr) = run_command(&npm, &args, UPDATE_TIMEOUT).await?;
-    let combined = format!("{stdout}\n{stderr}");
-    Ok(truncate(combined.trim(), MAX_OUTPUT_CHARS))
+/// 执行一次安装或更新（两者是同一个动作：安装到最新版）。命令与参数全部
+/// 来自内置常量，不接受任何用户输入。返回合并后的输出，供界面展示结果。
+pub async fn install(spec: &ToolSpec) -> Result<String, String> {
+    match &spec.source {
+        InstallSource::Npm { package } => {
+            let npm = resolve_npm().ok_or_else(|| {
+                "未找到 npm。请先安装 Node.js，或改用官方安装方式安装该 CLI。".to_string()
+            })?;
+            let args = ["install", "-g", &format!("{package}@latest")];
+            let (stdout, stderr) = run_command(&npm, &args, UPDATE_TIMEOUT).await?;
+            let combined = format!("{stdout}\n{stderr}");
+            Ok(truncate(combined.trim(), MAX_OUTPUT_CHARS))
+        }
+        InstallSource::PowerShellScript { command } => {
+            let powershell = resolve_powershell().ok_or_else(|| {
+                format!(
+                    "未找到 PowerShell，无法执行官方安装脚本。请按官方文档手动安装：{}",
+                    spec.docs_url
+                )
+            })?;
+            let (stdout, stderr) = run_command(
+                &powershell,
+                &[
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                SCRIPT_TIMEOUT,
+            )
+            .await?;
+            let combined = format!("{stdout}\n{stderr}");
+            Ok(truncate(combined.trim(), MAX_OUTPUT_CHARS))
+        }
+    }
 }
 
 fn resolve_npm() -> Option<PathBuf> {
     let path_env = std::env::var("PATH").unwrap_or_default();
     resolve_binary(&["npm"], &path_env, &well_known_dirs())
+}
+
+fn resolve_powershell() -> Option<PathBuf> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    resolve_binary(&["powershell", "pwsh"], &path_env, &well_known_dirs())
 }
 
 #[cfg(test)]
@@ -383,5 +650,92 @@ mod tests {
         assert!(missing.version.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_catalog_is_unique_and_carries_an_executable_install_command() {
+        let mut ids: Vec<&str> = TOOLS.iter().map(|spec| spec.id).collect();
+        ids.sort_unstable();
+        let count = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "工具 id 必须唯一");
+        // 阈值贴着清单规模设置：误删一半工具时这里必须变红，而不是仍然通过。
+        assert!(count >= 20, "工具清单不应缩水到 {count} 个");
+
+        for spec in TOOLS {
+            assert!(!spec.label.is_empty(), "{} 缺少显示名", spec.id);
+            assert!(!spec.binaries.is_empty(), "{} 缺少可执行文件名", spec.id);
+            assert!(
+                spec.docs_url.starts_with("https://"),
+                "{} 缺少官方说明地址",
+                spec.id
+            );
+            let command = spec.source.command();
+            assert!(!command.trim().is_empty(), "{} 缺少安装命令", spec.id);
+            match &spec.source {
+                InstallSource::Npm { package } => {
+                    assert!(
+                        command.contains(&format!("{package}@latest")),
+                        "{} 的 npm 命令与包名不一致：{command}",
+                        spec.id
+                    );
+                }
+                InstallSource::PowerShellScript { .. } => {
+                    // 脚本类必须来自官方 https 地址，且命令里不出现用户输入占位。
+                    assert!(command.contains("https://"), "{} 脚本缺少官方地址", spec.id);
+                    assert!(
+                        command.contains("iex"),
+                        "{} 脚本必须显式执行下载内容",
+                        spec.id
+                    );
+                }
+            }
+        }
+
+        // 两类来源都要有实际覆盖：工具清单里同时存在 npm 与官方脚本两类。
+        assert!(TOOLS.iter().any(|spec| spec.source.package().is_some()));
+        assert!(TOOLS.iter().any(|spec| spec.source.package().is_none()));
+    }
+
+    #[tokio::test]
+    async fn script_tools_report_their_own_source_and_never_invent_versions() {
+        let spec = TOOLS
+            .iter()
+            .find(|spec| spec.id == "grok_build")
+            .expect("Grok Build 必须在清单里");
+        let empty_path = std::env::join_paths([std::env::temp_dir()]).unwrap();
+        let status = detect(spec, empty_path.to_str().unwrap(), &[]).await;
+
+        assert_eq!(status.source, "script");
+        assert_eq!(status.install_target, "官方安装脚本");
+        assert_eq!(status.version, None);
+        assert_eq!(
+            status.install_command,
+            "irm https://x.ai/cli/install.ps1 | iex"
+        );
+        // 脚本类工具没有 npm 包，不能拿去查 registry。
+        assert!(spec.source.package().is_none());
+
+        // 未安装时也能给出类别正确的状态，供界面展示「安装」按钮。
+        assert!(!status.installed);
+        assert!(status.docs_url.starts_with("https://"));
+    }
+
+    #[tokio::test]
+    async fn npm_tools_expose_package_name_and_exact_command() {
+        let spec = TOOLS
+            .iter()
+            .find(|spec| spec.id == "qoder")
+            .expect("Qoder CLI 必须在清单里");
+        let empty_path = std::env::join_paths([std::env::temp_dir()]).unwrap();
+        let status = detect(spec, empty_path.to_str().unwrap(), &[]).await;
+
+        assert_eq!(status.source, "npm");
+        assert_eq!(status.install_target, "@qoder-ai/qodercli");
+        assert_eq!(
+            status.install_command,
+            "npm install -g @qoder-ai/qodercli@latest"
+        );
+        assert_eq!(spec.source.package(), Some("@qoder-ai/qodercli"));
     }
 }

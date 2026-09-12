@@ -3,7 +3,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import "./styles.css";
 import "./shell.css";
 import { api, AppConfig } from "./api";
-import { Icon, IconName } from "./components/Icons";
+import { Icon, IconName, LogoMark } from "./components/Icons";
 import Onboarding from "./components/Onboarding";
 import UserManual from "./components/UserManual";
 import ProvidersPage from "./pages/Providers";
@@ -245,7 +245,7 @@ export default function App() {
     <div className="app" data-runtime={desktopRuntime ? "desktop" : "preview"}>
       <aside className="sidebar" aria-label="LLM Gateway 导航与本地配置">
         <div className="brand">
-          <span className="brand-mark" aria-hidden="true">LG</span>
+          <span className="brand-mark" aria-hidden="true"><LogoMark size={34} /></span>
           <span>
             <strong>LLM Gateway</strong>
             <small>统一网关 · 本地优先</small>

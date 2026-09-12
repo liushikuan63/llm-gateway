@@ -430,10 +430,16 @@ export interface TokenCalibration {
 export interface CliToolStatus {
   id: string;
   label: string;
-  npm_package: string;
   installed: boolean;
   path: string | null;
   version: string | null;
+  // "npm" 或 "script"（官方 PowerShell 安装脚本）。
+  source: string;
+  // 未安装时展示的安装目标：npm 包名或「官方安装脚本」。
+  install_target: string;
+  docs_url: string;
+  // 当前平台是否具备执行该安装方式的条件。
+  can_install: boolean;
   install_command: string;
 }
 
@@ -503,7 +509,7 @@ export const api = {
   detectCliTools: () => invoke<CliToolReport[]>("detect_cli_tools"),
   detectCliToolsWithUpdates: () =>
     invoke<CliToolReport[]>("detect_cli_tools_with_updates"),
-  updateCliTool: (id: string) => invoke<string>("update_cli_tool", { id }),
+  installCliTool: (id: string) => invoke<string>("install_cli_tool", { id }),
   runGatewaySelfCheck: () =>
     invoke<SelfCheckResult>("run_gateway_self_check"),
 };

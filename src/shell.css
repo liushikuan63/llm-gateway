@@ -35,7 +35,8 @@
 }
 
 .brand { display: flex; gap: 10px; align-items: center; padding: 4px 8px 22px; }
-.brand-mark { display: inline-flex; width: 32px; height: 32px; flex: 0 0 auto; align-items: center; justify-content: center; color: #06392f; font-size: 11px; font-weight: 800; letter-spacing: 0.04em; background: var(--sidebar-accent); border-radius: 8px; }
+.brand-mark { display: inline-flex; width: 34px; height: 34px; flex: 0 0 auto; align-items: center; justify-content: center; }
+.brand-mark svg { display: block; }
 .brand strong { display: block; color: var(--sidebar-text); font-size: 15px; font-weight: 720; line-height: 1.2; letter-spacing: 0.01em; }
 .brand small { display: block; margin-top: 3px; color: var(--sidebar-muted); font-size: 11px; line-height: 1.2; }
 

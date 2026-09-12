@@ -121,7 +121,7 @@ pub fn run() {
             commands::import_bundle,
             commands::detect_cli_tools,
             commands::detect_cli_tools_with_updates,
-            commands::update_cli_tool,
+            commands::install_cli_tool,
             commands::run_gateway_self_check,
             commands::refresh_pricing,
             commands::pricing_status,

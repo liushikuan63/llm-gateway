@@ -1,4 +1,4 @@
-import type { SVGProps } from "react";
+import { useId, type SVGProps } from "react";
 
 export type IconName =
   | "providers"
@@ -11,6 +11,37 @@ export type IconName =
   | "sun"
   | "shield"
   | "monitor";
+
+/// 应用标识：多路上游汇聚为单一出口。与 src-tauri/icons/logo.svg 同构，
+/// 修改时两处保持一致并运行 npm run icons 重新生成图标文件。
+export function LogoMark({ size = 32 }: { size?: number }) {
+  const uid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+  const bgId = `logo-bg-${uid}`;
+  const flowId = `logo-flow-${uid}`;
+
+  return (
+    <svg width={size} height={size} viewBox="0 0 512 512" aria-hidden="true" focusable="false">
+      <defs>
+        <linearGradient id={bgId} x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#16403a" />
+          <stop offset="1" stopColor="#0a1e1a" />
+        </linearGradient>
+        <linearGradient id={flowId} gradientUnits="userSpaceOnUse" x1="128" y1="0" x2="276" y2="0">
+          <stop offset="0" stopColor="#2fb99b" />
+          <stop offset="1" stopColor="#7cecc9" />
+        </linearGradient>
+      </defs>
+      <rect x="20" y="20" width="472" height="472" rx="112" fill={`url(#${bgId})`} />
+      <g fill="none" stroke={`url(#${flowId})`} strokeWidth={46} strokeLinecap="round">
+        <path d="M128 152 C 208 152 212 256 276 256" />
+        <path d="M128 256 L 276 256" />
+        <path d="M128 360 C 208 360 212 256 276 256" />
+      </g>
+      <path d="M276 256 L 355 256" fill="none" stroke="#b8f5e0" strokeWidth={46} strokeLinecap="round" />
+      <circle cx="355" cy="256" r="40" fill="#eafff6" />
+    </svg>
+  );
+}
 
 type IconProps = Omit<SVGProps<SVGSVGElement>, "children"> & {
   name: IconName;
