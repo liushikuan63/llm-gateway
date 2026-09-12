@@ -9,6 +9,8 @@ pub mod domain;
 pub mod error;
 pub mod media;
 pub mod model_catalog;
+pub mod pet_window;
+pub mod petdex;
 pub mod pricing;
 pub mod pricing_refresh;
 pub mod protocol;
@@ -22,7 +24,7 @@ use std::sync::Arc;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager,
+    Emitter, Manager,
 };
 
 /// 全局共享状态：SQLite 池 + 运行时配置 + 网关状态（路由表 / 健康表 / 限流计数器）
@@ -85,6 +87,43 @@ pub fn run() {
             let gw2 = gateway.clone();
             tauri::async_runtime::spawn(async move { gw2.background_loop().await });
 
+            // 4.5 桌宠原生菜单：选择宠物 / 打开主窗口 / 暂停监控 / 隐藏。
+            let menu_handle = app.handle().clone();
+            app.on_menu_event(move |_app, event| {
+                let id = event.id().as_ref().to_owned();
+                let Some(action) = id.strip_prefix("pet-menu:") else {
+                    return;
+                };
+                match action {
+                    "hide" => {
+                        if let Some(window) = menu_handle.get_webview_window("pet") {
+                            let _ = window.close();
+                        }
+                    }
+                    "open-main" => {
+                        if let Some(window) = menu_handle.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "toggle-pause" => {
+                        let _ = menu_handle.emit(
+                            "pet-menu-action",
+                            serde_json::json!({ "action": "toggle-pause" }),
+                        );
+                    }
+                    other => {
+                        if let Some(slug) = other.strip_prefix("select:") {
+                            let _ = menu_handle.emit(
+                                "pet-menu-action",
+                                serde_json::json!({ "action": "select-pet", "slug": slug }),
+                            );
+                        }
+                    }
+                }
+            });
+
             // 5. 系统托盘：CC Switch 式的极速切换就靠它
             build_tray(&handle)?;
 
@@ -122,6 +161,16 @@ pub fn run() {
             commands::detect_cli_tools,
             commands::detect_cli_tools_with_updates,
             commands::install_cli_tool,
+            commands::get_pet_status,
+            commands::get_pet_asset,
+            commands::open_pet_window,
+            commands::close_pet_window,
+            commands::set_pet_window_size,
+            commands::show_pet_menu,
+            commands::focus_main_window,
+            commands::stop_ai_tool,
+            commands::petdex_catalog,
+            commands::petdex_install_pet,
             commands::run_gateway_self_check,
             commands::refresh_pricing,
             commands::pricing_status,

@@ -457,6 +457,66 @@ export interface SelfCheckResult {
   error: string | null;
 }
 
+// 桌宠：已安装宠物包（~/.petdex/pets/<slug>），字段来自包内 pet.json。
+export interface InstalledPet {
+  slug: string;
+  display_name: string;
+  description: string | null;
+  version: string | null;
+  spritesheet_file: string;
+  directory: string;
+}
+
+// 桌宠状态由网关最近活动与本机 AI 软件进程共同决定。
+export interface AiProcess {
+  tool_id: string;
+  tool_label: string;
+  // "cli"（编码 CLI）或 "app"（桌面应用）。
+  kind: string;
+  process_name: string;
+  pid: number;
+  memory_kb: number | null;
+}
+
+export interface PetStatus {
+  status: "idle" | "working" | "error";
+  reason: string;
+  // 网关自身状态：用于区分「网关出错」与「任务出错」。
+  gateway_status: "idle" | "working" | "error";
+  requests_last_minute: number;
+  failed_last_minute: number;
+  installed_pets: InstalledPet[];
+  ai_processes: AiProcess[];
+  // 工具会话日志中检测到的任务（错误优先、其次最近活动）。
+  active_tasks: DetectedTask[];
+  pet_window_open: boolean;
+}
+
+export interface DetectedTask {
+  source: string;
+  source_label: string;
+  project: string;
+  session_id: string;
+  status: "running" | "error" | "done";
+  detail: string;
+  updated_at: number;
+}
+
+export interface PetAnimations {
+  [action: string]: { row: number; delays_ms: number[] };
+}
+
+export interface PetAsset {
+  slug: string;
+  display_name: string;
+  columns: number;
+  rows: number;
+  cell_width: number;
+  cell_height: number;
+  animations: PetAnimations;
+  spritesheet_data_url: string;
+}
+
 export const api = {
   listProviders: () => invoke<ProviderView[]>("list_providers"),
   upsertProvider: (input: ProviderInput) => invoke<string>("upsert_provider", { input }),
@@ -512,6 +572,19 @@ export const api = {
   installCliTool: (id: string) => invoke<string>("install_cli_tool", { id }),
   runGatewaySelfCheck: () =>
     invoke<SelfCheckResult>("run_gateway_self_check"),
+
+  getPetStatus: () => invoke<PetStatus>("get_pet_status"),
+  getPetAsset: (slug: string) => invoke<PetAsset>("get_pet_asset", { slug }),
+  openPetWindow: () => invoke<void>("open_pet_window"),
+  closePetWindow: () => invoke<void>("close_pet_window"),
+  setPetWindowSize: (scale: number) => invoke<number>("set_pet_window_size", { scale }),
+  showPetMenu: (currentSlug: string | null, paused: boolean) =>
+    invoke<void>("show_pet_menu", { currentSlug, paused }),
+  focusMainWindow: (section?: string) =>
+    invoke<void>("focus_main_window", { section: section ?? null }),
+  stopAiTool: (toolId: string) => invoke<string>("stop_ai_tool", { toolId }),
+  petdexCatalog: () => invoke<string>("petdex_catalog"),
+  petdexInstallPet: (slug: string) => invoke<string>("petdex_install_pet", { slug }),
 };
 
 export const DIALECT_LABEL: Record<Dialect, string> = {

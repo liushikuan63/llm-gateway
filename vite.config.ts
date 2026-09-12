@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -17,5 +18,12 @@ export default defineConfig({
     target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari13",
     minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
+    rollupOptions: {
+      // 主窗口与桌宠窗口是两个入口；桌宠窗口独立加载，避免拖入整站资源。
+      input: {
+        main: resolve(__dirname, "index.html"),
+        pet: resolve(__dirname, "pet.html"),
+      },
+    },
   },
 });

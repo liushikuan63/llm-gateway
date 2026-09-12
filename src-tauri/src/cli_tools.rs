@@ -367,7 +367,7 @@ fn is_semver_like(token: &str) -> bool {
 
 /// 运行 `<exe> --version` 并解析版本。失败时返回错误文本，供界面提示。
 pub async fn read_version(path: &Path) -> Result<String, String> {
-    let output = run_command(path, &["--version"], VERSION_TIMEOUT).await?;
+    let output = run_path(path, &["--version"], VERSION_TIMEOUT).await?;
     let combined = format!("{}\n{}", output.0, output.1);
     parse_version(&combined).ok_or_else(|| {
         format!(
@@ -395,12 +395,12 @@ fn command_for(path: &Path) -> tokio::process::Command {
     tokio::process::Command::new(path)
 }
 
-async fn run_command(
-    program: &Path,
+async fn run_spawn(
+    mut command: tokio::process::Command,
+    display: &str,
     args: &[&str],
     timeout: Duration,
 ) -> Result<(String, String), String> {
-    let mut command = command_for(program);
     command
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -414,15 +414,45 @@ async fn run_command(
     }
     let child = command
         .spawn()
-        .map_err(|e| format!("启动 {} 失败：{e}", program.display()))?;
+        .map_err(|e| format!("启动 {display} 失败：{e}"))?;
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
-        .map_err(|_| format!("{} 执行超时（{} 秒）", program.display(), timeout.as_secs()))?
-        .map_err(|e| format!("{} 执行失败：{e}", program.display()))?;
+        .map_err(|_| format!("{display} 执行超时（{} 秒）", timeout.as_secs()))?
+        .map_err(|e| format!("{display} 执行失败：{e}"))?;
     Ok((
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     ))
+}
+
+/// 按已知路径运行程序（自动处理 Windows 上的 .cmd/.bat 包装）。
+pub(crate) async fn run_path(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<(String, String), String> {
+    run_spawn(
+        command_for(program),
+        &program.display().to_string(),
+        args,
+        timeout,
+    )
+    .await
+}
+
+/// 按 PATH 中的名字运行系统命令（如 tasklist / taskkill）。
+pub(crate) async fn run(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<(String, String), String> {
+    run_spawn(
+        tokio::process::Command::new(program),
+        program,
+        args,
+        timeout,
+    )
+    .await
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -506,7 +536,7 @@ pub async fn install(spec: &ToolSpec) -> Result<String, String> {
                 "未找到 npm。请先安装 Node.js，或改用官方安装方式安装该 CLI。".to_string()
             })?;
             let args = ["install", "-g", &format!("{package}@latest")];
-            let (stdout, stderr) = run_command(&npm, &args, UPDATE_TIMEOUT).await?;
+            let (stdout, stderr) = run_path(&npm, &args, UPDATE_TIMEOUT).await?;
             let combined = format!("{stdout}\n{stderr}");
             Ok(truncate(combined.trim(), MAX_OUTPUT_CHARS))
         }
@@ -517,7 +547,7 @@ pub async fn install(spec: &ToolSpec) -> Result<String, String> {
                     spec.docs_url
                 )
             })?;
-            let (stdout, stderr) = run_command(
+            let (stdout, stderr) = run_path(
                 &powershell,
                 &[
                     "-NoProfile",

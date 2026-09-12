@@ -14,6 +14,7 @@ import {
   SnapshotView,
   TakeoverResult,
 } from "../api";
+import PetCard from "./PetCard";
 
 type Message = { kind: "ok" | "err"; text: string };
 
@@ -941,6 +942,8 @@ ${keyInfo.ollama_endpoint}`}
           </div>
         )}
       </div>
+
+      <PetCard />
 
       <div className="card">
         <strong>CLI 工具接管</strong>

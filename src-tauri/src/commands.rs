@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 
 use crate::config::AppConfig;
 use crate::crypto;
@@ -1350,6 +1350,172 @@ pub async fn install_cli_tool(id: String) -> Result<String, String> {
         .find(|spec| spec.id == id)
         .ok_or_else(|| format!("不支持安装 {id}"))?;
     crate::cli_tools::install(spec).await
+}
+
+/* --------------------------- 桌宠（Petdex）与 AI 进程监控 --------------------------- */
+
+/// 桌宠状态：由网关最近活动 + 本机 AI 软件进程 + 工具任务日志共同决定。
+#[derive(Debug, Clone, Serialize)]
+pub struct PetStatus {
+    /// 综合状态（网关与任务取最高优先级）："idle" | "working" | "error"
+    pub status: String,
+    /// 状态原因（供界面与悬浮提示展示，不猜测未观测到的信息）。
+    pub reason: String,
+    /// 网关自身的状态，单独保留便于界面区分"网关出错"与"任务出错"。
+    pub gateway_status: String,
+    pub requests_last_minute: i64,
+    pub failed_last_minute: i64,
+    pub installed_pets: Vec<crate::petdex::InstalledPet>,
+    pub ai_processes: Vec<crate::petdex::AiProcess>,
+    /// 工具会话日志中检测到的最近任务（错误优先、其次最近活动）。
+    pub active_tasks: Vec<crate::petdex::DetectedTask>,
+    pub pet_window_open: bool,
+}
+
+/// 判定窗口：最近 60 秒内的事件参与状态判定。
+const PET_ACTIVITY_WINDOW_SECS: i64 = 60;
+
+#[tauri::command]
+pub async fn get_pet_status(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PetStatus, String> {
+    let now = chrono::Utc::now().timestamp();
+    let since = now - PET_ACTIVITY_WINDOW_SECS;
+    let summary = sqlx::query(
+        r#"SELECT COUNT(*) AS total,
+                  SUM(CASE WHEN status IS NULL OR status >= 400 THEN 1 ELSE 0 END) AS failed
+           FROM requests WHERE ts >= ?"#,
+    )
+    .bind(since)
+    .fetch_one(state.db.pool())
+    .await
+    .map_err(|error| format!("读取请求活动失败：{error}"))?;
+    let total: i64 = summary.get("total");
+    let failed: i64 = summary.get::<Option<i64>, _>("failed").unwrap_or(0);
+
+    // 最近一条请求决定 error 优先：只有失败之后还没有成功，才展示错误状态。
+    let last = sqlx::query("SELECT ts, status, error FROM requests ORDER BY id DESC LIMIT 1")
+        .fetch_optional(state.db.pool())
+        .await
+        .map_err(|error| format!("读取最近请求失败：{error}"))?;
+    let last_request = last.map(|row| {
+        (
+            row.get::<i64, _>("ts"),
+            row.get::<Option<i64>, _>("status"),
+            row.get::<Option<String>, _>("error"),
+        )
+    });
+    let (status, mut reason) =
+        crate::petdex::derive_activity_status(total, last_request, since, PET_ACTIVITY_WINDOW_SECS);
+
+    let ai_processes = crate::petdex::list_ai_processes().await;
+    if status == "idle" && !ai_processes.is_empty() {
+        // 同一软件常有多个进程（Electron 多进程），按软件数报更有意义。
+        let distinct_tools = ai_processes
+            .iter()
+            .map(|process| process.tool_id.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        reason = format!(
+            "{distinct_tools} 个 AI 软件正在运行（共 {} 个进程）",
+            ai_processes.len()
+        );
+    }
+
+    // 任务日志优先：出错的任务压过"空闲"说明，运行中的任务让宠物进入工作态。
+    let active_tasks = crate::petdex::list_qoder_tasks();
+    let gateway_status = status.clone();
+    let (status, reason) = crate::petdex::combine_pet_status(&status, &reason, &active_tasks);
+
+    Ok(PetStatus {
+        status,
+        reason,
+        gateway_status,
+        requests_last_minute: total,
+        failed_last_minute: failed,
+        installed_pets: crate::petdex::list_installed(),
+        ai_processes,
+        active_tasks,
+        pet_window_open: app.get_webview_window("pet").is_some(),
+    })
+}
+
+/// 读取宠物资源（精灵图以 data URL 返回）。
+#[tauri::command]
+pub async fn get_pet_asset(slug: String) -> Result<crate::petdex::PetAsset, String> {
+    crate::petdex::load_asset(&slug)
+}
+
+/// 显示桌宠窗口；已存在时直接显示并置顶。
+#[tauri::command]
+pub async fn open_pet_window(app: tauri::AppHandle) -> Result<(), String> {
+    crate::pet_window::ensure_pet_window(&app)
+}
+
+#[tauri::command]
+pub async fn close_pet_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("pet") {
+        window
+            .close()
+            .map_err(|error| format!("关闭桌宠窗口失败：{error}"))?;
+    }
+    Ok(())
+}
+
+/// 调整桌宠窗口大小（0.5× ~ 2×，基准 240×260）。返回实际生效的比例。
+#[tauri::command]
+pub async fn set_pet_window_size(app: tauri::AppHandle, scale: f64) -> Result<f64, String> {
+    crate::pet_window::set_pet_window_size(&app, scale)
+}
+
+/// 弹出桌宠的原生右键菜单（宠物列表 + 打开主窗口 / 暂停监控 / 隐藏）。
+/// 用系统菜单而不是页面内菜单：桌宠窗口可能很小，自绘菜单放不下。
+#[tauri::command]
+pub async fn show_pet_menu(
+    app: tauri::AppHandle,
+    current_slug: Option<String>,
+    paused: bool,
+) -> Result<(), String> {
+    let pets = crate::petdex::list_installed();
+    crate::pet_window::show_pet_menu(&app, current_slug.as_deref(), &pets, paused)
+}
+
+/// 打开并聚焦主窗口（桌宠点击跳转）。`section` 由前端映射到具体页面。
+#[tauri::command]
+pub async fn focus_main_window(
+    app: tauri::AppHandle,
+    section: Option<String>,
+) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "主窗口不存在".to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    window.unminimize().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())?;
+    if let Some(section) = section.filter(|value| !value.is_empty()) {
+        // 前端订阅该事件后切换到对应页面；此处只在窗口就绪后发送。
+        let _ = app.emit("llm-gateway-navigate", section);
+    }
+    Ok(())
+}
+
+/// 结束某个 AI 软件当前检测到的全部进程（工具标识必须来自监控结果）。
+#[tauri::command]
+pub async fn stop_ai_tool(tool_id: String) -> Result<String, String> {
+    crate::petdex::stop_tool_processes(&tool_id).await
+}
+
+/// 查询 Petdex 商店列表（返回 CLI 原始输出，界面按原样展示）。
+#[tauri::command]
+pub async fn petdex_catalog() -> Result<String, String> {
+    crate::petdex::petdex_list().await
+}
+
+/// 通过官方 Petdex CLI 安装宠物。
+#[tauri::command]
+pub async fn petdex_install_pet(slug: String) -> Result<String, String> {
+    crate::petdex::petdex_install(&slug).await
 }
 
 /// 网关连通性自检：确认服务在监听，并用统一 Key 发一次最小请求走通端到端链路。

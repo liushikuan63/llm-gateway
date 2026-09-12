@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 import "./shell.css";
 import { api, AppConfig } from "./api";
@@ -155,6 +156,23 @@ export default function App() {
     return () => {
       disposed = true;
       window.removeEventListener("llm-gateway-config-changed", onConfigChanged);
+    };
+  }, [desktopRuntime]);
+
+  useEffect(() => {
+    if (!desktopRuntime) return;
+    // 桌宠点击「打开主窗口」时发送该事件；这里是事件驱动的页面切换入口。
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<string>("llm-gateway-navigate", (event) => {
+      if (isTabId(event.payload)) setTab(event.payload);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, [desktopRuntime]);
 

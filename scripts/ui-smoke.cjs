@@ -97,6 +97,35 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       status: 200, latency_ms: 220, prompt_tokens: 234, completion_tokens: 67, fallback_attempts: 0, error: null,
       cost: null, currency: null, rate_label: null, estimated_prompt_tokens: 210, attempts: null },
   ];
+  // 桌宠夹具：一个工作中状态、运行中的 CLI 与桌面应用进程各一个、一个已安装宠物包与一个进行中的任务。
+  window.__fixturePetStatus = {
+    status: "working",
+    reason: "Qoder CLI 任务进行中：edit",
+    gateway_status: "idle",
+    requests_last_minute: 3,
+    failed_last_minute: 1,
+    installed_pets: [{
+      slug: "snow-plum-lillia", display_name: "Snow Plum Lillia", description: "雪梅莉利娅示例宠物", version: "1.1.0",
+      spritesheet_file: "spritesheet.webp", directory: "C:/Users/fixture/.petdex/pets/snow-plum-lillia",
+    }],
+    ai_processes: [
+      { tool_id: "codex", tool_label: "Codex CLI", kind: "cli", process_name: "codex.exe", pid: 4321, memory_kb: 56380 },
+      { tool_id: "qoder_ide", tool_label: "Qoder IDE", kind: "app", process_name: "Qoder CN.exe", pid: 5678, memory_kb: 512000 },
+    ],
+    active_tasks: [
+      { source: "qoder_cli", source_label: "Qoder CLI", project: "C:\\Users\\fixture", session_id: "sess-1", status: "running", detail: "进行中：edit", updated_at: 1789000000 },
+    ],
+    pet_window_open: false,
+  };
+  // 1×1 透明 PNG：桌宠窗口只需要能解码的图片，验证动画逻辑而不依赖真实素材。
+  window.__fixturePetAsset = {
+    slug: "snow-plum-lillia", display_name: "Snow Plum Lillia", columns: 8, rows: 9, cell_width: 192, cell_height: 208,
+    animations: {
+      idle: { row: 0, delays_ms: [120, 120] }, running: { row: 7, delays_ms: [120, 120] },
+      failed: { row: 5, delays_ms: [120, 120] }, jumping: { row: 4, delays_ms: [120, 120] },
+    },
+    spritesheet_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+  };
   const session = (id, title, compactCount = 0) => ({ id, title, snapshot_id: compactCount ? "snapshot-fixture" : null, sticky_provider_id: "openrouter", sticky_model: "vendor/chat:free", sticky_expires_at: null, total_tokens: 24680, compact_count: compactCount, summary: compactCount ? "任务目标：完善通用网关的会话界面。\n已完成：保留上下文、工具交换与降级处理。\n下一步：验证长文本排版和快速切换。" : null, created_at: "2026-09-10T08:00:00Z", updated_at: "2026-09-10T08:30:00Z", message_count: 4 });
   window.__fixtureSessions = [session("session-slow", "通用网关长上下文与工具调用验收", 2), session("session-fast", "快速切换验证会话"), session("session-empty", "空会话")];
   const message = (id, role, content, compacted = false) => ({ id, session_id: "session-slow", role, content, tool_calls: null, tool_call_id: null, name: null, routed_provider: role === "assistant" ? "OpenRouter" : null, routed_model: role === "assistant" ? "vendor/chat:free" : null, compacted, prompt_tokens: 2000, completion_tokens: 500, created_at: "2026-09-10T08:10:00Z" });
@@ -106,7 +135,12 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     { ...message(3, "tool", "读取结果：配置有效。\n" + "路径/".repeat(140), true), tool_call_id: "call-fixture", name: "read_config" },
     message(4, "assistant", "这里是最新的完整答复。\n\n" + "长文本应保留换行，在有限宽度内自然换行；工具调用记录可单独展开。\n".repeat(24)),
   ];
-  window.__TAURI_INTERNALS__ = { invoke: async (cmd, args) => {
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
+  window.__TAURI_INTERNALS__ = {
+    // @tauri-apps/api 的事件与窗口模块依赖这两个基础设施桩。
+    transformCallback: (callback) => { const id = Math.floor(Math.random() * 1e9); window[`_${id}`] = callback; return id; },
+    metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+    invoke: async (cmd, args) => {
     window.__fixtureCalls.push(cmd);
     switch (cmd) {
       case "list_providers": if (providerFailure) throw new Error("模拟供应商读取失败"); return structuredClone(window.__fixtureProviders);
@@ -165,6 +199,16 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         window.__fixtureCliAfterInstall = { ...(window.__fixtureCliAfterInstall ?? {}), [args.id]: { installed: true, version, latest_version: null, path: current?.path ?? `C:/Users/fixture/.local/bin/${args.id}` } };
         return "added 1 package in 2s";
       }
+      case "get_pet_status": return { ...structuredClone(window.__fixturePetStatus), pet_window_open: !!window.__fixturePetWindowOpen };
+      case "get_pet_asset": window.__fixturePetAssetSlug = args.slug; return structuredClone(window.__fixturePetAsset);
+      case "open_pet_window": window.__fixturePetWindowOpen = true; return null;
+      case "close_pet_window": window.__fixturePetWindowOpen = false; window.__fixturePetClosed = true; return null;
+      case "set_pet_window_size": window.__fixturePetScale = args.scale; return args.scale;
+      case "show_pet_menu": window.__fixturePetMenu = { slug: args.currentSlug, paused: args.paused }; return null;
+      case "focus_main_window": window.__fixtureFocusedSection = args.section ?? "none"; return null;
+      case "stop_ai_tool": window.__fixtureStoppedTool = args.toolId; return `已结束 Codex CLI 的 1 个进程：codex.exe (PID 4321)`;
+      case "petdex_catalog": return "snow-plum-lillia   Snow Plum Lillia   by fixture-author\nmoon-rabbit        Moon Rabbit         by fixture-author";
+      case "petdex_install_pet": window.__fixturePetInstalled = args.slug; return "installed";
       case "run_gateway_self_check": if (window.__fixtureSelfCheckFails) return { healthy: false, base_url: "http://127.0.0.1:15721", routed_via: null, latency_ms: 12, error: "网关返回 HTTP 503：所有候选 Provider 均不可用（尝试 2 次）" };
         return { healthy: true, base_url: "http://127.0.0.1:15721", routed_via: "openrouter/vendor/chat:free", latency_ms: 321, error: null };
       case "list_sessions": return structuredClone(window.__fixtureSessions);
@@ -189,7 +233,18 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
           { label: "订阅到期时间", scope: "subscription", expires_at: "2027-01-01T00:00:00Z", unlimited: false },
         ], warnings: ["当前 Key 限额不是账户余额，未提供逐模型剩余调用次数。"] };
       }
-      default: throw new Error(`Unexpected fixture IPC: ${cmd}`);
+      // Tauri 的窗口/事件插件调用属于基础设施；在夹具中视为成功，但不掩盖业务命令的意外调用。
+      default:
+        if (cmd === "plugin:event|listen") {
+          // 记录事件处理器，测试可以模拟后端 emit（如原生菜单动作）。
+          window.__fixtureEventHandlers = window.__fixtureEventHandlers ?? {};
+          window.__fixtureEventHandlers[args.event] = window[`_${args.handler}`] ?? null;
+          return 0;
+        }
+        if (cmd.startsWith("plugin:event|")) return 0;
+        if (cmd === "plugin:window|start_dragging") { window.__fixtureDragStarted = true; return 0; }
+        if (cmd.startsWith("plugin:window|")) return 0;
+        throw new Error(`Unexpected fixture IPC: ${cmd}`);
     }
   } };
 }
@@ -489,6 +544,43 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.getByRole("status").filter({ hasText: "Grok Build 安装命令已执行" }).waitFor();
     assert.equal(await page.evaluate(() => window.__fixtureInstalledCli), "grok_build");
     await page.screenshot({ path: path.join(output, "cli-tools-desktop.png"), fullPage: true });
+    // 桌宠与 AI 监控：状态、进程列表、结束进程、Petdex 安装都必须走真实 IPC。
+    const petCard = page.locator('[data-testid="pet-card"]');
+    await petCard.scrollIntoViewIfNeeded();
+    let petText = await petCard.innerText();
+    assert(petText.includes("工作中"), `桌宠状态应显示工作中：${petText}`);
+    assert(petText.includes("Codex CLI") && petText.includes("4321"), `运行中的 AI 工具必须列出进程与 PID：${petText}`);
+    // 监控范围必须覆盖 AI 桌面应用，并标注类型（CLI / 桌面应用）；多进程按软件聚合。
+    assert(petText.includes("Qoder IDE") && petText.includes("5678"), `AI 桌面应用必须在监控列表中：${petText}`);
+    assert(petText.includes("CLI") && petText.includes("桌面应用"), `进程类型必须标注：${petText}`);
+    assert(petText.includes("1 个"), `聚合视图必须显示进程数：${petText}`);
+    assert(petText.includes("Snow Plum Lillia"), `已安装宠物必须列出：${petText}`);
+    // 任务列表：来自工具会话日志，必须显示状态与项目（宠物动作据此切换）。
+    assert(petText.includes("Qoder CLI") && petText.includes("进行中"), `任务状态必须展示：${petText}`);
+    assert(petText.includes("C:\\Users\\fixture"), `任务项目必须展示：${petText}`);
+    // 宠物选择用下拉，选择后必须持久化（桌宠窗口据此切换）。
+    await petCard.getByTestId("pet-select").selectOption("snow-plum-lillia");
+    assert.equal(await page.evaluate(() => localStorage.getItem("llm-gateway-pet-slug")), "snow-plum-lillia", "选择宠物必须持久化");
+    await petCard.getByRole("button", { name: "开启桌宠", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "桌宠已开启" }).waitFor();
+    assert.equal(await page.evaluate(() => window.__fixturePetWindowOpen), true, "开启桌宠必须调用 open_pet_window");
+    // 大小调整：滑块必须实时下发到窗口。
+    await petCard.locator("#pet-scale").fill("150");
+    await page.waitForTimeout(300);
+    assert.equal(await page.evaluate(() => window.__fixturePetScale), 1.5, "滑块必须把缩放比例下发给桌宠窗口");
+    assert((await petCard.innerText()).includes("150%"), "界面必须回显当前大小");
+    const codexProcessRow = petCard.locator("tr").filter({ hasText: "Codex CLI" });
+    await codexProcessRow.getByRole("button", { name: "结束", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "已结束" }).waitFor();
+    assert.equal(await page.evaluate(() => window.__fixtureStoppedTool), "codex", "结束操作必须按工具标识下发（由后端自行枚举进程）");
+    await petCard.getByRole("button", { name: "浏览 Petdex 商店", exact: true }).click();
+    await page.getByTestId("petdex-catalog").waitFor();
+    assert((await page.getByTestId("petdex-catalog").innerText()).includes("moon-rabbit"), "商店输出必须原样展示");
+    await petCard.getByLabel("宠物 slug").fill("moon-rabbit");
+    await petCard.getByRole("button", { name: "从 Petdex 安装", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "已安装" }).waitFor();
+    assert.equal(await page.evaluate(() => window.__fixturePetInstalled), "moon-rabbit", "安装宠物必须把经校验的 slug 传给后端");
+    await page.screenshot({ path: path.join(output, "pet-card-desktop.png"), fullPage: true });
     for (const width of [900, 390]) {
       await page.setViewportSize({ width, height: 844 });
       assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `settings overflow at ${width}`);
@@ -598,6 +690,35 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       await offlineManual.screenshot({ path: path.join(output, `manual-html-${width}.png`) });
     }
     assert.deepEqual(manualRequests, []);
+    // 桌宠窗口：加载宠物资源、单击跳转主窗口、右键菜单可打开主窗口与隐藏桌宠。
+    const petContext = await browser.newContext({ viewport: { width: 240, height: 260 }, reducedMotion: "reduce" });
+    await petContext.addInitScript(fixture);
+    const petWindow = await petContext.newPage();
+    petWindow.on("pageerror", error => errors.push(`pet: ${error.message}`));
+    await petWindow.goto(`${baseUrl}/pet.html`);
+    await petWindow.getByTestId("pet-root").waitFor();
+    await petWindow.waitForTimeout(500);
+    assert.equal(await petWindow.getByTestId("pet-placeholder").count(), 0, "宠物资源加载完成后不应保留占位提示");
+    await petWindow.getByTestId("pet-root").click();
+    await petWindow.waitForTimeout(250);
+    assert.equal(await petWindow.evaluate(() => window.__fixtureFocusedSection), "stats", "单击桌宠必须跳转到用量页");
+    assert.equal(await petWindow.evaluate(() => window.__fixtureDragStarted ?? false), false, "短按点击不应触发窗口拖动");
+    // 右键弹出的是系统原生菜单（由 Rust 侧构建与消费），这里断言请求参数正确。
+    await petWindow.getByTestId("pet-root").click({ button: "right" });
+    await petWindow.waitForTimeout(250);
+    const menuRequest = await petWindow.evaluate(() => window.__fixturePetMenu ?? null);
+    assert(menuRequest !== null, "右键必须请求原生菜单（页面内菜单在极小窗口会显示不全）");
+    assert.equal(menuRequest.slug, "snow-plum-lillia", "菜单必须带上当前宠物以便勾选");
+    assert.equal(menuRequest.paused, false, "菜单必须带上暂停状态以显示正确文案");
+    // 模拟原生菜单动作：切换宠物 → 持久化并重新加载资源。
+    await petWindow.evaluate(() => {
+      window.__fixturePetStatus.installed_pets.push({ slug: "moon-rabbit", display_name: "Moon Rabbit", description: null, version: "0.9.0", spritesheet_file: "spritesheet.webp", directory: "C:/Users/fixture/.petdex/pets/moon-rabbit" });
+      window.__fixtureEventHandlers["pet-menu-action"]({ payload: { action: "select-pet", slug: "moon-rabbit" } });
+    });
+    assert.equal(await petWindow.evaluate(() => localStorage.getItem("llm-gateway-pet-slug")), "moon-rabbit", "菜单选择宠物必须持久化");
+    await petWindow.waitForTimeout(400);
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetAssetSlug), "moon-rabbit", "切换宠物后必须重新加载对应资源");
+    await petContext.close();
     assert.deepEqual(errors, []);
     const preview = await browser.newPage();
     await preview.goto(baseUrl);
