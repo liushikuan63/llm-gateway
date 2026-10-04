@@ -246,5 +246,6 @@ fn usage_from_ollama(value: &serde_json::Value) -> Usage {
         prompt_tokens,
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
+        ..Default::default()
     }
 }

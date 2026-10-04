@@ -285,6 +285,16 @@ pub fn messages_response(resp: &ChatResponse, model: &str) -> serde_json::Value 
         _ => "end_turn",
     };
     let u = resp.usage.clone().unwrap_or_default();
+    let mut usage = json!({
+        "input_tokens": u.normal_input_tokens(),
+        "output_tokens": u.completion_tokens,
+    });
+    if u.cache_read_tokens > 0 {
+        usage["cache_read_input_tokens"] = json!(u.cache_read_tokens);
+    }
+    if u.cache_creation_tokens > 0 {
+        usage["cache_creation_input_tokens"] = json!(u.cache_creation_tokens);
+    }
 
     json!({
         "id": resp.id,
@@ -294,7 +304,7 @@ pub fn messages_response(resp: &ChatResponse, model: &str) -> serde_json::Value 
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": { "input_tokens": u.prompt_tokens, "output_tokens": u.completion_tokens },
+        "usage": usage,
     })
 }
 
@@ -338,8 +348,6 @@ pub fn anthropic_to_internal(v: &serde_json::Value) -> crate::domain::ChatRespon
     }
 
     let u = v.get("usage").cloned().unwrap_or(json!({}));
-    let pt = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    let ct = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
 
     crate::domain::ChatResponse {
         id: v
@@ -364,11 +372,7 @@ pub fn anthropic_to_internal(v: &serde_json::Value) -> crate::domain::ChatRespon
             Some(_) => Some("stop".into()),
             None => None,
         },
-        usage: Some(crate::domain::Usage {
-            prompt_tokens: pt,
-            completion_tokens: ct,
-            total_tokens: pt + ct,
-        }),
+        usage: Some(crate::domain::Usage::from_anthropic(&u)),
     }
 }
 

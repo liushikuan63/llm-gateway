@@ -25,7 +25,7 @@ pub fn message_to_openai(m: &Message) -> serde_json::Value {
                         image_url: ImageUrl { url, detail },
                     } => {
                         let mut v = json!({ "type": "image_url", "image_url": { "url": url } });
-                        if let Some(d) = detail {
+                        if let Some(d) = detail.as_deref().and_then(normalize_openai_image_detail) {
                             v["image_url"]["detail"] = json!(d);
                         }
                         v
@@ -60,6 +60,18 @@ pub fn message_to_openai(m: &Message) -> serde_json::Value {
     out
 }
 
+/// Codex 的 Responses 工具图片会带 `detail: "original"`，但 Chat Completions
+/// 的图片只接受 `auto`、`low`、`high`。在最终出站边界统一收敛，未知值宁可
+/// 省略，也不把不兼容字段原样转发给严格上游。
+fn normalize_openai_image_detail(detail: &str) -> Option<&'static str> {
+    match detail.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some("auto"),
+        "low" => Some("low"),
+        "high" | "original" => Some("high"),
+        _ => None,
+    }
+}
+
 /// 从 OpenAI 响应里抽出内部表示
 pub fn openai_response_to_internal(v: &serde_json::Value) -> crate::domain::ChatResponse {
     let choice = v
@@ -84,14 +96,7 @@ pub fn openai_response_to_internal(v: &serde_json::Value) -> crate::domain::Chat
         .and_then(|v| v.as_array())
         .and_then(|calls| tool_calls_from_openai(calls));
 
-    let usage = v.get("usage").map(|u| crate::domain::Usage {
-        prompt_tokens: u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-        completion_tokens: u
-            .get("completion_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-        total_tokens: u.get("total_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-    });
+    let usage = v.get("usage").map(crate::domain::Usage::from_openai);
 
     crate::domain::ChatResponse {
         id: v

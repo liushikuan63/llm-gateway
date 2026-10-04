@@ -117,6 +117,15 @@ fn convert_message(m: OaMessage) -> Result<Message, crate::error::GatewayError> 
                     "input_audio" => ps.push(Part::InputAudio {
                         input_audio: p.get("input_audio").cloned().unwrap_or(json!({})),
                     }),
+                    "video_url" => ps.push(Part::VideoUrl {
+                        video_url: serde_json::from_value(
+                            p.get("video_url").cloned().unwrap_or(json!({})),
+                        )
+                        .unwrap_or(crate::domain::ImageUrl {
+                            url: String::new(),
+                            detail: None,
+                        }),
+                    }),
                     _ => {}
                 }
             }
@@ -233,11 +242,22 @@ pub fn chat_completion_response(
 }
 
 pub fn usage_json(u: &Usage) -> serde_json::Value {
-    json!({
+    let mut usage = json!({
         "prompt_tokens": u.prompt_tokens,
         "completion_tokens": u.completion_tokens,
         "total_tokens": u.total_tokens,
-    })
+    });
+    if u.cache_read_tokens > 0 || u.cache_creation_tokens > 0 {
+        let mut details = serde_json::Map::new();
+        if u.cache_read_tokens > 0 {
+            details.insert("cached_tokens".into(), json!(u.cache_read_tokens));
+        }
+        if u.cache_creation_tokens > 0 {
+            details.insert("cache_write_tokens".into(), json!(u.cache_creation_tokens));
+        }
+        usage["prompt_tokens_details"] = serde_json::Value::Object(details);
+    }
+    usage
 }
 
 /// 流式 chunk 的 JSON payload。

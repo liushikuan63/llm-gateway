@@ -290,20 +290,7 @@ pub fn from_gemini_response(v: &serde_json::Value) -> ChatResponse {
                 other => other.to_lowercase(),
             },
         ),
-        usage: Some(crate::domain::Usage {
-            prompt_tokens: u
-                .get("promptTokenCount")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0) as u32,
-            completion_tokens: u
-                .get("candidatesTokenCount")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0) as u32,
-            total_tokens: u
-                .get("totalTokenCount")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0) as u32,
-        }),
+        usage: Some(crate::domain::Usage::from_gemini(&u)),
     }
 }
 
