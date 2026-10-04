@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS models (
     supports_audio   INTEGER NOT NULL DEFAULT 0,
     supports_video   INTEGER NOT NULL DEFAULT 0,
     supports_stream  INTEGER NOT NULL DEFAULT 1,
+    model_type       TEXT NOT NULL DEFAULT 'chat',
+    upstream_path    TEXT,
     enabled          INTEGER NOT NULL DEFAULT 1,
     price_json       TEXT,
     overrides_json   TEXT
@@ -178,6 +180,19 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 "#,
     ),
+    (
+        "app_secrets",
+        r#"
+-- 应用级密钥（当前只有搜索后端 API Key）。值是 AES-256-GCM 密文：
+-- config.toml 是明文落盘且会随项目快照传播，密钥绝不能进那里。
+CREATE TABLE IF NOT EXISTS app_secrets (
+    name       TEXT PRIMARY KEY,
+    value_enc  TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#,
+    ),
 ];
 
 pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -208,11 +223,27 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    ensure_column(pool, "models", "model_type", "TEXT NOT NULL DEFAULT 'chat'").await?;
+    ensure_column(pool, "models", "upstream_path", "TEXT").await?;
+    ensure_column(pool, "models", "local_json", "TEXT").await?;
+    ensure_column(
+        pool,
+        "models",
+        "supports_thinking",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     ensure_column(pool, "requests", "cost", "REAL").await?;
     ensure_column(pool, "requests", "currency", "TEXT").await?;
     ensure_column(pool, "requests", "rate_label", "TEXT").await?;
     ensure_column(pool, "requests", "estimated_prompt_tokens", "INTEGER").await?;
     ensure_column(pool, "requests", "attempts_json", "TEXT").await?;
+    ensure_column(pool, "requests", "route_intent", "TEXT").await?;
+    ensure_column(pool, "requests", "route_classifier", "TEXT").await?;
+    ensure_column(pool, "requests", "route_search", "TEXT").await?;
+    ensure_column(pool, "requests", "route_search_hits", "INTEGER").await?;
+    ensure_column(pool, "requests", "route_refined", "INTEGER").await?;
+    ensure_column(pool, "requests", "route_refine_note", "TEXT").await?;
     ensure_column(pool, "sessions", "token_ratio", "REAL").await?;
     migrate_usage_daily_currency(pool).await?;
     Ok(())

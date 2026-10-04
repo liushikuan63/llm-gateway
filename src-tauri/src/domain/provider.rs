@@ -116,6 +116,12 @@ pub struct PriceTier {
     pub min_prompt_tokens: i64,
     pub prompt: f64,
     pub completion: f64,
+    /// 缓存命中输入单价；未提供时沿用该档普通输入价。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    /// 缓存创建输入单价；未提供时沿用该档普通输入价。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<f64>,
 }
 
 /// 时段价规则（峰谷价/忙闲价）。时间是 UTC 当日的分钟数，跨午夜用 start > end 表达。
@@ -163,6 +169,12 @@ impl PriceRule {
 pub struct ModelPrice {
     pub prompt: f64,
     pub completion: f64,
+    /// 缓存命中输入单价；未配置时回退到普通输入价。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    /// 缓存创建输入单价；未配置时回退到普通输入价。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<f64>,
     pub currency: Currency,
     /// 输入长度分档价；为空表示只有基础档
     #[serde(default)]
@@ -184,17 +196,25 @@ pub struct Charge {
 }
 
 impl ModelPrice {
+    fn optional_nonnegative(value: Option<f64>) -> bool {
+        value.map_or(true, |value| value.is_finite() && value >= 0.0)
+    }
+
     pub fn is_valid(&self) -> bool {
         self.prompt.is_finite()
             && self.completion.is_finite()
             && self.prompt >= 0.0
             && self.completion >= 0.0
+            && Self::optional_nonnegative(self.cache_read)
+            && Self::optional_nonnegative(self.cache_creation)
             && self.tiers.iter().all(|tier| {
                 tier.min_prompt_tokens >= 0
                     && tier.prompt.is_finite()
                     && tier.completion.is_finite()
                     && tier.prompt >= 0.0
                     && tier.completion >= 0.0
+                    && Self::optional_nonnegative(tier.cache_read)
+                    && Self::optional_nonnegative(tier.cache_creation)
             })
             && self.rules.iter().all(PriceRule::is_valid)
     }
@@ -220,12 +240,42 @@ impl ModelPrice {
 
     /// 完整计价：档位单价 × 时段倍率。
     pub fn charge(&self, prompt_tokens: i64, completion_tokens: i64, minute_of_day: u16) -> Charge {
+        self.charge_with_cache(prompt_tokens, completion_tokens, 0, 0, minute_of_day)
+    }
+
+    /// 缓存命中/创建 token 已包含在 `prompt_tokens` 中；计价时先从普通输入中扣除，
+    /// 再分别套用缓存单价，避免同一批 token 同时按普通输入和缓存输入收费。
+    pub fn charge_with_cache(
+        &self,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        cache_read_tokens: i64,
+        cache_creation_tokens: i64,
+        minute_of_day: u16,
+    ) -> Charge {
         let (prompt_unit, completion_unit, tier) = self.effective_unit(prompt_tokens);
+        let cache_read_unit = tier
+            .and_then(|tier| tier.cache_read)
+            .or(self.cache_read)
+            .unwrap_or(prompt_unit);
+        let cache_creation_unit = tier
+            .and_then(|tier| tier.cache_creation)
+            .or(self.cache_creation)
+            .unwrap_or(prompt_unit);
         let rule = self.active_rule(minute_of_day);
         let (prompt_multiplier, completion_multiplier) = rule
             .map(|rule| (rule.prompt_multiplier, rule.completion_multiplier))
             .unwrap_or((1.0, 1.0));
-        let prompt = prompt_tokens.max(0) as f64 / 1_000_000.0 * prompt_unit * prompt_multiplier;
+        let total_prompt = prompt_tokens.max(0);
+        let cache_read = cache_read_tokens.max(0).min(total_prompt);
+        let cache_creation = cache_creation_tokens
+            .max(0)
+            .min(total_prompt.saturating_sub(cache_read));
+        let normal_prompt = total_prompt.saturating_sub(cache_read + cache_creation);
+        let prompt = normal_prompt as f64 / 1_000_000.0 * prompt_unit * prompt_multiplier;
+        let cache_read_cost = cache_read as f64 / 1_000_000.0 * cache_read_unit * prompt_multiplier;
+        let cache_creation_cost =
+            cache_creation as f64 / 1_000_000.0 * cache_creation_unit * prompt_multiplier;
         let completion =
             completion_tokens.max(0) as f64 / 1_000_000.0 * completion_unit * completion_multiplier;
         let mut parts = Vec::new();
@@ -236,7 +286,7 @@ impl ModelPrice {
             parts.push(format!("输入≥{}K 档", tier.min_prompt_tokens / 1000));
         }
         Charge {
-            cost: prompt + completion,
+            cost: prompt + cache_read_cost + cache_creation_cost + completion,
             currency: self.currency,
             label: (!parts.is_empty()).then(|| parts.join(" · ")),
         }
@@ -248,6 +298,65 @@ impl ModelPrice {
         let completion = completion_tokens.max(0) as f64 / 1_000_000.0 * self.completion;
         prompt + completion
     }
+}
+
+/// 模型用途。聊天模型走对话协议；Embedding、文生图、TTS 各自拥有独立端点，
+/// 不能靠 alias 猜用途，也不能在请求时降级成聊天模型。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelType {
+    #[default]
+    Chat,
+    Embedding,
+    Image,
+    Speech,
+}
+
+impl ModelType {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Embedding => "embedding",
+            Self::Image => "image",
+            Self::Speech => "speech",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chat" | "text" | "completion" => Some(Self::Chat),
+            "embedding" | "embeddings" => Some(Self::Embedding),
+            "image" | "images" | "text_to_image" => Some(Self::Image),
+            "speech" | "tts" | "audio_speech" => Some(Self::Speech),
+            _ => None,
+        }
+    }
+}
+
+/// 本地模型的来源元数据。只在从本机运行时（Ollama / LM Studio / vLLM …）扫描登记
+/// 时才有值，云端模型为 `None`。
+///
+/// 与 `price` / `overrides` 一样整包存 JSON 列（`models.local_json`），
+/// 拆成定宽列会让 repo 与 domain 两处定义漂移。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LocalMeta {
+    /// 运行时标识，与 `LocalEndpoint::id` 对应（ollama / lmstudio / …）
+    pub runtime: String,
+    /// 模型家族，例如 `gemma4` / `qwen3` / `llama`
+    #[serde(default)]
+    pub family: Option<String>,
+    /// 参数量原文，例如 `11.9B`
+    #[serde(default)]
+    pub parameter_size: Option<String>,
+    /// 量化档位，例如 `Q4_K_M`
+    #[serde(default)]
+    pub quantization: Option<String>,
+    /// 磁盘占用字节数
+    #[serde(default)]
+    pub disk_bytes: Option<i64>,
+    /// 上游原样返回的能力列表，便于界面展示与排查
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// Provider 下的一个可调用模型
@@ -269,14 +378,85 @@ pub struct ModelRef {
     /// 是否接受视频输入
     #[serde(default)]
     pub supports_video: bool,
+    /// 是否具备思维链 / 推理能力。
+    ///
+    /// 来源是 Ollama `/api/tags` 的 `capabilities` 含 `"thinking"`，或由用户手工勾选。
+    /// `false` 的含义是「不确定是否支持」，因此必须按**不支持**处理——宁可让请求落到
+    /// 普通模型，也不要把一个会在 400 的 reasoning 参数发给上游。
+    #[serde(default)]
+    pub supports_thinking: bool,
     /// 是否支持流式
     pub supports_stream: bool,
+    /// 模型用途。旧配置缺失时按聊天模型处理。
+    #[serde(default)]
+    pub model_type: ModelType,
+    /// 可选的上游请求路径覆盖。必须以 `/` 开头，只允许同源路径；
+    /// 可用 `{model}` 占位上游模型 ID。留空时按模型类型走默认端点。
+    #[serde(default)]
+    pub upstream_path: Option<String>,
     /// 计价信息；未配置时为 `None`，缺失的花费必须显示为未知而不是 0。
     #[serde(default)]
     pub price: Option<ModelPrice>,
     /// 模型级参数覆盖；未配置时不改变请求。
     #[serde(default)]
     pub overrides: Option<ModelOverrides>,
+    /// 本地模型来源元数据；云端模型为 `None`。
+    #[serde(default)]
+    pub local: Option<LocalMeta>,
+}
+
+impl ModelRef {
+    pub fn validate_upstream_path(&self) -> Result<(), String> {
+        let Some(path) = self.upstream_path.as_deref() else {
+            return Ok(());
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(());
+        }
+        if !path.starts_with('/') {
+            return Err("上游请求路径必须以 / 开头".into());
+        }
+        if path.contains("://") || path.contains('?') || path.contains('#') || path.contains('\\') {
+            return Err("上游请求路径不能包含协议、查询参数、片段或反斜杠".into());
+        }
+        if path
+            .split('/')
+            .any(|segment| segment == ".." || segment == ".")
+        {
+            return Err("上游请求路径不能包含 . 或 .. 路径段".into());
+        }
+        if path.len() > 2048 {
+            return Err("上游请求路径过长".into());
+        }
+        let mut open = false;
+        for character in path.chars() {
+            match character {
+                '{' if !open => open = true,
+                '}' if open => open = false,
+                '{' | '}' => return Err("上游请求路径中的占位符括号不匹配".into()),
+                _ => {}
+            }
+        }
+        if open {
+            return Err("上游请求路径中的占位符缺少右花括号".into());
+        }
+        let mut rest = path;
+        while let Some(start) = rest.find('{') {
+            let end = rest[start + 1..]
+                .find('}')
+                .map(|offset| start + 1 + offset)
+                .expect("balanced placeholder");
+            if &rest[start + 1..end] != "model" {
+                return Err(format!(
+                    "不支持的路径占位符 {{{}}}，仅支持 {{model}}",
+                    &rest[start + 1..end]
+                ));
+            }
+            rest = &rest[end + 1..];
+        }
+        Ok(())
+    }
 }
 
 /// 附加到上游请求的一个请求头。
@@ -448,6 +628,7 @@ pub struct PublicModel {
     pub id: String,
     pub object: String,
     pub owned_by: String,
+    pub model_type: ModelType,
     pub context_window: i32,
     pub supports_tools: bool,
     pub supports_vision: bool,

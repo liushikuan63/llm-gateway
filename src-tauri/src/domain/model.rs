@@ -189,4 +189,89 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// 已包含在 `prompt_tokens` 内的缓存命中 token。
+    #[serde(default)]
+    pub cache_read_tokens: u32,
+    /// 已包含在 `prompt_tokens` 内的缓存创建 token。
+    #[serde(default)]
+    pub cache_creation_tokens: u32,
+}
+
+impl Usage {
+    /// Anthropic 把普通输入、缓存命中与缓存创建拆开返回；其它方言通常直接给出
+    /// 包含缓存的总输入。对外输出 Anthropic 口径时需要恢复普通输入部分。
+    pub fn normal_input_tokens(&self) -> u32 {
+        let cached = self
+            .cache_read_tokens
+            .saturating_add(self.cache_creation_tokens)
+            .min(self.prompt_tokens);
+        self.prompt_tokens.saturating_sub(cached)
+    }
+
+    pub fn from_openai(value: &serde_json::Value) -> Self {
+        let prompt_tokens = json_u32(value.get("prompt_tokens"));
+        let completion_tokens = json_u32(value.get("completion_tokens"));
+        let details = value
+            .get("prompt_tokens_details")
+            .or_else(|| value.get("input_tokens_details"));
+        let cache_read_tokens = details
+            .and_then(|details| details.get("cached_tokens"))
+            .or_else(|| value.get("cache_read_input_tokens"))
+            .or_else(|| value.get("prompt_cache_hit_tokens"))
+            .map(|value| json_u32(Some(value)))
+            .unwrap_or(0);
+        let cache_creation_tokens = details
+            .and_then(|details| details.get("cache_write_tokens"))
+            .or_else(|| details.and_then(|details| details.get("cache_creation_tokens")))
+            .or_else(|| value.get("cache_creation_input_tokens"))
+            .or_else(|| value.get("prompt_cache_write_tokens"))
+            .map(|value| json_u32(Some(value)))
+            .unwrap_or(0);
+        let total_tokens = json_u32(value.get("total_tokens"))
+            .max(prompt_tokens.saturating_add(completion_tokens));
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        }
+    }
+
+    pub fn from_anthropic(value: &serde_json::Value) -> Self {
+        let input_tokens = json_u32(value.get("input_tokens"));
+        let cache_read_tokens = json_u32(value.get("cache_read_input_tokens"));
+        let cache_creation_tokens = json_u32(value.get("cache_creation_input_tokens"));
+        let prompt_tokens = input_tokens
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_creation_tokens);
+        let completion_tokens = json_u32(value.get("output_tokens"));
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            cache_read_tokens,
+            cache_creation_tokens,
+        }
+    }
+
+    pub fn from_gemini(value: &serde_json::Value) -> Self {
+        let prompt_tokens = json_u32(value.get("promptTokenCount"));
+        let completion_tokens = json_u32(value.get("candidatesTokenCount"));
+        let cache_read_tokens = json_u32(value.get("cachedContentTokenCount"));
+        let cache_creation_tokens = json_u32(value.get("cacheCreationTokenCount"));
+        let total_tokens = json_u32(value.get("totalTokenCount"))
+            .max(prompt_tokens.saturating_add(completion_tokens));
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        }
+    }
+}
+
+fn json_u32(value: Option<&serde_json::Value>) -> u32 {
+    value.and_then(serde_json::Value::as_u64).unwrap_or(0) as u32
 }

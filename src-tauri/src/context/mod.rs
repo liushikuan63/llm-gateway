@@ -136,6 +136,12 @@ impl ContextStore {
         // 标题取首条用户消息的前 30 字，UI 列表里能一眼认出来
         let title: String = first_user_msg.trim().chars().take(30).collect();
         if session.title.is_empty() && !title.is_empty() {
+            if repo::looks_like_encoding_loss(&title) {
+                tracing::warn!(
+                    session = %session_id,
+                    "会话标题疑似编码丢失（连续问号）：{title:?}"
+                );
+            }
             if let Some(updated_at) =
                 repo::set_session_title_if_empty(self.db.pool(), session_id, &title).await?
             {

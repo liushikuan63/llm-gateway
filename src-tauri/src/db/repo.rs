@@ -62,8 +62,8 @@ fn dialect_str(d: Dialect) -> &'static str {
 pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<ModelRef>> {
     let rows = sqlx::query(
         r#"SELECT alias, upstream, context_window, supports_tools, supports_vision,
-                  supports_audio, supports_video, supports_stream,
-                  price_json, overrides_json
+                  supports_audio, supports_video, supports_thinking, supports_stream, model_type,
+                  upstream_path, price_json, overrides_json, local_json
            FROM models WHERE provider_id = ? AND enabled = 1"#,
     )
     .bind(provider_id)
@@ -79,9 +79,13 @@ pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<
             supports_vision: r.get::<i64, _>("supports_vision") == 1,
             supports_audio: r.get::<i64, _>("supports_audio") == 1,
             supports_video: r.get::<i64, _>("supports_video") == 1,
+            supports_thinking: r.get::<i64, _>("supports_thinking") == 1,
             supports_stream: r.get::<i64, _>("supports_stream") == 1,
+            model_type: ModelType::parse(&r.get::<String, _>("model_type")).unwrap_or_default(),
+            upstream_path: r.get::<Option<String>, _>("upstream_path"),
             price: read_model_price(&r),
             overrides: read_model_overrides(&r),
+            local: read_local_meta(&r),
         })
         .collect())
 }
@@ -100,6 +104,14 @@ fn read_model_overrides(row: &sqlx::sqlite::SqliteRow) -> Option<ModelOverrides>
     let raw = row.get::<Option<String>, _>("overrides_json")?;
     let parsed: ModelOverrides = serde_json::from_str(&raw).ok()?;
     (!parsed.is_empty()).then_some(parsed)
+}
+
+/// 本地元数据只用于界面展示与排查，坏 JSON 不该挡住一次正常路由，
+/// 因此解析失败一律降级为 `None` 而不是报错。
+fn read_local_meta(row: &sqlx::sqlite::SqliteRow) -> Option<LocalMeta> {
+    let raw = row.get::<Option<String>, _>("local_json")?;
+    let parsed: LocalMeta = serde_json::from_str(&raw).ok()?;
+    (!parsed.runtime.trim().is_empty()).then_some(parsed)
 }
 
 pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
@@ -145,11 +157,17 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
             .as_ref()
             .filter(|overrides| !overrides.is_empty())
             .and_then(|overrides| serde_json::to_string(overrides).ok());
+        let local = m
+            .local
+            .as_ref()
+            .filter(|local| !local.runtime.trim().is_empty())
+            .and_then(|local| serde_json::to_string(local).ok());
         sqlx::query(
             r#"INSERT OR REPLACE INTO models
                  (id, provider_id, alias, upstream, context_window, supports_tools, supports_vision,
-                  supports_audio, supports_video, supports_stream, price_json, overrides_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                  supports_audio, supports_video, supports_thinking, supports_stream, model_type,
+                  upstream_path, price_json, overrides_json, local_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
         )
         .bind(format!("{}:{}", p.id, m.alias))
         .bind(&p.id)
@@ -160,9 +178,13 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
         .bind(m.supports_vision as i64)
         .bind(m.supports_audio as i64)
         .bind(m.supports_video as i64)
+        .bind(m.supports_thinking as i64)
         .bind(m.supports_stream as i64)
+        .bind(m.model_type.code())
+        .bind(&m.upstream_path)
         .bind(price)
         .bind(overrides)
+        .bind(local)
         .execute(pool)
         .await?;
     }
@@ -286,10 +308,12 @@ pub async fn list_public_models(pool: &SqlitePool) -> Result<Vec<PublicModel>> {
         context_window: i32,
         supports_tools: i64,
         supports_vision: i64,
+        model_type: String,
         pname: String,
     }
     let rows = sqlx::query_as::<_, Row1>(
-        r#"SELECT m.alias, m.upstream, m.context_window, m.supports_tools, m.supports_vision, p.name AS pname
+        r#"SELECT m.alias, m.upstream, m.context_window, m.supports_tools, m.supports_vision,
+                  m.model_type, p.name AS pname
            FROM models m JOIN providers p ON p.id = m.provider_id
            WHERE p.enabled = 1 AND m.enabled = 1
            ORDER BY m.alias"#,
@@ -304,6 +328,7 @@ pub async fn list_public_models(pool: &SqlitePool) -> Result<Vec<PublicModel>> {
             id: r.alias.clone(),
             object: "model".into(),
             owned_by: r.pname.clone(),
+            model_type: ModelType::parse(&r.model_type).unwrap_or_default(),
             context_window: r.context_window,
             supports_tools: r.supports_tools == 1,
             supports_vision: r.supports_vision == 1,
@@ -588,6 +613,12 @@ pub async fn append_turn(
 
     let title: String = user_content.trim().chars().take(40).collect();
     if !title.is_empty() {
+        if looks_like_encoding_loss(&title) {
+            tracing::warn!(
+                session = %session_id,
+                "会话标题疑似编码丢失（连续问号）：{title:?}"
+            );
+        }
         sqlx::query("UPDATE sessions SET title = ? WHERE id = ? AND (title IS NULL OR title = '')")
             .bind(title)
             .bind(session_id)
@@ -661,6 +692,19 @@ pub async fn append_exchange(
     {
         let title: String = title_source.trim().chars().take(40).collect();
         if !title.is_empty() {
+            // 标题若是「连续问号」，说明**客户端在发过来之前就已把非 ASCII 字符
+            // 替换成了 `?`**（GBK/Latin-1 客户端常见）。库里存下去就永久是问号，
+            // 界面上只看到 `???????,???`，完全无从判断是编码问题还是用户真输入的问号。
+            //
+            // 刻意**不改写标题**：擅自猜回原文比留问号更危险。
+            // 只记一条警告，让它可被检索到。
+            if looks_like_encoding_loss(&title) {
+                tracing::warn!(
+                    session = %session_id,
+                    "会话标题疑似编码丢失（连续问号）：{:?}",
+                    title
+                );
+            }
             sqlx::query(
                 "UPDATE sessions SET title = ? WHERE id = ? AND (title IS NULL OR title = '')",
             )
@@ -729,6 +773,29 @@ async fn insert_message_in_transaction(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// 文本是否疑似**编码丢失**（非 ASCII 字符在到达网关前已被替换成 `?`）。
+///
+/// 判据是**连续 3 个以上**的 `?`：
+/// - 单个问号极可能是用户真的在提问（"为什么报错?"），不能误报；
+/// - `???????,???` 这种成片出现，只可能来自编码转换（GBK/Latin-1 客户端、
+///   或某些 HTTP 库在序列化时用了 ASCII 编码）。
+///
+/// 只用于**告警与诊断**，绝不用来改写内容：擅自猜回原文比留问号更危险。
+pub fn looks_like_encoding_loss(text: &str) -> bool {
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if ch == '?' {
+            run += 1;
+            if run >= 3 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -869,6 +936,29 @@ pub struct RequestLog<'a> {
     pub estimated_prompt_tokens: Option<i64>,
     /// 逐跳降级明细（JSON 数组）。没有尝试明细时为 `None`。
     pub attempts_json: Option<&'a str>,
+    /// 智能模式与联网搜索的可观测信息。未启用时整块为默认值。
+    pub route: RouteTrace,
+}
+
+/// 智能模式 + 联网搜索在审计里的落点。
+///
+/// 合成一个子结构而不是往 `RequestLog` 上再摊四个字段：审计写入点有八九处，
+/// 每处多四行既难读也容易漏。默认全空代表「这两项功能没开」。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RouteTrace {
+    /// simple / vision / reasoning
+    pub intent: Option<String>,
+    /// rule / jev / heuristic
+    pub classifier: Option<String>,
+    /// 实际生效的搜索后端；`failed` 表示所有后端都不可用。
+    pub search: Option<String>,
+    /// 注入上下文的检索结果条数。
+    pub search_hits: Option<i64>,
+    /// 提示词是否被改写过。`Some(true)` 才表示真的替换了提示词；
+    /// `Some(false)` 表示触发了但用原文（失败、过短、超限等）。
+    pub refined: Option<bool>,
+    /// 改写前后的字符数，写成 `原文→新文` 的形式便于人工核对改写幅度。
+    pub refine_note: Option<String>,
 }
 
 pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
@@ -877,8 +967,10 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
         r#"INSERT INTO requests
              (ts, session_id, client, requested_model, routed_provider, routed_model, status,
               latency_ms, prompt_tokens, completion_tokens, fallback_attempts, error,
-              cost, currency, rate_label, estimated_prompt_tokens, attempts_json)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+              cost, currency, rate_label, estimated_prompt_tokens, attempts_json,
+              route_intent, route_classifier, route_search, route_search_hits,
+              route_refined, route_refine_note)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
     )
     .bind(ts)
     .bind(log.session_id)
@@ -897,6 +989,12 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
     .bind(log.rate_label)
     .bind(log.estimated_prompt_tokens)
     .bind(log.attempts_json)
+    .bind(log.route.intent.as_deref())
+    .bind(log.route.classifier.as_deref())
+    .bind(log.route.search.as_deref())
+    .bind(log.route.search_hits)
+    .bind(log.route.refined)
+    .bind(log.route.refine_note.as_deref())
     .execute(pool)
     .await?;
 
@@ -959,7 +1057,9 @@ pub async fn recent_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<serde_
     let rows = sqlx::query(
         r#"SELECT ts, client, requested_model, routed_provider, routed_model, status, latency_ms,
                   prompt_tokens, completion_tokens, fallback_attempts, error,
-                  cost, currency, rate_label, estimated_prompt_tokens, attempts_json
+                  cost, currency, rate_label, estimated_prompt_tokens, attempts_json,
+                  route_intent, route_classifier, route_search, route_search_hits,
+                  route_refined, route_refine_note
            FROM requests ORDER BY id DESC LIMIT ?"#,
     )
     .bind(limit)
@@ -987,6 +1087,12 @@ pub async fn recent_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<serde_
                 "attempts": r
                     .get::<Option<String>, _>("attempts_json")
                     .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()),
+                "route_intent": r.get::<Option<String>, _>("route_intent"),
+                "route_classifier": r.get::<Option<String>, _>("route_classifier"),
+                "route_search": r.get::<Option<String>, _>("route_search"),
+                "route_search_hits": r.get::<Option<i64>, _>("route_search_hits"),
+                "route_refined": r.get::<Option<i64>, _>("route_refined").map(|v| v != 0),
+                "route_refine_note": r.get::<Option<String>, _>("route_refine_note"),
             })
         })
         .collect())
@@ -1280,4 +1386,44 @@ pub async fn meta_set(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/* ----------------------------- App secrets ----------------------------- */
+
+/// 搜索后端 API Key 的存放位置。集中成一个常量，避免各处硬编码字符串写错。
+pub const SECRET_SEARCH_API_KEY: &str = "search.api_key";
+
+/// 读取应用级密钥的**密文**。解密由调用方用 `crypto.rs` 完成 ——
+/// 存储层不碰密钥学，出错面越小越好。
+pub async fn get_secret(pool: &SqlitePool, name: &str) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT value_enc FROM app_secrets WHERE name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| row.get("value_enc")))
+}
+
+pub async fn set_secret(pool: &SqlitePool, name: &str, value_enc: &str) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query(
+        r#"INSERT INTO app_secrets (name, value_enc, created_at, updated_at) VALUES (?,?,?,?)
+           ON CONFLICT(name) DO UPDATE SET value_enc = excluded.value_enc,
+                                           updated_at = excluded.updated_at"#,
+    )
+    .bind(name)
+    .bind(value_enc)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 返回是否真的删掉了一行，供调用方区分「本来就没有」与「删掉了」。
+pub async fn delete_secret(pool: &SqlitePool, name: &str) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM app_secrets WHERE name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }

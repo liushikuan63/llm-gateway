@@ -4,6 +4,302 @@ use serde::{Deserialize, Serialize};
 
 use crate::router::{RouteRule, RuleAction};
 
+/// 本地模型运行时。Ollama 有原生管理面（拉取、删除、能力元数据），
+/// 其余本机推理服务（LM Studio / vLLM / llama.cpp）只提供 OpenAI 兼容面。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalRuntimeKind {
+    #[default]
+    Ollama,
+    OpenAiCompatible,
+}
+
+/// 一个本机推理服务地址。默认四条覆盖绝大多数本地部署，用户可增删。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalEndpoint {
+    /// 稳定标识（`ollama` / `lmstudio` / `vllm` / `llamacpp` / 用户自定义）
+    pub id: String,
+    pub label: String,
+    /// 不带尾斜杠、不带 `/v1` 的根地址，例如 `http://127.0.0.1:11434`
+    pub base_url: String,
+    pub kind: LocalRuntimeKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LocalModelConfig {
+    /// 本地模型是否参与路由。关掉时本地 Provider 仍可手动指定，只是不进 `auto` 候选链。
+    pub enabled: bool,
+    /// 扫描到未登记的本地模型时是否自动登记为 Provider。
+    pub auto_register: bool,
+    /// 单端点探测超时。
+    pub probe_timeout_ms: u64,
+    pub endpoints: Vec<LocalEndpoint>,
+}
+
+impl Default for LocalEndpoint {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            base_url: String::new(),
+            kind: LocalRuntimeKind::Ollama,
+        }
+    }
+}
+
+impl Default for LocalModelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_register: false,
+            probe_timeout_ms: 1500,
+            endpoints: default_local_endpoints(),
+        }
+    }
+}
+
+/// 内置的四个默认端点。它们的端口是各运行时的官方默认值；端口不对的用户自行增删。
+pub fn default_local_endpoints() -> Vec<LocalEndpoint> {
+    vec![
+        LocalEndpoint {
+            id: "ollama".into(),
+            label: "Ollama".into(),
+            base_url: "http://127.0.0.1:11434".into(),
+            kind: LocalRuntimeKind::Ollama,
+        },
+        LocalEndpoint {
+            id: "lmstudio".into(),
+            label: "LM Studio".into(),
+            base_url: "http://127.0.0.1:1234".into(),
+            kind: LocalRuntimeKind::OpenAiCompatible,
+        },
+        LocalEndpoint {
+            id: "vllm".into(),
+            label: "vLLM".into(),
+            base_url: "http://127.0.0.1:8000".into(),
+            kind: LocalRuntimeKind::OpenAiCompatible,
+        },
+        LocalEndpoint {
+            id: "llamacpp".into(),
+            label: "llama.cpp server".into(),
+            base_url: "http://127.0.0.1:8080".into(),
+            kind: LocalRuntimeKind::OpenAiCompatible,
+        },
+    ]
+}
+
+/// 分类器来源。`Auto` = 有 Jev 就用、不可用或弃权则回落启发式。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartClassifier {
+    #[default]
+    Auto,
+    Jev,
+    Heuristic,
+}
+
+/// 本地 edgeJev / Ollama 决策模型的连接参数。
+///
+/// 端点是 `POST {base_url}/v1/systemone`。edgeJev 会忽略 `model` 字段
+/// （模型在 build 期就烧进 ONNX），Ollama 侧则必须给对。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct JevConfig {
+    pub base_url: String,
+    pub model: String,
+    pub timeout_ms: u64,
+    /// `state` 发送前的字符上限。edgeJev 的 `max_len` 是 1024 token，
+    /// 超长输入会被它静默截断；我们自己先截断，才能保证保留的是请求尾部
+    /// （真实诉求通常写在最后）。
+    pub max_state_chars: usize,
+    pub auto_start: AutoStartConfig,
+}
+
+/// edgeJev 不随开机自启，允许网关按需拉起它。启动外部进程是不可逆副作用，
+/// 因此默认关闭，路径与端口全部由用户在界面上显式填写。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AutoStartConfig {
+    pub enabled: bool,
+    /// 形如 `...\jev\.venv-runtime\Scripts\edgejev.exe`
+    pub exe_path: String,
+    /// **入口脚本**，可选。填了就用 `<exe_path> <script_path> <其余参数…>` 启动。
+    ///
+    /// 为什么需要它：edgeJev 的实际启动方式不是固定的 exe。本机在 2026-10-05
+    /// 换成了 `.venv-runtime\Scripts\python.exe start_jev.py` —— 没有 `edgejev.exe`，
+    /// 只有一个 console-script 启动器（而且它 import 的模块已随清理丢失）。
+    /// 只有 `exe_path` 一个字段时，这种布局**根本无法表达**，自动拉起是废的。
+    ///
+    /// 留空表示「exe 本身就是入口」，保持旧布局的写法不变。
+    pub script_path: String,
+    /// 形如 `...\jev\jev-int8`
+    pub model_dir: String,
+    pub port: u16,
+    pub threads: u32,
+    /// 加载 320MB ONNX 实测需 10–15 秒，默认给 20 秒。
+    pub boot_wait_ms: u64,
+}
+
+impl Default for AutoStartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            exe_path: String::new(),
+            script_path: String::new(),
+            model_dir: String::new(),
+            port: 8009,
+            threads: 8,
+            boot_wait_ms: 20_000,
+        }
+    }
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "http://127.0.0.1:8009".into(),
+            model: "rl-agent".into(),
+            timeout_ms: 1200,
+            max_state_chars: 2000,
+            auto_start: AutoStartConfig::default(),
+        }
+    }
+}
+
+/// 提示词预优化。
+///
+/// Jev 只负责判断「这条提示词是不是含糊到需要先改写」——它**产不出文本**
+/// （scoring pass，`output_tokens` 恒为 0）。改写本身必须靠一次独立的小模型调用。
+///
+/// 这两件事必须分开，因为它们的失败模式完全不同：Jev 挂掉只是判定不出，
+/// 而改写模型挂掉或者改坏了，是会**直接污染发给上游的提示词**的。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PromptRefineConfig {
+    pub enabled: bool,
+    /// 指定改写用的供应商。留空则用当前候选链里 `supports_thinking=false` 的最轻模型。
+    pub provider_id: Option<String>,
+    /// 覆盖改写模型名。留空则用该供应商下的第一个 `supports_thinking=false` 模型。
+    pub model: Option<String>,
+    /// 硬超时。改写是锦上添花，绝不能拖慢主请求。
+    pub timeout_ms: u64,
+    /// 改写结果的长度上限。超过就判定改写失败并用原文——
+    /// 一个把 30 字请求膨胀成 800 字的「优化」是在制造问题。
+    pub max_chars: usize,
+    /// Jev 的 `clarity` noul 高于此值才认为「提示词够清楚，不需要改写」。
+    /// 低于此值即视为含糊。这个阈值比 `needs_web` 的 0.85 更宽松，
+    /// 因为判「含糊」比判「必须联网」容易得多。
+    pub clarity_noul: f32,
+    /// 短于这个长度的提示词一律不改写。短句缺上下文是常态，
+    /// 逐条去改写只会浪费一次网络往返并引入风险。
+    pub min_chars: usize,
+}
+
+impl Default for PromptRefineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider_id: None,
+            model: None,
+            timeout_ms: 2000,
+            max_chars: 2000,
+            clarity_noul: 0.72,
+            min_chars: 24,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SmartRoutingConfig {
+    pub enabled: bool,
+    pub classifier: SmartClassifier,
+    pub jev: JevConfig,
+    pub timeout_ms: u64,
+    /// Jev 自报置信度低于此值 → 弃权，回落启发式。
+    pub min_confidence: f32,
+    /// `p_top1 - p_top2` 低于此值 → 分布近均匀，说明模型自己也分不清 → 弃权。
+    pub min_margin: f32,
+    pub prompt_refine: PromptRefineConfig,
+}
+
+impl Default for SmartRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            classifier: SmartClassifier::Auto,
+            jev: JevConfig::default(),
+            timeout_ms: 1200,
+            min_confidence: 0.35,
+            min_margin: 0.25,
+            prompt_refine: PromptRefineConfig::default(),
+        }
+    }
+}
+
+/// 联网搜索后端。DuckDuckGo 不需要任何凭据，是最后兜底。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackendKind {
+    Tavily,
+    Brave,
+    SearXng,
+    /// 必应中国站。**免 Key、本机实测可用**（248 ms 响应、解析出 10 条真实结果），
+    /// 是本机唯一能真正工作的免 Key 后端。
+    ///
+    /// `serde(rename_all = "snake_case")` 下变体名会变成 `bing_cn`（下划线），
+    /// **不是** `bingcn`。写错会让 TOML 解析失败、整个应用起不来——
+    /// 这个坑真踩过，见 0.3.0验证记录 §4.11。
+    BingCn,
+    #[default]
+    DuckDuckGo,
+}
+
+/// 检索结果以什么身份注入上下文。作为 system 消息比塞进 system prompt 开头安全，
+/// 避免长检索结果挤掉真正的指令。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchInjectFormat {
+    #[default]
+    System,
+    User,
+}
+
+/// **只含非密钥字段**。搜索 API Key 存 SQLite `app_secrets`（AES-256-GCM 密文），
+/// 绝不进 config.toml —— 后者会随项目快照一起传播。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SearchConfig {
+    pub enabled: bool,
+    pub backend: SearchBackendKind,
+    /// SearXNG 自建实例根地址；其他后端忽略。
+    pub searxng_url: Option<String>,
+    pub max_results: u32,
+    pub timeout_ms: u64,
+    pub inject_as: SearchInjectFormat,
+}
+
+impl SearchConfig {
+    /// 结果条数必须落在 1..=10。UI 与手改 TOML 两条路径都会走到这里。
+    pub fn normalized_max_results(&self) -> u32 {
+        self.max_results.clamp(1, 10)
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: SearchBackendKind::DuckDuckGo,
+            searxng_url: None,
+            max_results: 5,
+            timeout_ms: 8000,
+            inject_as: SearchInjectFormat::System,
+        }
+    }
+}
+
 /// 应用级配置（落盘为 config.toml，可被「项目快照」整体打包/还原）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,7 +321,16 @@ pub struct AppConfig {
     pub custom_rules: Vec<RouteRule>,
     /// 最大降级重试次数（FreeLLMAPI 用 20，这里默认 8，够用且更快失败）
     pub max_fallback_attempts: usize,
-    /// 上游超时（秒）
+    /// 上游超时（秒）。
+    ///
+    /// **默认 600 而不是 120**，依据是本机实测（`docs/0.3.0验证记录.md` §4.10）：
+    /// `qwen3.8:27b-q4_K_M` 在本机 CPU 上约 **1.1 秒/token**，一条要求
+    /// 「容量估算与一致性证明」的回答实测要 **271 秒**。
+    /// 原来的 120 秒对本项目主打的本地模型场景是**必然超时**——
+    /// 一问就 504，功能等于不可用。
+    ///
+    /// 设长只影响「上游真的挂了要等更久才报错」；设短会让慢但正常的模型
+    /// 被误判成故障。两害相权，取后者。跑云端模型觉得等太久可以在设置里调小。
     pub upstream_timeout_secs: u64,
     /// 粘性会话有效期（秒）。FreeLLMAPI 取 30 分钟。
     pub sticky_ttl_secs: i64,
@@ -46,6 +351,12 @@ pub struct AppConfig {
     pub catalog_feed_url: Option<String>,
     /// 热切换：把已接管的 CLI 工具的 base_url 指向本地网关
     pub takeover: TakeoverConfig,
+    /// 本地模型运行时扫描与登记
+    pub local_models: LocalModelConfig,
+    /// 智能模式：请求先分类再选模
+    pub smart_routing: SmartRoutingConfig,
+    /// 网关内置联网搜索（不含密钥）
+    pub search: SearchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -57,6 +368,10 @@ pub struct TakeoverConfig {
     pub codex: bool,
     /// 写入 ~/.gemini/.env
     pub gemini_cli: bool,
+    /// 写入 ~/.config/opencode/opencode.json
+    pub opencode: bool,
+    /// 写入 ~/.config/crush/crushrc
+    pub crush: bool,
 }
 
 /// 远程模式的非密钥配置。客户端访问 Key 单独存入 SQLite，避免随 config.toml
@@ -86,6 +401,11 @@ pub enum RoutingStrategy {
     Reliable,
     /// 按模型名前缀/正则规则匹配（见 router.rs）
     Custom,
+    /// 智能模式：先把请求定性（简单 / 图像 / 复杂思考），再按定性挑模型。
+    ///
+    /// 分类优先用本地 Jev 决策模型，不可用时回落启发式规则。
+    /// **这一档是增量**：`auto` 与其余六档的行为不因它的存在而改变。
+    Smart,
 }
 
 impl Default for AppConfig {
@@ -99,7 +419,7 @@ impl Default for AppConfig {
             routing_strategy: RoutingStrategy::Priority,
             custom_rules: Vec::new(),
             max_fallback_attempts: 8,
-            upstream_timeout_secs: 120,
+            upstream_timeout_secs: 600,
             sticky_ttl_secs: 30 * 60,
             compact_threshold_tokens: 60_000,
             compact_keep_recent: 12,
@@ -110,38 +430,112 @@ impl Default for AppConfig {
             catalog_auto_update: false,
             catalog_feed_url: None,
             takeover: TakeoverConfig::default(),
+            local_models: LocalModelConfig::default(),
+            smart_routing: SmartRoutingConfig::default(),
+            search: SearchConfig::default(),
         }
     }
 }
 
 impl AppConfig {
+    /// 读配置；**读坏了也不让应用起不来**。
+    ///
+    /// 解析或语义校验失败时，把坏文件挪到 `config.corrupt-<时间戳>.toml`，
+    /// 写一份默认配置回去，然后**照常返回默认配置**。
+    /// 第二个返回值是要给用户看的说明（`None` = 没降级）。
+    ///
+    /// 为什么不直接失败：配置文件是用户（和手工编辑）能改的东西，
+    /// 一个枚举值拼错就让整个应用打不开、连界面都看不到，用户既没法用也没法自救。
+    /// 实测踩过：`backend = "duckduckgo"`（正确是 `duck_duck_go`）→ 网关不监听、
+    /// 窗口只剩一个空壳。
+    ///
+    /// 为什么不用 `#[serde(other)]` 之类的容错：那只会悄悄把一个错值当成别的值
+    /// （比如当成 `brave`），用户看到「换了后端怎么行为变了」比看不到更费解。
+    /// 降级必须**可见且可回滚**。
     pub fn load_or_init() -> anyhow::Result<Self> {
-        let p = config_path();
-        if p.exists() {
-            let s = std::fs::read_to_string(&p)?;
-            let mut cfg: AppConfig = toml::from_str(&s)?;
-            let original_bind = cfg.bind.clone();
-            let original_allow_lan = cfg.allow_lan;
-            let original_custom_rules = cfg.custom_rules.clone();
-            cfg.normalize_custom_rules();
-            cfg.validate_custom_rules()?;
-            cfg.normalize_listener();
-            cfg.validate_remote_mode()?;
-            // 不能相信手工编辑过的 bind。把规范化结果写回，下一次启动不会再次
-            // 短暂读取到意外的公网/错误地址。
-            if cfg.bind != original_bind
-                || cfg.allow_lan != original_allow_lan
-                || cfg.custom_rules != original_custom_rules
-            {
-                cfg.write_to(&p)?;
-            }
-            Ok(cfg)
-        } else {
+        let (cfg, _) = Self::load_or_init_with_warning()?;
+        Ok(cfg)
+    }
+
+    /// 同 [`load_or_init`]，但把降级说明一并返回。
+    pub fn load_or_init_with_warning() -> anyhow::Result<(Self, Option<String>)> {
+        Self::load_or_init_at(&config_path())
+    }
+
+    /// 同 [`load_or_init_with_warning`]，但**路径由调用方指定**。
+    ///
+    /// 单独暴露是为了让测试能在临时目录里跑真实的降级/非降级两条路径，
+    /// 而不去碰运行中应用的 `config.toml`（生产配置文件绝不能被测试改写）。
+    pub fn load_or_init_at(p: &std::path::Path) -> anyhow::Result<(Self, Option<String>)> {
+        let p = p.to_path_buf();
+        if !p.exists() {
             let cfg = Self::default();
-            std::fs::create_dir_all(p.parent().unwrap())?;
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::write(&p, toml::to_string_pretty(&cfg)?)?;
-            Ok(cfg)
+            return Ok((cfg, None));
         }
+        match Self::read_existing(&p) {
+            Ok(cfg) => Ok((cfg, None)),
+            Err(error) => {
+                let backup = Self::quarantine_bad_config(&p);
+                tracing::error!("config.toml 不可用（{error}），已回退默认配置");
+                let cfg = Self::default();
+                // 写回默认配置：否则下一次启动还会读到同一份坏文件、反复降级，
+                // 而且用户在界面上看到的是坏的旧值，改什么都会被覆盖回去。
+                if let Err(write_error) = std::fs::write(&p, toml::to_string_pretty(&cfg)?) {
+                    tracing::error!("回退默认配置失败：{write_error}");
+                }
+                let notice = match backup {
+                    Ok(path) => format!(
+                        "配置文件格式有误（{error}），已回退到默认设置。原文件已保留在 {}\n请修正后改回 config.toml。",
+                        display_name_of(&path)
+                    ),
+                    Err(_) => format!(
+                        "配置文件格式有误（{error}），已回退到默认设置。原文件未能备份，请查看日志。"
+                    ),
+                };
+                Ok((cfg, Some(notice)))
+            }
+        }
+    }
+
+    /// 读取并规范化现有配置。**不做降级**，失败就返回 Err（由调用方决定怎么办）。
+    fn read_existing(p: &std::path::Path) -> anyhow::Result<Self> {
+        let s = std::fs::read_to_string(p)?;
+        let mut cfg: AppConfig = toml::from_str(&s)?;
+        let original_bind = cfg.bind.clone();
+        let original_allow_lan = cfg.allow_lan;
+        let original_custom_rules = cfg.custom_rules.clone();
+        let original_search_results = cfg.search.max_results;
+        cfg.normalize_custom_rules();
+        cfg.validate_custom_rules()?;
+        cfg.normalize_local();
+        cfg.validate_local()?;
+        cfg.normalize_listener();
+        cfg.validate_remote_mode()?;
+        // 不能相信手工编辑过的 bind。把规范化结果写回，下一次启动不会再次
+        // 短暂读取到意外的公网/错误地址。
+        if cfg.bind != original_bind
+            || cfg.allow_lan != original_allow_lan
+            || cfg.custom_rules != original_custom_rules
+            || cfg.search.max_results != original_search_results
+        {
+            cfg.write_to(p)?;
+        }
+        Ok(cfg)
+    }
+
+    /// 把坏配置挪到同目录的 `config.corrupt-<秒级时间戳>.toml`。
+    ///
+    /// 用**挪**而不是复制：留下一个仍叫 `config.toml` 的坏文件，下次启动
+    /// 还会再降级一次，且用户不知道该改哪个。
+    fn quarantine_bad_config(p: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+        let stamp = chrono::Utc::now().timestamp();
+        let backup = p.with_file_name(format!("config.corrupt-{stamp}.toml"));
+        std::fs::rename(p, &backup)?;
+        Ok(backup)
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -149,6 +543,8 @@ impl AppConfig {
         let mut normalized = self.clone();
         normalized.normalize_custom_rules();
         normalized.validate_custom_rules()?;
+        normalized.normalize_local();
+        normalized.validate_local()?;
         normalized.normalize_listener();
         normalized.validate_remote_mode()?;
         normalized.write_to(&p)?;
@@ -181,6 +577,56 @@ impl AppConfig {
                 }
             }
         }
+    }
+
+    /// 归一化本地模型、智能模式与搜索三块配置。
+    ///
+    /// 这些字段既有 UI 表单也有手改 TOML 两条入口，必须在这里统一收口：
+    /// 条数钳位、地址去尾斜杠、超时下限。归一化后立即回写，避免下一次启动
+    /// 又读到一份越界值。
+    pub fn normalize_local(&mut self) {
+        self.search.max_results = self.search.normalized_max_results();
+        self.search.timeout_ms = self.search.timeout_ms.clamp(500, 60_000);
+        self.local_models.probe_timeout_ms = self.local_models.probe_timeout_ms.clamp(200, 30_000);
+        self.smart_routing.timeout_ms = self.smart_routing.timeout_ms.clamp(100, 30_000);
+        self.smart_routing.min_confidence = self.smart_routing.min_confidence.clamp(0.0, 1.0);
+        self.smart_routing.min_margin = self.smart_routing.min_margin.clamp(0.0, 1.0);
+        self.smart_routing.jev.timeout_ms = self.smart_routing.jev.timeout_ms.clamp(100, 30_000);
+        // edgeJev 的 max_len 是 1024 token；留 0 会让 state 不受控地膨胀，
+        // 而上游会静默截断到开头——真实诉求通常写在最后。
+        self.smart_routing.jev.max_state_chars = self.smart_routing.jev.max_state_chars.clamp(64, 16_000);
+        for endpoint in &mut self.local_models.endpoints {
+            endpoint.base_url = endpoint.base_url.trim().trim_end_matches('/').to_owned();
+        }
+        if let Some(url) = self.search.searxng_url.as_mut() {
+            *url = url.trim().trim_end_matches('/').to_owned();
+            if url.is_empty() {
+                self.search.searxng_url = None;
+            }
+        }
+    }
+
+    /// 地址类字段只接受 http/https。本地端点与 SearXNG 实例都由用户填写，
+    /// 不校验就等于给了任意协议拼接的口子。返回面向用户的中文错误。
+    pub fn validate_local(&self) -> anyhow::Result<()> {
+        for endpoint in &self.local_models.endpoints {
+            if endpoint.base_url.trim().is_empty() {
+                anyhow::bail!("本地端点「{}」的地址不能为空", endpoint.label);
+            }
+            validate_http_url(&endpoint.base_url)?;
+        }
+        validate_http_url(&self.smart_routing.jev.base_url)?;
+        if let Some(url) = self.search.searxng_url.as_deref() {
+            validate_http_url(url)?;
+        }
+        if matches!(
+            self.search.backend,
+            SearchBackendKind::SearXng
+        ) && self.search.searxng_url.as_deref().unwrap_or("").trim().is_empty()
+        {
+            anyhow::bail!("选择 SearXNG 后端时必须填写实例地址");
+        }
+        Ok(())
     }
 
     /// 规则必须能够清晰地表达匹配对象。空前缀会无意中匹配全部模型，因此要求
@@ -252,6 +698,21 @@ impl AppConfig {
     }
 }
 
+/// 本地端点、Jev 决策端点、SearXNG 实例这三类地址都由用户自由填写。
+/// 只放行 http/https 并要求带主机名，避免把任意字符串拼进请求 URL。
+pub fn validate_http_url(raw: &str) -> anyhow::Result<()> {
+    let raw = raw.trim();
+    let url = reqwest::Url::parse(raw)
+        .map_err(|error| anyhow::anyhow!("地址无效：{error}"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        anyhow::bail!("地址只允许 http 或 https，实际是 {}", url.scheme());
+    }
+    if url.host_str().unwrap_or("").trim().is_empty() {
+        anyhow::bail!("地址缺少主机名");
+    }
+    Ok(())
+}
+
 pub fn app_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -260,6 +721,13 @@ pub fn app_data_dir() -> PathBuf {
 
 pub fn config_path() -> PathBuf {
     app_data_dir().join("config.toml")
+}
+
+/// 降级提示里给用户看的文件名（不展开整条绝对路径，界面上太长）。
+fn display_name_of(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 pub fn db_path() -> PathBuf {
