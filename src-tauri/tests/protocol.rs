@@ -1,5 +1,6 @@
 use llm_gateway_lib::domain::{
-    ChatRequest, ChatResponse, Content, FunctionCall, Message, Role, ToolCall, Usage,
+    ChatRequest, ChatResponse, Content, FunctionCall, ImageUrl, Message, Part, Role, ToolCall,
+    Usage,
 };
 use llm_gateway_lib::protocol::{anthropic, convert, gemini, ollama, openai};
 use serde_json::json;
@@ -56,6 +57,109 @@ fn openai_request_maps_roles_and_preserves_unknown_fields() {
     assert_eq!(ir.max_tokens, Some(100));
     assert_eq!(ir.extra["user"], json!("tenant-alice"));
     assert_eq!(ir.extra["future_option"], json!({ "enabled": true }));
+}
+
+#[test]
+fn openai_image_detail_normalizes_codex_original_and_drops_unknown_values() {
+    let req = request(vec![Message {
+        role: Role::User,
+        content: Content::Parts(vec![
+            Part::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.test/codex-original.png".into(),
+                    detail: Some("original".into()),
+                },
+            },
+            Part::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.test/unknown-detail.png".into(),
+                    detail: Some("maximum".into()),
+                },
+            },
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    }]);
+
+    let upstream = openai::to_upstream_body(&req, "gpt-4o");
+    let parts = upstream["messages"][0]["content"].as_array().unwrap();
+
+    assert_eq!(parts[0]["image_url"]["detail"], json!("high"));
+    assert!(parts[1]["image_url"].get("detail").is_none());
+}
+
+#[test]
+fn openai_chat_video_parts_become_video_url_in_ir() {
+    let input: openai::OaChatRequest = serde_json::from_value(json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "描述视频" },
+                { "type": "video_url", "video_url": { "url": "https://example.test/clip.mp4" } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let ir = input.to_internal().unwrap();
+    let Content::Parts(parts) = &ir.messages[0].content else {
+        panic!("expected multimodal content");
+    };
+    assert!(parts.iter().any(|part| matches!(
+        part,
+        Part::VideoUrl { video_url } if video_url.url == "https://example.test/clip.mp4"
+    )));
+}
+
+#[test]
+fn cache_usage_details_are_preserved_across_protocols() {
+    let openai = convert::openai_response_to_internal(&json!({
+        "choices": [{ "message": { "role": "assistant", "content": "ok" } }],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110,
+            "prompt_tokens_details": { "cached_tokens": 60, "cache_write_tokens": 20 }
+        }
+    }))
+    .usage
+    .unwrap();
+    assert_eq!(openai.cache_read_tokens, 60);
+    assert_eq!(openai.cache_creation_tokens, 20);
+    assert_eq!(openai.normal_input_tokens(), 20);
+
+    let anthropic = anthropic::anthropic_to_internal(&json!({
+        "id": "msg_cache",
+        "model": "claude",
+        "content": [{ "type": "text", "text": "ok" }],
+        "usage": {
+            "input_tokens": 100,
+            "cache_read_input_tokens": 200,
+            "cache_creation_input_tokens": 50,
+            "output_tokens": 10
+        }
+    }))
+    .usage
+    .unwrap();
+    assert_eq!(anthropic.prompt_tokens, 350);
+    assert_eq!(anthropic.cache_read_tokens, 200);
+    assert_eq!(anthropic.cache_creation_tokens, 50);
+    assert_eq!(anthropic.normal_input_tokens(), 100);
+
+    let gemini = gemini::from_gemini_response(&json!({
+        "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
+        "usageMetadata": {
+            "promptTokenCount": 100,
+            "candidatesTokenCount": 10,
+            "totalTokenCount": 110,
+            "cachedContentTokenCount": 40
+        }
+    }))
+    .usage
+    .unwrap();
+    assert_eq!(gemini.cache_read_tokens, 40);
+    assert_eq!(gemini.normal_input_tokens(), 60);
 }
 
 #[test]
@@ -173,6 +277,7 @@ fn openai_tool_calls_round_trip_with_type_not_internal_kind() {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 total_tokens: 3,
+                ..Default::default()
             }),
         },
     );

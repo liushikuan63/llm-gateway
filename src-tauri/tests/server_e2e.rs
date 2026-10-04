@@ -24,6 +24,7 @@ struct MockState {
 #[derive(Clone)]
 enum OpenAiBehavior {
     Complete(&'static str),
+    CompleteWithCachedUsage(&'static str),
     Status(StatusCode),
     Html,
     TruncatedJson,
@@ -53,9 +54,13 @@ fn provider(id: &str, base_url: String, dialect: Dialect, priority: i32) -> Prov
             supports_vision: false,
             supports_audio: false,
             supports_video: false,
+            supports_thinking: false,
             supports_stream: true,
+            model_type: llm_gateway_lib::domain::ModelType::Chat,
+            upstream_path: None,
             price: None,
             overrides: None,
+            local: None,
         }],
         rpm_limit: 0,
         intelligence: 50,
@@ -70,7 +75,63 @@ async fn mock_openai_chat(
     Json(request): Json<serde_json::Value>,
 ) -> Response {
     mock.state.hits.fetch_add(1, Ordering::SeqCst);
-    mock.state.requests.lock().unwrap().push(request);
+    mock.state.requests.lock().unwrap().push(request.clone());
+
+    if request
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let (content, usage) = match &mock.behavior {
+            OpenAiBehavior::Complete(content) => (
+                *content,
+                serde_json::json!({
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5
+                }),
+            ),
+            OpenAiBehavior::CompleteWithCachedUsage(content) => (
+                *content,
+                serde_json::json!({
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 8,
+                        "cache_write_tokens": 1
+                    }
+                }),
+            ),
+            _ => ("", serde_json::json!({})),
+        };
+        if !content.is_empty() {
+            let first = serde_json::json!({
+                "id": "chatcmpl-stream",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": content }
+                }]
+            });
+            let finish = serde_json::json!({
+                "id": "chatcmpl-stream",
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+            });
+            let usage = serde_json::json!({
+                "id": "chatcmpl-stream",
+                "choices": [],
+                "usage": usage
+            });
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(
+                    format!("data: {first}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
+                        .into(),
+                )
+                .unwrap();
+        }
+    }
 
     match mock.behavior {
         OpenAiBehavior::Complete(content) => Json(serde_json::json!({
@@ -83,6 +144,26 @@ async fn mock_openai_chat(
                 "finish_reason": "stop",
             }],
             "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 },
+        }))
+        .into_response(),
+        OpenAiBehavior::CompleteWithCachedUsage(content) => Json(serde_json::json!({
+            "id": "chatcmpl-cache",
+            "object": "chat.completion",
+            "model": "integration-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "prompt_tokens_details": {
+                    "cached_tokens": 8,
+                    "cache_write_tokens": 1
+                }
+            },
         }))
         .into_response(),
         OpenAiBehavior::Status(status) => (
@@ -105,12 +186,59 @@ async fn mock_openai_chat(
     }
 }
 
+async fn mock_openai_embeddings(
+    State(mock): State<OpenAiMock>,
+    _uri: axum::http::Uri,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    mock.state.hits.fetch_add(1, Ordering::SeqCst);
+    mock.state.requests.lock().unwrap().push(request);
+    Json(serde_json::json!({
+        "object": "list",
+        "data": [{ "object": "embedding", "embedding": [0.9], "index": 0 }],
+        "model": "integration-model",
+        "usage": { "prompt_tokens": 2, "total_tokens": 2 },
+    }))
+    .into_response()
+}
+
+async fn mock_openai_images(
+    State(mock): State<OpenAiMock>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    mock.state.hits.fetch_add(1, Ordering::SeqCst);
+    mock.state.requests.lock().unwrap().push(request);
+    Json(serde_json::json!({
+        "created": 1,
+        "data": [{ "b64_json": "AAAA" }],
+    }))
+    .into_response()
+}
+
+async fn mock_openai_speech(
+    State(mock): State<OpenAiMock>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    mock.state.hits.fetch_add(1, Ordering::SeqCst);
+    mock.state.requests.lock().unwrap().push(request);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "audio/mpeg")
+        .body("ID3mock-audio".into())
+        .unwrap()
+}
+
 async fn spawn_openai_upstream(behavior: OpenAiBehavior) -> (String, MockState, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let state = MockState::default();
     let app = Router::new()
         .route("/v1/chat/completions", post(mock_openai_chat))
+        .route("/v1/embeddings", post(mock_openai_embeddings))
+        .route("/v1/images/generations", post(mock_openai_images))
+        .route("/v1/audio/speech", post(mock_openai_speech))
+        .route("/custom/embed", post(mock_openai_embeddings))
+        .route("/custom/models/:model/chat", post(mock_openai_chat))
         .with_state(OpenAiMock {
             state: state.clone(),
             behavior,
@@ -211,6 +339,14 @@ fn openai_body(model: &str) -> serde_json::Value {
         "model": model,
         "messages": [{ "role": "user", "content": "hello" }],
     })
+}
+
+fn parse_sse_json(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter_map(|line| line.trim().strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
 }
 
 #[tokio::test]
@@ -515,6 +651,464 @@ async fn responses_non_streaming_string_input_uses_responses_output_contract() {
 }
 
 #[tokio::test]
+async fn responses_remote_compaction_v2_returns_one_compaction_item_and_round_trips() {
+    let (upstream_url, state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("任务摘要：目标、进度、待办")).await;
+    let (_db, config, gateway_task, base_url) = spawn_gateway(vec![provider(
+        "compaction",
+        upstream_url,
+        Dialect::OpenAI,
+        1,
+    )])
+    .await;
+    let client = reqwest::Client::new();
+
+    let compact = client
+        .post(format!("{base_url}/v1/responses"))
+        .bearer_auth(&config.unified_key)
+        .json(&serde_json::json!({
+            "model": "integration-model",
+            "stream": true,
+            "input": [
+                { "type": "message", "role": "user", "content": "原始任务上下文" },
+                { "type": "compaction_trigger" }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(compact.status(), StatusCode::OK);
+    let events = parse_sse_json(&compact.text().await.unwrap());
+    let items = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), 1, "Codex V2 必须收到恰好一个输出项");
+    assert_eq!(items[0]["item"]["type"], "compaction");
+    let encrypted = items[0]["item"]["encrypted_content"]
+        .as_str()
+        .expect("compaction encrypted_content");
+    assert!(encrypted.starts_with("llm-gateway-compaction-v1:"));
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "response.completed"));
+
+    let compact_upstream = state.requests.lock().unwrap()[0].clone();
+    assert!(!compact_upstream.to_string().contains("compaction_trigger"));
+    assert_eq!(compact_upstream["messages"][0]["role"], "system");
+    assert!(compact_upstream["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("结构化"));
+
+    let follow_up = client
+        .post(format!("{base_url}/v1/responses"))
+        .bearer_auth(&config.unified_key)
+        .json(&serde_json::json!({
+            "model": "integration-model",
+            "input": [
+                { "type": "compaction", "encrypted_content": encrypted },
+                { "type": "message", "role": "user", "content": "继续下一步" }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(follow_up.status(), StatusCode::OK);
+    let follow_up_upstream = state.requests.lock().unwrap().last().cloned().unwrap();
+    assert!(follow_up_upstream["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message["role"] == "system"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("任务摘要"))
+        }));
+
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn responses_media_parts_survive_openai_conversion() {
+    let (upstream_url, state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("media reply")).await;
+    let mut multimodal = provider("multimodal", upstream_url, Dialect::OpenAI, 1);
+    multimodal.models[0].supports_vision = true;
+    multimodal.models[0].supports_audio = true;
+    multimodal.models[0].supports_video = true;
+    let (_db, config, gateway_task, base_url) = spawn_gateway(vec![multimodal]).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/responses"))
+        .bearer_auth(&config.unified_key)
+        .json(&serde_json::json!({
+            "model": "integration-model",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "分析" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,AAAA" },
+                    { "type": "input_audio", "input_audio": { "data": "BBBB", "format": "wav" } },
+                    { "type": "input_video", "video_url": "https://www.youtube.com/watch?v=abc" }
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let upstream = state.requests.lock().unwrap().last().cloned().unwrap();
+    let parts = upstream["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(parts[1]["type"], "image_url");
+    assert_eq!(parts[2]["type"], "input_audio");
+    assert_eq!(parts[3]["type"], "video_url");
+
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn non_chat_model_types_route_to_their_dedicated_openai_endpoints() {
+    let (upstream_url, state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("unused")).await;
+    let mut embedding = provider("embedding", upstream_url.clone(), Dialect::OpenAI, 1);
+    embedding.models[0].model_type = llm_gateway_lib::domain::ModelType::Embedding;
+    embedding.models[0].upstream_path = Some("/custom/embed".into());
+    let mut image = provider("image", upstream_url.clone(), Dialect::OpenAI, 2);
+    image.models[0].model_type = llm_gateway_lib::domain::ModelType::Image;
+    let mut speech = provider("speech", upstream_url, Dialect::OpenAI, 3);
+    speech.models[0].model_type = llm_gateway_lib::domain::ModelType::Speech;
+    let (_db, config, gateway_task, base_url) = spawn_gateway(vec![embedding, image, speech]).await;
+    let client = reqwest::Client::new();
+
+    let embedding_response = client
+        .post(format!("{base_url}/v1/embeddings"))
+        .bearer_auth(&config.unified_key)
+        .json(&serde_json::json!({ "model": "integration-model", "input": "hello" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(embedding_response.status(), StatusCode::OK);
+    assert_eq!(
+        embedding_response.headers()["x-routed-via"],
+        "embedding/integration-model"
+    );
+    let embedding_body: serde_json::Value = embedding_response.json().await.unwrap();
+    assert_eq!(embedding_body["data"][0]["embedding"][0], 0.9);
+
+    let image_response = client
+        .post(format!("{base_url}/v1/images/generations"))
+        .bearer_auth(&config.unified_key)
+        .json(&serde_json::json!({ "model": "integration-model", "prompt": "a cat" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(image_response.status(), StatusCode::OK);
+    assert_eq!(
+        image_response.headers()["x-routed-via"],
+        "image/integration-model"
+    );
+    let image_body: serde_json::Value = image_response.json().await.unwrap();
+    assert_eq!(image_body["data"][0]["b64_json"], "AAAA");
+
+    let speech_response = client
+        .post(format!("{base_url}/v1/audio/speech"))
+        .bearer_auth(&config.unified_key)
+        .json(&serde_json::json!({ "model": "integration-model", "input": "hello", "voice": "alloy" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(speech_response.status(), StatusCode::OK);
+    assert_eq!(
+        speech_response.headers()["x-routed-via"],
+        "speech/integration-model"
+    );
+    assert_eq!(speech_response.headers()["content-type"], "audio/mpeg");
+    assert_eq!(
+        speech_response.bytes().await.unwrap().as_ref(),
+        b"ID3mock-audio"
+    );
+
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0]["model"], "integration-model");
+    assert_eq!(requests[1]["prompt"], "a cat");
+    assert_eq!(requests[2]["voice"], "alloy");
+
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn per_model_upstream_path_supports_custom_chat_route_and_model_placeholder() {
+    let (upstream_url, state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("custom path reply")).await;
+    let mut routed = provider("custom-path", upstream_url, Dialect::OpenAI, 1);
+    routed.models[0].upstream_path = Some("/custom/models/{model}/chat".into());
+    let (_db, config, gateway_task, base_url) = spawn_gateway(vec![routed]).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&config.unified_key)
+        .json(&openai_body("integration-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "custom path reply"
+    );
+    assert_eq!(state.hits.load(Ordering::SeqCst), 1);
+
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn responses_tool_image_normalizes_codex_original_detail_for_openai_upstream() {
+    let (upstream_url, state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("image reply")).await;
+    let mut vision = provider("vision", upstream_url, Dialect::OpenAI, 1);
+    vision.models[0].supports_vision = true;
+    let (_db, config, gateway_task, base_url) = spawn_gateway(vec![vision]).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/responses"))
+        .bearer_auth(&config.unified_key)
+        .json(&serde_json::json!({
+            "model": "integration-model",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_image",
+                    "name": "view_image",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_image",
+                    "output": [{
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AAAA",
+                        "detail": "original"
+                    }]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let upstream = state.requests.lock().unwrap().last().cloned().unwrap();
+    let tool_message = upstream["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("Responses function_call_output must become a tool message");
+    assert_eq!(tool_message["content"][0]["image_url"]["detail"], "high");
+
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn responses_private_codex_tools_are_flattened_or_dropped_for_chat_upstreams() {
+    let (upstream_url, state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("tool normalization reply")).await;
+    let (_db, config, gateway_task, base_url) =
+        spawn_gateway(vec![provider("tools", upstream_url, Dialect::OpenAI, 1)]).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/responses"))
+        .bearer_auth(&config.unified_key)
+        .json(&serde_json::json!({
+            "model": "integration-model",
+            "input": "hello",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "multi_agent_v1",
+                    "tools": [{
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": "spawn",
+                        "parameters": { "type": "object" }
+                    }]
+                },
+                { "type": "web_search", "external_web_access": false },
+                {
+                    "type": "function",
+                    "name": "plain_tool",
+                    "description": "plain",
+                    "parameters": { "type": "object" }
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let upstream = state.requests.lock().unwrap().last().cloned().unwrap();
+    let tools = upstream["tools"]
+        .as_array()
+        .expect("tools must be forwarded");
+    let names = tools
+        .iter()
+        .filter_map(|tool| {
+            tool.pointer("/function/name")
+                .and_then(|name| name.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["lgw__multi_agent_v1__spawn_agent", "plain_tool"]
+    );
+    assert!(tools
+        .iter()
+        .all(|tool| tool["type"].as_str() == Some("function")));
+
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn cached_input_tokens_use_cache_prices_in_audit_cost() {
+    use llm_gateway_lib::domain::{Currency, ModelPrice, PriceSource};
+
+    let (upstream_url, _state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::CompleteWithCachedUsage("cached reply")).await;
+    let mut priced = provider("cache-priced", upstream_url, Dialect::OpenAI, 1);
+    priced.models[0].price = Some(ModelPrice {
+        prompt: 1.0,
+        completion: 2.0,
+        cache_read: Some(0.1),
+        cache_creation: Some(3.0),
+        currency: Currency::Usd,
+        tiers: Vec::new(),
+        rules: Vec::new(),
+        source: PriceSource::Manual,
+    });
+    let (db, config, gateway_task, base_url) = spawn_gateway(vec![priced]).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&config.unified_key)
+        .json(&openai_body("integration-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut logged = None;
+    for _ in 0..80 {
+        let rows = repo::recent_requests(db.pool(), 10).await.unwrap();
+        if let Some(row) = rows
+            .into_iter()
+            .find(|row| row["routed_provider"] == "cache-priced")
+        {
+            logged = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let logged = logged.expect("缓存用量请求必须写入审计");
+    let expected = (1.0 * 1.0 + 8.0 * 0.1 + 1.0 * 3.0 + 2.0 * 2.0) / 1_000_000.0;
+    let cost = logged["cost"].as_f64().expect("缓存价必须参与花费估算");
+    assert!((cost - expected).abs() < 1e-12, "实际成本 {cost}");
+
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires the local Codex CLI"]
+async fn codex_cli_can_use_gateway_as_responses_proxy() {
+    let (upstream_url, state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("proxy takeover ok")).await;
+    let mut codex_provider = provider("codex-proxy", upstream_url, Dialect::OpenAI, 1);
+    codex_provider.models[0].context_window = 0;
+    codex_provider.models[0].supports_vision = true;
+    codex_provider.models[0].supports_audio = true;
+    codex_provider.models[0].supports_video = true;
+    let (_db, config, gateway_task, base_url) = spawn_gateway(vec![codex_provider]).await;
+
+    let root =
+        std::env::temp_dir().join(format!("llm-gateway-codex-proxy-{}", uuid::Uuid::new_v4()));
+    let codex_home = root.join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(
+        codex_home.join("config.toml"),
+        format!(
+            r#"model = "integration-model"
+model_provider = "llm_gateway"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+[model_providers.llm_gateway]
+name = "LLM Gateway"
+base_url = "{base_url}/v1"
+wire_api = "responses"
+experimental_bearer_token = "{}"
+requires_openai_auth = false
+
+[features]
+plugins = false
+recommended_plugins = false
+"#,
+            config.unified_key
+        ),
+    )
+    .unwrap();
+
+    let codex = std::env::var("CODEX_CLI_PATH").unwrap_or_else(|_| "codex".into());
+    let output = tokio::process::Command::new(codex)
+        .args([
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--color",
+            "never",
+            "-C",
+        ])
+        .arg(&root)
+        .arg("Reply with exactly: proxy takeover ok")
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        output.status.success(),
+        "Codex CLI failed (upstream_hits={}): {combined}",
+        state.hits.load(Ordering::SeqCst)
+    );
+    assert!(
+        combined.contains("proxy takeover ok"),
+        "Codex CLI did not receive the gateway response: {combined}"
+    );
+    assert!(
+        state.hits.load(Ordering::SeqCst) > 0,
+        "gateway must have forwarded the Codex request to the mock upstream"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
 async fn priced_requests_record_cost_and_attempt_chain_while_unpriced_requests_do_not() {
     use llm_gateway_lib::domain::{Currency, ModelPrice};
 
@@ -527,6 +1121,8 @@ async fn priced_requests_record_cost_and_attempt_chain_while_unpriced_requests_d
     primary.models[0].price = Some(ModelPrice {
         prompt: 1_000_000.0,
         completion: 2_000_000.0,
+        cache_read: None,
+        cache_creation: None,
         currency: Currency::Usd,
         tiers: Vec::new(),
         rules: Vec::new(),
@@ -536,6 +1132,8 @@ async fn priced_requests_record_cost_and_attempt_chain_while_unpriced_requests_d
     backup.models[0].price = Some(ModelPrice {
         prompt: 0.5,
         completion: 1.5,
+        cache_read: None,
+        cache_creation: None,
         currency: Currency::Cny,
         tiers: Vec::new(),
         rules: Vec::new(),
@@ -646,6 +1244,7 @@ async fn spend_tables_separate_currencies_and_report_unpriced_requests() {
                 rate_label: None,
                 estimated_prompt_tokens: None,
                 attempts_json: None,
+                route: Default::default(),
             },
         )
         .await
@@ -697,12 +1296,16 @@ async fn time_rules_and_input_tiers_shape_the_recorded_cost_and_rate_label() {
     primary.models[0].price = Some(ModelPrice {
         prompt: 2.0,
         completion: 8.0,
+        cache_read: None,
+        cache_creation: None,
         currency: Currency::Usd,
         tiers: vec![PriceTier {
             // 阈值 0 与基础档重复，不参与档位选择，也不应污染 rate_label。
             min_prompt_tokens: 0,
             prompt: 2.0,
             completion: 8.0,
+            cache_read: None,
+            cache_creation: None,
         }],
         // 起止相同的规则按「全天生效」处理：断言不依赖运行时刻。
         rules: vec![PriceRule {

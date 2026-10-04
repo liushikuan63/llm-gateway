@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use llm_gateway_lib::crypto;
-use llm_gateway_lib::domain::{Dialect, Provider};
+use llm_gateway_lib::domain::{Dialect, ModelType, Provider};
 use llm_gateway_lib::model_catalog::{
     discover, matches_saved_provider_target, normalize_base_url, ContextSource, DiscoveryInput,
     DEFAULT_CONTEXT_WINDOW,
@@ -88,11 +88,15 @@ async fn openrouter_models(
             "name": "Example Vision",
             "context_length": 131072,
             "supported_parameters": ["tools"],
-            "architecture": { "input_modalities": ["text", "image"] },
+            "architecture": {
+                "input_modalities": ["text", "image"],
+                "modality": "text+image->text"
+            },
             "pricing": { "prompt": "0", "completion": "0" }
         }, {
             "id": "openrouter/paid",
             "context_window": 65536,
+            "model_type": "embedding",
             "pricing": { "prompt": "0", "completion": "0.0001" }
         }, {
             "id": "openrouter/incomplete-pricing",
@@ -136,6 +140,7 @@ async fn openai_catalog_normalizes_full_url_sends_bearer_and_reads_openrouter_me
     assert_eq!(model.context_source, ContextSource::Provider);
     assert_eq!(model.supports_tools, Some(true));
     assert_eq!(model.supports_vision, Some(true));
+    assert_eq!(model.model_type, Some(ModelType::Chat));
     assert_eq!(model.supports_stream, None);
     assert_eq!(model.is_free, Some(true));
     let paid = response
@@ -145,6 +150,7 @@ async fn openai_catalog_normalizes_full_url_sends_bearer_and_reads_openrouter_me
         .unwrap();
     assert_eq!(paid.context_window, 65_536);
     assert_eq!(paid.context_source, ContextSource::Provider);
+    assert_eq!(paid.model_type, Some(ModelType::Embedding));
     assert_eq!(paid.is_free, Some(false));
     let incomplete = response
         .models
@@ -220,6 +226,7 @@ async fn openai_catalog_deduplicates_and_marks_missing_metadata_as_default() {
     assert_eq!(model.supports_tools, None);
     assert_eq!(model.supports_vision, None);
     assert_eq!(model.supports_stream, None);
+    assert_eq!(model.model_type, None);
     assert_eq!(model.is_free, None);
 }
 

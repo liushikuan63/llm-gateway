@@ -1,7 +1,7 @@
 use std::sync::{Arc, Barrier};
 
 use llm_gateway_lib::config::{AppConfig, RoutingStrategy};
-use llm_gateway_lib::domain::{Dialect, Health, ModelRef, Provider};
+use llm_gateway_lib::domain::{Dialect, Health, ModelRef, ModelType, Provider};
 use llm_gateway_lib::error::GatewayError;
 use llm_gateway_lib::proxy::health::HealthRegistry;
 use llm_gateway_lib::router::ratelimit::{Quota, RateLimiter};
@@ -17,9 +17,13 @@ fn model(alias: &str, upstream: &str) -> ModelRef {
         supports_vision: false,
         supports_audio: false,
         supports_video: false,
+        supports_thinking: false,
         supports_stream: true,
+        model_type: ModelType::Chat,
+        upstream_path: None,
         price: None,
         overrides: None,
+        local: None,
     }
 }
 
@@ -185,10 +189,12 @@ fn score_uses_multiplicative_decay_when_quota_is_exhausted() {
         virtual_strategy: None,
     };
     let healthy = ScoreInput {
+        intent: None,
         health: Some(HealthRegistry::new().get("smart", "mock-model")),
         headroom: 1.0,
     };
     let exhausted = ScoreInput {
+        intent: None,
         health: healthy.health.clone(),
         headroom: 0.0,
     };
@@ -196,6 +202,38 @@ fn score_uses_multiplicative_decay_when_quota_is_exhausted() {
 
     assert!(score(&candidate, &healthy, &weights) > 0.5);
     assert!(score(&candidate, &exhausted, &weights) < 1e-6);
+}
+
+#[test]
+fn model_type_prevents_cross_endpoint_routing() {
+    let (router, _, _) = router();
+    let mut provider = provider("typed", 1, 60);
+    provider.models = vec![
+        model("text-model", "text-model"),
+        ModelRef {
+            alias: "embed-model".into(),
+            upstream: "embed-model".into(),
+            model_type: ModelType::Embedding,
+            upstream_path: None,
+            ..model("embed-model", "embed-model")
+        },
+    ];
+
+    let chat = router
+        .resolve("auto", std::slice::from_ref(&provider))
+        .unwrap();
+    assert_eq!(chat.len(), 1);
+    assert_eq!(chat[0].model.alias, "text-model");
+
+    let embeddings = router
+        .resolve_typed(
+            "auto",
+            std::slice::from_ref(&provider),
+            ModelType::Embedding,
+        )
+        .unwrap();
+    assert_eq!(embeddings.len(), 1);
+    assert_eq!(embeddings[0].model.alias, "embed-model");
 }
 
 #[test]
@@ -222,6 +260,7 @@ fn invalid_health_has_zero_score_and_does_not_auto_recover() {
         score(
             &candidate,
             &ScoreInput {
+                intent: None,
                 health: Some(status),
                 headroom: 1.0,
             },

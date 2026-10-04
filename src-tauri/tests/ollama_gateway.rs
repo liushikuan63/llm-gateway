@@ -133,6 +133,7 @@ fn ollama_non_stream_response_preserves_tool_calls_and_usage() {
                 prompt_tokens: 11,
                 completion_tokens: 7,
                 total_tokens: 18,
+                ..Default::default()
             }),
         },
         "llama3.3",

@@ -32,9 +32,13 @@ fn provider() -> Provider {
             supports_vision: false,
             supports_audio: false,
             supports_video: false,
+            supports_thinking: false,
             supports_stream: true,
+            model_type: llm_gateway_lib::domain::ModelType::Chat,
+            upstream_path: None,
             price: None,
             overrides: None,
+            local: None,
         }],
         rpm_limit: 60,
         intelligence: 80,
@@ -70,11 +74,31 @@ async fn file_database_uses_wal_and_creates_all_storage_tables() {
         "requests",
         "usage_daily",
         "snapshots",
+        "app_secrets",
     ] {
         assert!(
             tables.iter().any(|table| table == expected),
             "缺少表 {expected}"
         );
+    }
+
+    // 本批新增的三处迁移：models 表的两列 + requests 表的四列。
+    // ensure_column 是可重入的，所以列必须真实存在而不是靠「跑过就算」。
+    for (table, column) in [
+        ("models", "supports_thinking"),
+        ("models", "local_json"),
+        ("requests", "route_intent"),
+        ("requests", "route_classifier"),
+        ("requests", "route_search"),
+        ("requests", "route_search_hits"),
+    ] {
+        let found: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"
+        ))
+        .fetch_one(db.pool())
+        .await
+        .expect("应能读取列信息");
+        assert_eq!(found, 1, "{table} 缺少列 {column}");
     }
 
     let indexes: Vec<String> = sqlx::query_scalar(
@@ -102,6 +126,90 @@ async fn file_database_uses_wal_and_creates_all_storage_tables() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = fs::remove_file(PathBuf::from(format!("{}{suffix}", path.display())));
     }
+}
+
+#[tokio::test]
+async fn local_model_metadata_and_thinking_flag_survive_a_round_trip() {
+    // 这两个字段是本批新增的，漏写进 repo 的 INSERT/SELECT 只会在这里暴露。
+    let db = Db::connect_in_memory().await.expect("内存库应可用");
+    let mut p = provider();
+    p.models[0].supports_thinking = true;
+    p.models[0].local = Some(llm_gateway_lib::domain::LocalMeta {
+        runtime: "ollama".into(),
+        family: Some("gemma4".into()),
+        parameter_size: Some("11.9B".into()),
+        quantization: Some("Q4_K_M".into()),
+        disk_bytes: Some(8_021_618_941),
+        capabilities: vec!["vision".into(), "tools".into(), "thinking".into()],
+    });
+    repo::upsert_provider(db.pool(), &p).await.expect("写入应成功");
+
+    let models = repo::list_models_of(db.pool(), "provider-a").await.expect("读取应成功");
+    assert_eq!(models.len(), 1);
+    assert!(models[0].supports_thinking, "思维链能力位必须往返");
+    let local = models[0].local.as_ref().expect("本地元数据必须往返");
+    assert_eq!(local.runtime, "ollama");
+    assert_eq!(local.parameter_size.as_deref(), Some("11.9B"));
+    assert_eq!(local.disk_bytes, Some(8_021_618_941));
+    assert!(local.capabilities.contains(&"thinking".to_string()));
+}
+
+#[tokio::test]
+async fn 坏的本地元数据被静默降级而不是让查询失败() {
+    // 手工改库能塞进坏 JSON；一次坏模型不该让整条候选链查不出来。
+    let db = Db::connect_in_memory().await.expect("内存库应可用");
+    repo::upsert_provider(db.pool(), &provider()).await.expect("写入应成功");
+    sqlx::query("UPDATE models SET local_json = '{不是合法 JSON' WHERE provider_id = ?")
+        .bind("provider-a")
+        .execute(db.pool())
+        .await
+        .expect("应当能写入坏数据");
+
+    let models = repo::list_models_of(db.pool(), "provider-a").await.expect("查询必须成功");
+    assert_eq!(models.len(), 1);
+    assert!(models[0].local.is_none(), "坏 JSON 应降级为 None 而不是报错");
+}
+
+#[tokio::test]
+async fn 应用密钥可写入_覆盖_删除_且不与_meta_表混用() {
+    let db = Db::connect_in_memory().await.expect("内存库应可用");
+    assert_eq!(
+        repo::get_secret(db.pool(), repo::SECRET_SEARCH_API_KEY)
+            .await
+            .expect("查询应成功"),
+        None,
+        "初始应没有密钥"
+    );
+
+    repo::set_secret(db.pool(), repo::SECRET_SEARCH_API_KEY, "密文-1")
+        .await
+        .expect("写入应成功");
+    assert_eq!(
+        repo::get_secret(db.pool(), repo::SECRET_SEARCH_API_KEY)
+            .await
+            .expect("查询应成功"),
+        Some("密文-1".to_string())
+    );
+
+    repo::set_secret(db.pool(), repo::SECRET_SEARCH_API_KEY, "密文-2")
+        .await
+        .expect("覆盖应成功");
+    assert_eq!(
+        repo::get_secret(db.pool(), repo::SECRET_SEARCH_API_KEY)
+            .await
+            .expect("查询应成功"),
+        Some("密文-2".to_string()),
+        "同名重复写入必须是覆盖而不是插入失败"
+    );
+
+    // 反向对照：meta 表是明文配置，密钥绝不能落到那里。
+    assert_eq!(repo::meta_get(db.pool(), repo::SECRET_SEARCH_API_KEY).await.expect("查询"), None);
+
+    assert!(repo::delete_secret(db.pool(), repo::SECRET_SEARCH_API_KEY).await.expect("删除应成功"));
+    assert!(
+        !repo::delete_secret(db.pool(), repo::SECRET_SEARCH_API_KEY).await.expect("重复删除不应报错"),
+        "第二次删除应当返回 false，让调用方区分"
+    );
 }
 
 #[tokio::test]
@@ -284,4 +392,31 @@ async fn sticky_update_changes_session_state_and_foreign_keys_are_enforced() {
     )
     .await;
     assert!(orphan.is_err(), "外键约束应拒绝孤儿消息");
+}
+
+/* -------------------- 编码丢失的识别 -------------------- */
+//
+// 真机现象：会话列表里出现 `???????,???`。查库确认存的是 `3F 3F 3F…`（真问号），
+// 不是显示问题——**客户端在发过来之前就已把非 ASCII 字符替换成了 `?`**。
+//
+// 这里只负责**识别与告警**，刻意不自动改写内容：擅自猜回原文比留问号更危险。
+
+#[test]
+fn 连续问号_判为编码丢失() {
+    assert!(repo::looks_like_encoding_loss("???????,???"));
+    assert!(repo::looks_like_encoding_loss("abc???def"));
+    // 半角 `?` 才是编码替换后的产物；全角 `？` 是合法中文输入，不该误报。
+    assert!(!repo::looks_like_encoding_loss("中文全角问号？？？"));
+}
+
+#[test]
+fn 单个问号不误报_对照组() {
+    // 用户真的在提问，这是绝大多数情况；误报会让日志没法看。
+    assert!(!repo::looks_like_encoding_loss("为什么报错?"));
+    assert!(!repo::looks_like_encoding_loss("？"));
+    assert!(!repo::looks_like_encoding_loss("??"));
+    // 正常中文与英文一律不报。
+    assert!(!repo::looks_like_encoding_loss("限流是做什么的，一句话"));
+    assert!(!repo::looks_like_encoding_loss("2026年最新的 Rust 1.99 有什么新特性"));
+    assert!(!repo::looks_like_encoding_loss(""));
 }

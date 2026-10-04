@@ -4,17 +4,23 @@ fn price() -> ModelPrice {
     ModelPrice {
         prompt: 2.0,
         completion: 8.0,
+        cache_read: Some(0.5),
+        cache_creation: Some(2.5),
         currency: Currency::Usd,
         tiers: vec![
             PriceTier {
                 min_prompt_tokens: 128_000,
                 prompt: 4.0,
                 completion: 16.0,
+                cache_read: Some(1.0),
+                cache_creation: Some(5.0),
             },
             PriceTier {
                 min_prompt_tokens: 32_000,
                 prompt: 3.0,
                 completion: 12.0,
+                cache_read: Some(0.75),
+                cache_creation: Some(3.75),
             },
         ],
         rules: vec![
@@ -99,6 +105,15 @@ fn charge_combines_tier_and_time_rule_with_a_readable_label() {
     let charge = price.charge(1_000, 1_000, 1_000);
     assert!((charge.cost - (1_000.0 / 1e6 * 2.0 * 0.5 + 1_000.0 / 1e6 * 8.0 * 0.25)).abs() < 1e-12);
     assert_eq!(charge.label.as_deref(), Some("谷时"));
+}
+
+#[test]
+fn cache_prices_charge_cached_input_separately_from_normal_input() {
+    let price = price();
+    let charge = price.charge_with_cache(30_000, 0, 10_000, 5_000, 600);
+    let expected = 15_000.0 / 1e6 * 2.0 + 10_000.0 / 1e6 * 0.5 + 5_000.0 / 1e6 * 2.5;
+
+    assert!((charge.cost - expected).abs() < 1e-12);
 }
 
 #[test]

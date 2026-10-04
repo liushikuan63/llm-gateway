@@ -529,7 +529,10 @@ async fn model_overrides_apply_after_gateway_normalization_and_skip_protected_fi
         supports_vision: false,
         supports_audio: false,
         supports_video: false,
+        supports_thinking: false,
         supports_stream: true,
+        model_type: llm_gateway_lib::domain::ModelType::Chat,
+        upstream_path: None,
         price: None,
         overrides: Some(ModelOverrides {
             temperature: Some(0.25),
@@ -540,6 +543,7 @@ async fn model_overrides_apply_after_gateway_normalization_and_skip_protected_fi
                 value: "tenant-42".into(),
             }]),
         }),
+        local: None,
     }];
 
     let mut req = chat_request();
