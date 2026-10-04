@@ -62,7 +62,16 @@
 .shell-icon-button:hover:not(:disabled) { color: #063c31; background: var(--sidebar-accent); border-color: var(--sidebar-accent); }
 .endpoint-hint { display: block; min-height: 14px; margin-top: 6px; color: var(--sidebar-muted); font-size: 10px; line-height: 1.4; }
 
-.app-main { display: grid; min-width: 0; min-height: 0; grid-template-rows: auto minmax(0, 1fr); }
+/* 三行而不是两行：启动降级横幅是 auto 行，没有它时自动塌成 0，
+   布局与改动前完全一致（模式隔离）。 */
+.app-main { display: grid; min-width: 0; min-height: 0; grid-template-rows: auto auto minmax(0, 1fr); }
+
+.boot-notice { display: flex; align-items: flex-start; gap: 10px; margin: 12px 16px 0; padding: 11px 13px; border: 1px solid var(--border); border-left: 3px solid var(--purple); border-radius: 10px; background: var(--purple-soft); color: var(--text, inherit); }
+.boot-notice-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.boot-notice-text strong { font-size: 13px; font-weight: 600; }
+.boot-notice-text span { font-size: 12px; color: var(--muted); line-height: 1.55; white-space: pre-wrap; }
+.boot-notice-close { flex: none; border: 0; background: transparent; cursor: pointer; color: var(--muted); font-size: 19px; line-height: 1; padding: 0 3px; border-radius: 5px; }
+.boot-notice-close:hover { color: var(--text, inherit); }
 .workspace-header { display: flex; min-width: 0; min-height: 108px; align-items: center; justify-content: space-between; gap: 20px; padding: 22px 28px 20px; background: var(--bg); border-bottom: 1px solid var(--border); }
 .workspace-heading { min-width: 0; }
 .workspace-eyebrow { display: inline-flex; gap: 6px; align-items: center; margin-bottom: 4px; color: var(--accent); font-size: 11px; font-weight: 700; letter-spacing: 0.04em; }

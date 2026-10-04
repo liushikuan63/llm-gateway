@@ -948,7 +948,7 @@ ${keyInfo.ollama_endpoint}`}
       <div className="card">
         <strong>CLI 工具接管</strong>
         <div className="sub">
-          已有配置会先创建同目录的唯一备份并逐字节校验，备份失败不会改写原文件。Gemini CLI 暂不支持接管；已有旧选项可取消。写入后请重新启动对应 CLI。
+          已有配置会先创建同目录的唯一备份并逐字节校验，备份失败不会改写原文件。OpenCode 与 Crush 使用各自的官方自定义 Provider 配置；Gemini CLI 暂不支持接管。写入后请重新启动对应 CLI。
         </div>
         <div className="row">
           <label className="row" style={{ gap: 6 }}>
@@ -968,6 +968,24 @@ ${keyInfo.ollama_endpoint}`}
               onChange={(event) => void patch({ takeover: { ...cfg.takeover, codex: event.target.checked } })}
             />
             Codex CLI
+          </label>
+          <label className="row" style={{ gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={cfg.takeover.opencode}
+              disabled={busy !== null}
+              onChange={(event) => void patch({ takeover: { ...cfg.takeover, opencode: event.target.checked } })}
+            />
+            OpenCode
+          </label>
+          <label className="row" style={{ gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={cfg.takeover.crush}
+              disabled={busy !== null}
+              onChange={(event) => void patch({ takeover: { ...cfg.takeover, crush: event.target.checked } })}
+            />
+            Crush
           </label>
           <label className="row" style={{ gap: 6 }}>
             <input

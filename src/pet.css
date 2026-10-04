@@ -1,15 +1,42 @@
 :root {
-  color-scheme: light dark;
+  color-scheme: dark;
   background: transparent;
+  font-family: system-ui, "Microsoft YaHei", sans-serif;
 }
 
 html,
 body,
 #root {
   margin: 0;
+  width: 100%;
   height: 100%;
-  background: transparent;
   overflow: hidden;
+  background: transparent;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button {
+  min-width: 0;
+  color: #dce8f0;
+  font: inherit;
+  background: rgba(38, 57, 72, 0.9);
+  border: 1px solid rgba(137, 174, 198, 0.25);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: rgba(52, 78, 98, 0.96);
+  border-color: rgba(137, 174, 198, 0.48);
+}
+
+button:disabled {
+  color: #748896;
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
 .pet-root {
@@ -18,31 +45,757 @@ body,
   width: 100vw;
   height: 100vh;
   align-items: flex-end;
-  justify-content: center;
-  cursor: grab;
+  gap: 8px;
   user-select: none;
   -webkit-user-select: none;
 }
 
-.pet-root:active {
+.pet-stage {
+  position: relative;
+  flex: 0 0 var(--pet-width);
+  align-self: flex-end;
+  width: var(--pet-width);
+  height: var(--pet-height);
+  /* 底部留白给宠物阴影：不留白会被窗口边缘硬切出一条灰边。 */
+  margin-bottom: 12px;
+  cursor: grab;
+}
+
+.pet-stage:active {
   cursor: grabbing;
 }
 
 .pet-canvas {
+  display: block;
   width: 100%;
   height: 100%;
-  filter: drop-shadow(0 6px 10px rgba(8, 24, 20, 0.35));
+  filter: drop-shadow(0 4px 6px rgba(8, 24, 20, 0.28));
+  pointer-events: none;
 }
 
 .pet-placeholder {
   position: absolute;
-  right: 8px;
-  bottom: 8px;
-  left: 8px;
-  padding: 6px 8px;
+  right: 4px;
+  bottom: 4px;
+  left: 4px;
+  padding: 5px 6px;
   color: #e7f0eb;
-  font: 12px/1.5 system-ui, "Microsoft YaHei", sans-serif;
+  font-size: 11px;
+  line-height: 1.45;
   text-align: center;
-  background: rgba(12, 30, 25, 0.82);
+  background: rgba(12, 30, 25, 0.86);
+  border-radius: 7px;
+}
+
+.pet-expand-button {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: #d8f4ff;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(21, 52, 72, 0.94);
+  border-color: rgba(124, 211, 255, 0.5);
+  border-radius: 50%;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+}
+
+.pet-paused-badge {
+  position: absolute;
+  top: 5px;
+  left: 4px;
+  padding: 2px 5px;
+  color: #ffe2a8;
+  font-size: 9px;
+  background: rgba(83, 58, 18, 0.92);
+  border-radius: 999px;
+}
+
+.pet-bubble-stack {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 12px;
+}
+
+.pet-bubble {
+  position: relative;
+  display: flex;
+  width: 100%;
+  /* 固定行高：src-tauri/src/pet_window.rs 按同一数值计算窗口高度。 */
+  height: 66px;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+  /* 右侧留出独立关闭按钮的位置。 */
+  padding: 10px 34px 10px 16px;
+  color: #26343c;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.86);
+  border-radius: 16px;
+  /* 阴影必须在下方的窗口留白（pet_window.rs::BUBBLE_BOTTOM_MARGIN = 16）内衰减完，
+     否则会被窗口边缘硬切成一条灰边。 */
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.14);
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  animation: pet-bubble-in 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+/* 只有贴着宠物的那个气泡带尾巴，堆叠时指向宠物本体。 */
+.pet-bubble.is-tail::after {
+  position: absolute;
+  top: 50%;
+  left: -7px;
+  width: 14px;
+  height: 14px;
+  content: "";
+  background: rgba(255, 255, 255, 0.94);
+  transform: translateY(-50%) rotate(45deg);
+  border-bottom-left-radius: 3px;
+}
+
+/* 多个气泡收起时按 18px 步进堆叠，鼠标悬浮 / 任务结束时再展开（与
+   src-tauri/src/pet_window.rs::BUBBLE_STACK_OFFSET 保持一致）。 */
+.pet-bubble-stack.is-compact .pet-bubble + .pet-bubble {
+  margin-top: -56px;
+}
+
+.pet-bubble-stack.is-compact .pet-bubble:nth-of-type(1) {
+  z-index: 3;
+}
+
+.pet-bubble-stack.is-compact .pet-bubble:nth-of-type(2) {
+  z-index: 2;
+}
+
+.pet-bubble-stack.is-compact .pet-bubble:nth-of-type(3) {
+  z-index: 1;
+}
+
+/* 每个气泡自己的关闭按钮（贴在气泡左上角外侧），只关掉这一个任务；
+   默认隐藏，鼠标放到对应气泡上才出现。 */
+.pet-bubble-dismiss {
+  position: absolute;
+  top: -9px;
+  left: -9px;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  color: #7b8a94;
+  font-size: 13px;
+  line-height: 1;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(40, 62, 74, 0.14);
+  border-radius: 50%;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+  z-index: 2;
+}
+
+.pet-bubble-dismiss.is-visible,
+.pet-bubble:hover .pet-bubble-dismiss,
+/* 键盘定位到气泡里的按钮时才显示（鼠标点击不会触发 focus-visible）。 */
+.pet-bubble:has(:focus-visible) .pet-bubble-dismiss {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.pet-bubble-dismiss:hover {
+  color: #33424c;
+  background: #fff;
+  border-color: rgba(40, 62, 74, 0.3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-bubble-dismiss {
+    transition: none;
+  }
+}
+
+/* 气泡右侧的状态徽标：完成 ✓ / 出错 ! / 进行中 •。 */
+.pet-bubble-status {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  color: #7b8a94;
+  background: rgba(120, 144, 156, 0.16);
+  border-radius: 50%;
+  transform: translateY(-50%);
+}
+
+.pet-bubble-status.running {
+  color: #2f6f8f;
+  background: rgba(70, 160, 200, 0.18);
+}
+
+.pet-bubble-status.is-action {
+  padding: 0;
+  cursor: pointer;
+}
+
+.pet-bubble-status.is-action:hover {
+  background: rgba(70, 160, 200, 0.34);
+}
+
+/* 运行中的实心方块：点击后结束该软件进程。 */
+.pet-bubble-stop-square {
+  width: 9px;
+  height: 9px;
+  background: currentColor;
+  border-radius: 2px;
+}
+
+.pet-bubble-status.error {
+  color: #c0392b;
+  background: rgba(224, 90, 90, 0.18);
+}
+
+.pet-bubble-status.done {
+  color: #1f8b5f;
+  background: rgba(70, 201, 139, 0.18);
+}
+
+.pet-bubble-expand svg {
+  display: block;
+  width: 12px;
+  height: 12px;
+}
+
+.pet-root.is-bubble-left {
+  flex-direction: row-reverse;
+}
+
+.pet-root.is-bubble-left .pet-bubble.is-tail::after {
+  right: -7px;
+  left: auto;
+  border-top-right-radius: 3px;
+  border-bottom-left-radius: 0;
+}
+
+.pet-bubble-actions {
+  position: absolute;
+  top: -10px;
+  right: 9px;
+  display: flex;
+  gap: 5px;
+  /* 气泡是后渲染的兄弟节点：按钮必须抬到气泡之上，否则会被盖住、点不到。 */
+  z-index: 2;
+}
+
+.pet-bubble-actions button {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  place-items: center;
+  color: #40515c;
+  font-size: 14px;
+  line-height: 1;
+  background: rgba(255, 255, 255, 0.97);
+  border: 1px solid rgba(40, 62, 74, 0.12);
+  border-radius: 50%;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.16);
+}
+
+.pet-bubble-title {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.pet-bubble-source {
+  flex: 0 0 auto;
+  color: #6d7d87;
+  font-size: 10px;
+}
+
+.pet-bubble-title strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12.5px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pet-bubble-preview {
+  overflow: hidden;
+  color: #7d8991;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 运行中：标题与缩略都有一道循环掠过的流光，明确表示任务还在跑。 */
+.pet-bubble.is-running .pet-bubble-title strong {
+  background: linear-gradient(
+    100deg,
+    #26343c 0%,
+    #26343c 38%,
+    #2f9fd6 50%,
+    #26343c 62%,
+    #26343c 100%
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  background-size: 220% 100%;
+  color: transparent;
+  animation: pet-running-shimmer 2.6s linear infinite;
+}
+
+.pet-bubble.is-running .pet-bubble-preview {
+  background: linear-gradient(
+    100deg,
+    #7d8991 0%,
+    #7d8991 38%,
+    #2f9fd6 50%,
+    #7d8991 62%,
+    #7d8991 100%
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  background-size: 220% 100%;
+  color: transparent;
+  animation: pet-running-shimmer 2.6s linear infinite;
+}
+
+@keyframes pet-running-shimmer {
+  from {
+    background-position: 140% 0;
+  }
+  to {
+    background-position: -140% 0;
+  }
+}
+
+/* 展开面板里运行中的任务标题同样带流光。 */
+.task-row.task-running .task-title {
+  background: linear-gradient(
+    100deg,
+    #e8eef3 0%,
+    #e8eef3 38%,
+    #7fd3ff 50%,
+    #e8eef3 62%,
+    #e8eef3 100%
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  background-size: 220% 100%;
+  color: transparent;
+  animation: pet-running-shimmer 2.6s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-bubble.is-running .pet-bubble-title strong,
+  .pet-bubble.is-running .pet-bubble-preview,
+  .task-row.task-running .task-title {
+    animation: none;
+    /* 关闭动画时改用蓝色文字，运行中依然看得出来。 */
+    background: none;
+    color: #2f7fa6;
+  }
+}
+
+.pet-task-badge {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: auto;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 7px;
+  color: #d8f4ff;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(21, 52, 72, 0.94);
+  border-color: rgba(124, 211, 255, 0.5);
+  border-radius: 999px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+}
+
+@keyframes pet-bubble-in {
+  from {
+    opacity: 0;
+    transform: translateX(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-bubble {
+    animation: none;
+  }
+}
+
+.pet-hud {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  height: calc(100% - 12px);
+  margin-bottom: 12px;
+  gap: 7px;
+  padding: 9px;
+  overflow: hidden;
+  color: #e8eef3;
+  background: linear-gradient(165deg, rgba(16, 27, 36, 0.98), rgba(10, 18, 25, 0.96));
+  border: 1px solid rgba(118, 164, 193, 0.3);
+  border-radius: 14px;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.hud-header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-height: 27px;
+  cursor: move;
+}
+
+.hud-status {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+}
+
+.hud-status .muted {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  background: #6d8796;
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px rgba(109, 135, 150, 0.14);
+}
+
+.status-dot.working {
+  background: #46c98b;
+  box-shadow: 0 0 0 3px rgba(70, 201, 139, 0.16);
+}
+
+.status-dot.error {
+  background: #ff6b6b;
+  box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.16);
+}
+
+.hud-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.hud-header-actions button {
+  padding: 3px 7px;
+  font-size: 10px;
+}
+
+.hud-reason {
+  flex: 0 0 auto;
+  max-height: 34px;
+  overflow: hidden;
+  color: #a9bac7;
+  font-size: 10.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.hud-banner {
+  flex: 0 0 auto;
+  padding: 4px 6px;
+  color: #ffe2a8;
+  font-size: 10px;
+  background: rgba(91, 64, 20, 0.42);
+  border-radius: 7px;
+}
+
+.hud-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding-top: 5px;
+  overflow: auto;
+  border-top: 1px solid rgba(118, 164, 193, 0.16);
+  scrollbar-color: rgba(118, 164, 193, 0.32) transparent;
+}
+
+.hud-section:first-of-type {
+  flex: 1 1 auto;
+}
+
+.hud-section:last-of-type {
+  flex: 0 1 38%;
+}
+
+.hud-section-title {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1px 1px 5px;
+  color: #cfe1ec;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.task-group {
+  margin-bottom: 7px;
+}
+
+.task-group-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 1px 4px;
+}
+
+.running-count {
+  margin-left: auto;
+  padding: 1px 5px;
+  color: #8be0b5;
+  font-size: 9px;
+  background: rgba(35, 112, 78, 0.42);
+  border-radius: 999px;
+}
+
+.task-row {
+  cursor: pointer;
+}
+
+.task-row:hover {
+  background: rgba(43, 66, 82, 0.82);
+  border-color: rgba(137, 174, 198, 0.38);
+}
+
+.task-row.task-selected {
+  background: rgba(36, 64, 84, 0.88);
+  border-color: rgba(124, 211, 255, 0.52);
+}
+
+.task-title {
+  display: -webkit-box;
+  margin-top: 4px;
+  overflow: hidden;
+  font-size: 11.5px;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.task-expanded {
+  margin-top: 6px;
+  padding-top: 6px;
+  cursor: default;
+  border-top: 1px dashed rgba(137, 174, 198, 0.3);
+}
+
+.task-content-label {
+  margin-bottom: 2px;
+  color: #8da3b1;
+  font-size: 9px;
+}
+
+.task-content {
+  max-height: 76px;
+  overflow: auto;
+  color: #c7d6df;
+  font-size: 10px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.task-row {
+  flex: 0 0 auto;
+  margin-bottom: 5px;
+  padding: 6px;
+  background: rgba(32, 49, 62, 0.68);
+  border: 1px solid rgba(118, 164, 193, 0.18);
+  border-left: 3px solid #66879a;
   border-radius: 8px;
+}
+
+.task-row.task-running {
+  border-left-color: #46c98b;
+}
+
+.task-row.task-error {
+  border-left-color: #ff6b6b;
+}
+
+.task-row.task-done {
+  opacity: 0.78;
+}
+
+.task-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+}
+
+.source-chip {
+  max-width: 132px;
+  flex: 0 1 auto;
+  padding: 1px 6px;
+  overflow: hidden;
+  color: #9fd2ff;
+  font-size: 9.5px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: rgba(38, 82, 116, 0.72);
+  border-radius: 999px;
+}
+
+.status-chip {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  color: #b6c6d0;
+  font-size: 9px;
+  background: rgba(94, 112, 124, 0.38);
+  border-radius: 999px;
+}
+
+.status-chip.running {
+  color: #8be0b5;
+  background: rgba(35, 112, 78, 0.42);
+}
+
+.status-chip.error {
+  color: #ff9c9c;
+  background: rgba(129, 43, 43, 0.45);
+}
+
+.task-time {
+  margin-left: auto;
+  color: #78909c;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.task-detail {
+  display: -webkit-box;
+  margin-top: 4px;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.task-project {
+  margin-top: 2px;
+  overflow: hidden;
+  color: #718b9b;
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-actions,
+.tool-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.task-actions {
+  margin-top: 5px;
+}
+
+.task-actions button {
+  flex: 1 1 0;
+  padding: 3px 0;
+  font-size: 9.5px;
+}
+
+.tool-row {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 1px;
+}
+
+.tool-actions {
+  margin-left: auto;
+}
+
+.tool-actions button {
+  padding: 2px 6px;
+  font-size: 9.5px;
+}
+
+.danger {
+  color: #ffc0c0;
+  border-color: rgba(255, 107, 107, 0.34);
+  background: rgba(105, 38, 44, 0.72);
+}
+
+.danger:hover:not(:disabled) {
+  background: rgba(135, 47, 55, 0.88);
+  border-color: rgba(255, 107, 107, 0.62);
+}
+
+.hud-empty {
+  padding: 6px 2px;
+  color: #78909c;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.hud-message {
+  flex: 0 0 auto;
+  padding: 4px 6px;
+  color: #bfe6d3;
+  font-size: 9.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  background: rgba(35, 112, 78, 0.34);
+  border-radius: 7px;
+}
+
+.hud-message.err {
+  color: #ffc2c2;
+  background: rgba(129, 43, 43, 0.38);
+}
+
+.muted {
+  color: #8da3b1;
 }

@@ -1,0 +1,200 @@
+/* 本地模型 / 智能模式 / 联网搜索页面。
+   沿用全局 styles.css 的 card / table-card / field / button 等基础类，
+   这里只补本页特有的布局。 */
+
+.local-tabbar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.local-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line, #2a2f3a);
+  background: var(--panel, #161a22);
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.local-tab:hover {
+  border-color: #3d475a;
+}
+
+.local-tab.active {
+  border-color: var(--accent, #4c8dff);
+  background: color-mix(in srgb, var(--accent, #4c8dff) 12%, var(--panel, #161a22));
+}
+
+.local-tab span {
+  font-size: 12px;
+  opacity: 0.7;
+  line-height: 1.4;
+}
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.field-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.field-grow {
+  flex: 1 1 240px;
+  min-width: 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line, #2a2f3a);
+  background: var(--input, #0f131a);
+  color: inherit;
+  font: inherit;
+}
+
+textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line, #2a2f3a);
+  background: var(--input, #0f131a);
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+  margin-bottom: 10px;
+}
+
+.caps {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line, #2a2f3a);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.badge.ok {
+  border-color: #2f7d55;
+  color: #63d29b;
+}
+
+.badge.warn {
+  border-color: #7a5c2a;
+  color: #e0b062;
+}
+
+.badge.accent {
+  border-color: #4c8dff;
+  color: #86b4ff;
+}
+
+.local-result {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line, #2a2f3a);
+  background: color-mix(in srgb, var(--accent, #4c8dff) 6%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  line-height: 1.6;
+}
+
+@media (max-width: 900px) {
+  .local-tabbar {
+    grid-template-columns: 1fr;
+  }
+}
+/* ------------------------------ 校准报告 ------------------------------ */
+
+.calib-verdict {
+  padding: 8px 10px;
+  border-radius: 6px;
+  line-height: 1.6;
+  /* 结论是这块面板里最该被一眼看到的东西，给足对比度。 */
+  font-weight: 600;
+}
+
+.calib-verdict.ok {
+  border: 1px solid color-mix(in srgb, var(--ok, #3fb950) 55%, transparent);
+  background: color-mix(in srgb, var(--ok, #3fb950) 12%, transparent);
+}
+
+.calib-verdict.warn {
+  border: 1px solid color-mix(in srgb, var(--warn, #d29922) 55%, transparent);
+  background: color-mix(in srgb, var(--warn, #d29922) 12%, transparent);
+}
+
+.calib-verdict.err {
+  border: 1px solid color-mix(in srgb, var(--danger, #f85149) 55%, transparent);
+  background: color-mix(in srgb, var(--danger, #f85149) 12%, transparent);
+}
+
+.calib-numbers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  line-height: 1.6;
+}
+
+/* 矩阵用固定列宽而不是自适应：三列要能横向对照，
+   自适应会让数字列随内容宽度跳动，扫起来很累。 */
+.calib-matrix {
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+
+.calib-matrix th,
+.calib-matrix td {
+  border: 1px solid var(--line, #2a2f3a);
+  padding: 4px 12px;
+  text-align: center;
+  min-width: 72px;
+}
+
+.calib-matrix thead th,
+.calib-matrix tbody th {
+  background: color-mix(in srgb, var(--line, #2a2f3a) 45%, transparent);
+  font-weight: 600;
+}
+
+/* 判对的格子：绿色。判错的：红色。空格子保持弱化，
+   免得 0 和真实计数长得一样。 */
+.calib-matrix td.hit {
+  background: color-mix(in srgb, var(--ok, #3fb950) 18%, transparent);
+  font-weight: 600;
+}
+
+.calib-matrix td.miss {
+  background: color-mix(in srgb, var(--danger, #f85149) 22%, transparent);
+  font-weight: 600;
+}
+
+.calib-matrix td.zero {
+  color: color-mix(in srgb, currentColor 40%, transparent);
+}
+
+.calib-matrix details {
+  margin-top: 4px;
+}

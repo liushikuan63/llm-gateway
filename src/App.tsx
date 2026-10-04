@@ -11,9 +11,11 @@ import ProvidersPage from "./pages/Providers";
 import SessionsPage from "./pages/Sessions";
 import StatsPage from "./pages/Stats";
 import SettingsPage from "./pages/Settings";
+import LocalModelsPage from "./pages/LocalModels";
 
 const NAVIGATION = [
   { id: "providers", label: "供应商", description: "管理上游、模型映射与路由优先级。", icon: "providers" },
+  { id: "local", label: "本地模型与智能", description: "扫描本机运行时、按任务类型选模型、联网搜索。", icon: "settings" },
   { id: "sessions", label: "会话上下文", description: "查看持久化消息、摘要与路由续接信息。", icon: "sessions" },
   { id: "stats", label: "用量与审计", description: "核对请求量、降级过程与实际路由记录。", icon: "activity" },
   { id: "settings", label: "设置", description: "配置监听边界、访问控制与网关行为。", icon: "settings" },
@@ -91,7 +93,7 @@ async function copyText(value: string) {
   if (!copied) throw new Error("clipboard unavailable");
 }
 
-export default function App() {
+export default function App({ bootWarning = null }: { bootWarning?: string | null }) {
   const [tab, setTab] = useState<TabId>(readTab);
   const [theme, setTheme] = useState<Theme>(readTheme);
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -103,6 +105,8 @@ export default function App() {
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
   const [firstUseChecked, setFirstUseChecked] = useState(false);
+  // 启动降级提示（配置读坏了，已回退默认）。可手动关掉，但不能悄悄消失。
+  const [bootNotice, setBootNotice] = useState<string | null>(bootWarning);
   const helpMenuRef = useRef<HTMLDivElement>(null);
   const helpTriggerRef = useRef<HTMLButtonElement>(null);
   const desktopRuntime = isTauri();
@@ -309,6 +313,24 @@ export default function App() {
       </aside>
 
       <main className="app-main">
+        {bootNotice ? (
+          <div className="boot-notice" role="status" data-testid="boot-notice">
+            <Icon name="warning" size={16} />
+            <div className="boot-notice-text">
+              <strong>配置未生效，已用默认设置启动</strong>
+              <span>{bootNotice}</span>
+            </div>
+            <button
+              type="button"
+              className="boot-notice-close"
+              aria-label="关闭提示"
+              data-testid="boot-notice-close"
+              onClick={() => setBootNotice(null)}
+            >
+              ×
+            </button>
+          </div>
+        ) : null}
         <header className="workspace-header">
           <div className="workspace-heading">
             <div className="workspace-eyebrow"><Icon name={currentPage.icon as IconName} size={15} />网关工作区</div>
@@ -377,6 +399,7 @@ export default function App() {
           ) : (
             <>
               {tab === "providers" && <ProvidersPage />}
+              {tab === "local" && <LocalModelsPage />}
               {tab === "sessions" && <SessionsPage />}
               {tab === "stats" && <StatsPage />}
               {tab === "settings" && <SettingsPage />}

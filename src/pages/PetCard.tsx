@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { api, PetStatus } from "../api";
+import { api, DetectedTask, PetStatus } from "../api";
+import "./pet-card.css";
 
 type Message = { kind: "ok" | "err"; text: string };
 
@@ -18,7 +19,6 @@ const STATUS_LABEL: Record<PetStatus["status"], string> = {
 
 const KIND_LABEL: Record<string, string> = { cli: "CLI", app: "桌面应用" };
 const TASK_LABEL: Record<string, string> = { running: "进行中", error: "出错", done: "已完成" };
-const TASK_TAG: Record<string, string> = { running: "ok", error: "err", done: "" };
 
 function formatMemory(kb: number | null) {
   if (kb === null) return "-";
@@ -29,7 +29,9 @@ function formatMemory(kb: number | null) {
 function readStoredScale() {
   try {
     const stored = Number(window.localStorage.getItem(PET_SCALE_STORAGE_KEY));
-    return Number.isFinite(stored) && stored >= 0.5 && stored <= 2 ? stored : 1;
+    if (!Number.isFinite(stored)) return 1;
+    // 与 src-tauri/src/pet_window.rs 的 MIN_SCALE / MAX_SCALE 保持一致：最小 0.50×。
+    return Math.min(3, Math.max(0.5, stored));
   } catch {
     return 1;
   }
@@ -81,7 +83,7 @@ export default function PetCard() {
       // 开启后立即应用已保存的大小，保持与上次一致。
       await api.setPetWindowSize(scale);
       await refresh();
-      setMsg({ kind: "ok", text: "桌宠已开启：单击跳转主窗口，拖动可移动位置，右键可切换宠物或暂停监控。" });
+      setMsg({ kind: "ok", text: "桌宠已开启：宠物本体 100% 为 120×130（可缩到 50% = 60×65），展开面板可查看任务并定位 AI 软件。" });
     } catch (error) {
       setMsg({ kind: "err", text: `开启桌宠失败：${errorText(error)}` });
     } finally {
@@ -153,6 +155,29 @@ export default function PetCard() {
     }
   };
 
+  const openAiTask = async (task: DetectedTask) => {
+    const key = "task-" + task.source + ":" + task.session_id;
+    setBusy(key);
+    try {
+      setMsg({ kind: "ok", text: await api.openAiTask(task.tool_id, task.session_id) });
+    } catch (error) {
+      setMsg({ kind: "err", text: "打开任务失败：" + errorText(error) });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const openTaskProject = async (path: string) => {
+    setBusy("project-" + path);
+    try {
+      setMsg({ kind: "ok", text: await api.openTaskProject(path) });
+    } catch (error) {
+      setMsg({ kind: "err", text: "打开项目目录失败：" + errorText(error) });
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const installedPets = status?.installed_pets ?? [];
   // 同一软件常有多个进程（如 Electron 的主/渲染/GPU 进程），按软件聚合展示。
   const monitoredTools = Array.from(
@@ -173,8 +198,8 @@ export default function PetCard() {
     <div className="card" data-testid="pet-card">
       <strong>桌宠与 AI 监控</strong>
       <div className="sub">
-        桌宠是独立置顶小窗口，用宠物包动画呈现网关与 AI 工具的实时状态（工作中 / 空闲 / 出错）：单击跳转到用量记录，按住可拖动，右键切换宠物、暂停监控或隐藏。
-        宠物来自第三方 Petdex，本应用只读取 <code>~/.petdex/pets</code> 下的宠物包，不会修改宠物素材。
+        桌宠是独立置顶小窗口，用宠物包动画呈现网关与 AI 工具的实时状态（工作中 / 空闲 / 出错）：100% = 120×130，最小 50% = 60×65，展开信息面板后窗口会自动加大并显示当前任务。单击跳转到用量记录，按住可拖动，右键切换宠物、收起面板、暂停监控或隐藏。
+        任务行会前置显示 AI 软件名，并可定位窗口、打开项目目录或结束该软件；宠物来自第三方 Petdex，本应用只读取 <code>~/.petdex/pets</code> 下的宠物包。
       </div>
       <div className="row">
         <button className="primary" disabled={busy !== null} onClick={() => void openPet()}>
@@ -200,8 +225,8 @@ export default function PetCard() {
           id="pet-scale"
           type="range"
           min={50}
-          max={200}
-          step={10}
+          max={300}
+          step={25}
           value={Math.round(scale * 100)}
           disabled={busy !== null || !status?.pet_window_open}
           onChange={(event) => void applyScale(Number(event.target.value) / 100)}
@@ -216,85 +241,144 @@ export default function PetCard() {
         )}
       </div>
       {status && <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>{status.reason}</div>}
-      {!status?.pet_window_open && <div className="muted" style={{ fontSize: 11 }}>大小在开启桌宠后可调整，选择会立即生效并记住。</div>}
+      {!status?.pet_window_open && <div className="muted" style={{ fontSize: 11 }}>大小在开启桌宠后可调整；50%–300%，其中 100% 对应宠物本体 120×130（最小 50% = 60×65），信息面板会额外扩宽窗口。</div>}
 
       {msg && <div className={`msg ${msg.kind}`} role={msg.kind === "err" ? "alert" : "status"} style={{ marginTop: 10 }}>{msg.text}</div>}
 
       {status && status.active_tasks.length > 0 && (
-        <div style={{ marginTop: 12 }}>
-          <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
+        <div className="pet-table-block">
+          <div className="pet-table-hint">
             检测到的任务（来自工具会话日志，错误优先、其次最近活动）：宠物会按最高优先级切换动作。
           </div>
-          <table>
-            <thead>
-              <tr>
-                <th>来源</th>
-                <th>状态</th>
-                <th>项目</th>
-                <th>最近事件</th>
-              </tr>
-            </thead>
-            <tbody>
-              {status.active_tasks.map((task) => (
-                <tr key={`${task.source}-${task.session_id}`}>
-                  <td><strong>{task.source_label}</strong></td>
-                  <td><span className={`tag ${TASK_TAG[task.status] ?? ""}`}>{TASK_LABEL[task.status] ?? task.status}</span></td>
-                  <td className="mono" style={{ fontSize: 11, overflowWrap: "anywhere" }}>{task.project}</td>
-                  <td className="muted" style={{ fontSize: 11, overflowWrap: "anywhere" }}>{task.detail}</td>
+          <div className="pet-table-wrap">
+            <table className="pet-table pet-task-table">
+              <colgroup>
+                <col style={{ width: 108 }} />
+                <col />
+                <col style={{ width: 92 }} />
+                <col style={{ width: 150 }} />
+                <col />
+                <col style={{ width: 170 }} />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>来源</th>
+                  <th>具体任务</th>
+                  <th>状态</th>
+                  <th>项目</th>
+                  <th>最近事件</th>
+                  <th>定向操作</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {status.active_tasks.map((task) => (
+                  <tr key={`${task.source}-${task.session_id}`} data-testid="pet-card-task-row">
+                    <td className="pet-task-source">
+                      <strong>{task.source_label}</strong>
+                    </td>
+                    <td>
+                      <div className="pet-task-title">{task.title || task.detail}</div>
+                    </td>
+                    <td>
+                      <span
+                        className={`pet-status-chip ${task.status}`}
+                        data-testid="pet-card-task-status"
+                        title={TASK_LABEL[task.status] ?? task.status}
+                      >
+                        <i className="dot" aria-hidden="true" />
+                        {TASK_LABEL[task.status] ?? task.status}
+                      </span>
+                    </td>
+                    <td className="pet-task-project" title={task.project}>
+                      {task.project}
+                    </td>
+                    <td>
+                      <div className="pet-task-event">{task.last_message || task.detail}</div>
+                    </td>
+                    <td className="pet-ops-cell">
+                      <div className="row">
+                        <button
+                          className="ghost"
+                          disabled={busy !== null || (!task.deep_link && !task.tool_id.startsWith("qoder"))}
+                          onClick={() => void openAiTask(task)}
+                        >
+                          {busy === "task-" + task.source + ":" + task.session_id ? "打开中…" : task.deep_link ? "打开任务" : "定位"}
+                        </button>
+                        <button
+                          className="ghost"
+                          disabled={busy !== null || !task.project}
+                          onClick={() => void openTaskProject(task.project)}
+                        >
+                          {busy === "project-" + task.project ? "打开中…" : "项目"}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
       {status && (
-        <div style={{ marginTop: 12 }}>
-          <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
+        <div className="pet-table-block">
+          <div className="pet-table-hint">
             最近一分钟：{status.requests_last_minute} 个请求，{status.failed_last_minute} 个失败；本机运行中的 AI 软件 {monitoredTools.length} 个（{status.ai_processes.length} 个进程）。
             「结束」会终止该软件的全部进程树（未保存的工作可能丢失），确认前请核对工具名与进程数。
           </div>
           {monitoredTools.length > 0 ? (
-            <table>
-              <thead>
-                <tr>
-                  <th>AI 软件</th>
-                  <th>类型</th>
-                  <th>进程</th>
-                  <th>内存合计</th>
-                  <th style={{ width: 96 }}>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {monitoredTools.map((group) => {
-                  const totalMemory = group.processes.reduce((sum, process) => sum + (process.memory_kb ?? 0), 0);
-                  const hasMemory = group.processes.some((process) => process.memory_kb !== null);
-                  return (
-                    <tr key={group.toolId}>
-                      <td>
-                        <strong>{group.label}</strong>
-                        <div className="muted mono" style={{ fontSize: 10, overflowWrap: "anywhere" }}>
-                          {group.processes.slice(0, 3).map((process) => `PID ${process.pid}`).join(" · ")}
-                          {group.processes.length > 3 ? ` 等 ${group.processes.length} 个` : ""}
-                        </div>
-                      </td>
-                      <td><span className="tag">{KIND_LABEL[group.kind] ?? group.kind}</span></td>
-                      <td className="mono">{group.processes.length} 个</td>
-                      <td className="mono">{hasMemory ? formatMemory(totalMemory) : "-"}</td>
-                      <td>
-                        <button
-                          className="ghost"
-                          disabled={busy !== null}
-                          onClick={() => void stopTool(group.toolId, group.label, group.processes.length)}
-                        >
-                          {busy === `stop-${group.toolId}` ? "结束中…" : "结束"}
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+            <div className="pet-table-wrap">
+              <table className="pet-table pet-process-table">
+                <colgroup>
+                  <col />
+                  <col style={{ width: 104 }} />
+                  <col style={{ width: 88 }} />
+                  <col style={{ width: 110 }} />
+                  <col style={{ width: 96 }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>AI 软件</th>
+                    <th>类型</th>
+                    <th>进程</th>
+                    <th>内存合计</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {monitoredTools.map((group) => {
+                    const totalMemory = group.processes.reduce((sum, process) => sum + (process.memory_kb ?? 0), 0);
+                    const hasMemory = group.processes.some((process) => process.memory_kb !== null);
+                    return (
+                      <tr key={group.toolId}>
+                        <td>
+                          <strong>{group.label}</strong>
+                          <div className="muted mono pet-process-pids">
+                            {group.processes.slice(0, 3).map((process) => `PID ${process.pid}`).join(" · ")}
+                            {group.processes.length > 3 ? ` 等 ${group.processes.length} 个` : ""}
+                          </div>
+                        </td>
+                        <td>
+                          <span className="tag pet-kind-chip">{KIND_LABEL[group.kind] ?? group.kind}</span>
+                        </td>
+                        <td className="mono">{group.processes.length} 个</td>
+                        <td className="mono">{hasMemory ? formatMemory(totalMemory) : "-"}</td>
+                        <td>
+                          <button
+                            className="ghost"
+                            disabled={busy !== null}
+                            onClick={() => void stopTool(group.toolId, group.label, group.processes.length)}
+                          >
+                            {busy === `stop-${group.toolId}` ? "结束中…" : "结束"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           ) : (
             <div className="muted" style={{ fontSize: 12 }}>未检测到运行中的 AI 软件进程（匹配编码 CLI 的可执行名与常见 AI 桌面应用）。</div>
           )}

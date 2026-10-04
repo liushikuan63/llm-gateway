@@ -3,10 +3,32 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b1215" />
     <title>LLM Gateway</title>
+    <link rel="stylesheet" href="/src/boot.css" />
   </head>
   <body>
     <div id="root"></div>
+    <div id="boot-splash" class="boot-splash" role="status" aria-live="polite">
+      <div class="boot-splash__aurora" aria-hidden="true"></div>
+      <div class="boot-splash__card">
+        <div class="boot-splash__mark" aria-hidden="true">
+          <span class="boot-splash__pulse"></span>
+          <span class="boot-splash__pulse boot-splash__pulse--delay"></span>
+          <svg viewBox="0 0 64 64" role="img">
+            <path d="M32 7 53 19v26L32 57 11 45V19L32 7Z" />
+            <path d="M21 24.5 32 18l11 6.5v15L32 46l-11-6.5v-15Z" />
+            <path d="m21 24.5 11 6.6 11-6.6M32 31.1V46" />
+          </svg>
+        </div>
+        <div class="boot-splash__brand">LLM Gateway</div>
+        <div class="boot-splash__status" data-boot-status>正在启动本地网关…</div>
+        <div class="boot-splash__progress" aria-hidden="true"><span></span></div>
+        <div class="boot-splash__hint" data-boot-hint>正在恢复配置、数据库与会话上下文</div>
+        <div class="boot-splash__error" data-boot-error hidden></div>
+      </div>
+    </div>
+    <noscript>请启用 JavaScript 以启动 LLM Gateway。</noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

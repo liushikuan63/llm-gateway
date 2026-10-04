@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type Dialect = "openai" | "anthropic" | "gemini" | "ollama";
 export type Currency = "usd" | "cny";
+export type ModelType = "chat" | "embedding" | "image" | "speech";
 // manual：用户手填，刷新定价时永不被覆盖；catalog：由目录/定价源带出，可被刷新。
 export type PriceSource = "manual" | "catalog";
 
@@ -10,6 +11,8 @@ export interface PriceTier {
   min_prompt_tokens: number;
   prompt: number;
   completion: number;
+  cache_read?: number | null;
+  cache_creation?: number | null;
 }
 
 // 时段价（峰谷价/忙闲价）。时间为 UTC 当日分钟数；起止相同表示全天生效，
@@ -26,6 +29,9 @@ export interface PriceRule {
 export interface ModelPrice {
   prompt: number;
   completion: number;
+  // 缓存命中/创建单价；null 或未返回时沿用输入价格。
+  cache_read?: number | null;
+  cache_creation?: number | null;
   currency: Currency;
   tiers: PriceTier[];
   rules: PriceRule[];
@@ -48,14 +54,33 @@ export interface ModelOverrides {
 export interface ModelRef {
   alias: string;
   upstream: string;
+  // 用途决定请求端点：chat=/v1/chat/completions 与 Responses，
+  // embedding=/v1/embeddings，image=/v1/images/generations，speech=/v1/audio/speech。
+  model_type: ModelType;
+  // 单模型上游路径覆盖，例如 /v1/embeddings；支持 {model} 占位符。
+  // null 表示按 model_type 使用默认路径。
+  upstream_path: string | null;
   context_window: number;
   supports_tools: boolean;
   supports_vision: boolean;
   supports_audio: boolean;
   supports_video: boolean;
+  // 是否具备思维链/推理能力。false 的含义是「不确定」，网关按不支持处理。
+  supports_thinking: boolean;
   supports_stream: boolean;
   price: ModelPrice | null;
   overrides: ModelOverrides | null;
+  // 本地模型来源元数据；云端模型为 null。
+  local: LocalMeta | null;
+}
+
+export interface LocalMeta {
+  runtime: string;
+  family: string | null;
+  parameter_size: string | null;
+  quantization: string | null;
+  disk_bytes: number | null;
+  capabilities: string[];
 }
 
 export interface ProviderView {
@@ -113,7 +138,253 @@ export interface AppConfig {
   failover_enabled: boolean;
   catalog_auto_update: boolean;
   catalog_feed_url: string | null;
-  takeover: { claude_code: boolean; codex: boolean; gemini_cli: boolean };
+  takeover: {
+    claude_code: boolean;
+    codex: boolean;
+    gemini_cli: boolean;
+    opencode: boolean;
+    crush: boolean;
+  };
+  local_models: LocalModelConfig;
+  smart_routing: SmartRoutingConfig;
+  search: SearchConfig;
+}
+
+export type LocalRuntimeKind = "ollama" | "open_ai_compatible";
+
+export interface LocalEndpoint {
+  id: string;
+  label: string;
+  base_url: string;
+  kind: LocalRuntimeKind;
+}
+
+export interface LocalModelConfig {
+  enabled: boolean;
+  auto_register: boolean;
+  probe_timeout_ms: number;
+  endpoints: LocalEndpoint[];
+}
+
+export type SmartClassifier = "auto" | "jev" | "heuristic";
+
+/**
+ * 与 `src-tauri/src/config.rs` 的 `SearchBackendKind` **逐字对应**。
+ *
+ * 该枚举在 Rust 侧是 `#[serde(rename_all = "snake_case")]`，所以值是
+ * `sear_xng` / `duck_duck_go`，**不是** `searxng` / `duckduckgo`。
+ * 写错的后果不是「选不中」，而是**保存后整个应用起不来**
+ * （TOML 反序列化失败 → 网关不监听、窗口只剩空壳）。
+ * 已真机踩过：`backend = "duckduckgo"` 让网关完全不监听。
+ * 对应回归测试见 `src-tauri/tests/config.rs` 的
+ * `四个搜索后端的枚举名必须与前端下拉一致`。
+ */
+export type SearchBackendKind = "tavily" | "brave" | "sear_xng" | "bing_cn" | "duck_duck_go";
+export type SearchInjectFormat = "system" | "user";
+
+export interface AutoStartConfig {
+  enabled: boolean;
+  exe_path: string;
+  model_dir: string;
+  port: number;
+  threads: number;
+  boot_wait_ms: number;
+}
+
+export interface JevConfig {
+  base_url: string;
+  model: string;
+  timeout_ms: number;
+  max_state_chars: number;
+  auto_start: AutoStartConfig;
+}
+
+export interface PromptRefineConfig {
+  enabled: boolean;
+  /** 指定改写用的供应商；留空则用候选链里最轻的非思考模型。 */
+  provider_id: string | null;
+  model: string | null;
+  timeout_ms: number;
+  /** 改写结果长度上限，超过判失败并用原文。 */
+  max_chars: number;
+  /** Jev 的 clarity noul 低于此值即认为提示词含糊。 */
+  clarity_noul: number;
+  /** 短于这个长度一律不改写。 */
+  min_chars: number;
+}
+
+export interface SmartRoutingConfig {
+  enabled: boolean;
+  classifier: SmartClassifier;
+  jev: JevConfig;
+  timeout_ms: number;
+  min_confidence: number;
+  min_margin: number;
+  prompt_refine: PromptRefineConfig;
+}
+
+export interface SearchConfig {
+  enabled: boolean;
+  backend: SearchBackendKind;
+  searxng_url: string | null;
+  max_results: number;
+  timeout_ms: number;
+  inject_as: SearchInjectFormat;
+}
+
+export interface ProbeOutcome {
+  id: string;
+  label: string;
+  base_url: string;
+  kind: LocalRuntimeKind;
+  reachable: boolean;
+  version: string | null;
+  model_count: number;
+  error: string | null;
+}
+
+export interface LocalModelInfo {
+  upstream: string;
+  alias: string;
+  context_window: number;
+  supports_tools: boolean;
+  supports_vision: boolean;
+  supports_audio: boolean;
+  supports_video: boolean;
+  supports_thinking: boolean;
+  supports_stream: boolean;
+  model_type: ModelType;
+  meta: LocalMeta;
+}
+
+export interface RegisterLocalInput {
+  endpoint_id: string;
+  upstream: string;
+  alias: string | null;
+  provider_name: string | null;
+  enabled: boolean | null;
+}
+
+export interface RegisterLocalOutcome {
+  provider_id: string;
+  alias: string;
+  added_models: number;
+  all_models: LocalModelInfo[];
+}
+
+export interface PullProgress {
+  model: string;
+  status: string;
+  completed: number | null;
+  total: number | null;
+  done: boolean;
+}
+
+export interface SearchSettingsInput {
+  enabled: boolean;
+  backend: SearchBackendKind;
+  searxng_url: string | null;
+  max_results: number;
+  timeout_ms: number;
+  inject_as: SearchInjectFormat;
+  api_key: string | null;
+  clear_api_key: boolean;
+}
+
+export interface SearchSettingsView {
+  enabled: boolean;
+  backend: SearchBackendKind;
+  searxng_url: string | null;
+  max_results: number;
+  timeout_ms: number;
+  inject_as: SearchInjectFormat;
+  api_key_masked: string | null;
+  backend_needs_key: boolean;
+}
+
+export interface SearchResultItem {
+  title: string;
+  url: string;
+  snippet: string;
+  score: number;
+}
+
+export interface SearchOutcome {
+  backend: SearchBackendKind;
+  hits: number;
+  error: string | null;
+  results: SearchResultItem[];
+}
+
+export type ClassifierSource = "rule" | "jev" | "heuristic";
+export type TaskClass = "simple" | "vision" | "reasoning";
+
+export interface TaskIntent {
+  class: TaskClass;
+  complexity: number;
+  needs_web: boolean;
+  /** Jev 判定提示词含糊到值得先改写。改写本身另有一次模型调用。 */
+  needs_refine: boolean;
+  classifier: ClassifierSource;
+  jev_note: string | null;
+  jev_evidence: Record<string, unknown> | null;
+}
+
+export interface JevPreviewRow {
+  name: string;
+  kind: string;
+  summary: string;
+  confidence: number;
+  margin: number | null;
+  adopted: boolean;
+}
+
+export interface JevProbeResult {
+  ok: boolean;
+  endpoint: string;
+  rows?: JevPreviewRow[];
+  error?: string;
+}
+
+export interface LabeledSample {
+  text: string;
+  /** 人工标注的正确答案。 */
+  expected: TaskClass;
+  has_image: boolean;
+  has_tools: boolean;
+}
+
+export interface SampleOutcome {
+  text: string;
+  expected: TaskClass;
+  /** 不采信 Jev 时的结果（= 启发式）。 */
+  heuristic: TaskClass;
+  /** 采信 Jev 后的最终结果。 */
+  adopted: TaskClass;
+  adopted_from_jev: boolean;
+  /** 没被采纳的原因。 */
+  abstain_reason: string | null;
+  confidence: number;
+  margin: number;
+  raw_choice: string | null;
+}
+
+export interface CalibrationReport {
+  total: number;
+  /** 行 = 真实类别，列 = 系统判定。 */
+  matrix: Record<string, Record<string, number>>;
+  adopted_count: number;
+  adopted_correct: number;
+  adopted_wrong: number;
+  abstained_count: number;
+  abstained_but_heuristic_right: number;
+  heuristic_correct: number;
+  /** 采纳 Jev 比不采纳多对/少对几条。唯一的决策依据。 */
+  net_gain: number;
+  wrong_confidences: number[];
+  worst_wrong: SampleOutcome | null;
+  per_sample: SampleOutcome[];
+  verdict: string;
 }
 
 export interface ConfigUpdateResult {
@@ -155,6 +426,7 @@ export interface DiscoverModelsInput {
 export interface DiscoveredModel {
   id: string;
   name: string;
+  model_type: ModelType | null;
   context_window: number;
   context_source: "provider" | "default";
   supports_tools: boolean | null;
@@ -493,13 +765,35 @@ export interface PetStatus {
 }
 
 export interface DetectedTask {
+  // 可执行操作对应的受监控工具标识，例如 codex / codex_desktop / qoder。
+  tool_id: string;
   source: string;
   source_label: string;
   project: string;
   session_id: string;
   status: "running" | "error" | "done";
   detail: string;
+  // 从用户消息/会话 Recap 提取的具体任务标题与最近内容。
+  title: string;
+  last_message: string;
+  // 官方任务级深链；没有可靠协议时为 null。
+  deep_link: string | null;
   updated_at: number;
+}
+
+export interface PetWindowLayout {
+  scale: number;
+  expanded: boolean;
+  bubble_hidden: boolean;
+  bubble_left: boolean;
+  // 当前气泡数量与上限（多个任务时气泡纵向堆叠，窗口高度随之变化）。
+  bubble_count: number;
+  bubble_limit: number;
+  // 气泡堆叠是否展开（鼠标悬浮 / 任务结束时展开）。
+  bubbles_expanded: boolean;
+  width: number;
+  height: number;
+  window_open: boolean;
 }
 
 export interface PetAnimations {
@@ -577,14 +871,68 @@ export const api = {
   getPetAsset: (slug: string) => invoke<PetAsset>("get_pet_asset", { slug }),
   openPetWindow: () => invoke<void>("open_pet_window"),
   closePetWindow: () => invoke<void>("close_pet_window"),
-  setPetWindowSize: (scale: number) => invoke<number>("set_pet_window_size", { scale }),
-  showPetMenu: (currentSlug: string | null, paused: boolean) =>
-    invoke<void>("show_pet_menu", { currentSlug, paused }),
+  setPetWindowSize: (scale: number) =>
+    invoke<PetWindowLayout>("set_pet_window_size", { scale }),
+  setPetWindowExpanded: (expanded: boolean) =>
+    invoke<PetWindowLayout>("set_pet_window_expanded", { expanded }),
+  setPetWindowBubbleHidden: (hidden: boolean) =>
+    invoke<PetWindowLayout>("set_pet_window_bubble_hidden", { hidden }),
+  getPetWindowLayout: () =>
+    invoke<PetWindowLayout>("get_pet_window_layout"),
+  refreshPetWindowLayout: () =>
+    invoke<PetWindowLayout>("refresh_pet_window_layout"),
+  setPetBubbles: (bubbleCount: number, bubblesExpanded: boolean) =>
+    invoke<PetWindowLayout>("set_pet_bubbles", { bubbleCount, bubblesExpanded }),
+  showPetMenu: (currentSlug: string | null, paused: boolean, expanded: boolean) =>
+    invoke<void>("show_pet_menu", { currentSlug, paused, expanded }),
   focusMainWindow: (section?: string) =>
     invoke<void>("focus_main_window", { section: section ?? null }),
+  focusAiTool: (toolId: string) => invoke<string>("focus_ai_tool", { toolId }),
+  openAiTask: (toolId: string, sessionId: string) =>
+    invoke<string>("open_ai_task", { toolId, sessionId }),
+  openTaskProject: (path: string) => invoke<string>("open_task_project", { path }),
   stopAiTool: (toolId: string) => invoke<string>("stop_ai_tool", { toolId }),
   petdexCatalog: () => invoke<string>("petdex_catalog"),
   petdexInstallPet: (slug: string) => invoke<string>("petdex_install_pet", { slug }),
+
+  // 本地模型 / 智能模式 / 联网搜索
+  listLocalRuntimes: () => invoke<ProbeOutcome[]>("list_local_runtimes"),
+  listLocalModels: (endpointId: string) =>
+    invoke<LocalModelInfo[]>("list_local_models", { endpointId }),
+  registerLocalModel: (input: RegisterLocalInput) =>
+    invoke<RegisterLocalOutcome>("register_local_model", { input }),
+  pullLocalModel: (endpointId: string, model: string) =>
+    invoke<void>("pull_local_model", { endpointId, model }),
+  getSearchSettings: () => invoke<SearchSettingsView>("get_search_settings"),
+  updateSearchSettings: (input: SearchSettingsInput) =>
+    invoke<SearchSettingsView>("update_search_settings", { input }),
+  testSearchBackend: (text: string) => invoke<SearchOutcome>("test_search_backend", { text }),
+  classifyPreview: (text: string, hasImage: boolean, hasTools: boolean) =>
+    invoke<TaskIntent>("classify_preview", { text, hasImage, hasTools }),
+  jevProbe: (text: string) => invoke<JevProbeResult>("jev_probe", { text }),
+  calibrateClassifier: (samples: LabeledSample[]) =>
+    invoke<CalibrationReport>("calibrate_classifier", { samples }),
+  calibrateDefaultSamples: () => invoke<CalibrationReport>("calibrate_default_samples"),
+};
+
+export const TASK_CLASS_LABEL: Record<TaskClass, string> = {
+  simple: "简单任务",
+  vision: "图像识别",
+  reasoning: "复杂思考",
+};
+
+export const CLASSIFIER_LABEL: Record<ClassifierSource, string> = {
+  rule: "硬规则",
+  jev: "Jev 决策",
+  heuristic: "启发式",
+};
+
+export const SEARCH_BACKEND_LABEL: Record<SearchBackendKind, string> = {
+  tavily: "Tavily（需 Key）",
+  brave: "Brave（需 Key）",
+  sear_xng: "SearXNG（自建，免 Key）",
+  bing_cn: "必应中国（免 Key，国内可达）",
+  duck_duck_go: "DuckDuckGo（免 Key，可用性无保证）",
 };
 
 export const DIALECT_LABEL: Record<Dialect, string> = {

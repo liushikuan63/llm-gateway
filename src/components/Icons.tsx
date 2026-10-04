@@ -10,7 +10,8 @@ export type IconName =
   | "moon"
   | "sun"
   | "shield"
-  | "monitor";
+  | "monitor"
+  | "warning";
 
 /// 应用标识：多路上游汇聚为单一出口。与 src-tauri/icons/logo.svg 同构，
 /// 修改时两处保持一致并运行 npm run icons 重新生成图标文件。
@@ -106,6 +107,12 @@ export function Icon({ name, size = 18, ...props }: IconProps) {
         <>
           <rect x="3.5" y="4" width="17" height="12" rx="2" {...shared} />
           <path d="M8 20h8M12 16v4" {...shared} />
+        </>
+      )}
+      {name === "warning" && (
+        <>
+          <path d="M12 4.5 2.8 20h18.4z" {...shared} />
+          <path d="M12 10v4.2M12 17.3h.01" {...shared} />
         </>
       )}
     </svg>

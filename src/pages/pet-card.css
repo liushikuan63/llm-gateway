@@ -1,0 +1,147 @@
+/* 桌宠卡片：任务表与 AI 软件表的排版优化。 */
+
+.pet-table-block {
+  margin-top: 12px;
+}
+
+.pet-table-hint {
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.pet-table-wrap {
+  overflow-x: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.pet-table {
+  width: 100%;
+  min-width: 840px;
+  border-collapse: collapse;
+}
+
+.pet-table th,
+.pet-table td {
+  vertical-align: top;
+}
+
+.pet-table tbody tr:hover {
+  background: var(--panel-2);
+}
+
+.pet-task-source {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.pet-task-title {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.pet-task-project {
+  max-width: 150px;
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.pet-task-event {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+/* 状态标签：单行胶囊 + 前置圆点，避免窄列把「进行中」竖排。 */
+.pet-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.pet-status-chip .dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  background: currentColor;
+  border-radius: 50%;
+}
+
+.pet-status-chip.running {
+  color: var(--ok);
+  background: var(--ok-soft);
+  border-color: #9ac9b4;
+}
+
+.pet-status-chip.error {
+  color: var(--err);
+  background: var(--err-soft);
+  border-color: #d9a1a3;
+}
+
+/* 运行中的圆点轻微呼吸，和气泡里的流光呼应。 */
+.pet-status-chip.running .dot {
+  animation: pet-status-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes pet-status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.45;
+    transform: scale(0.78);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-status-chip.running .dot {
+    animation: none;
+  }
+}
+
+.pet-ops-cell .row {
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.pet-kind-chip {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.pet-process-table {
+  min-width: 620px;
+}
+
+.pet-process-pids {
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}

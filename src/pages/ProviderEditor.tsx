@@ -1,15 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, clockToMinutes, Currency, DIALECT_LABEL, DiscoveredModel, formatPricePerMillion, HeaderPair, minutesToClock, ModelOverrides, ModelRef, PriceRule, PriceSource, ProviderInput } from "../api";
+import { api, clockToMinutes, Currency, DIALECT_LABEL, DiscoveredModel, formatPricePerMillion, HeaderPair, minutesToClock, ModelOverrides, ModelRef, ModelType, PriceRule, PriceSource, ProviderInput } from "../api";
 import { DEFAULT_CONTEXT_WINDOW, emptyModel, errorText, formatContext, PRESETS, ProviderForm } from "./providerPresets";
 
 type Source = "provider" | "default" | "manual" | "saved";
 type DraftModel = ModelRef & { rowId: number; source: Source };
 const SOURCE_LABEL: Record<Source, string> = { provider: "上游提供", default: "默认值 · 待确认", manual: "手动设置", saved: "已保存" };
+const MODEL_TYPE_LABEL: Record<ModelType, string> = {
+  chat: "聊天",
+  embedding: "Embedding",
+  image: "文生图",
+  speech: "语音合成",
+};
 
 // 价格输入允许「未填」这一中间状态，因此草稿用字符串保存，保存时再整体校验。
 // 时段价用百分比表达倍率：50 表示五折，跨午夜由「起点晚于终点」自动表达。
 type RuleDraft = { label: string; start: string; end: string; promptPercent: string; completionPercent: string };
-type PriceDraft = { prompt: string; completion: string; currency: Currency; rules: RuleDraft[] };
+type PriceDraft = {
+  prompt: string;
+  completion: string;
+  cacheRead: string;
+  cacheCreation: string;
+  currency: Currency;
+  rules: RuleDraft[];
+};
 const priceRulesDraft = (rules: PriceRule[]): RuleDraft[] => rules.map(rule => ({
   label: rule.label,
   start: minutesToClock(rule.start_minute),
@@ -20,9 +33,11 @@ const priceRulesDraft = (rules: PriceRule[]): RuleDraft[] => rules.map(rule => (
 const draftFromPrice = (price: ModelRef["price"]): PriceDraft => price ? {
   prompt: String(price.prompt),
   completion: String(price.completion),
+  cacheRead: price.cache_read === null || price.cache_read === undefined ? "" : String(price.cache_read),
+  cacheCreation: price.cache_creation === null || price.cache_creation === undefined ? "" : String(price.cache_creation),
   currency: price.currency,
   rules: priceRulesDraft(price.rules),
-} : { prompt: "", completion: "", currency: "usd", rules: [] };
+} : { prompt: "", completion: "", cacheRead: "", cacheCreation: "", currency: "usd", rules: [] };
 
 // 覆盖配置的草稿：数值用字符串以便「留空 = 不覆盖」，extra_body 用 JSON 文本。
 type OverridesDraft = { temperature: string; max_tokens: string; extraBody: string; headers: HeaderPair[] };
@@ -152,7 +167,7 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
     } finally { if (version === requestVersion.current) setDiscovering(false); }
   };
   const configured = useMemo(() => new Set(models.map(m => m.upstream.trim())), [models]);
-  const visible = useMemo(() => (catalog ?? []).filter(m => `${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase()) && (filter === "all" || filter === "free" && m.is_free === true || filter === "tools" && m.supports_tools === true || filter === "vision" && m.supports_vision === true || filter === "audio" && m.supports_audio === true || filter === "video" && m.supports_video === true)), [catalog, query, filter]);
+  const visible = useMemo(() => (catalog ?? []).filter(m => `${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase()) && (filter === "all" || filter === "free" && m.is_free === true || filter === "tools" && m.supports_tools === true || filter === "vision" && m.supports_vision === true || filter === "audio" && m.supports_audio === true || filter === "video" && m.supports_video === true || filter === "chat" && (m.model_type ?? "chat") === "chat" || filter === "embedding" && m.model_type === "embedding" || filter === "image" && m.model_type === "image" || filter === "speech" && m.model_type === "speech")), [catalog, query, filter]);
   const selectable = visible.filter(m => !configured.has(m.id));
   const validateDefaultContext = () => {
     if (Number.isInteger(defaultContext) && defaultContext >= 1 && defaultContext <= 2147483647) return true;
@@ -166,14 +181,16 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
     const conflicts = incoming.filter(m => aliases.has(m.id));
     if (conflicts.length) { setMessage({ kind: "err", text: `别名 ${conflicts[0].id} 已被使用，请先修改该别名再添加。` }); return; }
     dirty.current = true;
-    const added = incoming.map(m => ({ alias: m.id, upstream: m.id,
+    const added = incoming.map(m => ({ alias: m.id, upstream: m.id, model_type: m.model_type ?? "chat", upstream_path: null,
       context_window: m.context_source === "provider" ? m.context_window : defaultContext,
       supports_tools: m.supports_tools ?? false, supports_vision: m.supports_vision ?? false,
       // 目录给出的模态能力直接带入；未识别时保持 false，由用户按官方说明确认。
       supports_audio: m.supports_audio ?? false, supports_video: m.supports_video ?? false,
+      // 目录不提供思维链信息，一律按「不确定 → 不支持」处理。
+      supports_thinking: false,
       supports_stream: m.supports_stream ?? true, price: m.price,
       // 目录只提供价格，不提供覆盖配置：新添加的模型从「无覆盖」开始。
-      overrides: null,
+      overrides: null, local: null,
       source: m.context_source, rowId: nextRow.current++,
     }));
     setModels(previous => [...previous, ...added]);
@@ -193,10 +210,12 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
     const draft = priceDrafts[m.rowId] ?? draftFromPrice(m.price);
     const prompt = draft.prompt.trim();
     const completion = draft.completion.trim();
+    const cacheRead = draft.cacheRead.trim();
+    const cacheCreation = draft.cacheCreation.trim();
     const label = m.upstream.trim() || m.alias.trim() || "当前模型";
     const rules = draft.rules.filter(rule => rule.label.trim() || rule.start.trim() || rule.end.trim());
     if (!prompt && !completion) {
-      if (rules.length) return { error: `模型 ${label} 配置了时段价，但还没有填写基础价格。` };
+      if (rules.length || cacheRead || cacheCreation) return { error: `模型 ${label} 配置了时段价或缓存价，但还没有填写基础输入/输出价格。` };
       return null;
     }
     if (!prompt || !completion) return { error: `模型 ${label} 的输入价格与输出价格必须同时填写，或同时留空。` };
@@ -204,6 +223,15 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
     const completionValue = Number(completion);
     if (!Number.isFinite(promptValue) || !Number.isFinite(completionValue) || promptValue < 0 || completionValue < 0) {
       return { error: `模型 ${label} 的价格必须是 0 或更大的数值（单位为每 100 万 token）。` };
+    }
+    const parseOptionalPrice = (raw: string) => raw ? Number(raw) : null;
+    const cacheReadValue = parseOptionalPrice(cacheRead);
+    const cacheCreationValue = parseOptionalPrice(cacheCreation);
+    if (
+      (cacheReadValue !== null && (!Number.isFinite(cacheReadValue) || cacheReadValue < 0))
+      || (cacheCreationValue !== null && (!Number.isFinite(cacheCreationValue) || cacheCreationValue < 0))
+    ) {
+      return { error: `模型 ${label} 的缓存价格必须是 0 或更大的数值；留空表示沿用普通输入价。` };
     }
     const resolvedRules: PriceRule[] = [];
     for (const rule of rules) {
@@ -231,10 +259,21 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
     const edited = !original
       || original.prompt !== promptValue
       || original.completion !== completionValue
+      || (original.cache_read ?? null) !== cacheReadValue
+      || (original.cache_creation ?? null) !== cacheCreationValue
       || original.currency !== draft.currency
       || JSON.stringify(original.rules) !== JSON.stringify(resolvedRules);
     const source: PriceSource = edited ? "manual" : original.source;
-    return { prompt: promptValue, completion: completionValue, currency: draft.currency, tiers: original?.tiers ?? [], rules: resolvedRules, source };
+    return {
+      prompt: promptValue,
+      completion: completionValue,
+      cache_read: cacheReadValue,
+      cache_creation: cacheCreationValue,
+      currency: draft.currency,
+      tiers: original?.tiers ?? [],
+      rules: resolvedRules,
+      source,
+    };
   };
   // 覆盖要么整体留空（不改变请求），要么逐项通过校验；错误必须指出具体模型与字段。
   const resolveOverrides = (m: DraftModel): ModelOverrides | null | { error: string } => {
@@ -287,6 +326,19 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
     if (!form.name.trim() || !form.base_url.trim()) { setMessage({ kind: "err", text: "请填写供应商名称和 API 地址。" }); return; }
     if (!models.length || models.some(m => !m.alias.trim() || !m.upstream.trim())) { setMessage({ kind: "err", text: "请至少添加一个模型，并填写每个模型的名称与别名。" }); return; }
     if (new Set(models.map(m => m.alias.trim())).size !== models.length) { setMessage({ kind: "err", text: "模型对外别名不能重复。" }); return; }
+    const invalidPath = models.find(model => {
+      const path = model.upstream_path?.trim();
+      if (!path) return false;
+      const placeholders = path.match(/\{([^}]*)\}/g) ?? [];
+      return !path.startsWith("/")
+        || path.includes("://")
+        || path.includes("?")
+        || path.includes("#")
+        || path.includes("\\")
+        || path.split("/").some(segment => segment === "." || segment === "..")
+        || placeholders.some(placeholder => placeholder !== "{model}");
+    });
+    if (invalidPath) { setMessage({ kind: "err", text: `模型 ${invalidPath.alias || invalidPath.upstream} 的上游请求路径无效。路径必须以 / 开头，只支持 {model} 占位符。` }); return; }
     if (models.some(m => !Number.isInteger(m.context_window) || m.context_window < 1 || m.context_window > 2147483647)) { setMessage({ kind: "err", text: "上下文长度必须为 1 到 2,147,483,647 之间的整数。" }); return; }
     if (![form.priority, form.rpm_limit, form.intelligence].every(Number.isInteger) || form.rpm_limit < 0 || form.intelligence < 0 || form.intelligence > 100) { setMessage({ kind: "err", text: "请检查优先级、RPM（非负整数）和能力分（0–100）。" }); return; }
     const resolved: ModelRef[] = [];
@@ -334,9 +386,9 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
           <section className="model-pane" aria-labelledby="model-selection-title">
             <div className="section-caption"><span>02</span><h3 id="model-selection-title">选择与配置模型</h3></div>
             {catalog === null ? <div className="catalog-placeholder"><div className="catalog-symbol" aria-hidden="true">≋</div><strong>{discovering ? "正在读取服务的模型目录" : "让服务告诉你支持哪些模型"}</strong><p>获取后可搜索、多选，并自动填入上游提供的上下文长度。</p><span>接口不提供目录时，也可以手动添加。</span></div> : <div className="model-catalog">
-              <div className="catalog-toolbar"><input aria-label="搜索可用模型" placeholder="搜索模型名称或 ID…" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="筛选模型能力" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部模型</option><option value="free">免费模型</option><option value="tools">支持工具</option><option value="vision">支持图像</option><option value="audio">支持音频</option><option value="video">支持视频</option></select></div>
+              <div className="catalog-toolbar"><input aria-label="搜索可用模型" placeholder="搜索模型名称或 ID…" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="筛选模型能力和类型" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部模型</option><option value="chat">聊天模型</option><option value="embedding">Embedding</option><option value="image">文生图</option><option value="speech">语音合成</option><option value="free">免费模型</option><option value="tools">支持工具</option><option value="vision">支持图像</option><option value="audio">支持音频</option><option value="video">支持视频</option></select></div>
               <div className="catalog-meta"><span>显示 {visible.length} / {catalog.length} 个</span><button className="ghost" disabled={!selectable.length || busy} onClick={() => setSelected(previous => { const next = new Set(previous); const all = selectable.every(m => next.has(m.id)); selectable.forEach(m => all ? next.delete(m.id) : next.add(m.id)); return next; })}>{selectable.length > 0 && selectable.every(m => selected.has(m.id)) ? "取消当前筛选" : "选择当前筛选"}</button></div>
-              <div className="catalog-list" aria-label="可用模型目录">{visible.length === 0 ? <p className="empty">没有匹配的模型，试试其他关键词或筛选条件。</p> : visible.map(m => <label className={`catalog-item ${configured.has(m.id) ? "configured" : ""}`} key={m.id}><input type="checkbox" disabled={busy || configured.has(m.id)} checked={configured.has(m.id) || selected.has(m.id)} onChange={e => setSelected(previous => { const next = new Set(previous); e.target.checked ? next.add(m.id) : next.delete(m.id); return next; })} /><span className="catalog-item-content"><strong>{m.name || m.id}</strong><span className="mono breakable">{m.id}</span><span className="model-tags"><span>{formatContext(m.context_source === "provider" ? m.context_window : defaultContext)} tokens · {m.context_source === "provider" ? "上游提供" : "默认待确认"}</span>{m.is_free === true && <span className="tag ok">免费</span>}{m.price && <span className="tag">{formatPricePerMillion(m.price)}</span>}{m.supports_tools === true && <span className="tag">工具</span>}{m.supports_vision === true && <span className="tag">图像</span>}{m.supports_audio === true && <span className="tag">音频</span>}{m.supports_video === true && <span className="tag">视频</span>}{configured.has(m.id) && <span className="tag">已添加</span>}</span></span></label>)}</div>
+              <div className="catalog-list" aria-label="可用模型目录">{visible.length === 0 ? <p className="empty">没有匹配的模型，试试其他关键词或筛选条件。</p> : visible.map(m => <label className={`catalog-item ${configured.has(m.id) ? "configured" : ""}`} key={m.id}><input type="checkbox" disabled={busy || configured.has(m.id)} checked={configured.has(m.id) || selected.has(m.id)} onChange={e => setSelected(previous => { const next = new Set(previous); e.target.checked ? next.add(m.id) : next.delete(m.id); return next; })} /><span className="catalog-item-content"><strong>{m.name || m.id}</strong><span className="mono breakable">{m.id}</span><span className="model-tags"><span>{formatContext(m.context_source === "provider" ? m.context_window : defaultContext)} tokens · {m.context_source === "provider" ? "上游提供" : "默认待确认"}</span><span className="tag">{MODEL_TYPE_LABEL[m.model_type ?? "chat"]}</span>{m.is_free === true && <span className="tag ok">免费</span>}{m.price && <span className="tag">{formatPricePerMillion(m.price)}</span>}{m.supports_tools === true && <span className="tag">工具</span>}{m.supports_vision === true && <span className="tag">图像</span>}{m.supports_audio === true && <span className="tag">音频</span>}{m.supports_video === true && <span className="tag">视频</span>}{configured.has(m.id) && <span className="tag">已添加</span>}</span></span></label>)}</div>
               <div className="catalog-footer"><span>已勾选 {selected.size} 个</span><button className="primary" disabled={!selected.size || busy} onClick={addSelected}>添加所选模型</button></div>
             </div>}
             {catalogWarnings.map((warning, i) => <p className="catalog-warning" key={i}>{warning}</p>)}
@@ -344,7 +396,8 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
             {!models.length && <div className="selected-empty">还未添加模型。{PRESETS.find(p => p.name === preset)?.models.length ? <button className="ghost" disabled={busy} onClick={addPresetModels}>使用预设名称</button> : null}</div>}
             <div className="configured-models">{models.map((m, index) => <article className="configured-model" key={m.rowId}>
               <div className="configured-model-title"><strong className="breakable">{m.upstream || `新模型 ${index + 1}`}</strong><button className="icon-button ghost danger" disabled={busy} aria-label={`移除模型 ${m.upstream || index + 1}`} onClick={() => removeModel(m.rowId)}>×</button></div>
-              <div className="grid2"><div className="field"><label htmlFor={`upstream-${m.rowId}`}>上游模型 ID</label><input id={`upstream-${m.rowId}`} disabled={busy} value={m.upstream} placeholder="例如 deepseek-chat" onChange={e => patchModel(m.rowId, { upstream: e.target.value, source: "manual" })} /></div><div className="field"><label htmlFor={`alias-${m.rowId}`}>对外别名</label><input id={`alias-${m.rowId}`} disabled={busy} value={m.alias} placeholder="客户端使用的模型名" onChange={e => patchModel(m.rowId, { alias: e.target.value })} /></div></div>
+              <div className="grid2"><div className="field"><label htmlFor={`upstream-${m.rowId}`}>上游模型 ID</label><input id={`upstream-${m.rowId}`} disabled={busy} value={m.upstream} placeholder="例如 deepseek-chat" onChange={e => patchModel(m.rowId, { upstream: e.target.value, source: "manual" })} /></div><div className="field"><label htmlFor={`model-type-${m.rowId}`}>模型类型</label><select id={`model-type-${m.rowId}`} disabled={busy} value={m.model_type} onChange={e => patchModel(m.rowId, { model_type: e.target.value as ModelType })}><option value="chat">聊天 / Responses</option><option value="embedding">Embedding</option><option value="image">文生图</option><option value="speech">语音合成 TTS</option></select></div><div className="field"><label htmlFor={`alias-${m.rowId}`}>对外别名</label><input id={`alias-${m.rowId}`} disabled={busy} value={m.alias} placeholder="客户端使用的模型名" onChange={e => patchModel(m.rowId, { alias: e.target.value })} /></div></div>
+              <div className="field"><label htmlFor={`upstream-path-${m.rowId}`}>上游请求路径 <span className="muted">· 可选</span></label><input id={`upstream-path-${m.rowId}`} disabled={busy} spellCheck={false} value={m.upstream_path ?? ""} placeholder={m.model_type === "embedding" ? "/v1/embeddings" : m.model_type === "image" ? "/v1/images/generations" : m.model_type === "speech" ? "/v1/audio/speech" : "/v1/chat/completions"} onChange={e => patchModel(m.rowId, { upstream_path: e.target.value.trim() ? e.target.value : null })} /><small>从域名根开始填写；留空使用协议默认路径。支持 <code>{"{model}"}</code> 占位符。</small></div>
               <div className="context-line"><div className="field"><label htmlFor={`context-${m.rowId}`}>上下文长度（tokens）</label><input id={`context-${m.rowId}`} type="number" min={1} max={2147483647} disabled={busy} value={m.context_window} onChange={e => patchModel(m.rowId, { context_window: Number(e.target.value), source: "manual" })} /></div><span className={`context-source ${m.source === "default" ? "unverified" : ""}`}>{SOURCE_LABEL[m.source]}</span>{catalog?.find(item => item.id === m.upstream)?.context_source === "provider" && <button className="ghost" disabled={busy} onClick={() => { const remote = catalog.find(item => item.id === m.upstream)!; patchModel(m.rowId, { context_window: remote.context_window, source: "provider" }); }}>采用上游长度</button>}</div>
               <div className="model-capabilities">{([['supports_tools', '工具调用'], ['supports_vision', '图像输入'], ['supports_audio', '音频输入'], ['supports_video', '视频输入'], ['supports_stream', '流式响应']] as const).map(([key, label]) => <label key={key}><input type="checkbox" checked={m[key]} disabled={busy} onChange={e => patchModel(m.rowId, { [key]: e.target.checked })} />{label}</label>)}</div>
               {(() => {
@@ -356,10 +409,18 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
                   <div className="price-line">
                     <div className="field"><label htmlFor={`price-prompt-${m.rowId}`}>输入价格</label><input id={`price-prompt-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={busy} value={draft.prompt} placeholder="每 100 万 token" onChange={e => patchPrice(m.rowId, { prompt: e.target.value })} /></div>
                     <div className="field"><label htmlFor={`price-completion-${m.rowId}`}>输出价格</label><input id={`price-completion-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={busy} value={draft.completion} placeholder="每 100 万 token" onChange={e => patchPrice(m.rowId, { completion: e.target.value })} /></div>
+                    <div className="field"><label htmlFor={`price-cache-read-${m.rowId}`}>缓存命中价</label><input id={`price-cache-read-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={busy} value={draft.cacheRead} placeholder="留空 = 输入价" onChange={e => patchPrice(m.rowId, { cacheRead: e.target.value })} /></div>
+                    <div className="field"><label htmlFor={`price-cache-creation-${m.rowId}`}>缓存创建价</label><input id={`price-cache-creation-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={busy} value={draft.cacheCreation} placeholder="留空 = 输入价" onChange={e => patchPrice(m.rowId, { cacheCreation: e.target.value })} /></div>
                     <div className="field"><label htmlFor={`price-currency-${m.rowId}`}>币种</label><select id={`price-currency-${m.rowId}`} disabled={busy || !filled} value={draft.currency} onChange={e => patchPrice(m.rowId, { currency: e.target.value as Currency })}><option value="usd">美元 USD</option><option value="cny">人民币 CNY</option></select></div>
                     <span className={`price-state ${filled ? "" : "unverified"}`}>{filled ? (m.price?.source === "catalog" ? "目录定价 · 可自动更新" : "手工定价 · 刷新时不覆盖") : "未配置价格 · 不计花费"}</span>
                   </div>
-                  {tiers.length > 0 && <p className="price-tiers muted">目录提供的输入长度分档：{tiers.map(tier => `${Math.round(tier.min_prompt_tokens / 1000)}K起 ${formatPricePerMillion({ prompt: tier.prompt, completion: tier.completion, currency: draft.currency })}`).join("；")}（自动生效，无需手填）</p>}
+                  {tiers.length > 0 && <p className="price-tiers muted">目录提供的输入长度分档：{tiers.map(tier => {
+                    const cache = [
+                      tier.cache_read === null || tier.cache_read === undefined ? null : `命中 ${tier.cache_read}`,
+                      tier.cache_creation === null || tier.cache_creation === undefined ? null : `创建 ${tier.cache_creation}`,
+                    ].filter(Boolean).join(" / ");
+                    return `${Math.round(tier.min_prompt_tokens / 1000)}K起 ${formatPricePerMillion({ prompt: tier.prompt, completion: tier.completion, currency: draft.currency })}${cache ? `（${cache}）` : ""}`;
+                  }).join("；")}（自动生效，无需手填）</p>}
                   <details className="price-rules">
                     <summary>峰谷价 / 忙闲价 {draft.rules.length > 0 && <span className="tag">已配置 {draft.rules.length} 条</span>}</summary>
                     <p className="overrides-help">按 UTC 时间对基础价打折：倍率填百分比（50 = 五折）。起点晚于终点表示跨午夜，例如 16:30 → 00:30。同一时刻命中多条时以第一条为准。</p>
