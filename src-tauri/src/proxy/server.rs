@@ -33,12 +33,12 @@ use crate::context::{
 };
 use crate::db::{self, repo};
 use crate::domain::{
-    ChatRequest, Content, FunctionCall, ImageUrl, Message, Part, Provider, RemoteAccessKey, Role,
-    ToolCall, Usage,
+    ChatRequest, Content, FunctionCall, ImageUrl, Message, ModelType, Part, Provider,
+    RemoteAccessKey, Role, ToolCall, Usage,
 };
 use crate::error::{GatewayError, Result};
 use crate::proxy::health::HealthRegistry;
-use crate::proxy::upstream::{UpstreamClient, UpstreamEvent};
+use crate::proxy::upstream::{PassthroughResponse, UpstreamClient, UpstreamEvent};
 use crate::router::failover::{classify, AtomicFlag, FailoverChain};
 use crate::router::ratelimit::{Quota, RateLimiter};
 use crate::router::Router as GatewayRouter;
@@ -191,6 +191,21 @@ impl GatewayState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{flattened_response_tool_name, restore_response_function_name};
+
+    #[test]
+    fn response_namespace_tool_names_round_trip() {
+        let flat = flattened_response_tool_name("multi_agent_v1", "spawn_agent");
+        assert_eq!(flat, "lgw__multi_agent_v1__spawn_agent");
+        assert_eq!(
+            restore_response_function_name(&flat),
+            ("spawn_agent", Some("multi_agent_v1"))
+        );
+    }
+}
+
 /* ------------------------------ 服务启动 ------------------------------ */
 
 pub async fn serve(state: Arc<GatewayState>) -> Result<()> {
@@ -215,6 +230,9 @@ pub async fn serve(state: Arc<GatewayState>) -> Result<()> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .route("/v1/responses", post(responses))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/v1/images/generations", post(image_generations))
+        .route("/v1/audio/speech", post(audio_speech))
         // Anthropic 原生面（Claude Code / Claude Desktop 走这里）
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
@@ -527,6 +545,7 @@ async fn responses(
         .get("stream")
         .and_then(|x| x.as_bool())
         .unwrap_or(false);
+    let compaction = responses_compaction_requested(body.get("input"));
 
     // `input` 既可能是纯字符串，也可能是 Responses 原生 item 数组。后者与
     // Chat Completions 的 content 类型不同（input_text/function_call_output 等），
@@ -536,7 +555,7 @@ async fn responses(
         Err(error) => return error_response(&error),
     };
 
-    let req = ChatRequest {
+    let mut req = ChatRequest {
         model,
         messages,
         temperature: body
@@ -558,7 +577,603 @@ async fn responses(
         extra: Default::default(),
     };
 
+    if compaction {
+        // Codex Remote Compaction V2 把普通 /responses 请求末尾追加
+        // compaction_trigger，并要求响应中恰好有一个 compaction item。上游若是
+        // Chat Completions，不可能原生返回该协议项，因此先让模型生成结构化
+        // 摘要，再由网关在出口包装成 Codex 能识别的协议项。
+        req.tools = None;
+        req.tool_choice = None;
+        req.messages
+            .insert(0, Message::system(crate::context::summarization_prompt("")));
+        return dispatch_remote_compaction(state, req, &headers, auth.client, stream).await;
+    }
+
     dispatch(state, req, &headers, auth.client, Exit::Responses).await
+}
+
+async fn embeddings(
+    State(state): State<Arc<GatewayState>>,
+    Extension(auth): Extension<AuthContext>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    passthrough_dispatch(
+        state,
+        &headers,
+        auth.client,
+        body,
+        ModelType::Embedding,
+        &["embeddings"],
+        true,
+    )
+    .await
+}
+
+async fn image_generations(
+    State(state): State<Arc<GatewayState>>,
+    Extension(auth): Extension<AuthContext>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    passthrough_dispatch(
+        state,
+        &headers,
+        auth.client,
+        body,
+        ModelType::Image,
+        &["images", "generations"],
+        true,
+    )
+    .await
+}
+
+async fn audio_speech(
+    State(state): State<Arc<GatewayState>>,
+    Extension(auth): Extension<AuthContext>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    passthrough_dispatch(
+        state,
+        &headers,
+        auth.client,
+        body,
+        ModelType::Speech,
+        &["audio", "speech"],
+        false,
+    )
+    .await
+}
+
+const COMPACTION_PREFIX: &str = "llm-gateway-compaction-v1:";
+
+fn responses_compaction_requested(input: Option<&serde_json::Value>) -> bool {
+    input
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
+            })
+        })
+}
+
+fn decode_compaction_content(value: &str) -> String {
+    value
+        .strip_prefix(COMPACTION_PREFIX)
+        .unwrap_or(value)
+        .to_string()
+}
+
+fn compaction_context(encrypted_content: &str) -> String {
+    let summary = decode_compaction_content(encrypted_content);
+    format!("【以下为远程压缩的上下文摘要，请据此保持上下文连贯】\n{summary}\n【摘要结束】")
+}
+
+fn compaction_item(response_id: &str, summary: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("cmp_{response_id}"),
+        "type": "compaction",
+        "encrypted_content": format!("{COMPACTION_PREFIX}{summary}"),
+    })
+}
+
+fn passthrough_usage(value: &PassthroughResponse) -> (u32, u32, u32) {
+    let PassthroughResponse::Json(value) = value else {
+        return (0, 0, 0);
+    };
+    let usage = value.get("usage");
+    let prompt = usage
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    let completion = usage
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    let total = usage
+        .and_then(|usage| usage.get("total_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as u32)
+        .unwrap_or(prompt.saturating_add(completion));
+    (prompt, completion, total)
+}
+
+/// Embedding / 图片生成 / TTS 的统一非聊天派发。
+///
+/// 这些端点必须按 `ModelType` 过滤候选；不能把 embedding 模型降级成聊天模型，
+/// 也不能把 TTS 请求发给不支持 `/audio/speech` 的 Anthropic/Gemini/Ollama 方言。
+async fn passthrough_dispatch(
+    state: Arc<GatewayState>,
+    _headers: &HeaderMap,
+    client: Option<String>,
+    body: serde_json::Value,
+    model_type: ModelType,
+    path_segments: &[&str],
+    expect_json: bool,
+) -> Response {
+    let requested_model = match body.get("model").and_then(serde_json::Value::as_str) {
+        Some(model) if !model.trim().is_empty() => model.to_string(),
+        _ => return error_response(&GatewayError::Protocol("非聊天请求缺少 model".into())),
+    };
+    let cfg = state.cfg_snapshot();
+    let providers = state.providers.read().clone();
+    let candidates = match state
+        .router
+        .resolve_typed(&requested_model, &providers, model_type)
+    {
+        Ok(candidates) => candidates,
+        Err(error) => return error_response(&error),
+    };
+    if candidates.is_empty() {
+        return error_response(&GatewayError::ModelNotFound(format!(
+            "{requested_model}（类型 {}）",
+            model_type.code()
+        )));
+    }
+
+    let mut ranked = state
+        .router
+        .rank(candidates, &cfg, Default::default(), None);
+    if let Some(active_id) = state.active.read().clone() {
+        if let Some(position) = ranked
+            .iter()
+            .position(|candidate| candidate.provider.id == active_id)
+        {
+            let active = ranked.remove(position);
+            ranked.insert(0, active);
+        }
+    }
+    if ranked.is_empty() {
+        return error_response(&GatewayError::CapabilityUnavailable {
+            kind: format!("{} 模型当前没有可用候选", model_type.code()),
+        });
+    }
+
+    let max_attempts = if cfg.failover_enabled {
+        cfg.max_fallback_attempts
+    } else {
+        1
+    };
+    let flag = AtomicFlag::new();
+    let chain = FailoverChain::new(&ranked, max_attempts, &flag);
+    let upstream = state.upstream.clone();
+    let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
+    let body = Arc::new(body);
+    let started = Instant::now();
+    let mut attempt_records = Vec::new();
+    let outcome = chain
+        .run(
+            &mut attempt_records,
+            |provider, model| {
+                let upstream = upstream.clone();
+                let body = body.clone();
+                async move {
+                    upstream
+                        .call_passthrough(
+                            &provider,
+                            &model,
+                            path_segments,
+                            &body,
+                            timeout,
+                            expect_json,
+                        )
+                        .await
+                }
+            },
+            |provider, model, error| {
+                if let GatewayError::Upstream { status: 429, .. } = error {
+                    if let Some(model_ref) = provider
+                        .models
+                        .iter()
+                        .find(|candidate| candidate.upstream == model)
+                    {
+                        state.router.mark_rate_limited(provider, model_ref);
+                    }
+                }
+                state.health.record_failure(&provider.id, model, error);
+            },
+        )
+        .await;
+
+    match outcome {
+        Ok(outcome) => {
+            let latency = started.elapsed().as_millis() as u64;
+            state
+                .health
+                .record_success(&outcome.provider_id, &outcome.model, latency as u32);
+            let (prompt_tokens, completion_tokens, total_tokens) =
+                passthrough_usage(&outcome.value);
+            if let Some(provider) = ranked
+                .iter()
+                .find(|candidate| candidate.provider.id == outcome.provider_id)
+            {
+                if let Some(model) = provider
+                    .provider
+                    .models
+                    .iter()
+                    .find(|model| model.upstream == outcome.model)
+                {
+                    state
+                        .router
+                        .consume(&provider.provider, model, total_tokens);
+                }
+            }
+
+            let audit_state = state.clone();
+            let audit_client = client.clone();
+            let audit_requested_model = requested_model.clone();
+            let audit_provider = outcome.provider_id.clone();
+            let audit_model = outcome.model.clone();
+            let attempts = outcome.attempts;
+            let attempts_json = attempts_json(&attempt_records);
+            tokio::spawn(async move {
+                let _ = repo::log_request(
+                    audit_state.db.pool(),
+                    repo::RequestLog {
+                        session_id: None,
+                        client: audit_client.as_deref(),
+                        requested_model: &audit_requested_model,
+                        routed_provider: Some(&audit_provider),
+                        routed_model: Some(&audit_model),
+                        status: Some(200),
+                        latency_ms: latency as i64,
+                        prompt_tokens: prompt_tokens as i64,
+                        completion_tokens: completion_tokens as i64,
+                        fallback_attempts: fallback_count(attempts),
+                        error: None,
+                        cost: None,
+                        currency: None,
+                        rate_label: None,
+                        estimated_prompt_tokens: None,
+                        attempts_json: attempts_json.as_deref(),
+                        route: Default::default(),
+                    },
+                )
+                .await;
+            });
+
+            let mut response = match outcome.value {
+                PassthroughResponse::Json(value) => Json(value).into_response(),
+                PassthroughResponse::Bytes { body, content_type } => {
+                    let mut response = Body::from(body).into_response();
+                    response.headers_mut().insert(
+                        "content-type",
+                        parse_header(content_type.as_deref().unwrap_or("audio/mpeg")),
+                    );
+                    response
+                }
+            };
+            response.headers_mut().insert(
+                "x-routed-via",
+                parse_header(&format!("{}/{}", outcome.provider_id, outcome.model)),
+            );
+            response.headers_mut().insert(
+                "x-fallback-attempts",
+                parse_header(&outcome.attempts.to_string()),
+            );
+            response
+        }
+        Err(error) => {
+            let status = error.http_status().as_u16() as i64;
+            let kind = classify(&error);
+            let attempts = attempt_count_from_error(&error);
+            let audit_state = state.clone();
+            let audit_client = client.clone();
+            let audit_requested_model = requested_model.clone();
+            let attempts_json = attempts_json(&attempt_records);
+            let latency = started.elapsed().as_millis() as i64;
+            tokio::spawn(async move {
+                let _ = repo::log_request(
+                    audit_state.db.pool(),
+                    repo::RequestLog {
+                        session_id: None,
+                        client: audit_client.as_deref(),
+                        requested_model: &audit_requested_model,
+                        routed_provider: None,
+                        routed_model: None,
+                        status: Some(status),
+                        latency_ms: latency,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        fallback_attempts: fallback_count(attempts),
+                        error: Some(kind),
+                        cost: None,
+                        currency: None,
+                        rate_label: None,
+                        estimated_prompt_tokens: None,
+                        attempts_json: attempts_json.as_deref(),
+                        route: Default::default(),
+                    },
+                )
+                .await;
+            });
+            error_response(&error)
+        }
+    }
+}
+
+/// Remote Compaction V2 专用出口。它不写回网关的会话历史：Codex 自己维护
+/// compaction checkpoint，网关再把压缩摘要混入持久化上下文会造成双重摘要。
+async fn dispatch_remote_compaction(
+    state: Arc<GatewayState>,
+    req: ChatRequest,
+    headers: &HeaderMap,
+    client: Option<String>,
+    client_stream: bool,
+) -> Response {
+    let cfg = state.cfg_snapshot();
+    let header_sid = headers
+        .get("x-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let response_session_id = crate::context::derive_session_id(&req, header_sid.as_deref());
+
+    let providers = state.providers.read().clone();
+    let candidates = match state.router.resolve(&req.model, &providers) {
+        Ok(candidates) => candidates,
+        Err(error) => return error_response(&error),
+    };
+
+    let required = required_capabilities(&req);
+    let media = crate::media::Media::of(&req);
+    let mut ranked = state.router.rank(candidates, &cfg, required, None);
+    let _media_rejections = filter_by_media_carry(&mut ranked, &media);
+    if ranked.is_empty() {
+        return error_response(&missing_capability_error(
+            &required,
+            &media,
+            &_media_rejections,
+        ));
+    }
+    if let Some(active_id) = state.active.read().clone() {
+        if let Some(position) = ranked
+            .iter()
+            .position(|candidate| candidate.provider.id == active_id)
+        {
+            let active = ranked.remove(position);
+            ranked.insert(0, active);
+        }
+    }
+
+    let max_attempts = if cfg.failover_enabled {
+        cfg.max_fallback_attempts
+    } else {
+        1
+    };
+    let flag = AtomicFlag::new();
+    let chain = FailoverChain::new(&ranked, max_attempts, &flag);
+    let upstream = state.upstream.clone();
+    let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
+    let upstream_req = Arc::new(ChatRequest {
+        stream: false,
+        ..req.clone()
+    });
+    let started = Instant::now();
+    let mut attempt_records = Vec::new();
+    let outcome = chain
+        .run(
+            &mut attempt_records,
+            |provider, model| {
+                let upstream = upstream.clone();
+                let request = upstream_req.clone();
+                async move { upstream.call(&provider, &request, &model, timeout).await }
+            },
+            |provider, model, error| {
+                if let GatewayError::Upstream { status: 429, .. } = error {
+                    if let Some(model_ref) = provider
+                        .models
+                        .iter()
+                        .find(|candidate| candidate.upstream == model)
+                    {
+                        state.router.mark_rate_limited(provider, model_ref);
+                    }
+                }
+                state.health.record_failure(&provider.id, model, error);
+            },
+        )
+        .await;
+
+    match outcome {
+        Ok(outcome) => {
+            let summary = outcome.value.content.trim();
+            if summary.is_empty() {
+                return error_response(&GatewayError::Upstream {
+                    provider: outcome.provider_id.clone(),
+                    model: outcome.model.clone(),
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    body: "上游没有生成可用的压缩摘要".into(),
+                });
+            }
+
+            let latency = started.elapsed().as_millis() as u64;
+            state
+                .health
+                .record_success(&outcome.provider_id, &outcome.model, latency as u32);
+            if let Some(provider) = ranked
+                .iter()
+                .find(|candidate| candidate.provider.id == outcome.provider_id)
+            {
+                if let Some(model) = provider
+                    .provider
+                    .models
+                    .iter()
+                    .find(|model| model.upstream == outcome.model)
+                {
+                    state.router.consume(
+                        &provider.provider,
+                        model,
+                        outcome
+                            .value
+                            .usage
+                            .as_ref()
+                            .map(|usage| usage.total_tokens)
+                            .unwrap_or(0),
+                    );
+                }
+            }
+
+            let response_id = format!("resp_compact_{}", uuid::Uuid::new_v4().simple());
+            let item = compaction_item(&response_id, summary);
+            let usage = outcome.value.usage.clone().unwrap_or_default();
+            let audit_state = state.clone();
+            let audit_session_id = response_session_id.clone();
+            let audit_client = client.clone();
+            let requested_model = req.model.clone();
+            let routed_provider = outcome.provider_id.clone();
+            let routed_model = outcome.model.clone();
+            let attempts = outcome.attempts;
+            let prompt_tokens = usage.prompt_tokens as i64;
+            let completion_tokens = usage.completion_tokens as i64;
+            let attempts_json = attempts_json(&attempt_records);
+            tokio::spawn(async move {
+                let _ = repo::log_request(
+                    audit_state.db.pool(),
+                    repo::RequestLog {
+                        session_id: Some(&audit_session_id),
+                        client: audit_client.as_deref(),
+                        requested_model: &requested_model,
+                        routed_provider: Some(&routed_provider),
+                        routed_model: Some(&routed_model),
+                        status: Some(200),
+                        latency_ms: latency as i64,
+                        prompt_tokens,
+                        completion_tokens,
+                        fallback_attempts: fallback_count(attempts),
+                        error: None,
+                        cost: None,
+                        currency: None,
+                        rate_label: None,
+                        estimated_prompt_tokens: None,
+                        attempts_json: attempts_json.as_deref(),
+                        route: Default::default(),
+                    },
+                )
+                .await;
+            });
+
+            let payload = serde_json::json!({
+                "id": response_id,
+                "object": "response",
+                "model": outcome.model,
+                "status": "completed",
+                "output": [item.clone()],
+                "usage": responses_usage_json(&usage),
+            });
+            let mut response = if client_stream {
+                let created = sse_event(
+                    Some("response.created"),
+                    serde_json::json!({
+                        "type": "response.created",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "model": outcome.model,
+                            "status": "in_progress",
+                            "output": [],
+                        },
+                    })
+                    .to_string(),
+                );
+                let item_done = sse_event(
+                    Some("response.output_item.done"),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": item,
+                    })
+                    .to_string(),
+                );
+                let completed = sse_event(
+                    Some("response.completed"),
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": payload,
+                    })
+                    .to_string(),
+                );
+                Body::from(format!("{created}{item_done}{completed}")).into_response()
+            } else {
+                Json(payload).into_response()
+            };
+            let response_headers = response.headers_mut();
+            if client_stream {
+                response_headers.insert(
+                    "content-type",
+                    parse_header("text/event-stream; charset=utf-8"),
+                );
+                response_headers.insert("cache-control", parse_header("no-cache"));
+                response_headers.insert("x-accel-buffering", parse_header("no"));
+            }
+            response_headers.insert(
+                "x-routed-via",
+                parse_header(&format!("{}/{}", outcome.provider_id, outcome.model)),
+            );
+            response_headers.insert(
+                "x-fallback-attempts",
+                parse_header(&outcome.attempts.to_string()),
+            );
+            response_headers.insert("x-session-id", parse_header(&response_session_id));
+            response
+        }
+        Err(error) => {
+            let status = error.http_status().as_u16() as i64;
+            let kind = classify(&error);
+            let attempts = attempt_count_from_error(&error);
+            let audit_state = state.clone();
+            let audit_session_id = response_session_id.clone();
+            let audit_client = client.clone();
+            let requested_model = req.model.clone();
+            let attempts_json = attempts_json(&attempt_records);
+            let latency = started.elapsed().as_millis() as i64;
+            tokio::spawn(async move {
+                let _ = repo::log_request(
+                    audit_state.db.pool(),
+                    repo::RequestLog {
+                        session_id: Some(&audit_session_id),
+                        client: audit_client.as_deref(),
+                        requested_model: &requested_model,
+                        routed_provider: None,
+                        routed_model: None,
+                        status: Some(status),
+                        latency_ms: latency,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        fallback_attempts: fallback_count(attempts),
+                        error: Some(kind),
+                        cost: None,
+                        currency: None,
+                        rate_label: None,
+                        estimated_prompt_tokens: None,
+                        attempts_json: attempts_json.as_deref(),
+                        route: Default::default(),
+                    },
+                )
+                .await;
+            });
+            error_response(&error)
+        }
+    }
 }
 
 fn responses_input_messages(
@@ -567,7 +1182,18 @@ fn responses_input_messages(
     match input {
         None => Ok(Vec::new()),
         Some(serde_json::Value::String(text)) => Ok(vec![Message::user(text)]),
-        Some(serde_json::Value::Array(items)) => items.iter().map(response_input_item).collect(),
+        Some(serde_json::Value::Array(items)) => {
+            let mut messages = Vec::with_capacity(items.len());
+            for item in items {
+                let kind = item.get("type").and_then(serde_json::Value::as_str);
+                if kind == Some("compaction_trigger") {
+                    // Remote Compaction V2 的请求控制项不是消息，不能送给上游。
+                    continue;
+                }
+                messages.push(response_input_item(item)?);
+            }
+            Ok(messages)
+        }
         Some(other) => Err(GatewayError::Protocol(format!(
             "Responses input 必须是字符串或 item 数组，实际为 {other}"
         ))),
@@ -579,7 +1205,7 @@ fn response_input_item(item: &serde_json::Value) -> std::result::Result<Message,
     match kind {
         Some("function_call") => {
             let call_id = response_required_string(item, "call_id")?;
-            let name = response_required_string(item, "name")?;
+            let name = response_function_name(item)?;
             let arguments = item
                 .get("arguments")
                 .map(json_value_as_text)
@@ -603,6 +1229,10 @@ fn response_input_item(item: &serde_json::Value) -> std::result::Result<Message,
             tool_call_id: Some(response_required_string(item, "call_id")?),
             name: None,
         }),
+        Some("compaction") => {
+            let encrypted_content = response_required_string(item, "encrypted_content")?;
+            Ok(Message::system(compaction_context(&encrypted_content)))
+        }
         Some("message") | None => {
             let role = match item.get("role").and_then(|value| value.as_str()) {
                 Some("system") | Some("developer") => Role::System,
@@ -690,6 +1320,27 @@ fn responses_content(value: Option<&serde_json::Value>) -> Content {
                             .cloned()
                             .unwrap_or_else(|| serde_json::json!({})),
                     }),
+                    Some("input_video") | Some("video_url") => {
+                        let video_url = part.get("video_url");
+                        let url = video_url
+                            .and_then(|value| value.as_str())
+                            .or_else(|| {
+                                video_url
+                                    .and_then(|value| value.get("url"))
+                                    .and_then(|value| value.as_str())
+                            })
+                            .or_else(|| part.get("url").and_then(|value| value.as_str()))
+                            .unwrap_or_default()
+                            .to_owned();
+                        let detail = part
+                            .get("detail")
+                            .or_else(|| video_url.and_then(|value| value.get("detail")))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned);
+                        content_parts.push(Part::VideoUrl {
+                            video_url: ImageUrl { url, detail },
+                        });
+                    }
                     // 未知 block 不应被静默丢弃；保留 JSON 文本至少让上游和日志
                     // 能看到内容，而不是错误地发送空消息。
                     Some(_) | None => content_parts.push(Part::Text {
@@ -728,26 +1379,95 @@ fn json_value_as_text(value: &serde_json::Value) -> String {
 
 fn normalize_responses_tools(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
     let tools = value?.as_array()?;
-    Some(serde_json::Value::Array(
-        tools
-            .iter()
-            .map(|tool| {
-                if tool.get("type").and_then(|value| value.as_str()) == Some("function")
-                    && tool.get("function").is_none()
-                {
-                    let mut function = serde_json::Map::new();
-                    for key in ["name", "description", "parameters", "strict"] {
-                        if let Some(value) = tool.get(key) {
-                            function.insert(key.to_owned(), value.clone());
+    let mut normalized = Vec::new();
+    for tool in tools {
+        match tool.get("type").and_then(serde_json::Value::as_str) {
+            Some("function") => {
+                if let Some(function) = responses_function_tool(tool, None) {
+                    normalized.push(function);
+                }
+            }
+            Some("namespace") => {
+                let Some(namespace) = tool
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                let Some(children) = tool.get("tools").and_then(serde_json::Value::as_array) else {
+                    continue;
+                };
+                for child in children {
+                    if child.get("type").and_then(serde_json::Value::as_str) == Some("function") {
+                        if let Some(function) = responses_function_tool(child, Some(namespace)) {
+                            normalized.push(function);
                         }
                     }
-                    serde_json::json!({ "type": "function", "function": function })
-                } else {
-                    tool.clone()
                 }
-            })
-            .collect(),
-    ))
+            }
+            // Codex 还会发送 web_search、tool_search 等 ChatGPT 私有工具。
+            // Chat Completions 没有对应声明，严格上游会直接 400；这里必须丢弃，
+            // 不能原样透传，也不能伪造一个语义不同的 function。
+            _ => {}
+        }
+    }
+    (!normalized.is_empty()).then_some(serde_json::Value::Array(normalized))
+}
+
+fn responses_function_tool(
+    tool: &serde_json::Value,
+    namespace: Option<&str>,
+) -> Option<serde_json::Value> {
+    let function = tool.get("function").unwrap_or(tool);
+    let name = function
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())?;
+    let flat_name = namespace
+        .map(|namespace| flattened_response_tool_name(namespace, name))
+        .unwrap_or_else(|| name.to_string());
+    let mut normalized = serde_json::Map::new();
+    normalized.insert("name".into(), serde_json::Value::String(flat_name));
+    for key in ["description", "parameters", "strict"] {
+        if let Some(value) = function.get(key) {
+            normalized.insert(key.to_owned(), value.clone());
+        }
+    }
+    Some(serde_json::json!({
+        "type": "function",
+        "function": normalized,
+    }))
+}
+
+const RESPONSE_TOOL_NAMESPACE_PREFIX: &str = "lgw__";
+
+fn flattened_response_tool_name(namespace: &str, name: &str) -> String {
+    format!("{RESPONSE_TOOL_NAMESPACE_PREFIX}{namespace}__{name}")
+}
+
+fn response_function_name(item: &serde_json::Value) -> Result<String> {
+    let name = response_required_string(item, "name")?;
+    Ok(item
+        .get("namespace")
+        .and_then(serde_json::Value::as_str)
+        .filter(|namespace| !namespace.is_empty())
+        .map(|namespace| flattened_response_tool_name(namespace, &name))
+        .unwrap_or(name))
+}
+
+fn restore_response_function_name(name: &str) -> (&str, Option<&str>) {
+    let Some(rest) = name.strip_prefix(RESPONSE_TOOL_NAMESPACE_PREFIX) else {
+        return (name, None);
+    };
+    let Some((namespace, child)) = rest.split_once("__") else {
+        return (name, None);
+    };
+    if namespace.is_empty() || child.is_empty() {
+        (name, None)
+    } else {
+        (child, Some(namespace))
+    }
 }
 
 fn normalize_responses_tool_choice(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
@@ -755,6 +1475,17 @@ fn normalize_responses_tool_choice(value: Option<&serde_json::Value>) -> Option<
     if choice.get("type").and_then(|value| value.as_str()) == Some("function")
         && choice.get("function").is_none()
     {
+        if let Some(namespace) = choice
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            .filter(|namespace| !namespace.is_empty())
+        {
+            let name = choice.get("name")?.as_str()?;
+            return Some(serde_json::json!({
+                "type": "function",
+                "function": { "name": flattened_response_tool_name(namespace, name) },
+            }));
+        }
         let name = choice.get("name")?.clone();
         Some(serde_json::json!({
             "type": "function",
@@ -834,6 +1565,290 @@ struct DispatchInput {
     ranked: Vec<crate::router::score::Candidate>,
     cfg: AppConfig,
     exit: Exit,
+    /// 智能模式的判定结果。未开智能模式时为 `None`。
+    intent: Option<crate::intellect::TaskIntent>,
+    /// 联网搜索的可观测状态。未开搜索时为 `None`。
+    search: Option<crate::search::executor::SearchOutcome>,
+    /// 提示词预优化的结果。未开启或未触发时为 `None`。
+    refine: Option<crate::intellect::RefineOutcome>,
+}
+
+/// 智能模式 + 联网搜索在路由前的预处理结果。
+///
+/// 落点必须在**上下文重建之后、`resolve()` 之前**：注入的检索消息会改变 token
+/// 估算，放晚了预算会算错；放早了上下文还不完整，分类器看到的不是真实请求。
+struct RoutingPreflight {
+    intent: Option<crate::intellect::TaskIntent>,
+    search: Option<crate::search::executor::SearchOutcome>,
+    /// 提示词预优化的结果。未开启或未触发时为 `None`。
+    refine: Option<crate::intellect::RefineOutcome>,
+}
+
+/// 智能模式的**总开关**。
+///
+/// 这是唯一的权威口径：分类、联网搜索、以及虚拟模型名 `smart` 带来的排序权重
+/// 全部由它决定。三者必须同进同退，否则会出现界面上无法解释的半吊子行为。
+fn smart_mode_enabled(cfg: &AppConfig) -> bool {
+    cfg.smart_routing.enabled
+}
+
+/// 判定本次请求要不要走智能模式。
+///
+/// 两条启用路径互不干扰：全局策略设为 `smart`，或客户端点名虚拟模型 `smart`。
+/// **都不成立时返回 `false`，后续路径与改动前逐行等价。**
+fn smart_mode_active(cfg: &AppConfig, requested_model: &str) -> bool {
+    smart_mode_enabled(cfg)
+        && (cfg.routing_strategy == RoutingStrategy::Smart || requested_model.trim() == "smart")
+}
+
+async fn run_routing_preflight(
+    state: &Arc<GatewayState>,
+    cfg: &AppConfig,
+    req: &mut ChatRequest,
+) -> RoutingPreflight {
+    let mut preflight = RoutingPreflight {
+        intent: None,
+        search: None,
+        refine: None,
+    };
+    if !smart_mode_active(cfg, &req.model) {
+        return preflight;
+    }
+
+    let media = crate::media::Media::of(req);
+    let user_text = {
+        let input = crate::intellect::ClassifyInput {
+            messages: &req.messages,
+            media,
+            has_tools: req.tools.is_some(),
+            requested_model: &req.model,
+        };
+        // 决策端点不可达时按需拉起一次（默认关闭，开关与路径全由用户填）。
+        //
+        // **只在配置了端点时尝试**，且失败不阻断——拉不起来就是走启发式，
+        // 请求照常发出。这一步每条请求都会走到，所以必须便宜：
+        // `ensure_running` 内部先探 `/health`，端点在就立即返回。
+        if cfg.smart_routing.jev.auto_start.enabled {
+            match crate::intellect::autostart::ensure_running(
+                &cfg.smart_routing.jev.auto_start,
+                &cfg.smart_routing.jev.base_url,
+            )
+            .await
+            {
+                crate::intellect::SpawnOutcome::AlreadyRunning => {}
+                crate::intellect::SpawnOutcome::Started { pid } => {
+                    tracing::info!(pid, "已拉起本地决策服务，尚未就绪，本轮按弃权处理")
+                }
+                crate::intellect::SpawnOutcome::Refused(reason) => {
+                    tracing::warn!("未拉起本地决策服务：{reason}")
+                }
+            }
+        }
+
+        // Jev 客户端按需构造：配置无效时只是拿不到决策信号，不是错误。
+        let jev = crate::intellect::JevClient::new(
+            &cfg.smart_routing.jev.base_url,
+            &cfg.smart_routing.jev.model,
+            cfg.smart_routing.jev.timeout_ms,
+            cfg.smart_routing.jev.max_state_chars,
+        )
+        .ok();
+        let intent =
+            crate::intellect::classify(&input, &cfg.smart_routing, jev.as_ref()).await;
+        tracing::info!(
+            intent = intent.class.code(),
+            classifier = intent.classifier.code(),
+            complexity = intent.complexity,
+            needs_web = intent.needs_web,
+            jev_note = intent.jev_note.as_deref().unwrap_or(""),
+            "智能模式分类完成"
+        );
+        preflight.intent = Some(intent);
+        // 显式在这里结束 `input` 对 `req` 的不可变借用：
+        // 下面预取要拿 `&mut req.messages`，两者不能重叠。
+        input.last_user_text()
+    };
+
+    // 提示词预优化。排在联网搜索**之前**：改写后的提示词才是用户真正想问的东西，
+    // 检索词应该从它身上取，否则会出现「按原文检索、按改写稿回答」的错位。
+    //
+    // 失败一律用原文，不阻断。
+    let mut effective_text = user_text.clone();
+    if cfg.smart_routing.prompt_refine.enabled {
+        let wants_refine = preflight
+            .intent
+            .as_ref()
+            .map(|intent| intent.needs_refine)
+            .unwrap_or(false);
+        if wants_refine {
+            if let Some(outcome) =
+                run_prompt_refine(state, cfg, &user_text).await
+            {
+                if outcome.applied {
+                    effective_text = outcome.prompt.clone();
+                    apply_refined_prompt(&mut req.messages, &outcome.prompt);
+                }
+                preflight.refine = Some(outcome);
+            }
+        }
+    }
+
+    // 联网搜索预取。失败不阻断请求——只把状态记下来回给客户端。
+    if cfg.search.enabled {
+        let needs_web = preflight
+            .intent
+            .as_ref()
+            .map(|intent| intent.needs_web)
+            .unwrap_or(false);
+        if needs_web {
+            let key = load_search_key(state).await;
+            let outcome = crate::search::executor::prefetch(
+                crate::search::executor::shared_client(),
+                &cfg.search,
+                key.as_deref(),
+                &mut req.messages,
+                &effective_text,
+            )
+            .await;
+            if let Some(error) = outcome.error.as_deref() {
+                tracing::warn!("联网搜索未生效：{error}");
+            }
+            preflight.search = Some(outcome);
+        }
+    }
+
+    // 保留 `smart` 这个虚拟名，不改写成 `auto`：路由器认得它，会把本轮候选标记为
+    // 虚拟策略覆盖，于是「客户端按请求点名 smart」在全局策略不是 smart 时也能生效，
+    // 与 `fastest` / `smartest` 的既有行为一致。
+    preflight
+}
+
+/// 跑一次提示词改写。返回 `None` 表示「压根没找到可用的改写目标」，
+/// 调用方据此保持原文不变（连一次网络请求都不该发）。
+async fn run_prompt_refine(
+    state: &Arc<GatewayState>,
+    cfg: &AppConfig,
+    user_text: &str,
+) -> Option<crate::intellect::RefineOutcome> {
+    let providers = state.providers.read().clone();
+    let required = crate::router::score::RequiredCapabilities::default();
+    let ranked = state.router.rank(
+        state.router.resolve("auto", &providers).ok()?,
+        cfg,
+        required,
+        None,
+    );
+    let mut target = crate::intellect::refine::pick_target(&cfg.smart_routing.prompt_refine, &ranked)?;
+    // 解密放在选目标之后：没选中就不用解密，避免白读一次密钥。
+    let provider = providers
+        .iter()
+        .find(|p| p.base_url == target.base_url && p.dialect == target.dialect);
+    let key = provider.and_then(|p| {
+        if p.api_key_enc.trim().is_empty() {
+            return None;
+        }
+        crate::crypto::decrypt(&p.api_key_enc).ok()
+    });
+    target.api_key = key;
+    Some(
+        crate::intellect::refine::refine(
+            crate::search::executor::shared_client(),
+            &target,
+            target.api_key.clone(),
+            user_text,
+            &cfg.smart_routing.prompt_refine,
+        )
+        .await,
+    )
+}
+
+/// 把改写后的文本替换进**最后一条 user 消息**。
+///
+/// 只替换那一条，不动历史：历史是已经发生的事实，改写它等于伪造上下文。
+/// 找不到 user 消息时什么都不做——那说明请求只有 system 提示，改写无处可放。
+fn apply_refined_prompt(messages: &mut [crate::domain::Message], refined: &str) {
+    for message in messages.iter_mut().rev() {
+        if message.role == crate::domain::Role::User {
+            message.content = crate::domain::Content::Text(refined.to_owned());
+            return;
+        }
+    }
+}
+
+/// 读取搜索后端 API Key 并解密。解密失败按「没有凭据」处理，
+/// 不让一个坏密文阻断整个请求。
+async fn load_search_key(state: &Arc<GatewayState>) -> Option<String> {
+    let encoded = match repo::get_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY).await {
+        Ok(Some(value)) => value,
+        _ => return None,
+    };
+    match crate::crypto::decrypt(&encoded) {
+        Ok(plain) => Some(plain),
+        Err(error) => {
+            tracing::warn!("搜索后端密钥解密失败，按未配置处理：{error}");
+            None
+        }
+    }
+}
+
+impl DispatchInput {
+    /// 智能模式 + 联网搜索的审计视图。关掉任一功能时对应字段为 `None`，
+    /// 这与「判定为 false / 空结果」是两件事，界面上要分开显示。
+    fn route_trace(&self) -> repo::RouteTrace {
+        route_trace_of(self.intent.as_ref(), self.search.as_ref(), self.refine.as_ref())
+    }
+}
+
+fn route_trace_of(
+    intent: Option<&crate::intellect::TaskIntent>,
+    search: Option<&crate::search::executor::SearchOutcome>,
+    refine: Option<&crate::intellect::RefineOutcome>,
+) -> repo::RouteTrace {
+    repo::RouteTrace {
+        intent: intent.map(|i| i.class.code().to_owned()),
+        classifier: intent.map(|i| i.classifier.code().to_owned()),
+        search: search.map(|outcome| match outcome.error {
+            Some(_) => "failed".to_owned(),
+            None => crate::search::backend_code(outcome.backend),
+        }),
+        search_hits: search.map(|outcome| outcome.hits as i64),
+        refined: refine.map(|outcome| outcome.applied),
+        refine_note: refine.map(|outcome| {
+            outcome
+                .reason
+                .clone()
+                .unwrap_or_else(|| format!("{}→{} 字", outcome.original_chars, outcome.final_chars))
+        }),
+    }
+}
+
+/// 把诊断头写进响应。**未开智能模式/搜索时一个都不写**——
+/// 输出 `none` 这类空值会让客户端误以为网关做了判定但结论是「无」。
+fn apply_route_headers(trace: &repo::RouteTrace, headers: &mut HeaderMap) {
+    if let Some(intent) = trace.intent.as_deref() {
+        headers.insert("x-route-intent", parse_header(intent));
+    }
+    if let Some(classifier) = trace.classifier.as_deref() {
+        headers.insert("x-route-classifier", parse_header(classifier));
+    }
+    if let Some(search) = trace.search.as_deref() {
+        headers.insert("x-route-search", parse_header(search));
+        headers.insert(
+            "x-route-search-hits",
+            parse_header(&trace.search_hits.unwrap_or(0).to_string()),
+        );
+    }
+    // 只在真的触发了改写链路时才发。没触发时一个头都不多，
+    // 这样「客户端看到 refined 头」就等于「提示词确实被动过」。
+    if let Some(refined) = trace.refined {
+        headers.insert(
+            "x-route-refined",
+            parse_header(if refined { "1" } else { "0" }),
+        );
+        if let Some(note) = trace.refine_note.as_deref() {
+            headers.insert("x-route-refine-note", parse_header(note));
+        }
+    }
 }
 
 /// Anthropic SSE 不是“把文本 delta 换个 event 名”即可：客户端会按 content
@@ -855,7 +1870,18 @@ struct AnthropicToolBlock {
 
 impl AnthropicStreamState {
     fn new(req_id: &str, model: &str, initial_usage: Option<&Usage>) -> (Self, String) {
-        let input_tokens = initial_usage.map(|usage| usage.prompt_tokens).unwrap_or(0);
+        let usage = initial_usage.cloned().unwrap_or_default();
+        let mut stream_usage = serde_json::json!({
+            "input_tokens": usage.normal_input_tokens(),
+            "output_tokens": 0,
+        });
+        if usage.cache_read_tokens > 0 {
+            stream_usage["cache_read_input_tokens"] = serde_json::json!(usage.cache_read_tokens);
+        }
+        if usage.cache_creation_tokens > 0 {
+            stream_usage["cache_creation_input_tokens"] =
+                serde_json::json!(usage.cache_creation_tokens);
+        }
         let start = sse_event(
             Some("message_start"),
             serde_json::json!({
@@ -868,7 +1894,7 @@ impl AnthropicStreamState {
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": { "input_tokens": input_tokens, "output_tokens": 0 },
+                    "usage": stream_usage,
                 },
             })
             .to_string(),
@@ -1183,6 +2209,18 @@ impl ResponsesStreamState {
             if let Some((call_id, name, initial_arguments)) = start {
                 let output_index = self.allocate_output_index();
                 let item_id = format!("fc_{}_{}", self.response_id, source_index);
+                let (name, namespace) = restore_response_function_name(&name);
+                let mut item = serde_json::json!({
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                });
+                if let Some(namespace) = namespace {
+                    item["namespace"] = serde_json::json!(namespace);
+                }
                 let block = self
                     .tools
                     .get_mut(&source_index)
@@ -1194,14 +2232,7 @@ impl ResponsesStreamState {
                     serde_json::json!({
                         "type": "response.output_item.added",
                         "output_index": output_index,
-                        "item": {
-                            "id": item_id,
-                            "type": "function_call",
-                            "status": "in_progress",
-                            "call_id": call_id,
-                            "name": name,
-                            "arguments": "",
-                        },
+                        "item": item,
                     }),
                 ));
                 if !initial_arguments.is_empty() {
@@ -1276,23 +2307,28 @@ impl ResponsesStreamState {
                     "item_id": item_id,
                     "output_index": output_index,
                     "call_id": call_id,
-                    "name": name,
+                    "name": restore_response_function_name(name).0,
                     "arguments": block.arguments,
                 }),
             ));
+            let (name, namespace) = restore_response_function_name(name);
+            let mut item = serde_json::json!({
+                "id": item_id,
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": name,
+                "arguments": block.arguments,
+            });
+            if let Some(namespace) = namespace {
+                item["namespace"] = serde_json::json!(namespace);
+            }
             output.push(response_event(
                 "response.output_item.done",
                 serde_json::json!({
                     "type": "response.output_item.done",
                     "output_index": output_index,
-                    "item": {
-                        "id": item_id,
-                        "type": "function_call",
-                        "status": "completed",
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": block.arguments,
-                    },
+                    "item": item,
                 }),
             ));
         }
@@ -1383,9 +2419,19 @@ async fn dispatch(
         _ => None,
     };
 
-    // 4) 候选链
+    // 4) 智能模式分类与联网搜索预取。必须夹在上下文重建之后、`resolve()` 之前：
+    //    注入的检索消息会改变 token 估算，而分类器需要看到完整历史。
+    let preflight = run_routing_preflight(&state, &cfg, &mut req).await;
+
+    // 5) 候选链
     let providers = state.providers.read().clone();
-    let candidates = match state.router.resolve(&req.model, &providers) {
+    // 总开关关着时，虚拟模型名 `smart` 不产生任何效果——否则会出现
+    // 「不分类、不搜索，但排序已经换成 Smart 权重」的半吊子状态。
+    let smart_enabled = smart_mode_enabled(&cfg);
+    let candidates = match state
+        .router
+        .resolve_typed_with(&req.model, &providers, ModelType::Chat, smart_enabled)
+    {
         Ok(c) => c,
         Err(e) => return error_response(&e),
     };
@@ -1452,11 +2498,12 @@ async fn dispatch(
     let required = required_capabilities(&req);
     let media = crate::media::Media::of(&req);
 
-    let mut ranked = state.router.rank(
+    let mut ranked = state.router.rank_with_intent(
         candidates,
         &cfg,
         required,
         sticky.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
+        preflight.intent.as_ref().map(|intent| intent.class),
     );
     // 方言承载过滤要看到被剔除前的候选，才能区分「模型没勾选能力」与
     // 「该方言承载不了这种媒体」两种情况，给出可操作的错误。
@@ -1488,7 +2535,7 @@ async fn dispatch(
         }
     }
 
-    // 5) 执行（区分流式/非流式）
+    // 6) 执行（区分流式/非流式）
     let dispatch_input = DispatchInput {
         req,
         new_messages,
@@ -1498,6 +2545,9 @@ async fn dispatch(
         ranked,
         cfg,
         exit,
+        intent: preflight.intent,
+        search: preflight.search,
+        refine: preflight.refine,
     };
     if dispatch_input.req.stream {
         stream_dispatch(state.clone(), dispatch_input).await
@@ -1681,6 +2731,10 @@ fn schedule_compaction(state: Arc<GatewayState>, session_id: String) {
 
 /// 非流式
 async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Response {
+    let route = input.route_trace();
+    // `tokio::spawn(async move { … })` 是**按值**捕获用到的变量，
+    // 所以下面的后台任务要用的是一份克隆，原变量留给响应头。
+    let audit_route = route.clone();
     let DispatchInput {
         req,
         new_messages,
@@ -1690,6 +2744,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         ranked,
         cfg,
         exit,
+        intent: _intent,
+        search: _search,
+        refine: _refine,
     } = input;
     let started = Instant::now();
     let flag = AtomicFlag::new();
@@ -1744,12 +2801,19 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
             // 上下文和粘性是下一次同会话请求的前置条件，必须在 HTTP 成功响应
             // 之前完成；仅审计日志允许异步，避免紧随其后的请求读到旧历史。
-            let (pt, ct) = o
+            let (pt, ct, cache_read, cache_creation) = o
                 .value
                 .usage
                 .as_ref()
-                .map(|u| (u.prompt_tokens, u.completion_tokens))
-                .unwrap_or((0, 0));
+                .map(|u| {
+                    (
+                        u.prompt_tokens,
+                        u.completion_tokens,
+                        u.cache_read_tokens,
+                        u.cache_creation_tokens,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
             let pid = o.provider_id.clone();
             let mid = o.model.clone();
             let assistant = Message {
@@ -1827,8 +2891,13 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 .iter()
                 .find(|c| c.provider.id == pid && c.model.upstream == mid)
                 .and_then(|c| c.model.price.as_ref());
-            let (audit_cost, audit_currency, audit_rate_label) =
-                price_charge(audit_price, pt as i64, ct as i64);
+            let (audit_cost, audit_currency, audit_rate_label) = price_charge(
+                audit_price,
+                pt as i64,
+                ct as i64,
+                cache_read as i64,
+                cache_creation as i64,
+            );
             let audit_attempts = attempts_json(&attempt_records);
             let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
             tokio::spawn(async move {
@@ -1851,6 +2920,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         rate_label: audit_rate_label.as_deref(),
                         estimated_prompt_tokens: Some(estimated_prompt),
                         attempts_json: audit_attempts.as_deref(),
+                        route: audit_route,
                     },
                 )
                 .await;
@@ -1858,6 +2928,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
             let body = encode_response(&o.value, &o.model, exit);
             let mut resp = Json(body).into_response();
+            apply_route_headers(&route, resp.headers_mut());
             let h = resp.headers_mut();
             h.insert(
                 "x-routed-via",
@@ -1896,6 +2967,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         rate_label: None,
                         estimated_prompt_tokens: None,
                         attempts_json: audit_attempts.as_deref(),
+                        route: Default::default(),
                     },
                 )
                 .await;
@@ -1911,6 +2983,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Response {
     use async_stream::stream;
 
+    let route = input.route_trace();
     let DispatchInput {
         req,
         new_messages,
@@ -1920,6 +2993,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         ranked,
         cfg,
         exit,
+        intent: _intent,
+        search: _search,
+        refine: _refine,
     } = input;
 
     let req_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
@@ -2062,6 +3138,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let stream_session_id = session_id.clone();
     let stream_attempts = attempts;
     let stream_client = client.clone();
+    // 同上：`stream!` 展开成 `async move`，会按值捕获。审计里那份另存，
+    // 响应头那一份留在外层函数里。
+    let stream_route = route.clone();
 
     let s = stream! {
         let mut full = String::new();
@@ -2333,6 +3412,8 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             candidate.model.price.as_ref(),
             prompt_tokens as i64,
             completion_tokens as i64,
+            final_usage.cache_read_tokens as i64,
+            final_usage.cache_creation_tokens as i64,
         );
         let audit_attempts = attempts_json(&attempt_records);
         let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
@@ -2356,6 +3437,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     rate_label: audit_rate_label.as_deref(),
                     estimated_prompt_tokens: Some(estimated_prompt),
                     attempts_json: audit_attempts.as_deref(),
+                    route: stream_route,
                 },
             )
             .await;
@@ -2370,6 +3452,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         Ok::<Bytes, std::convert::Infallible>(Bytes::from(data))
     }));
     let mut resp = body.into_response();
+    apply_route_headers(&route, resp.headers_mut());
     let h = resp.headers_mut();
     h.insert("x-session-id", parse_header(&response_session_id));
     h.insert("x-routed-via", parse_header(&routed_via));
@@ -2393,6 +3476,8 @@ fn merge_usage(current: &mut Option<Usage>, next: Usage) {
     let usage = current.get_or_insert_with(Usage::default);
     usage.prompt_tokens = usage.prompt_tokens.max(next.prompt_tokens);
     usage.completion_tokens = usage.completion_tokens.max(next.completion_tokens);
+    usage.cache_read_tokens = usage.cache_read_tokens.max(next.cache_read_tokens);
+    usage.cache_creation_tokens = usage.cache_creation_tokens.max(next.cache_creation_tokens);
     usage.total_tokens = usage
         .total_tokens
         .max(next.total_tokens)
@@ -2529,10 +3614,18 @@ fn price_charge(
     price: Option<&crate::domain::ModelPrice>,
     prompt_tokens: i64,
     completion_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
 ) -> (Option<f64>, Option<&'static str>, Option<String>) {
     match price {
         Some(price) => {
-            let charge = price.charge(prompt_tokens, completion_tokens, utc_minute_of_day());
+            let charge = price.charge_with_cache(
+                prompt_tokens,
+                completion_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                utc_minute_of_day(),
+            );
             (
                 Some(charge.cost),
                 Some(charge.currency.code()),
@@ -2604,6 +3697,7 @@ fn spawn_failed_stream_audit(state: Arc<GatewayState>, audit: FailedStreamAudit<
                 rate_label: None,
                 estimated_prompt_tokens: None,
                 attempts_json: attempts_json.as_deref(),
+                route: Default::default(),
             },
         )
         .await;
@@ -2611,6 +3705,31 @@ fn spawn_failed_stream_audit(state: Arc<GatewayState>, audit: FailedStreamAudit<
 }
 
 /* ---------------------------- 响应编码 ---------------------------- */
+
+fn responses_usage_json(usage: &Usage) -> serde_json::Value {
+    let mut usage_json = serde_json::json!({
+        "input_tokens": usage.prompt_tokens,
+        "output_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    });
+    if usage.cache_read_tokens > 0 || usage.cache_creation_tokens > 0 {
+        let mut details = serde_json::Map::new();
+        if usage.cache_read_tokens > 0 {
+            details.insert(
+                "cached_tokens".into(),
+                serde_json::json!(usage.cache_read_tokens),
+            );
+        }
+        if usage.cache_creation_tokens > 0 {
+            details.insert(
+                "cache_write_tokens".into(),
+                serde_json::json!(usage.cache_creation_tokens),
+            );
+        }
+        usage_json["input_tokens_details"] = serde_json::Value::Object(details);
+    }
+    usage_json
+}
 
 fn encode_response(
     resp: &crate::domain::ChatResponse,
@@ -2641,29 +3760,29 @@ fn encode_response(
             }
             if let Some(tool_calls) = &resp.tool_calls {
                 for (index, call) in tool_calls.iter().enumerate() {
-                    output.push(serde_json::json!({
+                    let (name, namespace) = restore_response_function_name(&call.function.name);
+                    let mut item = serde_json::json!({
                         "id": format!("fc_{}_{}", resp.id, index),
                         "type": "function_call",
                         "status": "completed",
                         "call_id": call.id,
-                        "name": call.function.name,
+                        "name": name,
                         "arguments": call.function.arguments,
-                    }));
+                    });
+                    if let Some(namespace) = namespace {
+                        item["namespace"] = serde_json::json!(namespace);
+                    }
+                    output.push(item);
                 }
             }
 
-            let usage = resp.usage.clone().unwrap_or_default();
             serde_json::json!({
                 "id": resp.id,
                 "object": "response",
                 "model": model,
                 "status": "completed",
                 "output": output,
-                "usage": {
-                    "input_tokens": usage.prompt_tokens,
-                    "output_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens,
-                },
+                "usage": responses_usage_json(&resp.usage.clone().unwrap_or_default()),
             })
         }
         Exit::Ollama => crate::protocol::ollama::ollama_response(resp, model),
@@ -2855,6 +3974,10 @@ fn encode_done(
                         "input_tokens": usage.prompt_tokens,
                         "output_tokens": usage.completion_tokens,
                         "total_tokens": usage.total_tokens,
+                        "input_tokens_details": {
+                            "cached_tokens": usage.cache_read_tokens,
+                            "cache_write_tokens": usage.cache_creation_tokens,
+                        },
                     },
                 },
             })
@@ -2981,8 +4104,35 @@ fn error_response(e: &GatewayError) -> Response {
 }
 
 fn parse_header(s: &str) -> axum::http::HeaderValue {
-    axum::http::HeaderValue::from_str(s)
+    // **无条件**编码，而不是只在 `from_str` 报错时才编码。
+    //
+    // `HeaderValue::from_str` 会放行 0x80–0xFF 的原始字节，所以中文能写进去；
+    // 但客户端的 `HeaderValue::to_str()` 在遇到非 ASCII 时返回 `Err`——
+    // 也就是说头「存在」却**读不出来**，看起来和没发一样。
+    // 这个坑是端到端测试逼出来的：`tests/route_headers.rs` 里
+    // 「改写失败要写明原因」一条长期报「头是空的」。
+    axum::http::HeaderValue::from_str(&encode_header_value(s))
         .unwrap_or_else(|_| axum::http::HeaderValue::from_static(""))
+}
+
+/// 把任意文本转成可以安全放进 HTTP 头的形式。
+///
+/// 纯 ASCII 原样返回（含 `:` `/` `-` 等），其余字节转成 UTF-8 的 `%XX`。
+/// 抽成纯函数是为了能单独打测——「中文会不会被吞掉」在端到端测试里
+/// 只表现为「头读不出来」，很容易被当成测试写错而放过。
+fn encode_header_value(s: &str) -> String {
+    if s.bytes().all(|byte| (0x20..=0x7E).contains(&byte) && byte != b'"' && byte != b'\\') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        let byte = *byte;
+        match byte {
+            0x20..=0x7E if byte != b'"' && byte != b'\\' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn now_secs() -> i64 {

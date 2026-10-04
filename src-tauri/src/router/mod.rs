@@ -15,12 +15,12 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, RoutingStrategy};
-use crate::domain::{Dialect, ModelRef, Provider, PublicModel};
+use crate::domain::{Dialect, ModelRef, ModelType, Provider, PublicModel};
 use crate::error::{GatewayError, Result};
 use crate::proxy::health::HealthRegistry;
 use crate::router::ratelimit::{Quota, RateLimiter};
 use crate::router::score::{
-    satisfies_hard_constraints, Candidate, RequiredCapabilities, ScoreInput, Weights,
+    satisfies_hard_constraints, Candidate, RequiredCapabilities, ScoreInput, TaskClass, Weights,
 };
 
 pub struct Router {
@@ -61,6 +61,32 @@ impl Router {
     ///   "deepseek:deepseek-chat"  → 限定 provider
     ///   "fastest"、"smartest"     → 虚拟模型，按策略挑
     pub fn resolve(&self, requested: &str, providers: &[Provider]) -> Result<Vec<Candidate>> {
+        self.resolve_typed(requested, providers, ModelType::Chat)
+    }
+
+    /// 按模型用途解析候选。聊天端点只允许 Chat，Embedding/Image/Speech 端点
+    /// 各自只允许对应类型，避免把 TTS 模型送进 /chat/completions。
+    pub fn resolve_typed(
+        &self,
+        requested: &str,
+        providers: &[Provider],
+        model_type: ModelType,
+    ) -> Result<Vec<Candidate>> {
+        self.resolve_typed_with(requested, providers, model_type, true)
+    }
+
+    /// `smart_enabled` 是智能模式的**总开关**。
+    ///
+    /// 关着的时候，客户端点名虚拟模型 `smart` 不得改变任何排序权重。否则会出现
+    /// 「不分类、不搜索，但排序已经换成 Smart 权重」的半吊子状态——请求看起来走了
+    /// 智能模式，实际只换了一套权重，而界面上没有任何东西能解释这个差异。
+    pub fn resolve_typed_with(
+        &self,
+        requested: &str,
+        providers: &[Provider],
+        model_type: ModelType,
+        smart_enabled: bool,
+    ) -> Result<Vec<Candidate>> {
         let mut out: Vec<Candidate> = Vec::new();
 
         let virtual_strategy = match requested {
@@ -68,6 +94,7 @@ impl Router {
             "smartest" => Some(RoutingStrategy::Smartest),
             "reliable" => Some(RoutingStrategy::Reliable),
             "balanced" => Some(RoutingStrategy::Balanced),
+            "smart" if smart_enabled => Some(RoutingStrategy::Smart),
             _ => None,
         };
         // OpenRouter 的 :free、Ollama 的 :latest 等后缀属于完整模型名。
@@ -75,6 +102,7 @@ impl Router {
         let exact_name = providers.iter().filter(|p| p.enabled).any(|p| {
             p.models
                 .iter()
+                .filter(|m| m.model_type == model_type)
                 .any(|m| m.alias == requested || m.upstream == requested)
         });
 
@@ -87,9 +115,13 @@ impl Router {
                 supports_vision: false,
                 supports_audio: false,
                 supports_video: false,
+                supports_thinking: false,
                 supports_stream: true,
+                model_type: crate::domain::ModelType::Chat,
+                upstream_path: None,
                 price: None,
                 overrides: None,
+                local: None,
             };
             let models = if p.models.is_empty() {
                 std::slice::from_ref(&default_model)
@@ -98,8 +130,11 @@ impl Router {
             };
 
             for m in models {
+                if m.model_type != model_type {
+                    continue;
+                }
                 let hit = match requested {
-                    "auto" | "fastest" | "smartest" | "reliable" | "balanced" => true,
+                    "auto" | "fastest" | "smartest" | "reliable" | "balanced" | "smart" => true,
                     name => {
                         if exact_name {
                             m.alias == name || m.upstream == name
@@ -131,10 +166,23 @@ impl Router {
     /// 候选链排序
     pub fn rank(
         &self,
+        candidates: Vec<Candidate>,
+        cfg: &AppConfig,
+        required: RequiredCapabilities,
+        sticky: Option<(&str, &str)>,
+    ) -> Vec<Candidate> {
+        self.rank_with_intent(candidates, cfg, required, sticky, None)
+    }
+
+    /// 带任务定性的候选链排序。`intent` 为 `None` 时与既有 `rank` 完全等价——
+    /// 这条等价关系由 `tests/router.rs` 的不变量用例守着。
+    pub fn rank_with_intent(
+        &self,
         mut candidates: Vec<Candidate>,
         cfg: &AppConfig,
         required: RequiredCapabilities,
         sticky: Option<(&str, &str)>,
+        intent: Option<TaskClass>,
     ) -> Vec<Candidate> {
         // 1) 硬约束：缺少任一所需模态（工具/视觉/音频/视频）的直接剔除
         candidates.retain(|c| satisfies_hard_constraints(c, &required));
@@ -170,19 +218,26 @@ impl Router {
         }
         // Custom 只表示“按显式规则路由”。没有规则时不能悄悄改用另一套
         // 权重，退化为稳定的 Balanced 排序，仍保留健康和回退链路。
-        let strategy =
-            if matches!(configured_strategy, RoutingStrategy::Custom) && !custom_rules_active {
-                RoutingStrategy::Balanced
-            } else {
-                configured_strategy
-            };
+        // Smart 同理：总开关关着时退化为 Balanced，绝不留下「只换权重不分类」的
+        // 半吊子状态。两条共用同一个降级口径。
+        let strategy = if matches!(configured_strategy, RoutingStrategy::Custom)
+            && !custom_rules_active
+        {
+            RoutingStrategy::Balanced
+        } else if matches!(configured_strategy, RoutingStrategy::Smart)
+            && !cfg.smart_routing.enabled
+        {
+            RoutingStrategy::Balanced
+        } else {
+            configured_strategy
+        };
 
         // 4) 先按现有健康、额度、能力、延迟权重打分。显式 Boost 作为额外
         // 排序层级：同一层级仍完全沿用原有分数，避免规则吞掉正常的权重排序。
         let w = Weights::for_strategy(strategy);
         candidates.sort_by(|a, b| {
-            let sa = self.score_of(a, &w);
-            let sb = self.score_of(b, &w);
+            let sa = self.score_of(a, &w, intent);
+            let sb = self.score_of(b, &w, intent);
             let score_order = sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal);
             if custom_rules_active {
                 custom_rule_boost(b, &custom_rules)
@@ -212,12 +267,13 @@ impl Router {
         candidates
     }
 
-    fn score_of(&self, c: &Candidate, w: &Weights) -> f32 {
+    fn score_of(&self, c: &Candidate, w: &Weights, intent: Option<TaskClass>) -> f32 {
         let key = rate_key(&c.provider, &c.model);
         let q = quota_of(&c.provider);
         let input = ScoreInput {
             health: Some(self.health.get(&c.provider.id, &c.model.upstream)),
             headroom: self.limiter.headroom(&key, &q),
+            intent,
         };
         score::score(c, &input, w)
     }
@@ -242,6 +298,7 @@ impl Router {
                     id: m.alias.clone(),
                     object: "model".into(),
                     owned_by: p.name.clone(),
+                    model_type: m.model_type,
                     context_window: m.context_window,
                     supports_tools: m.supports_tools,
                     supports_vision: m.supports_vision,

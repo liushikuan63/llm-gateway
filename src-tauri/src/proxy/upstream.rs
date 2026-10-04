@@ -7,6 +7,7 @@
 //!     跨方言组合才是真转换，而不是把上游的 SSE 原样透传。
 //!  3) 上游返回的 4xx/5xx 原样带上 body，方便上层判定 429 还是 401。
 
+use axum::body::Bytes;
 use futures_util::Stream;
 use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Url;
@@ -29,6 +30,14 @@ fn overrides(model: &str, p: &Provider) -> Option<ModelOverrides> {
 
 pub struct UpstreamClient {
     http: reqwest::Client,
+}
+
+pub enum PassthroughResponse {
+    Json(serde_json::Value),
+    Bytes {
+        body: Bytes,
+        content_type: Option<String>,
+    },
 }
 
 impl Default for UpstreamClient {
@@ -123,6 +132,13 @@ impl UpstreamClient {
     }
 
     fn build_url(p: &Provider, model: &str, stream: bool) -> Result<Url> {
+        if let Some(path) = custom_upstream_path(p, model)? {
+            let mut url = build_url_from_path(p, &path, model)?;
+            if p.dialect == Dialect::Gemini && stream {
+                url.query_pairs_mut().append_pair("alt", "sse");
+            }
+            return Ok(url);
+        }
         let mut url = validate_upstream_base_url(&p.base_url)?;
         match p.dialect {
             Dialect::OpenAI => append_url_path(&mut url, &["chat", "completions"])?,
@@ -219,6 +235,99 @@ impl UpstreamClient {
             Dialect::Gemini => crate::protocol::gemini::from_gemini_response(&v),
             Dialect::Ollama => crate::protocol::ollama::from_ollama_response(&v),
         })
+    }
+
+    /// 非聊天端点（Embedding / 图片 / TTS）的原生转发。
+    ///
+    /// 这些端点没有共同 IR，先只对接 OpenAI 兼容厂商；不能用聊天模型顶替，
+    /// 也不能在协议边界悄悄改成 `/chat/completions`。
+    pub async fn call_passthrough(
+        &self,
+        p: &Provider,
+        model: &str,
+        path_segments: &[&str],
+        body: &serde_json::Value,
+        timeout: Duration,
+        expect_json: bool,
+    ) -> Result<PassthroughResponse> {
+        if p.dialect != Dialect::OpenAI {
+            return Err(GatewayError::CapabilityUnavailable {
+                kind: format!("{} 当前仅支持 OpenAI 兼容上游", path_segments.join("/")),
+            });
+        }
+
+        let url = if let Some(path) = custom_upstream_path(p, model)? {
+            build_url_from_path(p, &path, model)?
+        } else {
+            let mut url = validate_upstream_base_url(&p.base_url)?;
+            append_url_path(&mut url, path_segments)?;
+            url
+        };
+        let key = decrypt_provider_key(p)?;
+        let mut headers = Self::headers_for(p, &key)?;
+        let overrides = overrides(model, p);
+        Self::apply_extra_headers(&mut headers, overrides.as_ref())?;
+
+        let mut body = body.clone();
+        if let Some(object) = body.as_object_mut() {
+            object.insert("model".into(), serde_json::json!(model));
+            if let Some(extra) = overrides
+                .as_ref()
+                .and_then(|overrides| overrides.extra_body.as_ref())
+                .and_then(serde_json::Value::as_object)
+            {
+                for (key, value) in extra {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        let resp = self
+            .http
+            .post(url)
+            .timeout(timeout)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| map_reqwest_err(&p.name, model, error))?;
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Upstream {
+                provider: p.name.clone(),
+                model: model.into(),
+                status: status.as_u16(),
+                body: truncate(&text, 800),
+            });
+        }
+
+        if expect_json {
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|error| GatewayError::Other(anyhow::anyhow!(error.to_string())))?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| GatewayError::Upstream {
+                    provider: p.name.clone(),
+                    model: model.into(),
+                    status: 502,
+                    body: truncate(&String::from_utf8_lossy(&bytes), 800),
+                })?;
+            Ok(PassthroughResponse::Json(value))
+        } else {
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|error| GatewayError::Other(anyhow::anyhow!(error.to_string())))?;
+            Ok(PassthroughResponse::Bytes { body, content_type })
+        }
     }
 
     /// 流式请求：返回统一的事件流
@@ -453,20 +562,7 @@ fn parse_openai_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
 
 fn openai_usage(v: &serde_json::Value) -> Option<Usage> {
     let usage = v.get("usage")?;
-    Some(Usage {
-        prompt_tokens: usage
-            .get("prompt_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-        completion_tokens: usage
-            .get("completion_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-        total_tokens: usage
-            .get("total_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-    })
+    Some(Usage::from_openai(usage))
 }
 
 fn parse_anthropic_chunk(
@@ -560,19 +656,7 @@ fn parse_anthropic_chunk(
 
 fn anthropic_usage(usage: Option<&serde_json::Value>) -> Option<Usage> {
     let usage = usage?;
-    let prompt_tokens = usage
-        .get("input_tokens")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
-    let completion_tokens = usage
-        .get("output_tokens")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
-    Some(Usage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: prompt_tokens + completion_tokens,
-    })
+    Some(Usage::from_anthropic(usage))
 }
 
 fn parse_gemini_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) {
@@ -617,20 +701,7 @@ fn parse_gemini_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
 
 fn gemini_usage(v: &serde_json::Value) -> Option<Usage> {
     let usage = v.get("usageMetadata")?;
-    Some(Usage {
-        prompt_tokens: usage
-            .get("promptTokenCount")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-        completion_tokens: usage
-            .get("candidatesTokenCount")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-        total_tokens: usage
-            .get("totalTokenCount")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-    })
+    Some(Usage::from_gemini(usage))
 }
 
 fn parse_ollama_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) {
@@ -661,6 +732,7 @@ fn parse_ollama_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            ..Default::default()
         });
         out.push(Ok(UpstreamEvent::Done {
             finish_reason: Some(if has_tool_calls {
@@ -917,6 +989,34 @@ fn allows_insecure_local_http(url: &Url) -> bool {
 
 fn is_ipv6_unique_local(address: Ipv6Addr) -> bool {
     (address.segments()[0] & 0xfe00) == 0xfc00
+}
+
+fn custom_upstream_path(p: &Provider, model: &str) -> Result<Option<String>> {
+    let Some(model_ref) = p
+        .models
+        .iter()
+        .find(|candidate| candidate.upstream == model)
+    else {
+        return Ok(None);
+    };
+    model_ref
+        .validate_upstream_path()
+        .map_err(GatewayError::Protocol)?;
+    Ok(model_ref
+        .upstream_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned))
+}
+
+fn build_url_from_path(p: &Provider, path: &str, model: &str) -> Result<Url> {
+    let mut url = validate_upstream_base_url(&p.base_url)?;
+    let resolved = path.replace("{model}", model);
+    url.set_path(&resolved);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
 }
 
 fn append_url_path(url: &mut Url, segments: &[&str]) -> Result<()> {

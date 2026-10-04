@@ -126,6 +126,8 @@ pub fn parse_feed(value: &Value) -> Vec<FeedPrice> {
         let price = ModelPrice {
             prompt,
             completion,
+            cache_read: per_token_to_per_million(pricing.get("input_cache_read")),
+            cache_creation: per_token_to_per_million(pricing.get("input_cache_write")),
             currency: Currency::Usd,
             tiers: parse_tiers(pricing.get("overrides")),
             rules: Vec::new(),
@@ -171,6 +173,8 @@ fn parse_tiers(value: Option<&Value>) -> Vec<PriceTier> {
                 min_prompt_tokens: min.max(0),
                 prompt,
                 completion,
+                cache_read: per_token_to_per_million(entry.get("input_cache_read")),
+                cache_creation: per_token_to_per_million(entry.get("input_cache_write")),
             })
         })
         .collect();
@@ -293,9 +297,13 @@ mod tests {
                     supports_vision: false,
                     supports_audio: false,
                     supports_video: false,
+                    supports_thinking: false,
                     supports_stream: true,
+                    model_type: crate::domain::ModelType::Chat,
+                    upstream_path: None,
                     price,
                     overrides: None,
+                    local: None,
                 })
                 .collect(),
             rpm_limit: 0,
@@ -310,6 +318,8 @@ mod tests {
         ModelPrice {
             prompt,
             completion: prompt * 2.0,
+            cache_read: None,
+            cache_creation: None,
             currency: Currency::Usd,
             tiers: Vec::new(),
             rules: Vec::new(),
@@ -322,7 +332,9 @@ mod tests {
         let feed = json!({ "data": [
             { "id": "deepseek/deepseek-chat",
               "pricing": { "prompt": "0.0000002574", "completion": "0.0000010287",
-                           "overrides": [ { "min_prompt_tokens": 272000, "prompt": "0.0000006", "completion": "0.000002" } ] } },
+                           "input_cache_read": "0.00000002574",
+                           "input_cache_write": "0.000000321",
+                           "overrides": [ { "min_prompt_tokens": 272000, "prompt": "0.0000006", "completion": "0.000002", "input_cache_read": "0.00000004", "input_cache_write": "0.0000008" } ] } },
             { "id": "broken/entry", "pricing": { "prompt": "abc" } },
         ]});
         let parsed = parse_feed(&feed);
@@ -335,8 +347,12 @@ mod tests {
             entry.price.prompt
         );
         assert!((entry.price.completion - 1.0287).abs() < 1e-9);
+        assert!((entry.price.cache_read.unwrap() - 0.02574).abs() < 1e-9);
+        assert!((entry.price.cache_creation.unwrap() - 0.321).abs() < 1e-9);
         assert_eq!(entry.price.tiers.len(), 1);
         assert_eq!(entry.price.tiers[0].min_prompt_tokens, 272_000);
+        assert!((entry.price.tiers[0].cache_read.unwrap() - 0.04).abs() < 1e-9);
+        assert!((entry.price.tiers[0].cache_creation.unwrap() - 0.8).abs() < 1e-9);
         assert_eq!(entry.price.source, PriceSource::Catalog);
     }
 

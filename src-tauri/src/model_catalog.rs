@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use crate::crypto;
-use crate::domain::{Currency, Dialect, ModelPrice, PriceSource, PriceTier, Provider};
+use crate::domain::{Currency, Dialect, ModelPrice, ModelType, PriceSource, PriceTier, Provider};
 use crate::proxy::upstream::validate_upstream_base_url;
 
 pub const DEFAULT_CONTEXT_WINDOW: i32 = 32_768;
@@ -55,6 +55,9 @@ pub struct DiscoveredModel {
     pub supports_audio: Option<bool>,
     pub supports_video: Option<bool>,
     pub supports_stream: Option<bool>,
+    /// 模型用途；只有目录明确给出结构或方法时才填写，缺失时由用户在录入界面确认。
+    #[serde(default)]
+    pub model_type: Option<ModelType>,
     pub is_free: Option<bool>,
     /// 仅当目录提供可辨识的定价结构时填写；缺失表示未知。
     pub price: Option<ModelPrice>,
@@ -79,6 +82,7 @@ impl DiscoveredModel {
             supports_audio: None,
             supports_video: None,
             supports_stream: None,
+            model_type: None,
             is_free: None,
             price: None,
         }
@@ -332,6 +336,9 @@ async fn discover_anthropic(
             // Anthropic 的目录会在 `capabilities.image_input.supported` 明确
             // 报告视觉输入能力；没有该字段时不能根据模型名补猜。
             model.supports_vision = nested_supported(entry, "capabilities", "image_input");
+            model.supports_audio = nested_supported(entry, "capabilities", "audio_input");
+            model.supports_video = nested_supported(entry, "capabilities", "video_input");
+            model.model_type = Some(ModelType::Chat);
             Some(model)
         }));
 
@@ -494,6 +501,7 @@ fn openai_model(entry: &Value) -> Option<DiscoveredModel> {
         entry,
         &["context_length", "context_window", "max_input_tokens"],
     ));
+    model.model_type = detect_openai_model_type(entry);
 
     if let Some(parameters) = entry.get("supported_parameters").and_then(string_list) {
         model.supports_tools = Some(parameters.iter().any(|parameter| parameter == "tools"));
@@ -504,7 +512,8 @@ fn openai_model(entry: &Value) -> Option<DiscoveredModel> {
     if let Some(modalities) = entry
         .get("architecture")
         .and_then(|architecture| architecture.get("input_modalities"))
-        .and_then(string_list)
+        .and_then(named_list)
+        .or_else(|| entry.get("input_modalities").and_then(named_list))
     {
         let accepts = |name: &str| {
             modalities
@@ -527,6 +536,7 @@ fn gemini_model(entry: &Value) -> Option<DiscoveredModel> {
     let name = non_empty_string(entry.get("displayName")).unwrap_or_else(|| id.clone());
     let mut model = DiscoveredModel::default_for(id, name)
         .with_context(context_value(entry.get("inputTokenLimit")));
+    model.model_type = detect_gemini_model_type(entry);
 
     if let Some(methods) = entry
         .get("supportedGenerationMethods")
@@ -565,6 +575,26 @@ fn apply_ollama_details(model: &mut DiscoveredModel, response: &Value) {
             capabilities
                 .iter()
                 .any(|capability| capability.eq_ignore_ascii_case("vision")),
+        );
+        model.supports_audio = Some(
+            capabilities
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case("audio")),
+        );
+        model.supports_video = Some(
+            capabilities
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case("video")),
+        );
+        model.model_type = Some(
+            if capabilities
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case("embedding"))
+            {
+                ModelType::Embedding
+            } else {
+                ModelType::Chat
+            },
         );
     }
 }
@@ -631,6 +661,14 @@ fn openrouter_price(pricing: Option<&Value>) -> Option<ModelPrice> {
     let price = ModelPrice {
         prompt: prompt * 1_000_000.0,
         completion: completion * 1_000_000.0,
+        cache_read: pricing
+            .get("input_cache_read")
+            .and_then(nonnegative_price)
+            .map(|price| price * 1_000_000.0),
+        cache_creation: pricing
+            .get("input_cache_write")
+            .and_then(nonnegative_price)
+            .map(|price| price * 1_000_000.0),
         currency: Currency::Usd,
         tiers: openrouter_tiers(pricing.get("overrides")),
         rules: Vec::new(),
@@ -653,6 +691,14 @@ fn openrouter_tiers(value: Option<&Value>) -> Vec<PriceTier> {
                 min_prompt_tokens: min.max(0),
                 prompt,
                 completion,
+                cache_read: entry
+                    .get("input_cache_read")
+                    .and_then(nonnegative_price)
+                    .map(|price| price * 1_000_000.0),
+                cache_creation: entry
+                    .get("input_cache_write")
+                    .and_then(nonnegative_price)
+                    .map(|price| price * 1_000_000.0),
             })
         })
         .collect();
@@ -711,6 +757,87 @@ fn string_list(value: &Value) -> Option<Vec<String>> {
     })
 }
 
+fn named_list(value: &Value) -> Option<Vec<String>> {
+    value.as_array().map(|values| {
+        values
+            .iter()
+            .filter_map(|value| {
+                non_empty_string(Some(value)).or_else(|| {
+                    value
+                        .get("name")
+                        .or_else(|| value.get("type"))
+                        .or_else(|| value.get("modality"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+fn detect_openai_model_type(entry: &Value) -> Option<ModelType> {
+    for key in ["model_type", "modelType", "type"] {
+        if let Some(model_type) = entry
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(ModelType::parse)
+        {
+            return Some(model_type);
+        }
+    }
+    let modality = entry
+        .pointer("/architecture/modality")
+        .and_then(Value::as_str)?;
+    let lower = modality.to_ascii_lowercase();
+    if lower.contains("embedding") {
+        return Some(ModelType::Embedding);
+    }
+    let output = lower.split("->").nth(1).unwrap_or(&lower);
+    if output.contains("image") {
+        Some(ModelType::Image)
+    } else if output.contains("audio") || output.contains("speech") {
+        Some(ModelType::Speech)
+    } else if output.contains("text") {
+        Some(ModelType::Chat)
+    } else {
+        None
+    }
+}
+
+fn detect_gemini_model_type(entry: &Value) -> Option<ModelType> {
+    let methods = entry
+        .get("supportedGenerationMethods")
+        .and_then(string_list)
+        .unwrap_or_default();
+    let output_modalities = entry
+        .get("outputModalities")
+        .and_then(named_list)
+        .or_else(|| entry.get("output_modalities").and_then(named_list))
+        .unwrap_or_default();
+    if output_modalities
+        .iter()
+        .any(|modality| modality.eq_ignore_ascii_case("image"))
+    {
+        return Some(ModelType::Image);
+    }
+    if output_modalities
+        .iter()
+        .any(|modality| modality.eq_ignore_ascii_case("audio"))
+    {
+        return Some(ModelType::Speech);
+    }
+    if methods.iter().any(|method| {
+        method.eq_ignore_ascii_case("embedContent")
+            || method.eq_ignore_ascii_case("batchEmbedContents")
+    }) {
+        return Some(ModelType::Embedding);
+    }
+    methods
+        .iter()
+        .any(|method| method.eq_ignore_ascii_case("generateContent"))
+        .then_some(ModelType::Chat)
+}
+
 fn non_empty_string(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
@@ -754,6 +881,9 @@ fn merge_model(existing: &mut DiscoveredModel, incoming: &DiscoveredModel) {
     }
     if existing.supports_stream.is_none() {
         existing.supports_stream = incoming.supports_stream;
+    }
+    if existing.model_type.is_none() {
+        existing.model_type = incoming.model_type;
     }
     if existing.is_free.is_none() {
         existing.is_free = incoming.is_free;

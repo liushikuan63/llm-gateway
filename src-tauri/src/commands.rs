@@ -89,6 +89,14 @@ impl ProviderView {
     }
 }
 
+/// 启动状态查询：不依赖 AppState，供前端在后端初始化完成前轮询。
+#[tauri::command]
+pub fn get_boot_state(
+    boot: tauri::State<'_, crate::boot::BootState>,
+) -> crate::boot::BootStateView {
+    boot.view()
+}
+
 #[tauri::command]
 pub async fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderView>, String> {
     let list = repo::list_providers(state.db.pool())
@@ -187,6 +195,9 @@ pub async fn upsert_provider(
     }
     // 模型级覆盖会直接改写发往上游的请求，必须在保存期整体校验。
     for model in &input.models {
+        model
+            .validate_upstream_path()
+            .map_err(|error| format!("模型 {} 的上游请求路径无效：{error}", model.alias.trim()))?;
         if let Some(overrides) = &model.overrides {
             overrides
                 .validate()
@@ -842,8 +853,8 @@ async fn replace_snapshot_providers(
                 r#"INSERT INTO models
                      (id, provider_id, alias, upstream, context_window, supports_tools,
                       supports_vision, supports_audio, supports_video, supports_stream,
-                      price_json, overrides_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                      model_type, upstream_path, price_json, overrides_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
             )
             .bind(format!("{}:{}", provider.id, model.alias))
             .bind(&provider.id)
@@ -855,6 +866,8 @@ async fn replace_snapshot_providers(
             .bind(model.supports_audio as i64)
             .bind(model.supports_video as i64)
             .bind(model.supports_stream as i64)
+            .bind(model.model_type.code())
+            .bind(&model.upstream_path)
             .bind(price)
             .bind(overrides)
             .execute(&mut *tx)
@@ -1424,7 +1437,7 @@ pub async fn get_pet_status(
     }
 
     // 任务日志优先：出错的任务压过"空闲"说明，运行中的任务让宠物进入工作态。
-    let active_tasks = crate::petdex::list_qoder_tasks();
+    let active_tasks = crate::petdex::list_tasks();
     let gateway_status = status.clone();
     let (status, reason) = crate::petdex::combine_pet_status(&status, &reason, &active_tasks);
 
@@ -1463,22 +1476,70 @@ pub async fn close_pet_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 调整桌宠窗口大小（0.5× ~ 2×，基准 240×260）。返回实际生效的比例。
+/// 调整宠物本体大小（1.00× = 120×130，最大 3.00×）。返回窗口实际布局。
 #[tauri::command]
-pub async fn set_pet_window_size(app: tauri::AppHandle, scale: f64) -> Result<f64, String> {
+pub async fn set_pet_window_size(
+    app: tauri::AppHandle,
+    scale: f64,
+) -> Result<crate::pet_window::PetWindowLayout, String> {
     crate::pet_window::set_pet_window_size(&app, scale)
 }
 
-/// 弹出桌宠的原生右键菜单（宠物列表 + 打开主窗口 / 暂停监控 / 隐藏）。
-/// 用系统菜单而不是页面内菜单：桌宠窗口可能很小，自绘菜单放不下。
+/// 展开 / 收起当前任务与 AI 软件信息面板。
+#[tauri::command]
+pub async fn set_pet_window_expanded(
+    app: tauri::AppHandle,
+    expanded: bool,
+) -> Result<crate::pet_window::PetWindowLayout, String> {
+    crate::pet_window::set_pet_window_expanded(&app, expanded)
+}
+
+/// 隐藏 / 恢复宠物旁边的任务气泡；隐藏时窗口缩回宠物本体，避免透明区域挡住桌面点击。
+#[tauri::command]
+pub async fn set_pet_window_bubble_hidden(
+    app: tauri::AppHandle,
+    hidden: bool,
+) -> Result<crate::pet_window::PetWindowLayout, String> {
+    crate::pet_window::set_pet_window_bubble_hidden(&app, hidden)
+}
+
+/// 读取桌宠窗口当前布局（缩放比例、面板展开状态、逻辑尺寸）。
+#[tauri::command]
+pub async fn get_pet_window_layout(
+    app: tauri::AppHandle,
+) -> Result<crate::pet_window::PetWindowLayout, String> {
+    Ok(crate::pet_window::pet_window_layout(&app))
+}
+
+/// 任务数量变化后重算桌宠窗口布局：气泡堆叠高度必须跟着任务条数变化。
+#[tauri::command]
+pub async fn refresh_pet_window_layout(
+    app: tauri::AppHandle,
+) -> Result<crate::pet_window::PetWindowLayout, String> {
+    crate::pet_window::refresh_pet_window(&app)
+}
+
+/// 前端上报可见气泡数量与堆叠状态：关闭单个气泡 / 悬浮展开时窗口高度随之变化。
+#[tauri::command]
+pub async fn set_pet_bubbles(
+    app: tauri::AppHandle,
+    bubble_count: usize,
+    bubbles_expanded: bool,
+) -> Result<crate::pet_window::PetWindowLayout, String> {
+    crate::pet_window::set_pet_bubbles(&app, bubble_count, bubbles_expanded)
+}
+
+/// 弹出桌宠的原生右键菜单（宠物列表 + 面板 / 主窗口 / 暂停 / 隐藏）。
+/// 用系统菜单而不是页面内菜单：即使面板收起，菜单仍然可用。
 #[tauri::command]
 pub async fn show_pet_menu(
     app: tauri::AppHandle,
     current_slug: Option<String>,
     paused: bool,
+    expanded: bool,
 ) -> Result<(), String> {
     let pets = crate::petdex::list_installed();
-    crate::pet_window::show_pet_menu(&app, current_slug.as_deref(), &pets, paused)
+    crate::pet_window::show_pet_menu(&app, current_slug.as_deref(), &pets, paused, expanded)
 }
 
 /// 打开并聚焦主窗口（桌宠点击跳转）。`section` 由前端映射到具体页面。
@@ -1498,6 +1559,69 @@ pub async fn focus_main_window(
         let _ = app.emit("llm-gateway-navigate", section);
     }
     Ok(())
+}
+
+/// 打开指定的 AI 任务。
+/// Codex 使用官方 codex://threads/<id> 深链；Qoder 没有任务级协议，退化为聚焦 Qoder IDE。
+#[tauri::command]
+pub async fn open_ai_task(tool_id: String, session_id: String) -> Result<String, String> {
+    let tasks = crate::petdex::list_tasks();
+    let task = tasks
+        .iter()
+        .find(|task| task.tool_id == tool_id && task.session_id == session_id)
+        .ok_or_else(|| "任务已不在当前监控窗口内；请刷新后重试".to_string())?;
+
+    if let Some(link) = task.deep_link.as_deref() {
+        tauri_plugin_opener::open_url(link, None::<&str>)
+            .map_err(|error| format!("打开任务失败：{error}"))?;
+        return Ok(format!("已打开 [{}] {}。", task.source_label, task.title));
+    }
+
+    let focus_result = if tool_id.starts_with("qoder") {
+        match crate::petdex::focus_tool_window("qoder_ide").await {
+            Ok(message) => Ok(message),
+            Err(_) => crate::petdex::focus_tool_window("qoder").await,
+        }
+    } else {
+        crate::petdex::focus_tool_window(&tool_id).await
+    };
+    focus_result
+        .map(|message| {
+            format!(
+                "{message}。当前任务：[{}] {}",
+                task.source_label, task.title
+            )
+        })
+        .map_err(|error| {
+            format!(
+                "无法打开任务“{}”：{error}。可使用「项目」打开任务目录。",
+                task.title
+            )
+        })
+}
+
+/// 将某个 AI 软件的顶层窗口切到前台（工具标识必须来自监控结果）。
+#[tauri::command]
+pub async fn focus_ai_tool(tool_id: String) -> Result<String, String> {
+    crate::petdex::focus_tool_window(&tool_id).await
+}
+
+/// 打开检测到任务的项目目录。只接受真实存在的目录，不执行路径中的内容。
+#[tauri::command]
+pub async fn open_task_project(path: String) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("该任务没有可用的项目路径".to_string());
+    }
+    let directory = std::path::PathBuf::from(trimmed);
+    let metadata =
+        std::fs::metadata(&directory).map_err(|error| format!("项目目录不可访问：{error}"))?;
+    if !metadata.is_dir() {
+        return Err(format!("项目路径不是目录：{}", directory.display()));
+    }
+    tauri_plugin_opener::open_path(&directory, None::<&str>)
+        .map_err(|error| format!("打开项目目录失败：{error}"))?;
+    Ok(format!("已打开项目目录：{}", directory.display()))
 }
 
 /// 结束某个 AI 软件当前检测到的全部进程（工具标识必须来自监控结果）。
@@ -1630,7 +1754,12 @@ pub async fn run_gateway_self_check(state: State<'_, AppState>) -> Result<SelfCh
 pub async fn apply_takeover(state: State<'_, AppState>) -> Result<Vec<TakeoverResult>, String> {
     let cfg = state.config.read().clone();
     ensure_supported_takeover_selection(cfg.takeover.gemini_cli)?;
-    if !cfg.takeover.claude_code && !cfg.takeover.codex && !cfg.takeover.gemini_cli {
+    if !cfg.takeover.claude_code
+        && !cfg.takeover.codex
+        && !cfg.takeover.gemini_cli
+        && !cfg.takeover.opencode
+        && !cfg.takeover.crush
+    {
         return Ok(Vec::new());
     }
 
@@ -1650,6 +1779,22 @@ pub async fn apply_takeover(state: State<'_, AppState>) -> Result<Vec<TakeoverRe
         prepared.push(prepare_codex_takeover(
             &home.join(".codex").join("config.toml"),
             &base,
+            &cfg.unified_key,
+        )?);
+    }
+
+    if cfg.takeover.opencode {
+        prepared.push(prepare_opencode_takeover(
+            &home.join(".config").join("opencode").join("opencode.json"),
+            &format!("{base}/v1"),
+            &cfg.unified_key,
+        )?);
+    }
+
+    if cfg.takeover.crush {
+        prepared.push(prepare_crush_takeover(
+            &home.join(".config").join("crush").join("crushrc"),
+            &format!("{base}/v1"),
             &cfg.unified_key,
         )?);
     }
@@ -1712,6 +1857,98 @@ fn prepare_codex_takeover(
             unified_key,
         )
     })
+}
+
+fn prepare_opencode_takeover(
+    path: &std::path::Path,
+    gateway_url: &str,
+    unified_key: &str,
+) -> Result<PreparedTakeover, String> {
+    prepare_takeover_file("OpenCode", path, |contents| {
+        let mut value: serde_json::Value = match contents {
+            Some(contents) => serde_json::from_str(contents)
+                .map_err(|_| "OpenCode opencode.json 不是有效 JSON；未改写原文件".to_string())?,
+            None => serde_json::json!({}),
+        };
+        let root = value
+            .as_object_mut()
+            .ok_or_else(|| "OpenCode opencode.json 根节点必须是对象；未改写原文件".to_string())?;
+        root.entry("$schema")
+            .or_insert_with(|| serde_json::json!("https://opencode.ai/config.json"));
+        let providers = root
+            .entry("provider")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                "OpenCode opencode.json 的 provider 必须是对象；未改写原文件".to_string()
+            })?;
+        providers.insert(
+            "llm-gateway".into(),
+            serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "LLM Gateway",
+                "options": {
+                    "baseURL": gateway_url,
+                    "apiKey": unified_key,
+                },
+                "models": {
+                    "auto": { "name": "LLM Gateway auto" },
+                },
+            }),
+        );
+        root.insert("model".into(), serde_json::json!("llm-gateway/auto"));
+        root.insert("small_model".into(), serde_json::json!("llm-gateway/auto"));
+        serde_json::to_string_pretty(&value)
+            .map_err(|_| "OpenCode opencode.json 序列化失败；未改写原文件".to_string())
+    })
+}
+
+fn prepare_crush_takeover(
+    path: &std::path::Path,
+    gateway_url: &str,
+    unified_key: &str,
+) -> Result<PreparedTakeover, String> {
+    prepare_takeover_file("Crush", path, |contents| {
+        merge_crush_takeover_config(contents.unwrap_or(""), gateway_url, unified_key)
+    })
+}
+
+const CRUSH_TAKEOVER_BEGIN: &str = "# >>> llm-gateway takeover >>>";
+const CRUSH_TAKEOVER_END: &str = "# <<< llm-gateway takeover <<<";
+
+fn merge_crush_takeover_config(
+    contents: &str,
+    gateway_url: &str,
+    unified_key: &str,
+) -> Result<String, String> {
+    let block = format!(
+        "{CRUSH_TAKEOVER_BEGIN}\nprovider add llm-gateway --name {} --type openai-compat --base-url {} --api-key {}\nmodel add llm-gateway/auto --name {}\nmodel large llm-gateway/auto\nmodel small llm-gateway/auto\n{CRUSH_TAKEOVER_END}",
+        shell_single_quote("LLM Gateway"),
+        shell_single_quote(gateway_url),
+        shell_single_quote(unified_key),
+        shell_single_quote("LLM Gateway auto"),
+    );
+
+    let start = contents.find(CRUSH_TAKEOVER_BEGIN);
+    let end = contents.find(CRUSH_TAKEOVER_END);
+    match (start, end) {
+        (None, None) => Ok({
+            if contents.trim().is_empty() {
+                format!("{block}\n")
+            } else {
+                format!("{}\n\n{block}\n", contents.trim_end())
+            }
+        }),
+        (Some(start), Some(end)) if end >= start => Ok({
+            let end = end + CRUSH_TAKEOVER_END.len();
+            format!("{}{}{}", &contents[..start], block, &contents[end..])
+        }),
+        _ => Err("Crush crushrc 的接管标记不完整；未改写原文件".into()),
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// 只改 Codex 选择的 provider 与 `llm_gateway` 专用表，保留其它 provider 的语义字段。
@@ -2286,7 +2523,8 @@ mod takeover_tests {
     use super::{
         apply_prepared_takeovers, create_verified_takeover_backup_with,
         ensure_supported_takeover_selection, prepare_claude_takeover, prepare_codex_takeover,
-        prepare_gemini_takeover, TakeoverStatus,
+        prepare_crush_takeover, prepare_gemini_takeover, prepare_opencode_takeover, TakeoverStatus,
+        CRUSH_TAKEOVER_BEGIN, CRUSH_TAKEOVER_END,
     };
     use std::{io, path::PathBuf};
 
@@ -2586,6 +2824,66 @@ X-Gateway-Env-Header = "LLM_GATEWAY_PRESERVE_HEADER"
     }
 
     #[test]
+    fn opencode_and_crush_takeover_preserve_user_configuration() {
+        let temp = TempDir::new();
+        let opencode_path = temp
+            .0
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json");
+        let crush_path = temp.0.join(".config").join("crush").join("crushrc");
+        std::fs::create_dir_all(opencode_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(crush_path.parent().unwrap()).unwrap();
+        let opencode_original = r#"{
+  "provider": { "existing": { "name": "Keep me" } },
+  "theme": "dark"
+}"#;
+        let crush_original =
+            "option debug true\nprovider add existing --type openai --base-url 'https://old.invalid/v1'\n";
+        std::fs::write(&opencode_path, opencode_original).unwrap();
+        std::fs::write(&crush_path, crush_original).unwrap();
+
+        let results = apply_prepared_takeovers(vec![
+            prepare_opencode_takeover(&opencode_path, "http://127.0.0.1:15721/v1", "test-token")
+                .unwrap(),
+            prepare_crush_takeover(&crush_path, "http://127.0.0.1:15721/v1", "test-token").unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.backup_path.is_some()));
+
+        let opencode: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&opencode_path).unwrap()).unwrap();
+        assert_eq!(opencode["theme"], "dark");
+        assert_eq!(opencode["provider"]["existing"]["name"], "Keep me");
+        assert_eq!(opencode["model"], "llm-gateway/auto");
+        assert_eq!(
+            opencode["provider"]["llm-gateway"]["options"]["baseURL"],
+            "http://127.0.0.1:15721/v1"
+        );
+
+        let crush = std::fs::read_to_string(&crush_path).unwrap();
+        assert!(crush.contains("option debug true"));
+        assert!(crush.contains("provider add existing"));
+        assert!(crush.contains(CRUSH_TAKEOVER_BEGIN));
+        assert!(crush.contains("provider add llm-gateway"));
+        assert!(crush.contains("model large llm-gateway/auto"));
+
+        // 再次接管必须替换托管块，而不是每执行一次就追加一份。
+        apply_prepared_takeovers(vec![prepare_crush_takeover(
+            &crush_path,
+            "http://127.0.0.1:16721/v1",
+            "next-token",
+        )
+        .unwrap()])
+        .unwrap();
+        let replay = std::fs::read_to_string(&crush_path).unwrap();
+        assert_eq!(replay.matches(CRUSH_TAKEOVER_BEGIN).count(), 1);
+        assert_eq!(replay.matches(CRUSH_TAKEOVER_END).count(), 1);
+        assert!(replay.contains("http://127.0.0.1:16721/v1"));
+    }
+
+    #[test]
     fn backup_failure_stops_before_the_original_file_is_changed() {
         let temp = TempDir::new();
         let path = temp.0.join(".gemini").join(".env");
@@ -2646,6 +2944,449 @@ X-Gateway-Env-Header = "LLM_GATEWAY_PRESERVE_HEADER"
             malformed_toml
         );
     }
+}
+
+/* --------------------- 本地模型 / 智能模式 / 联网搜索 --------------------- */
+
+/// 扫描本机全部推理运行时。并发探测，一个端点不可达不影响其它端点。
+#[tauri::command]
+pub async fn list_local_runtimes(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::local_models::ProbeOutcome>, String> {
+    let cfg = state.config.read().clone();
+    let http = crate::local_models::runtime::default_client();
+    let outcomes = crate::local_models::probe_all(
+        &http,
+        &cfg.local_models.endpoints,
+        cfg.local_models.probe_timeout_ms,
+    )
+    .await;
+    Ok(outcomes)
+}
+
+/// 某个端点上的已装模型。端点不可达时返回明确的错误文案，不返回空列表假装「没模型」。
+#[tauri::command]
+pub async fn list_local_models(
+    state: State<'_, AppState>,
+    endpoint_id: String,
+) -> Result<Vec<crate::local_models::LocalModelInfo>, String> {
+    let cfg = state.config.read().clone();
+    let endpoint = crate::local_models::find_endpoint(&cfg.local_models.endpoints, &endpoint_id)
+        .ok_or_else(|| format!("找不到本地端点 {endpoint_id}"))?;
+    let http = crate::local_models::runtime::default_client();
+    crate::local_models::runtime::fetch_models(&http, endpoint, cfg.local_models.probe_timeout_ms)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 登记一个本地模型为供应商。
+///
+/// 登记后它与云端模型**完全平权**：同样进候选链、同样打分降级、同样审计。
+/// 重复登记同一个 `endpoint_id + upstream` 会并入已有 Provider，而不是新建。
+#[tauri::command]
+pub async fn register_local_model(
+    state: State<'_, AppState>,
+    input: crate::local_models::RegisterLocalInput,
+) -> Result<crate::local_models::RegisterLocalOutcome, String> {
+    if input.upstream.trim().is_empty() {
+        return Err("本地模型名不能为空".into());
+    }
+    let (http, endpoint, probe_timeout, providers, now) = {
+        let cfg = state.config.read().clone();
+        let endpoint = crate::local_models::find_endpoint(&cfg.local_models.endpoints, &input.endpoint_id)
+            .cloned()
+            .ok_or_else(|| format!("找不到本地端点 {}", input.endpoint_id))?;
+        (
+            crate::local_models::runtime::default_client(),
+            endpoint,
+            cfg.local_models.probe_timeout_ms,
+            repo::list_providers(state.db.pool())
+                .await
+                .map_err(|e| e.to_string())?,
+            chrono::Utc::now(),
+        )
+    };
+
+    // 每次登记都重新扫一次目录：用户可能在登记前又拉了新模型，
+    // 一次性全部收进来比让他逐个点更省事。
+    let scanned = crate::local_models::runtime::fetch_models(&http, &endpoint, probe_timeout)
+        .await
+        .map_err(|e| e.to_string())?;
+    let target = crate::local_models::find_by_upstream(&scanned, input.upstream.trim())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "{} 上没有名为 {} 的模型，请先在运行时里下载",
+                endpoint.label, input.upstream
+            )
+        })?;
+
+    let alias = input
+        .alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&target.alias)
+        .to_owned();
+
+    // 同一端点的模型共用一个 Provider；重复登记并入它。
+    let mut provider = providers
+        .iter()
+        .find(|p| p.base_url == endpoint.base_url && p.dialect == crate::local_models::dialect_of(endpoint.kind))
+        .cloned();
+    if provider.is_none() {
+        provider = Some(Provider {
+            id: format!("lp-{}", uuid::Uuid::new_v4().simple()),
+            name: input
+                .provider_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("本地 · {}", endpoint.label)),
+            dialect: crate::local_models::dialect_of(endpoint.kind),
+            base_url: endpoint.base_url.clone(),
+            api_key_enc: String::new(),
+            enabled: input.enabled.unwrap_or(true),
+            priority: 0,
+            models: Vec::new(),
+            rpm_limit: 0,
+            intelligence: 50,
+            note: Some(format!("由 {} 自动登记的本地模型", endpoint.label)),
+            created_at: now,
+            updated_at: now,
+        });
+    }
+    let mut provider = provider.expect("上一步已确保存在");
+
+    // 端点地址被改过之后，同一个端点会留下一份**永远 404 的僵尸供应商**：
+    // 上一步按 `base_url == endpoint.base_url` 匹配，地址变了就匹配不到、
+    // 于是新建一份，旧的原封不动留着。真机踩到过（把 `…:11434` 改成
+    // `…:11434/v1` 登记一次），表现是路由一直挑中那个失效项、
+    // 每次请求都 `404 page not found`，界面上完全看不出有两个。
+    //
+    // 清理条件刻意收得很紧：只删「同一 dialect + 同名自动登记 + 标记是本地登记的
+    // + 声明的 host 与当前端点相同，只是路径不同」。绝不动用户手工建的供应商。
+    let stale: Vec<String> = providers
+        .iter()
+        .filter(|old| {
+            old.id != provider.id
+                && old.dialect == provider.dialect
+                && old.base_url != endpoint.base_url
+                && crate::local_models::same_host(&endpoint.base_url, &old.base_url)
+                && old
+                    .note
+                    .as_deref()
+                    .map(|n| n.starts_with("由 ") && n.ends_with(" 自动登记的本地模型"))
+                    .unwrap_or(false)
+        })
+        .map(|old| old.id.clone())
+        .collect();
+    for id in stale {
+        repo::delete_provider(state.db.pool(), &id)
+            .await
+            .map_err(|e| e.to_string())?;
+        tracing::info!(provider = %id, "端点地址已变更，清理自动登记的失效供应商");
+    }
+
+    // 把该端点扫到的全部模型并进去（已存在的按 upstream 跳过）。
+    let mut added = 0usize;
+    for info in &scanned {
+        if info.upstream == target.upstream {
+            continue;
+        }
+        if provider.models.iter().any(|m| m.upstream == info.upstream) {
+            continue;
+        }
+        provider.models.push(crate::local_models::to_model_ref(info));
+        added += 1;
+    }
+    let target_ref = crate::local_models::to_model_ref(&target);
+    let already = provider
+        .models
+        .iter()
+        .position(|m| m.upstream == target.upstream);
+    match already {
+        Some(index) => {
+            // 保留用户改过的 alias，其余元数据跟着运行时刷新。
+            let mut merged = target_ref.clone();
+            merged.alias = provider.models[index].alias.clone();
+            provider.models[index] = merged;
+        }
+        None => {
+            provider.models.push(target_ref);
+            added += 1;
+        }
+    }
+    let provider_id = provider.id.clone();
+    repo::upsert_provider(state.db.pool(), &provider)
+        .await
+        .map_err(|e| e.to_string())?;
+    state
+        .gateway
+        .reload_providers()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(crate::local_models::RegisterLocalOutcome {
+        provider_id,
+        alias,
+        added_models: added,
+        all_models: scanned,
+    })
+}
+
+/// 拉取本地模型（仅 Ollama）。逐行进度通过 Tauri 事件推给界面。
+#[tauri::command]
+pub async fn pull_local_model(
+    app: tauri::AppHandle,
+    endpoint_id: String,
+    model: String,
+) -> Result<(), String> {
+    let endpoint = state_config_endpoint(&app, &endpoint_id)?;
+    if endpoint.kind != crate::config::LocalRuntimeKind::Ollama {
+        return Err(format!(
+            "{} 没有统一的模型下载接口，请用它自带的客户端下载",
+            endpoint.label
+        ));
+    }
+    let http = crate::local_models::runtime::default_client();
+    let progress_app = app.clone();
+    crate::local_models::pull_ollama_model(&http, &endpoint.base_url, &model, 600_000, move |event| {
+        let _ = progress_app.emit("local-model://pull-progress", &event);
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 读配置里的端点。抽成函数是因为命令签名里拿不到 `State`，只能走 AppHandle。
+fn state_config_endpoint(
+    app: &tauri::AppHandle,
+    endpoint_id: &str,
+) -> Result<crate::config::LocalEndpoint, String> {
+    let cfg = app.state::<AppState>().config.read().clone();
+    crate::local_models::find_endpoint(&cfg.local_models.endpoints, endpoint_id)
+        .cloned()
+        .ok_or_else(|| format!("找不到本地端点 {endpoint_id}"))
+}
+
+/// 搜索设置（Key 只回掩码）。
+#[tauri::command]
+pub async fn get_search_settings(
+    state: State<'_, AppState>,
+) -> Result<crate::search::SearchSettingsView, String> {
+    let cfg = state.config.read().clone();
+    let api_key_masked = match repo::get_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY).await {
+        Ok(Some(encoded)) => crypto::decrypt(&encoded)
+            .ok()
+            .and_then(|key| crate::search::mask_key(&key)),
+        _ => None,
+    };
+    Ok(crate::search::SearchSettingsView {
+        enabled: cfg.search.enabled,
+        backend: cfg.search.backend,
+        // 先算再挪：`searxng_url` 是 `Option<String>`，移走之后
+        // 再借用 `cfg.search` 属于部分移动后的借用。
+        max_results: cfg.search.normalized_max_results(),
+        searxng_url: cfg.search.searxng_url,
+        timeout_ms: cfg.search.timeout_ms,
+        inject_as: cfg.search.inject_as,
+        api_key_masked,
+        backend_needs_key: matches!(
+            cfg.search.backend,
+            crate::config::SearchBackendKind::Tavily | crate::config::SearchBackendKind::Brave
+        ),
+    })
+}
+
+/// 更新搜索设置。`api_key` 留空表示不改；`clear_api_key` 才真的删。
+#[tauri::command]
+pub async fn update_search_settings(
+    state: State<'_, AppState>,
+    input: crate::search::SearchSettingsInput,
+) -> Result<crate::search::SearchSettingsView, String> {
+    // 必须先克隆再提交，不能就地改 `state.config`：
+    //   ① 代理读的是 `state.gateway.cfg`（`cfg_snapshot()`），和 `state.config`
+    //      是**两把独立的锁**。只写前者的话，开关/后端/条数在重启前完全不生效，
+    //      而 `get_search_settings` 读的是刚被改过的 `state.config`，
+    //      界面上看起来「保存成功了」——这种假成功最难查。
+    //   ② 就地改会在校验或落盘失败时留下一个被拒绝的内存值。
+    {
+        let guard = state.config.read();
+        let mut next = guard.clone();
+        drop(guard);
+        next.search.enabled = input.enabled;
+        next.search.backend = input.backend;
+        next.search.searxng_url = input.searxng_url.clone();
+        next.search.max_results = input.max_results;
+        next.search.timeout_ms = input.timeout_ms;
+        next.search.inject_as = input.inject_as;
+        next.normalize_local();
+        crate::search::validate(&next.search).map_err(|e| e.to_string())?;
+        next.save().map_err(|e| e.to_string())?;
+        *state.gateway.cfg.write() = next.clone();
+        *state.config.write() = next;
+    }
+    if input.clear_api_key {
+        repo::delete_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(key) = input.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        let encoded = crypto::encrypt(key).map_err(|e| e.to_string())?;
+        repo::set_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY, &encoded)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    get_search_settings(state).await
+}
+
+/// 实跑一次搜索后端，不注入上下文。用于「测试后端」按钮。
+#[tauri::command]
+pub async fn test_search_backend(
+    state: State<'_, AppState>,
+    text: String,
+) -> Result<crate::search::executor::SearchOutcome, String> {
+    let cfg = state.config.read().clone();
+    if !cfg.search.enabled {
+        return Err("联网搜索尚未启用".into());
+    }
+    let key = match repo::get_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY).await {
+        Ok(Some(encoded)) => crypto::decrypt(&encoded).ok(),
+        _ => None,
+    };
+    let http = reqwest::Client::new();
+    Ok(crate::search::test_backend(&http, &cfg.search, key.as_deref(), &text).await)
+}
+
+/// 分类器试跑。走**完整链路**（硬规则 → Jev → 启发式），与线上同一份代码。
+#[tauri::command]
+pub async fn classify_preview(
+    state: State<'_, AppState>,
+    text: String,
+    has_image: bool,
+    has_tools: bool,
+) -> Result<crate::intellect::TaskIntent, String> {
+    let cfg = state.config.read().clone();
+    let messages = vec![crate::domain::Message::user(text)];
+    let media = crate::media::Media {
+        image: has_image,
+        ..Default::default()
+    };
+    let input = crate::intellect::ClassifyInput {
+        messages: &messages,
+        media,
+        has_tools,
+        requested_model: "auto",
+    };
+    let jev = crate::intellect::JevClient::new(
+        &cfg.smart_routing.jev.base_url,
+        &cfg.smart_routing.jev.model,
+        cfg.smart_routing.jev.timeout_ms,
+        cfg.smart_routing.jev.max_state_chars,
+    )
+    .ok();
+    Ok(crate::intellect::classify(&input, &cfg.smart_routing, jev.as_ref()).await)
+}
+
+/// 决策端点健康检查 + 一道题的原始分布。界面上用它解释「为什么没走 Jev」。
+#[tauri::command]
+pub async fn jev_probe(
+    state: State<'_, AppState>,
+    text: String,
+) -> Result<serde_json::Value, String> {
+    let cfg = state.config.read().clone();
+    let client = crate::intellect::JevClient::new(
+        &cfg.smart_routing.jev.base_url,
+        &cfg.smart_routing.jev.model,
+        cfg.smart_routing.jev.timeout_ms,
+        cfg.smart_routing.jev.max_state_chars,
+    )
+    .map_err(|e| e.to_string())?;
+    let body = serde_json::json!({
+        "model": client.model_name(),
+        "state": { "prompt": client.truncate_state(&text) },
+        "questions": crate::intellect::jev::preview_questions(),
+    });
+    match client.decide(body).await {
+        Ok(result) => {
+            let rows = crate::intellect::jev::preview(
+                &result,
+                cfg.smart_routing.min_confidence,
+                cfg.smart_routing.min_margin,
+            );
+            Ok(serde_json::json!({
+                "ok": true,
+                "endpoint": client.endpoint(),
+                "rows": rows,
+            }))
+        }
+        Err(error) => Ok(serde_json::json!({
+            "ok": false,
+            "endpoint": client.endpoint(),
+            "error": error.to_string(),
+        })),
+    }
+}
+
+/// 批量校分类器：算混淆矩阵，回答「该不该更信任 Jev」。
+///
+/// **只跑样本，不改任何配置。** 校准的价值在于让人看完数据自己决定阈值，
+/// 命令擅自调阈值就越权了。
+///
+/// 逐条串行：每条都要打一次决策端点，并发打过去只会挤占它本来就紧张的
+/// 单核推理（edgeJev 是 CPU int8）。样本量是几十条量级，串行的总耗时可接受。
+#[tauri::command]
+pub async fn calibrate_classifier(
+    state: State<'_, AppState>,
+    samples: Vec<crate::intellect::LabeledSample>,
+) -> Result<crate::intellect::CalibrationReport, String> {
+    if samples.is_empty() {
+        return Err("校准至少需要一条样本".into());
+    }
+    if samples.len() > 200 {
+        // 上限不是为了防滥用，是因为每条都是一次真实推理，
+        // 200 条 × 20ms 已经接近 5 秒，再多就会卡住界面。
+        return Err(format!("一次最多校准 200 条，收到 {}", samples.len()));
+    }
+    let cfg = state.config.read().clone();
+    // 配置无效时仍然可以校准——结果会全部落到「弃权」，
+    // 那本身就是有用信息（告诉用户端点还没配好）。
+    let jev = crate::intellect::JevClient::new(
+        &cfg.smart_routing.jev.base_url,
+        &cfg.smart_routing.jev.model,
+        cfg.smart_routing.jev.timeout_ms,
+        cfg.smart_routing.jev.max_state_chars,
+    )
+    .ok();
+    let smart = cfg.smart_routing.clone();
+    Ok(crate::intellect::calibrate::calibrate(samples, smart, jev.as_ref()).await)
+}
+
+/// 校准用的默认样本集。
+///
+/// **这些不是拍脑袋写的**，而是本机 edgeJev 实测的五条（`docs/0.3.0验证记录.md` §2.6）。
+/// 预置它们是为了让用户点一下就能看到「它到底行不行」，而不是面对空白输入框。
+/// 其中「线上排查根因」是已知的**错判样本**，刻意保留在集里——
+/// 删掉它报告就会显示成一切正常，那种样本集没有诊断价值。
+#[tauri::command]
+pub async fn calibrate_default_samples(
+    state: State<'_, AppState>,
+) -> Result<crate::intellect::CalibrationReport, String> {
+    calibrate_classifier(state, default_calibration_samples()).await
+}
+
+fn default_calibration_samples() -> Vec<crate::intellect::LabeledSample> {
+    use crate::intellect::calibrate::LabeledSample as S;
+    vec![
+        S { text: "把变量名 x 改成 userName".into(), expected: crate::intellect::TaskClass::Simple, has_image: false, has_tools: false },
+        S { text: "写一个快速排序算法".into(), expected: crate::intellect::TaskClass::Simple, has_image: false, has_tools: false },
+        S { text: "帮我设计一个分布式限流器，需要考虑故障转移和一致性".into(), expected: crate::intellect::TaskClass::Reasoning, has_image: false, has_tools: false },
+        // 已知错判样本：edgeJev 给 0.747 置信度判成 simple，而正确答案是 reasoning。
+        S { text: "线上服务 500 白屏，帮我定位根因".into(), expected: crate::intellect::TaskClass::Reasoning, has_image: false, has_tools: false },
+        S { text: "你好".into(), expected: crate::intellect::TaskClass::Simple, has_image: false, has_tools: false },
+    ]
 }
 
 /* --------------------------- 定价与校准 --------------------------- */

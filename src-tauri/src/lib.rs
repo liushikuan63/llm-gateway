@@ -1,3 +1,4 @@
+pub mod boot;
 pub mod bundle;
 pub mod cli_tools;
 mod commands;
@@ -7,6 +8,8 @@ pub mod crypto;
 pub mod db;
 pub mod domain;
 pub mod error;
+pub mod intellect;
+pub mod local_models;
 pub mod media;
 pub mod model_catalog;
 pub mod pet_window;
@@ -17,6 +20,7 @@ pub mod protocol;
 pub mod provider_quota;
 pub mod proxy;
 pub mod router;
+pub mod search;
 
 use crate::config::AppConfig;
 use crate::proxy::server::GatewayState;
@@ -32,6 +36,59 @@ pub struct AppState {
     pub db: db::Db,
     pub config: Arc<parking_lot::RwLock<AppConfig>>,
     pub gateway: Arc<GatewayState>,
+}
+
+/// 在事件循环启动后异步完成后端初始化，避免阻塞首帧渲染。
+async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
+    let started = std::time::Instant::now();
+    // 读坏了也要起得来：坏配置会被备份成 config.corrupt-<时间戳>.toml，
+    // 这里先用默认配置把应用带起来，同时把「原配置没生效」透给界面。
+    // 直接失败的话，一个枚举值拼错就是「双击没反应」，用户既用不了也没法自救。
+    let (cfg, config_warning) = match AppConfig::load_or_init_with_warning() {
+        Ok(pair) => pair,
+        Err(error) => {
+            // 连文件都读不动（权限/占用）时才真的无路可走。
+            tracing::error!("load config failed: {error}");
+            boot.mark_error(error.to_string());
+            return;
+        }
+    };
+    if let Some(warning) = config_warning {
+        boot.mark_warning(warning);
+    }
+    let db = match db::Db::connect(&cfg).await {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::error!("open database failed: {error}");
+            boot.mark_error(error.to_string());
+            return;
+        }
+    };
+    let gateway = Arc::new(GatewayState::new(db.clone(), cfg.clone()));
+    // 服务开始监听前完成首次加载，避免启动后的首个请求因缓存尚为空而 404。
+    if let Err(error) = gateway.reload_providers().await {
+        tracing::error!("load providers failed: {error}");
+        boot.mark_error(error.to_string());
+        return;
+    }
+
+    app.manage(AppState {
+        db,
+        config: Arc::new(parking_lot::RwLock::new(cfg)),
+        gateway: gateway.clone(),
+    });
+
+    let gw = gateway.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = proxy::server::serve(gw).await {
+            tracing::error!("gateway server exited: {error}");
+        }
+    });
+    let gw2 = gateway.clone();
+    tauri::async_runtime::spawn(async move { gw2.background_loop().await });
+
+    tracing::info!("backend ready in {} ms", started.elapsed().as_millis());
+    boot.mark_ready();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -62,30 +119,19 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // 2. 阻塞初始化：配置 -> 密钥 -> 数据库 -> 网关状态
-            let cfg = AppConfig::load_or_init()?;
-            let db = tauri::async_runtime::block_on(db::Db::connect(&cfg))?;
-            let gateway = Arc::new(GatewayState::new(db.clone(), cfg.clone()));
-            // 服务开始监听前完成首次加载，避免启动后的首个请求因缓存尚为空而 404。
-            tauri::async_runtime::block_on(gateway.reload_providers())?;
+            // 2. 先把窗口背景设为深色，避免 WebView 首帧白闪。
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_background_color(Some(tauri::window::Color(11, 18, 21, 255)));
+            }
 
-            app.manage(AppState {
-                db: db.clone(),
-                config: Arc::new(parking_lot::RwLock::new(cfg.clone())),
-                gateway: gateway.clone(),
+            // 3. 启动状态：配置、SQLite 迁移和 Provider 预加载放到异步任务中，
+            //    让事件循环先启动，静态启动动画可以立即绘制。
+            let boot = boot::BootState::default();
+            app.manage(boot.clone());
+            let init_handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                tauri::async_runtime::block_on(initialize_backend(init_handle, boot));
             });
-
-            // 3. 启动本地网关 HTTP 服务（默认 127.0.0.1:15721）
-            let gw = gateway.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = proxy::server::serve(gw).await {
-                    tracing::error!("gateway server exited: {e}");
-                }
-            });
-
-            // 4. 后台任务：健康探测 + 冷却恢复 + 用量聚合
-            let gw2 = gateway.clone();
-            tauri::async_runtime::spawn(async move { gw2.background_loop().await });
 
             // 4.5 桌宠原生菜单：选择宠物 / 打开主窗口 / 暂停监控 / 隐藏。
             let menu_handle = app.handle().clone();
@@ -106,6 +152,12 @@ pub fn run() {
                             let _ = window.unminimize();
                             let _ = window.set_focus();
                         }
+                    }
+                    "toggle-panel" => {
+                        let _ = menu_handle.emit(
+                            "pet-menu-action",
+                            serde_json::json!({ "action": "toggle-panel" }),
+                        );
                     }
                     "toggle-pause" => {
                         let _ = menu_handle.emit(
@@ -130,6 +182,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_boot_state,
             commands::list_providers,
             provider_quota::get_provider_quota,
             commands::discover_provider_models,
@@ -166,8 +219,16 @@ pub fn run() {
             commands::open_pet_window,
             commands::close_pet_window,
             commands::set_pet_window_size,
+            commands::set_pet_window_expanded,
+            commands::set_pet_window_bubble_hidden,
+            commands::get_pet_window_layout,
+            commands::refresh_pet_window_layout,
+            commands::set_pet_bubbles,
             commands::show_pet_menu,
             commands::focus_main_window,
+            commands::focus_ai_tool,
+            commands::open_ai_task,
+            commands::open_task_project,
             commands::stop_ai_tool,
             commands::petdex_catalog,
             commands::petdex_install_pet,
@@ -176,6 +237,17 @@ pub fn run() {
             commands::pricing_status,
             commands::list_token_calibrations,
             commands::clear_token_calibrations,
+            commands::list_local_runtimes,
+            commands::list_local_models,
+            commands::register_local_model,
+            commands::pull_local_model,
+            commands::get_search_settings,
+            commands::update_search_settings,
+            commands::test_search_backend,
+            commands::classify_preview,
+            commands::jev_probe,
+            commands::calibrate_classifier,
+            commands::calibrate_default_samples,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
