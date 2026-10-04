@@ -11,9 +11,9 @@ const baseUrl = process.env.LLMGW_UI_URL || "http://127.0.0.1:5173";
 const manualSections = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../src/content/user-manual.json"), "utf8")).sections;
 assert(manualSections.length >= 10, `手册章节只有 ${manualSections.length} 个，内容来源可能已损坏`);
 
-async function fixture({ empty = false, configFailure = false, providerFailure = false } = {}) {
+async function fixture({ empty = false, configFailure = false, providerFailure = false, bootWarning = null } = {}) {
   window.isTauri = true;
-  const model = (id, context = 32768, price = null, extra = {}) => ({ alias: id, upstream: id, context_window: context, supports_tools: true, supports_vision: false, supports_audio: false, supports_video: false, supports_stream: true, price, overrides: null, ...extra });
+  const model = (id, context = 32768, price = null, extra = {}) => ({ alias: id, upstream: id, model_type: "chat", upstream_path: null, context_window: context, supports_tools: true, supports_vision: false, supports_audio: false, supports_video: false, supports_stream: true, price, overrides: null, ...extra });
   // 带峰谷价的模型：谷时（UTC 16:30–00:30）打五折，用于验证时段规则的往返保存。
   const peakValleyPrice = { prompt: 2, completion: 8, currency: "cny", tiers: [], source: "manual", rules: [
     { label: "谷时", start_minute: 990, end_minute: 30, prompt_multiplier: 0.5, completion_multiplier: 0.25 },
@@ -26,10 +26,84 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     provider("multimodal", "多模态服务", "openai", "https://example.test/v1", [model("vision-model", 65536, peakValleyPrice, { supports_vision: true, supports_audio: true, supports_video: true })]),
     { ...provider("disabled", "备用服务", "openai", "https://example.test/v1", [model("backup-chat")]), enabled: false },
   ];
-  window.__fixtureConfig = { bind: "127.0.0.1", port: 15721, allow_lan: false, unified_key: "fixture-only", routing_strategy: "balanced", custom_rules: [], max_fallback_attempts: 3, upstream_timeout_secs: 90, sticky_ttl_secs: 1800, compact_threshold_tokens: 60000, compact_keep_recent: 12, analytics_retention_days: 30, log_request_body: false, http_proxy: null, failover_enabled: true, catalog_auto_update: false, catalog_feed_url: null, remote_mode: { enabled: false, public_url: null }, takeover: { claude_code: false, codex: false, gemini_cli: false } };
+  window.__fixtureConfig = { bind: "127.0.0.1", port: 15721, allow_lan: false, unified_key: "fixture-only", routing_strategy: "balanced", custom_rules: [], max_fallback_attempts: 3, upstream_timeout_secs: 90, sticky_ttl_secs: 1800, compact_threshold_tokens: 60000, compact_keep_recent: 12, analytics_retention_days: 30, log_request_body: false, http_proxy: null, failover_enabled: true, catalog_auto_update: false, catalog_feed_url: null, remote_mode: { enabled: false, public_url: null }, takeover: { claude_code: false, codex: false, gemini_cli: false, opencode: false, crush: false },
+    smart_routing: {
+      enabled: true, classifier: "jev",
+      jev: { base_url: "http://127.0.0.1:8009/v1/systemone", model: "rl-agent", timeout_ms: 1200, max_state_chars: 4000,
+        auto_start: { enabled: false, binary: "", port: 8009 } },
+      timeout_ms: 1200, min_confidence: 0.35, min_margin: 0.25,
+      // 预优化默认关闭：先用关闭态验"开关关着时字段不生效"，
+      // 再打开验 UI 能提交并回填。
+      prompt_refine: { enabled: false, provider_id: null, model: null, timeout_ms: 2000, max_chars: 2000, clarity_noul: 0.72, min_chars: 24 },
+    },
+    search: { enabled: true, backend: "tavily", searxng_url: null, max_results: 5, timeout_ms: 8000, inject_as: "text" },
+    local_models: {
+      enabled: true, auto_register: false, probe_timeout_ms: 2000,
+      endpoints: [
+        { id: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434", kind: "ollama" },
+        { id: "lmstudio", label: "LM Studio", base_url: "http://127.0.0.1:1234", kind: "open_ai_compatible" },
+        { id: "dead", label: "已停止的服务", base_url: "http://127.0.0.1:1", kind: "open_ai_compatible" },
+      ],
+    },
+  };
+  window.__fixtureSearchKey = { masked: "tvly-****-abc", configured: true };
+  // 搜索设置快照。`get_search_settings` 与 `update_search_settings` 共用它，
+  // 这样"保存后重新打开页面设置仍是新值"这条断言才不是自说自话。
+  const searchSettings = () => {
+    const s = window.__fixtureConfig.search;
+    // 必须与 commands.rs 的 matches!(Tavily | Brave) 同一套口径：
+    // 白名单判定，不是「除 DuckDuckGo 外都要 Key」。新加免 Key 后端时
+    // 只有白名单写法不会漏 —— 实测踩过：夹具写成 `!== "duckduckgo"`，
+    // 必应中国（免 Key）会被误报成需要 Key，断言跟着一起错。
+    const needsKey = s.backend === "tavily" || s.backend === "brave";
+    return { enabled: s.enabled, backend: s.backend, searxng_url: s.searxng_url, max_results: s.max_results, timeout_ms: s.timeout_ms, inject_as: s.inject_as, api_key_masked: window.__fixtureSearchKey.masked, has_key: window.__fixtureSearchKey.configured, backend_needs_key: needsKey };
+  };
   window.__fixtureSaved = [];
   if (empty) window.__fixtureProviders = [];
   window.__fixtureCalls = [];
+  // 本地模型 / 智能模式 / 联网搜索的夹具。
+  //
+  // **这个块必须完整**：页面是 `cfg.smart_routing.enabled` 这种直接解构，
+  // 缺一个字段就是运行时报错而不是"显示为空"。夹具少给字段，
+  // 冒烟测试就测不到页面，而测试全绿看起来像页面是好的。
+  //
+  // 命令名与 `src/api.ts` 逐一对应；改后端命令名时这里必须同步，
+  // 否则冒烟会抛 `Unexpected fixture IPC` 而不是安静地跳过。
+  window.__fixtureLocalRuntimes = [
+    { id: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434", kind: "ollama", reachable: true, version: "0.35.1", model_count: 2, error: null },
+    { id: "lmstudio", label: "LM Studio", base_url: "http://127.0.0.1:1234", kind: "open_ai_compatible", reachable: true, version: null, model_count: 1, error: null },
+    // 不可达端点：界面上必须显示原因，不能只显示一个「不可达」。
+    { id: "dead", label: "已停止的服务", base_url: "http://127.0.0.1:1", kind: "open_ai_compatible", reachable: false, version: null, model_count: 0, error: "连接被拒绝（127.0.0.1:1）" },
+  ];
+  // 能力位刻意不一致：同族的 q4_K_M 有 vision，q3 没有。
+  // 两者都列出来，才能验「能力保守」这条规则在界面上是真的按上游元数据走。
+  const localModel = (upstream, extra = {}) => ({
+    upstream, alias: upstream.split("/").pop(), context_window: 40960,
+    supports_tools: true, supports_vision: false, supports_audio: false, supports_video: false,
+    supports_thinking: true, supports_stream: true, model_type: "chat",
+    meta: { runtime: "ollama", family: null, parameter_size: "27B", quantization: null, disk_bytes: 17_760_000_000, capabilities: ["completion", "tools", "thinking"] },
+    ...extra,
+  });
+  window.__fixtureLocalModels = {
+    ollama: [
+      localModel("qwen3.8:27b-q4_K_M", { supports_vision: true, meta: { runtime: "ollama", family: null, parameter_size: "27B", quantization: "Q4_K_M", disk_bytes: 17_760_000_000, capabilities: ["completion", "vision", "tools", "thinking"] } }),
+      localModel("batiai/qwen3.8-27b:q3", { meta: { runtime: "ollama", family: null, parameter_size: "27B", quantization: "Q3", disk_bytes: 13_300_000_000, capabilities: ["completion", "tools", "thinking"] } }),
+    ],
+    lmstudio: [
+      localModel("local-model", { context_window: 8192, supports_tools: false, supports_thinking: false, meta: { runtime: "openai-compatible", family: null, parameter_size: null, quantization: null, disk_bytes: null, capabilities: [] } }),
+    ],
+  };
+  window.__fixtureJevPreview = [
+    { name: "complexity", kind: "choice", detail: "simple 0.20 / moderate 0.60 / complex 0.20 · 置信度 0.60" },
+    { name: "clarity", kind: "noul", detail: "0.10" },
+  ];
+  // Jev 原始判定试跑：返回 heuristic + 弃权原因，这正是本机的真实形态。
+  window.__fixtureJevProbe = {
+    classifier: "heuristic",
+    intent: { class: "simple", complexity: 8, needs_web: false, needs_refine: false, classifier: "heuristic", jev_note: "置信度不足，已弃权", jev_evidence: null },
+    jev_note: "置信度不足，已弃权",
+    jev_evidence: { complexity: { choice: "simple", confidence: 0.117, probabilities: { simple: 0.55, moderate: 0.30, complex: 0.15 } } },
+  };
   // CLI 检测夹具：覆盖 npm 与官方脚本两类来源，以及已安装 / 未安装 / 可更新 / 缺前置条件等分支。
   const cliTool = (id, label, source, installTarget, installed, version, latest, canInstall = true) => ({
     id, label, installed,
@@ -100,7 +174,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
   // 桌宠夹具：一个工作中状态、运行中的 CLI 与桌面应用进程各一个、一个已安装宠物包与一个进行中的任务。
   window.__fixturePetStatus = {
     status: "working",
-    reason: "Qoder CLI 任务进行中：edit",
+    reason: "[Qoder CLI] 进行中：edit",
     gateway_status: "idle",
     requests_last_minute: 3,
     failed_last_minute: 1,
@@ -110,12 +184,48 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     }],
     ai_processes: [
       { tool_id: "codex", tool_label: "Codex CLI", kind: "cli", process_name: "codex.exe", pid: 4321, memory_kb: 56380 },
+      { tool_id: "codex_desktop", tool_label: "Codex Desktop", kind: "app", process_name: "ChatGPT.exe", pid: 2468, memory_kb: 474684 },
+      { tool_id: "qoder", tool_label: "Qoder CLI", kind: "cli", process_name: "qoder.exe", pid: 6789, memory_kb: 120000 },
       { tool_id: "qoder_ide", tool_label: "Qoder IDE", kind: "app", process_name: "Qoder CN.exe", pid: 5678, memory_kb: 512000 },
     ],
     active_tasks: [
-      { source: "qoder_cli", source_label: "Qoder CLI", project: "C:\\Users\\fixture", session_id: "sess-1", status: "running", detail: "进行中：edit", updated_at: 1789000000 },
+      { tool_id: "qoder", source: "qoder_cli", source_label: "Qoder CLI", project: "C:\\Users\\fixture", session_id: "sess-1", status: "running", detail: "进行中：edit", title: "清理界面乱码与提交历史", last_message: "已完成 configHash 调整；剩余释义卡分层与跨术借用门禁仍待收尾。", deep_link: null, updated_at: 1789000000 },
+      { tool_id: "codex_desktop", source: "codex", source_label: "Codex Desktop", project: "D:\\Java\\GitHub\\llm-auto", session_id: "sess-codex", status: "running", detail: "任务进行中", title: "完善桌宠任务列表", last_message: "已提取任务标题和最近内容，正在联调任务跳转。", deep_link: "codex://threads/sess-codex", updated_at: 1789000100 },
+      { tool_id: "codex_desktop", source: "codex", source_label: "Codex Desktop", project: "D:\\Java\\GitHub\\llm-auto", session_id: "sess-codex-2", status: "done", detail: "任务已完成", title: "检查窗口定位回归", last_message: "定位 Qoder 与 Codex 桌面窗口通过。", deep_link: "codex://threads/sess-codex-2", updated_at: 1789000200 },
     ],
     pet_window_open: false,
+  };
+  window.__fixturePetScale = 1;
+  window.__fixturePetExpanded = false;
+  window.__fixturePetBubbleHidden = false;
+  window.__fixturePetBubbleLeft = false;
+  // 气泡尺寸公式必须与 src-tauri/src/pet_window.rs 保持一致
+  //（行高 66 / 间距 8 / 收起步进 18 / 顶部留白 12 / 底部留白 16）。
+  window.__fixturePetLayout = (scale = window.__fixturePetScale) => {
+    const visible = window.__fixturePetBubbleCount ?? window.__fixturePetStatus.active_tasks.length;
+    const bubbleCount = Math.min(Math.max(visible, 1), 3);
+    const expandedStack = !!window.__fixturePetBubblesExpanded;
+    const rows = bubbleCount > 1 && !expandedStack
+      ? 66 + 18 * (bubbleCount - 1)
+      : 66 * bubbleCount + 8 * (bubbleCount - 1);
+    const stackHeight = rows + 12 + 16;
+    const petHeight = 130 * scale + 12;
+    return {
+      scale,
+      expanded: !!window.__fixturePetExpanded,
+      bubble_hidden: !!window.__fixturePetBubbleHidden,
+      bubble_left: !!window.__fixturePetBubbleLeft,
+      bubble_count: bubbleCount,
+      bubble_limit: 3,
+      bubbles_expanded: expandedStack,
+      width: window.__fixturePetExpanded || !window.__fixturePetBubbleHidden ? 120 * scale + 8 + 340 : 120 * scale,
+      height: window.__fixturePetExpanded
+        ? Math.max(petHeight, 372)
+        : window.__fixturePetBubbleHidden
+          ? petHeight
+          : Math.max(petHeight, stackHeight),
+      window_open: !!window.__fixturePetWindowOpen,
+    };
   };
   // 1×1 透明 PNG：桌宠窗口只需要能解码的图片，验证动画逻辑而不依赖真实素材。
   window.__fixturePetAsset = {
@@ -148,10 +258,10 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       case "discover_provider_models":
         if (args.input.base_url.includes("broken")) throw new Error("上游返回 HTTP 401，请检查密钥权限");
         return { base_url: "https://example.test/v1", warnings: [], models: [
-          { id: "sample/chat", name: "Sample Chat", context_window: 131072, context_source: "provider", supports_tools: true, supports_vision: true, supports_audio: false, supports_video: true, supports_stream: true, is_free: true,
-            price: { prompt: 1.5, completion: 6, currency: "usd", source: "catalog", rules: [], tiers: [{ min_prompt_tokens: 272000, prompt: 3, completion: 12 }] } },
-          { id: "unknown/chat", name: "Unknown Chat", context_window: 32768, context_source: "default", supports_tools: null, supports_vision: null, supports_audio: null, supports_video: null, supports_stream: null, is_free: false, price: null },
-          { id: "sample/reasoner", name: "Sample Reasoner", context_window: 65536, context_source: "provider", supports_tools: true, supports_vision: false, supports_audio: true, supports_video: false, supports_stream: true, is_free: true,
+          { id: "sample/chat", name: "Sample Chat", model_type: "chat", context_window: 131072, context_source: "provider", supports_tools: true, supports_vision: true, supports_audio: false, supports_video: true, supports_stream: true, is_free: true,
+            price: { prompt: 1.5, completion: 6, cache_read: 0.15, cache_creation: 1.8, currency: "usd", source: "catalog", rules: [], tiers: [{ min_prompt_tokens: 272000, prompt: 3, completion: 12, cache_read: 0.3, cache_creation: 3.6 }] } },
+          { id: "unknown/chat", name: "Unknown Chat", model_type: null, context_window: 32768, context_source: "default", supports_tools: null, supports_vision: null, supports_audio: null, supports_video: null, supports_stream: null, is_free: false, price: null },
+          { id: "sample/reasoner", name: "Sample Reasoner", model_type: "chat", context_window: 65536, context_source: "provider", supports_tools: true, supports_vision: false, supports_audio: true, supports_video: false, supports_stream: true, is_free: true,
             price: { prompt: 0.5, completion: 1.5, currency: "usd", source: "catalog", rules: [], tiers: [] } },
         ] };
       case "upsert_provider": {
@@ -199,14 +309,35 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         window.__fixtureCliAfterInstall = { ...(window.__fixtureCliAfterInstall ?? {}), [args.id]: { installed: true, version, latest_version: null, path: current?.path ?? `C:/Users/fixture/.local/bin/${args.id}` } };
         return "added 1 package in 2s";
       }
+      case "get_boot_state": return { status: "ready", error: null, warning: bootWarning };
       case "get_pet_status": return { ...structuredClone(window.__fixturePetStatus), pet_window_open: !!window.__fixturePetWindowOpen };
       case "get_pet_asset": window.__fixturePetAssetSlug = args.slug; return structuredClone(window.__fixturePetAsset);
       case "open_pet_window": window.__fixturePetWindowOpen = true; return null;
       case "close_pet_window": window.__fixturePetWindowOpen = false; window.__fixturePetClosed = true; return null;
-      case "set_pet_window_size": window.__fixturePetScale = args.scale; return args.scale;
-      case "show_pet_menu": window.__fixturePetMenu = { slug: args.currentSlug, paused: args.paused }; return null;
+      case "set_pet_window_size":
+        window.__fixturePetScale = args.scale;
+        return window.__fixturePetLayout(args.scale);
+      case "set_pet_window_expanded":
+        window.__fixturePetExpanded = args.expanded;
+        if (args.expanded) window.__fixturePetBubbleHidden = false;
+        return window.__fixturePetLayout();
+      case "set_pet_window_bubble_hidden":
+        window.__fixturePetBubbleHidden = args.hidden;
+        return window.__fixturePetLayout();
+      case "get_pet_window_layout": return window.__fixturePetLayout();
+      // 任务数量变化时前端会请求重算窗口高度；夹具按同一公式返回。
+      case "refresh_pet_window_layout": return window.__fixturePetLayout();
+      // 前端上报可见气泡数量与堆叠状态（关闭单个气泡 / 悬浮展开）。
+      case "set_pet_bubbles":
+        window.__fixturePetBubbleCount = args.bubbleCount;
+        window.__fixturePetBubblesExpanded = args.bubblesExpanded;
+        return window.__fixturePetLayout();
+      case "show_pet_menu": window.__fixturePetMenu = { slug: args.currentSlug, paused: args.paused, expanded: args.expanded }; return null;
       case "focus_main_window": window.__fixtureFocusedSection = args.section ?? "none"; return null;
-      case "stop_ai_tool": window.__fixtureStoppedTool = args.toolId; return `已结束 Codex CLI 的 1 个进程：codex.exe (PID 4321)`;
+      case "focus_ai_tool": window.__fixtureFocusedTool = args.toolId; return "已跳转到 " + args.toolId;
+      case "open_ai_task": window.__fixtureOpenedTask = { toolId: args.toolId, sessionId: args.sessionId }; return "已打开任务 " + args.sessionId;
+      case "open_task_project": window.__fixtureOpenedProject = args.path; return "已打开项目目录：" + args.path;
+      case "stop_ai_tool": window.__fixtureStoppedTool = args.toolId; return "已结束 " + args.toolId + " 的 1 个进程";
       case "petdex_catalog": return "snow-plum-lillia   Snow Plum Lillia   by fixture-author\nmoon-rabbit        Moon Rabbit         by fixture-author";
       case "petdex_install_pet": window.__fixturePetInstalled = args.slug; return "installed";
       case "run_gateway_self_check": if (window.__fixtureSelfCheckFails) return { healthy: false, base_url: "http://127.0.0.1:15721", routed_via: null, latency_ms: 12, error: "网关返回 HTTP 503：所有候选 Provider 均不可用（尝试 2 次）" };
@@ -222,6 +353,78 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       case "delete_session": window.__fixtureSessions = window.__fixtureSessions.filter(item => item.id !== args.id); return null;
       case "apply_takeover": return [{ client: "Codex", path: "C:/fixture/.codex/config.toml", backup_path: "C:/fixture/.codex/config.toml.backup-test", status: "updated" }];
       case "get_unified_key": return { unified_key: "fixture-only", openai_endpoint: "http://127.0.0.1:15721/v1" };
+      // 本地模型 / 智能模式 / 联网搜索
+      case "list_local_runtimes": return structuredClone(window.__fixtureLocalRuntimes);
+      case "list_local_models": {
+        const found = window.__fixtureLocalModels[args.endpointId];
+        if (!found) throw new Error(`未知的本地端点：${args.endpointId}`);
+        return structuredClone(found);
+      }
+      case "register_local_model": return {
+        provider_id: args.input.endpoint_id, alias: args.input.alias ?? args.input.upstream,
+        added_models: 1, all_models: structuredClone(window.__fixtureLocalModels[args.input.endpointId] ?? []),
+      };
+      case "pull_local_model": return null;
+      case "calibrate_classifier": case "calibrate_default_samples": {
+        // 净收益为负是本机实测的真实形态：edgeJev 有一条高置信度错判，
+        // 而启发式判对。报告必须如实显示出来，而不是挑个好看的样本集。
+        return {
+          total: 3,
+          matrix: {
+            "简单任务": { "简单任务": 1 },
+            "复杂思考": { "简单任务": 1, "复杂思考": 1 },
+          },
+          adopted_count: 2, adopted_correct: 1, adopted_wrong: 1,
+          abstained_count: 1, abstained_but_heuristic_right: 1,
+          heuristic_correct: 3, net_gain: -1,
+          wrong_confidences: [0.747],
+          worst_wrong: { text: "线上服务 500 白屏，帮我定位根因", expected: "reasoning",
+            heuristic: "reasoning", adopted: "simple", adopted_from_jev: true,
+            abstain_reason: null, confidence: 0.747, margin: 0.4, raw_choice: "simple" },
+          per_sample: [
+            { text: "把变量名 x 改成 userName", expected: "simple", heuristic: "simple", adopted: "simple",
+              adopted_from_jev: true, abstain_reason: null, confidence: 0.641, margin: 0.4, raw_choice: "simple" },
+            { text: "线上服务 500 白屏，帮我定位根因", expected: "reasoning", heuristic: "reasoning", adopted: "simple",
+              adopted_from_jev: true, abstain_reason: null, confidence: 0.747, margin: 0.4, raw_choice: "simple" },
+            { text: "你好", expected: "simple", heuristic: "simple", adopted: "simple",
+              adopted_from_jev: false, abstain_reason: "置信度不足，已弃权", confidence: 0.117, margin: 0.05, raw_choice: "simple" },
+          ],
+          verdict: "Jev 在 3 条样本里被采纳 2 条，只判对 1 条（50%），净收益 -1 条：采纳它反而更差。错判最高置信度高达 0.747，阈值挡不住——它可以又自信又错。建议关掉，或加一条「启发式越过阈值就不许降级」的否决规则。",
+        };
+      }
+      case "jev_probe": return structuredClone(window.__fixtureJevProbe);
+      case "classify_preview": return structuredClone(window.__fixtureJevProbe.intent);
+      case "get_search_settings": return searchSettings();
+      case "update_search_settings": {
+        // 必须同时改夹具配置，否则「保存后回到页面设置被还原」这条断言能通过。
+        const next = args.input;
+        // **必须复现后端 `search::validate()` 的拒绝规则**，否则界面测试永远发现不了这类 bug。
+        // 真实 commands.rs 在保存前会调 validate()：选 SearXNG 时 searxng_url 为空就整条拒绝。
+        // 夹具此前不做任何校验 → 「选了 SearXNG 却填不了地址」这条路径在测试里是绿的，真机却卡死。
+        if (next.backend === "sear_xng") {
+          const url = ("searxng_url" in next ? next.searxng_url : window.__fixtureConfig.search.searxng_url) ?? "";
+          if (!String(url).trim()) throw "选择 SearXNG 后端时必须填写实例地址";
+        }
+        // 记录每次保存的后端值：用来断言「切换真的发出了 IPC」，
+      // 而不是只断言控件长得对。少了它，「保存成功但界面没回填」这类
+      // 回归会一路滑到「保存没发生」才被看见。
+      (window.__fixtureDiag = window.__fixtureDiag || []).push(next.backend);
+        window.__fixtureConfig.search = { ...window.__fixtureConfig.search, ...next };
+        if ("api_key" in next && next.api_key) window.__fixtureSearchKey = { masked: "tvly-****-zzzz", configured: true };
+        // 返回**裸的** SearchSettingsView，不包一层 —— commands.rs 的
+        // update_search_settings 结尾是直接 `get_search_settings(state)`。
+        // 包成 `{ settings: … }` 时前端 `setSettings(saved)` 拿到的是
+        // `undefined` 的 backend，控件静默回落到第一个选项（实测症状：
+        // 保存成功了但下拉还是 tavily）。
+        return searchSettings();
+      }
+      case "test_search_backend": return {
+        backend: window.__fixtureConfig.search.backend, hits: 2, error: null, latency_ms: 214,
+        results: [
+          { title: "edgeJev 部署说明", url: "https://example.test/jev", snippet: "本机 edgeJev 默认监听 8009 端口。" },
+          { title: "Ollama 能力位说明", url: "https://example.test/ollama", snippet: "/api/tags 的 capabilities 是能力位的唯一可靠来源。" },
+        ],
+      };
       case "get_provider_quota": {
         await new Promise(resolve => setTimeout(resolve, args.adapter === "auto" ? 180 : 5));
         if (args.adapter === "deepseek") throw new Error("额度接口返回 HTTP 401");
@@ -242,7 +445,11 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
           return 0;
         }
         if (cmd.startsWith("plugin:event|")) return 0;
-        if (cmd === "plugin:window|start_dragging") { window.__fixtureDragStarted = true; return 0; }
+        if (cmd === "plugin:window|start_dragging") {
+          window.__fixtureDragStarted = true;
+          window.__fixtureDragStarts = (window.__fixtureDragStarts ?? 0) + 1;
+          return 0;
+        }
         if (cmd.startsWith("plugin:window|")) return 0;
         throw new Error(`Unexpected fixture IPC: ${cmd}`);
     }
@@ -292,6 +499,8 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     // 目录价格随模型带入，未提供的模型保持「未配置价格」。
     assert.equal(await configured.nth(0).getByLabel("输入价格").inputValue(), "1.5");
     assert.equal(await configured.nth(0).getByLabel("输出价格").inputValue(), "6");
+    assert.equal(await configured.nth(0).getByLabel("缓存命中价").inputValue(), "0.15");
+    assert.equal(await configured.nth(0).getByLabel("缓存创建价").inputValue(), "1.8");
     assert.equal(await configured.nth(1).getByLabel("输入价格").inputValue(), "");
     assert((await configured.nth(1).locator(".price-state").innerText()).includes("未配置价格"));
     // 只填一半价格必须被拒绝，且指明具体模型。
@@ -339,9 +548,11 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     // 价格与参数覆盖必须整体提交，且未配置的模型保持 null 而不是 0。
     assert.equal(saved.models[0].price.prompt, 1.5);
     assert.equal(saved.models[0].price.completion, 6);
+    assert.equal(saved.models[0].price.cache_read, 0.15);
+    assert.equal(saved.models[0].price.cache_creation, 1.8);
     assert.equal(saved.models[0].price.currency, "usd");
     // 目录提供的输入长度分档必须随模型保留，长上下文估算才不会被低估。
-    assert.deepEqual(saved.models[0].price.tiers, [{ min_prompt_tokens: 272000, prompt: 3, completion: 12 }]);
+    assert.deepEqual(saved.models[0].price.tiers, [{ min_prompt_tokens: 272000, prompt: 3, completion: 12, cache_read: 0.3, cache_creation: 3.6 }]);
     assert.equal(saved.models[1].price, null);
     assert.equal(saved.models[0].overrides.temperature, 0.25);
     assert.equal(saved.models[0].overrides.max_tokens, 512);
@@ -384,6 +595,282 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     // 手工定价的模型仍显示手工标记，说明未被刷新覆盖。
     assert((await page.locator(".provider-card").filter({ hasText: "多模态服务" }).innerText()).includes("vision-model"));
     await page.screenshot({ path: path.join(output, "pricing-refresh-desktop.png"), fullPage: true });
+
+    /* ------------------------------------------------------------------ */
+    /* 本地模型与智能模式                                                  */
+    /* ------------------------------------------------------------------ */
+    await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "本地模型与智能", exact: true }).click();
+    // 端点表：不可达的那行必须带原因，只显示「不可达」等于让用户自己去猜。
+    // `tr:has-text()` 会连表头一起匹配到，用「整行文本完全等于」收紧。
+    const runtimeRow = (url) => page.locator("tr").filter({
+      has: page.locator(`td.mono:text-is("${url}")`),
+    });
+    const deadRow = runtimeRow("http://127.0.0.1:1");
+    await deadRow.first().waitFor();
+    assert((await deadRow.first().innerText()).includes("连接被拒绝"), `不可达端点必须显示具体原因：${await deadRow.first().innerText()}`);
+    // 模型表：同族的两个模型只有 vision 不同，能力列必须按上游元数据区分。
+    const q4 = page.locator("tr").filter({ has: page.locator(`td:text-is("qwen3.8:27b-q4_K_M")`) }).first();
+    const q3 = page.locator("tr").filter({ has: page.locator(`td:text-is("batiai/qwen3.8-27b:q3")`) }).first();
+    await q4.waitFor();
+    await q3.waitFor();
+    const q4Text = await q4.innerText();
+    const q3Text = await q3.innerText();
+    assert(q4Text.includes("视觉"), `有 vision 的模型必须标出来：${q4Text}`);
+    assert(!q3Text.includes("视觉"), `上游说没有 vision 就不许显示有：${q3Text}`);
+    assert(q4Text.includes("思考") && q4Text.includes("16.54 GB"), `磁盘占用与思考能力都要可见：${q4Text}`);
+    await page.screenshot({ path: path.join(output, "local-models-desktop.png"), fullPage: true });
+
+    // 智能模式页。tab 按钮同时带标签和提示文字，用 getByRole(name) 会被两个文本一起匹配。
+    await page.locator(".local-tab").filter({ hasText: "智能模式" }).click();
+    await page.getByText("Jev 决策端点", { exact: false }).first().waitFor();
+    // 「置信度 ≠ 正确性」这条实测结论必须写在界面上，否则用户只会去调阈值。
+    const smartCard = page.locator(".card").filter({ hasText: "智能模式" }).first();
+    const smartText = await smartCard.innerText();
+    assert(smartText.includes("置信度高不等于判得对"), `实测结论必须写进界面：${smartText}`);
+
+    // 提示词预优化：先验关闭态——开关关着时其余输入框必须是禁用的。
+    const refineCard = page.locator(".card").filter({ hasText: "提示词预优化" });
+    await refineCard.waitFor();
+    // 必须在界面上说明「Jev 产不出文本」，否则用户会以为开了就有改写。
+    assert((await refineCard.innerText()).includes("产不出文本"), "必须说明 Jev 只判要不要改，不产文本");
+    assert.equal(await refineCard.getByRole("checkbox").isChecked(), false, "预优化默认必须关闭");
+    assert.equal(await refineCard.getByLabel("硬超时（毫秒）", { exact: true }).isDisabled(), true, "开关关着时其余字段应禁用");
+
+    // 打开开关 → 字段解禁 → 改值 → 保存 → 配置里真的变了（往返）。
+    //
+    // 用 click + 轮询而不是 check()：`check()` 点击后**立刻**读 checked，
+    // 而保存是异步的（onChange → patch → IPC → setCfg），
+    // 那一刻读到的还是旧值，于是 check 判定「状态没变」并重试，
+    // 重试的第二次点击又把它点回去了。这是竞态，不是应用缺陷。
+    const refineCheckbox = refineCard.getByRole("checkbox");
+    await refineCheckbox.click();
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.smart_routing?.prompt_refine?.enabled === true,
+      null, { timeout: 5000 },
+    );
+    await page.waitForTimeout(200);
+    assert.equal(await refineCheckbox.isChecked(), true, "开关打开后受控状态必须跟着变");
+    assert.equal(await refineCard.getByLabel("硬超时（毫秒）", { exact: true }).isDisabled(), false, "开关打开后字段必须解禁");
+
+    await refineCard.getByLabel("硬超时（毫秒）", { exact: true }).fill("3500");
+    await refineCard.getByLabel("含糊阈值（clarity 低于则改写）", { exact: true }).fill("0.6");
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.smart_routing?.prompt_refine?.timeout_ms === 3500,
+      null, { timeout: 5000 },
+    );
+    assert.equal(await page.evaluate(() => window.__fixtureConfig.smart_routing.prompt_refine.clarity_noul), 0.6);
+    // 改别的字段时不得把预优化其它字段抹掉（spread 写错就是这种症状）。
+    assert.equal(await page.evaluate(() => window.__fixtureConfig.smart_routing.prompt_refine.min_chars), 24, "改预优化时其它字段必须保持");
+    // 回到配置再读一次，确认是持久化的结果而不是组件内的临时状态。
+    assert.equal(await page.evaluate(() => window.__fixtureConfig.smart_routing.jev.model), "rl-agent", "改预优化不得影响同一对象里的其它配置段");
+    await page.screenshot({ path: path.join(output, "prompt-refine-desktop.png"), fullPage: true });
+
+    // 试跑分类器：必须显示 needs_refine（这是预优化的触发条件，界面上看不见就没法调）。
+    await page.getByRole("button", { name: /查看 Jev 原始判定|试跑/ }).first().click();
+    await page.getByText("值得改写", { exact: false }).first().waitFor();
+    const probeCard = page.locator(".card").filter({ hasText: "值得改写" }).last();
+    const probeText = await probeCard.innerText();
+    // 判定来源必须写出来，否则用户分不清「启发式兜底」和「Jev 判的」。
+    assert(/硬规则|Jev 决策|启发式/.test(probeText), `判定来源必须可见：${probeText}`);
+    await page.screenshot({ path: path.join(output, "smart-probe-desktop.png"), fullPage: true });
+
+    // 校准面板：必须真的跑一次，并把「净收益为负」如实显示。
+    const calibCard = page.locator(".card").filter({ hasText: "校准：这个决策模型到底值不值得用" });
+    await calibCard.waitFor();
+    const calibIntro = await calibCard.innerText();
+    assert(calibIntro.includes("只跑样本"), "必须说明校准不改配置：缺这句用户会以为命令擅自调了阈值");
+    assert(calibIntro.includes("已知错判样本"), "必须说明默认样本里刻意留了错判那条");
+    await calibCard.getByRole("button", { name: "用实测样本校准", exact: true }).click();
+    await calibCard.locator(".calib-verdict").waitFor();
+    const verdict = await calibCard.locator(".calib-verdict").innerText();
+    assert(verdict.includes("净收益"), `结论必须给出净收益：${verdict}`);
+    // 净收益为负要显示成错误态，不能是中性色——那是"别用它"的信号。
+    const verdictClass = await calibCard.locator(".calib-verdict").getAttribute("class");
+    assert(verdictClass.includes("err"), `净收益为负必须标成错误态：${verdictClass}`);
+    // 混淆矩阵：3×3 里只该点亮实际出现的格子。
+    const hit1 = await calibCard.locator(".calib-matrix td.hit").count();
+    const miss = await calibCard.locator(".calib-matrix td.miss").count();
+    assert.equal(hit1, 2, "矩阵里判对的格子数");
+    assert.equal(miss, 1, "矩阵里判错的格子数");
+    assert((await calibCard.locator(".calib-numbers").innerText()).includes("-1"), "净收益数字要可见");
+    // 最危险的那条错判必须点名——它是"调阈值解决不了"的证据。
+    const calibText = await calibCard.innerText();
+    assert(calibText.includes("0.747"), `最高错判置信度要可见：${calibText.slice(0, 400)}`);
+    assert(calibText.includes("高置信度不等于判得对"), "必须点明核心结论");
+    await page.screenshot({ path: path.join(output, "calibration-desktop.png"), fullPage: true });
+
+    // 自动拉起：默认关闭时其余字段必须禁用，且界面上要写明不可逆。
+    const autoStartCard = page.locator(".card").filter({ hasText: "端点不可达时自动拉起" });
+    await autoStartCard.waitFor();
+    assert((await autoStartCard.innerText()).includes("不可逆"), "必须写明启动外部进程不可逆");
+    assert.equal(await autoStartCard.getByRole("checkbox").isChecked(), false, "自动拉起默认必须关闭");
+    // 关闭时整块路径输入**不渲染**（而不是 disabled）：
+    // 渲染出来会让用户以为填了就生效。
+    assert.equal(await autoStartCard.getByLabel("edgejev.exe 路径", { exact: true }).count(), 0, "开关关着时不该出现路径输入框");
+    await autoStartCard.getByRole("checkbox").check();
+    await page.waitForTimeout(200);
+    const exePathBox = autoStartCard.getByLabel("edgejev.exe 路径", { exact: true });
+    assert.equal(await exePathBox.count(), 1, "开关打开后路径输入框必须出现");
+    assert.equal(await exePathBox.isDisabled(), false, "开关打开后路径字段可填");
+    // 开关状态必须真的落到配置，而不是组件内临时状态。
+    await page.waitForFunction(() => window.__fixtureConfig?.smart_routing?.jev?.auto_start?.enabled === true, null, { timeout: 5000 });
+    assert.equal(await page.evaluate(() => window.__fixtureConfig.smart_routing.jev.base_url), "http://127.0.0.1:8009/v1/systemone", "开自动拉起不得改掉端点地址");
+    assert.equal(await page.evaluate(() => window.__fixtureConfig.smart_routing.jev.auto_start.port), 8009, "端口默认值必须保留");
+    // 明细必须能展开看逐条，否则用户无法自己核对。
+    await calibCard.locator("details > summary").click();
+    const detail = await calibCard.locator("details").innerText();
+    assert(detail.includes("Jev 弃权"), "弃权条目要写明原因：${detail}");
+    assert(detail.includes("置信度不足"), "弃权原因要具体：${detail}");
+
+    // 联网搜索：Key 必须只显示掩码，完整值绝不能出现在界面上。
+    await page.locator(".local-tab").filter({ hasText: "联网搜索" }).click();
+    // 掩码只出现在 password 输入框的 placeholder 上，不在文本里——
+    // 所以断言必须读属性，读 textContent 会永远为假。
+    const keyBox = page.locator(".workspace-content input[type=password]").first();
+    await keyBox.waitFor({ timeout: 5000 });
+    const masked = await keyBox.getAttribute("placeholder");
+    assert(masked === "tvly-****-abc", `Key 必须只以掩码出现：${masked}`);
+    assert(!(await page.locator(".workspace-content").innerText()).includes("tvyl-abcdef123456"), "完整 Key 绝不能出现在界面上");
+
+    // 「测试后端」是卡片标题（<h3>），触发按钮叫「搜索一次」。
+    // 真跑一次搜索：结果必须逐条列出标题与链接，命中条数也要回显，
+    // 否则用户无从判断后端是不是真的活着。
+
+    // 真跑一次搜索：结果必须逐条列出标题与链接。
+    await page.getByRole("textbox").last().fill("edgeJev 本机部署");
+    await page.getByRole("button", { name: "搜索一次", exact: true }).click();
+    await page.getByText("命中 2 条", { exact: false }).first().waitFor();
+    const resultText = await page.locator(".local-result").first().innerText();
+    assert(resultText.includes("edgeJev 部署说明"), `结果标题必须可见：${resultText}`);
+    assert(resultText.includes("https://example.test/jev"), `结果链接必须可见：${resultText}`);
+    await page.screenshot({ path: path.join(output, "web-search-desktop.png"), fullPage: true });
+
+    // 后端下拉必须包含全部五个，且**值必须与后端 serde 名逐字一致**。
+    // 写错值（bingcn / searxng）的后果不是「选不中」，而是保存后整个应用起不来。
+    const backendOptions = await page.locator(".workspace-content select option").evaluateAll((els) =>
+      els.map((e) => ({ value: e.getAttribute("value"), label: e.textContent ?? "" })),
+    );
+    const backendValues = backendOptions.map((o) => o.value);
+    for (const expected of ["bing_cn", "duck_duck_go", "tavily", "brave", "sear_xng"]) {
+      assert(backendValues.includes(expected), `后端下拉缺少 ${expected}，实际：${backendValues.join(",")}`);
+    }
+    assert(
+      !backendValues.includes("bingcn") && !backendValues.includes("searxng"),
+      `下拉里混进了错误拼法（会让应用起不来）：${backendValues.join(",")}`,
+    );
+    const bingLabel = backendOptions.find((o) => o.value === "bing_cn")?.label ?? "";
+    assert(bingLabel.includes("必应"), `必应应有中文标签，实际：${bingLabel}`);
+    await page.screenshot({ path: path.join(output, "search-backends.png"), fullPage: true });
+
+    // DOM 属性断言过了**不等于人能看见** —— 下拉默认收起，截图里根本看不到选项。
+    // 所以真选中一次再截，让必应中国出现在交付证据里而不只活在断言里。
+    //
+    // `selectOption` 之后**必须等保存落库**再读控件值：onChange → save() → IPC →
+    // setCfg 是异步的，中间那一瞬组件重渲染，读到的仍是旧值。直接
+    // `inputValue()` 会读到 `tavily` 而失败（实测踩过）。
+    // 页面上有**多个** select（端点选择器在后端下拉之前），
+    // 用 `.first()` 会选到端点选择器 —— 实测踩过：保存成功了但断言读的是另一个控件。
+    // 必须按「含 bing_cn 选项」这个语义定位。
+    const backendSelect = page.locator(".workspace-content select").filter({ has: page.locator("option[value=bing_cn]") });
+    assert.equal(await backendSelect.count(), 1, "必须唯一定位到后端下拉");
+    await backendSelect.selectOption("bing_cn");
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.search?.backend === "bing_cn",
+      null,
+      { timeout: 5000 },
+    );
+    await backendSelect.waitFor({ state: "visible" });
+    const calls = await page.evaluate(() => window.__fixtureDiag || []);
+    assert.deepEqual(calls.slice(-1), ["bing_cn"], `后端切换必须真的发出 IPC：实际调用=${JSON.stringify(calls)}`);
+    // 断言的是**控件当前值**而不是「保存调用发生过」：
+    // 后端已经成功收到 bing_cn 但控件还显示 tavily，就是保存结果没回填到界面。
+    assert.equal(
+      await backendSelect.inputValue(),
+      "bing_cn",
+      `保存完成后控件值必须是 bing_cn，实际=${await backendSelect.inputValue()}`,
+    );
+    const bingHint = await page.locator(".workspace-content").innerText();
+    assert(
+      !bingHint.includes("必应中国") || bingHint.includes("免 Key"),
+      `选中必应中国后不应出现需要 Key 的措辞：${bingHint.slice(0, 300)}`,
+    );
+    await page.screenshot({ path: path.join(output, "search-backend-bing-cn.png"), fullPage: true });
+
+    // ── SearXNG 实例地址输入框（用户 2026-10-05 报告：选了 SearXNG 但没法填地址）──
+    // 根因：后端 search::validate() 规定「选了 SearXNG 而 searxng_url 为空 → 整条保存拒绝」，
+    // 而输入框的显隐条件是 `settings.backend === "sear_xng"`（**已保存**的值）。
+    // 于是：选中的保存必然失败 → settings.backend 不变 → 输入框永不出现 → 用户被锁死。
+    //
+    // 所以断言必须打在「保存**之前**输入框就出现」上 ——
+    // 等保存成功再断言，等于把 bug 本身当成了通过条件。
+    await backendSelect.selectOption("sear_xng");
+    const searxInput = page.getByPlaceholder("http://127.0.0.1:8888");
+    await searxInput.waitFor({ timeout: 5000 });
+    assert.equal(await searxInput.count(), 1, "刚选中 SearXNG（尚未保存）就必须出现地址输入框");
+    // 输入框出现时，**已保存**的后端仍应停在旧值 —— 地址为空时后端必然拒绝。
+    // 这两条合起来才是修复点：输入框不依赖保存（靠 shownBackend），提交仍然延后。
+    //
+    // 刻意**不**断言「有没有发过 IPC」：守卫去掉后它同样为 0（因为压根没发），
+    // 断言它等于什么都测不到 —— 实测踩过：注入回归后测试仍然绿。
+    // 真正的不变量是「输入框出现 ⟹ 用户能填」，由上面那条 waitFor + count 守住。
+    const savedBeforeFill = await page.evaluate(() => window.__fixtureConfig?.search?.backend);
+    assert.notEqual(
+      savedBeforeFill,
+      "sear_xng",
+      `地址为空时后端不该被切成 SearXNG（配置仍应是 ${savedBeforeFill}）`,
+    );
+    // 真填一次并落库，确认这条路径通（不是只渲染了一个框）。
+    await searxInput.fill("http://127.0.0.1:8888");
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.search?.searxng_url === "http://127.0.0.1:8888",
+      null,
+      { timeout: 5000 },
+    );
+    // 后端也必须同步切过去：只存地址不改后端的话，界面显示的选中态是假的。
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.search?.backend === "sear_xng",
+      null,
+      { timeout: 5000 },
+    );
+    await page.screenshot({ path: path.join(output, "search-backend-searxng.png"), fullPage: true });
+
+    // 对照组：切走 SearXNG 后这个输入框必须消失 —— 免 Key 后端下留个
+    // 无用的地址框会让人误以为所有后端都要配地址。
+    await backendSelect.selectOption("bing_cn");
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.search?.backend === "bing_cn",
+      null,
+      { timeout: 5000 },
+    );
+    assert.equal(
+      await page.getByPlaceholder("http://127.0.0.1:8888").count(),
+      0,
+      "切走后端后 SearXNG 地址框必须消失",
+    );
+    await backendSelect.selectOption("bing_cn");
+    // 对照组：换回需要 Key 的后端，Key 输入框必须重新出现。
+    // 只断言「免 Key 时不提示」是不够的 —— 那可能只是因为输入框压根没渲染。
+    await backendSelect.selectOption("tavily");
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.search?.backend === "tavily",
+      null,
+      { timeout: 5000 },
+    );
+    assert.equal(await backendSelect.inputValue(), "tavily", "保存完成后应能切回 Tavily");
+    const tavilyKeyBox = page.locator(".workspace-content input[type=password]").first();
+    await tavilyKeyBox.waitFor({ timeout: 5000 });
+    assert(
+      (await tavilyKeyBox.getAttribute("placeholder")) === "tvly-****-abc",
+      "切回 Tavily 后掩码 Key 框必须重新出现",
+
+    );
+    for (const width of [900, 390]) {
+      await page.setViewportSize({ width, height: 844 });
+      assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `local-models overflow at ${width}`);
+      await page.screenshot({ path: path.join(output, `local-models-${width}.png`), fullPage: true });
+    }
+    await page.setViewportSize({ width: 1440, height: 1000 });
+
     await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "用量与审计", exact: true }).click();
     // 分币种展示：两种币种必须分别出现，且不能相加成一个数。
     await page.locator(".spend-cards").waitFor();
@@ -483,6 +970,8 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.screenshot({ path: path.join(output, "providers-dark.png"), fullPage: true });
     await page.getByRole("button", { name: "切换到浅色主题", exact: true }).click();
     await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
+    assert.equal(await page.getByLabel("OpenCode", { exact: true }).count(), 1, "接管面板必须提供 OpenCode");
+    assert.equal(await page.getByLabel("Crush", { exact: true }).count(), 1, "接管面板必须提供 Crush");
     await page.getByRole("button", { name: "备份并写入配置", exact: true }).click();
     await page.getByText("C:/fixture/.codex/config.toml.backup-test", { exact: true }).waitFor();
     // CLI 检测：先只读检测（未安装的工具不得伪造成已安装），再查最新版本并更新与安装。
@@ -557,7 +1046,30 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     assert(petText.includes("Snow Plum Lillia"), `已安装宠物必须列出：${petText}`);
     // 任务列表：来自工具会话日志，必须显示状态与项目（宠物动作据此切换）。
     assert(petText.includes("Qoder CLI") && petText.includes("进行中"), `任务状态必须展示：${petText}`);
+    assert(petText.includes("Codex Desktop"), `任务前必须标记实际 AI 软件名：${petText}`);
+    assert(petText.includes("清理界面乱码与提交历史"), `任务必须展示具体内容：${petText}`);
+    assert(petText.includes("完善桌宠任务列表") && petText.includes("检查窗口定位回归"), `同一软件的任务必须全部列出：${petText}`);
+    assert(petText.includes("最近内容" ) || petText.includes("已完成 configHash 调整"), `任务必须展示最近内容：${petText}`);
     assert(petText.includes("C:\\Users\\fixture"), `任务项目必须展示：${petText}`);
+    // 任务表截图：状态标签必须是单行胶囊（不能把「进行中」竖排）。
+    const statusChip = petCard.locator('[data-testid="pet-card-task-status"]').first();
+    const chipBox = await statusChip.boundingBox();
+    assert(
+      chipBox.height < 32 && chipBox.width > 56,
+    );
+    await petCard.locator(".pet-task-table").screenshot({ path: path.join(output, "pet-task-table.png") });
+    // 任务行定向操作：打开指定任务、打开项目目录，不依赖任意 PID。
+    const qoderTaskRow = petCard.locator('[data-testid="pet-card-task-row"]').filter({ hasText: "Qoder CLI" });
+    await qoderTaskRow.getByRole("button", { name: "定位", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "已打开任务 sess-1" }).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.__fixtureOpenedTask), { toolId: "qoder", sessionId: "sess-1" }, "任务定位必须下发任务标识与会话 ID");
+    const codexTaskRow = petCard.locator('[data-testid="pet-card-task-row"]').filter({ hasText: "完善桌宠任务列表" });
+    await codexTaskRow.getByRole("button", { name: "打开任务", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "已打开任务 sess-codex" }).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.__fixtureOpenedTask), { toolId: "codex_desktop", sessionId: "sess-codex" }, "Codex 任务必须走官方深链参数");
+    await qoderTaskRow.getByRole("button", { name: "项目", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "已打开项目目录" }).waitFor();
+    assert.equal(await page.evaluate(() => window.__fixtureOpenedProject), "C:\\Users\\fixture", "项目操作必须下发任务项目路径");
     // 宠物选择用下拉，选择后必须持久化（桌宠窗口据此切换）。
     await petCard.getByTestId("pet-select").selectOption("snow-plum-lillia");
     assert.equal(await page.evaluate(() => localStorage.getItem("llm-gateway-pet-slug")), "snow-plum-lillia", "选择宠物必须持久化");
@@ -566,6 +1078,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     assert.equal(await page.evaluate(() => window.__fixturePetWindowOpen), true, "开启桌宠必须调用 open_pet_window");
     // 大小调整：滑块必须实时下发到窗口。
     await petCard.locator("#pet-scale").fill("150");
+    assert.equal(await petCard.locator("#pet-scale").getAttribute("min"), "50", "大小滑块最小必须是 50%");
     await page.waitForTimeout(300);
     assert.equal(await page.evaluate(() => window.__fixturePetScale), 1.5, "滑块必须把缩放比例下发给桌宠窗口");
     assert((await petCard.innerText()).includes("150%"), "界面必须回显当前大小");
@@ -677,6 +1190,39 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       assert.equal(await failedPage.getByTestId("onboarding-dialog").count(), 0);
       await failedContext.close();
     }
+
+    // 启动降级横幅：配置读坏时后端**仍要起来**（status 仍是 ready），
+    // 但必须把「原配置没生效 + 备份在哪」显式告诉用户。
+    // 少了横幅就是静默降级：界面上一切正常，用户以为自己的设置生效了。
+    const degradedContext = await browser.newContext();
+    await degradedContext.addInitScript(fixture, { bootWarning: "配置文件格式有误（TOML parse error at line 86），已回退到默认设置。原文件已保留在 config.corrupt-1791137918.toml" });
+    const degradedPage = await degradedContext.newPage();
+    await degradedPage.goto(baseUrl);
+    await degradedPage.getByTestId("boot-notice").waitFor({ timeout: 8000 });
+    const noticeText = await degradedPage.getByTestId("boot-notice").innerText();
+    assert(noticeText.includes("配置未生效"), `横幅必须说明配置没生效：${noticeText}`);
+    assert(noticeText.includes("config.corrupt-"), `横幅必须给出备份文件名：${noticeText}`);
+    assert(noticeText.includes("已回退到默认设置"), `横幅必须说明回退行为：${noticeText}`);
+    // 应用本身必须能用：横幅是警告，不是错误页。
+    assert.equal(await degradedPage.getByRole("alert").filter({ hasText: "加载失败" }).count(), 0, "降级不等于启动失败");
+    await degradedPage.screenshot({ path: path.join(output, "boot-degraded.png"), fullPage: true });
+    // 可关闭
+    await degradedPage.getByTestId("boot-notice-close").click();
+    await degradedPage.waitForFunction(() => document.querySelector('[data-testid="boot-notice"]') === null, null, { timeout: 3000 });
+    await degradedPage.screenshot({ path: path.join(output, "boot-degraded-dismissed.png"), fullPage: true });
+    await degradedContext.close();
+
+    // 对照组：没有降级时横幅**不得**出现。
+    const normalContext = await browser.newContext();
+    await normalContext.addInitScript(fixture);
+    const normalPage = await normalContext.newPage();
+    await normalPage.goto(baseUrl);
+    await normalPage.locator(".workspace-header").waitFor({ timeout: 8000 });
+    assert.equal(
+      await normalPage.getByTestId("boot-notice").count(),
+      0,
+    );
+    await normalContext.close();
     const offlineManual = await browser.newPage();
     const manualRequests = [];
     offlineManual.on("request", request => { if (/^https?:/.test(request.url())) manualRequests.push(request.url()); });
@@ -690,19 +1236,280 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       await offlineManual.screenshot({ path: path.join(output, `manual-html-${width}.png`) });
     }
     assert.deepEqual(manualRequests, []);
+    // 启动动画：后端仍在 loading 时必须保持可见，不能退回白屏。
+    const startupContext = await browser.newContext({ viewport: { width: 1180, height: 760 }, reducedMotion: "reduce" });
+    await startupContext.addInitScript(() => {
+      window.isTauri = true;
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd) => {
+          if (cmd === "get_boot_state") return { status: "loading", error: null };
+          throw new Error("unexpected startup IPC: " + cmd);
+        },
+      };
+    });
+    const startupPage = await startupContext.newPage();
+    await startupPage.goto(baseUrl);
+    await startupPage.locator("#boot-splash").waitFor();
+    const startupStatus = await startupPage.locator("[data-boot-status]").innerText();
+    assert(startupStatus.includes("正在"), `启动动画必须保持可见并显示进度：${startupStatus}`);
+    await startupPage.screenshot({ path: path.join(output, "boot-splash.png") });
+    await startupContext.close();
+
     // 桌宠窗口：加载宠物资源、单击跳转主窗口、右键菜单可打开主窗口与隐藏桌宠。
-    const petContext = await browser.newContext({ viewport: { width: 240, height: 260 }, reducedMotion: "reduce" });
+    // 3 个任务 → 收起堆叠高度 = 66 + 18 * 2 + 12 + 12 = 126；窗口 = max(130 + 12, 126) = 142。
+    const petContext = await browser.newContext({ viewport: { width: 468, height: 142 }, reducedMotion: "reduce" });
     await petContext.addInitScript(fixture);
     const petWindow = await petContext.newPage();
     petWindow.on("pageerror", error => errors.push(`pet: ${error.message}`));
+    petWindow.on("dialog", dialog => dialog.accept());
     await petWindow.goto(`${baseUrl}/pet.html`);
     await petWindow.getByTestId("pet-root").waitFor();
     await petWindow.waitForTimeout(500);
     assert.equal(await petWindow.getByTestId("pet-placeholder").count(), 0, "宠物资源加载完成后不应保留占位提示");
-    await petWindow.getByTestId("pet-root").click();
+    // 气泡态：只显示 AI 软件、任务标题和一行缩略，状态与时间保留在展开面板中。
+    await petWindow.getByTestId("pet-bubble").waitFor();
+    const bubbleText = await petWindow.getByTestId("pet-bubble").innerText();
+    assert(bubbleText.includes("Qoder CLI") && bubbleText.includes("清理界面乱码与提交历史"), `气泡必须显示来源与任务标题：${bubbleText}`);
+    assert(bubbleText.includes("configHash"), `气泡必须显示一行任务缩略：${bubbleText}`);
+    // 多个任务 → 多个气泡自动堆叠；每个气泡可单独关闭，右上角是放大窗口图标。
+    const bubbleItems = petWindow.getByTestId("pet-bubble-item");
+    assert.equal(await bubbleItems.count(), 3, "每个任务一个气泡");
+    const itemHeights = await bubbleItems.evaluateAll((nodes) =>
+      nodes.map((node) => Math.round(node.getBoundingClientRect().height)),
+    );
+    assert(
+      itemHeights.every((height) => height === 66),
+      `每个气泡固定 66px：${itemHeights}`,
+    );
+    assert(
+      await petWindow.getByTestId("pet-bubble").evaluate((element) => element.classList.contains("is-compact")),
+      "多个气泡默认收起堆叠",
+    );
+    const compactTops = await bubbleItems.evaluateAll((nodes) =>
+      nodes.map((node) => Math.round(node.getBoundingClientRect().top)),
+    );
+    assert.deepEqual(
+      compactTops.map((top, index) => (index === 0 ? 0 : top - compactTops[index - 1])),
+      [0, 18, 18],
+      `堆叠步进必须是 18px：${compactTops}`,
+    );
+    let tailFlags = await bubbleItems.evaluateAll((nodes) =>
+      nodes.map((node) => node.classList.contains("is-tail")),
+    );
+    assert.deepEqual(tailFlags, [true, false, false], `收起时尾巴挂在最前面的气泡：${tailFlags}`);
+    assert.equal(await petWindow.getByTestId("pet-bubble-dismiss").count(), 3, "每个气泡都有自己的关闭按钮");
+    assert.equal(await petWindow.getByTestId("pet-bubble-status").count(), 3, "每个气泡都有状态徽标");
+    // 运行中的气泡文字带流光动画（无动画偏好下才应用，先模拟成 no-preference）。
+    await petWindow.emulateMedia({ reducedMotion: "no-preference" });
+    const runningTitle = petWindow.locator('[data-testid="pet-bubble-item"].is-running .pet-bubble-title strong').first();
+    assert.equal(await runningTitle.count(), 1, "运行中的气泡必须带 is-running 标记");
+    assert.equal(
+      await runningTitle.evaluate((node) => getComputedStyle(node).animationName),
+      "pet-running-shimmer",
+    );
+      "运行中的标题必须应用流光动画",
+    assert(
+      (await runningTitle.evaluate((node) => getComputedStyle(node).backgroundImage)).includes("linear-gradient"),
+      "运行中的标题必须有渐变底色用于流光",
+    );
+    await petWindow.emulateMedia({ reducedMotion: "reduce" });
+    // 运行中 = 实心方块，点击方块结束该软件进程（确认框由对话框处理器自动接受）。
+    const runningBadge = petWindow.getByTestId("pet-bubble-status").first();
+    assert.equal(await runningBadge.evaluate((node) => node.tagName.toLowerCase()), "button", "运行中的徽标必须是可点击按钮");
+    assert.equal(await runningBadge.locator(".pet-bubble-stop-square").count(), 1, "运行中必须显示实心方块");
+    await runningBadge.click();
     await petWindow.waitForTimeout(250);
-    assert.equal(await petWindow.evaluate(() => window.__fixtureFocusedSection), "stats", "单击桌宠必须跳转到用量页");
+    assert.equal(await petWindow.evaluate(() => window.__fixtureStoppedTool), "qoder", "点方块必须结束对应软件进程");
+    assert.equal(
+      await petWindow.getByTestId("pet-bubble-expand").locator("svg").count(),
+      1,
+      "右上角展开按钮必须是 Windows 放大图标",
+    );
+    const stackBox = await petWindow.getByTestId("pet-bubble").boundingBox();
+    const petLayout = await petWindow.evaluate(() => window.__fixturePetLayout());
+    assert(
+      stackBox.height <= petLayout.height,
+      `气泡堆叠不能被窗口裁掉：${JSON.stringify({ stackBox, petLayout })}`,
+    );
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetExpanded), false, "默认显示任务气泡而不是完整面板");
+    const expandBox = await petWindow.getByTestId("pet-bubble-expand").boundingBox();
+    assert(
+      expandBox.x + expandBox.width / 2 > stackBox.x + stackBox.width - 40,
+      `展开按钮必须贴在气泡右侧：${JSON.stringify({ expandBox, stackBox })}`,
+    );
+    await petWindow.screenshot({ path: path.join(output, "pet-bubble.png") });
+    // 鼠标悬浮：堆叠展开，尾巴移到最下面那个气泡上。
+    await petWindow.getByTestId("pet-bubble").hover();
+    await petWindow.waitForTimeout(250);
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetBubblesExpanded), true, "悬浮必须展开堆叠");
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetBubbleCount), 3, "展开必须把气泡数量上报给后端");
+    assert(
+      !(await petWindow.getByTestId("pet-bubble").evaluate((element) => element.classList.contains("is-compact"))),
+      "展开后不再是收起态",
+    );
+    tailFlags = await bubbleItems.evaluateAll((nodes) => nodes.map((node) => node.classList.contains("is-tail")));
+    assert.deepEqual(tailFlags, [false, false, true], `展开后尾巴挂在最下面那个气泡：${tailFlags}`);
+    await petWindow.setViewportSize({ width: 468, height: 242 });
+    await petWindow.screenshot({ path: path.join(output, "pet-bubble-expanded.png") });
+    // 鼠标移开后堆叠必须收起，避免窗口一直占着高位。
+    await petWindow.mouse.move(4, 4);
+    await petWindow.waitForTimeout(300);
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetBubblesExpanded), false, "鼠标移开必须收起堆叠");
+    // 关闭按钮默认隐藏，鼠标放到对应气泡上才出现。
+    const hiddenDiag = await petWindow.evaluate(() => {
+      const item = document.querySelector('[data-testid="pet-bubble-item"]');
+      const btn = document.querySelector('[data-testid="pet-bubble-dismiss"]');
+      return {
+        itemHover: item ? item.matches(":hover") : null,
+        btnClass: btn ? btn.className : null,
+        btnOpacity: btn ? getComputedStyle(btn).opacity : null,
+      };
+    });
+    assert.equal(hiddenDiag.btnOpacity, "0", `关闭按钮默认必须隐藏：${JSON.stringify(hiddenDiag)}`);
+    await bubbleItems.first().hover();
+    await petWindow.waitForTimeout(250);
+    const dismissDiag = await petWindow.evaluate(() => {
+      const item = document.querySelector('[data-testid="pet-bubble-item"]');
+      const btn = document.querySelector('[data-testid="pet-bubble-dismiss"]');
+      return {
+        itemClass: item ? item.className : null,
+        itemHover: item ? item.matches(":hover") : null,
+        btnClass: btn ? btn.className : null,
+        btnOpacity: btn ? getComputedStyle(btn).opacity : null,
+      };
+    });
+    assert.equal(
+      await petWindow.getByTestId("pet-bubble-dismiss").first().evaluate((node) => getComputedStyle(node).opacity),
+      "1",
+      `鼠标放在气泡上必须显示关闭按钮：${JSON.stringify(dismissDiag)}`,
+    );
+    await petWindow.getByTestId("pet-bubble").hover();
+    await petWindow.waitForTimeout(250);
+    // 单独关闭一个气泡：悬浮会让堆叠展开、气泡位移，所以点“鼠标当前所在气泡”的关闭按钮。
+    await bubbleItems.first().hover();
+    await petWindow.waitForTimeout(300);
+    await petWindow
+      .locator('[data-testid="pet-bubble-item"]:hover [data-testid="pet-bubble-dismiss"]')
+      .first()
+      .click();
+    await petWindow.waitForTimeout(250);
+    assert.equal(await bubbleItems.count(), 2, "关闭单个气泡后只移除那一个");
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetBubbleCount), 2, "关闭单个气泡必须上报新数量");
+    // 屏幕右侧时后端返回 bubble_left，前端切换为“气泡在左、宠物在右”。
+    await petWindow.evaluate(() => {
+      window.__fixturePetBubbleLeft = true;
+      window.__fixturePetBubblesExpanded = false;
+      window.__fixtureEventHandlers["pet-layout-changed"]({ payload: window.__fixturePetLayout() });
+    });
+    assert(await petWindow.getByTestId("pet-root").evaluate((element) => element.classList.contains("is-bubble-left")), "靠屏幕右侧时气泡必须切到左侧");
+    await petWindow.setViewportSize({ width: 468, height: 142 });
+    await petWindow.screenshot({ path: path.join(output, "pet-bubble-left.png") });
+    await petWindow.evaluate(() => {
+      window.__fixturePetBubbleLeft = false;
+      window.__fixtureEventHandlers["pet-layout-changed"]({ payload: window.__fixturePetLayout() });
+    });
+    // 逐个关闭剩余气泡后缩回宠物本体；任务徽标把气泡（含单独关闭的）一起恢复。
+    for (let index = 0; index < 2; index += 1) {
+      // 先把鼠标移开再悬浮，确保每次都会触发新的 mouseenter（按钮才会显示出来）。
+      await petWindow.mouse.move(4, 4);
+      await petWindow.waitForTimeout(200);
+      await petWindow.getByTestId("pet-bubble-item").first().hover();
+      await petWindow.waitForTimeout(300);
+      await petWindow
+        .locator('[data-testid="pet-bubble-item"]:hover [data-testid="pet-bubble-dismiss"]')
+        .first()
+        .click();
+      await petWindow.waitForTimeout(300);
+      assert.equal(
+        await petWindow.getByTestId("pet-bubble-item").count(),
+        1 - index,
+        `第 ${index + 1} 次关闭后剩余气泡数量不对`,
+    );
+    }
+    await petWindow.getByTestId("pet-bubble").waitFor({ state: "hidden" });
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetBubbleHidden), true, "关闭全部气泡必须同步窗口布局");
+    await petWindow.getByTestId("pet-task-badge").click();
+    await petWindow.getByTestId("pet-bubble").waitFor();
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetBubbleHidden), false, "任务徽标必须恢复气泡");
+    assert.equal(await petWindow.getByTestId("pet-bubble-item").count(), 3, "恢复时被单独关闭的气泡也要回来");
+    // 从气泡展开完整面板，继续验证状态、时间与定向操作。
+    await petWindow.setViewportSize({ width: 468, height: 242 });
+    await petWindow.getByTestId("pet-bubble-expand").click();
+    await petWindow.setViewportSize({ width: 468, height: 372 });
+    await petWindow.getByTestId("pet-hud").waitFor();
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetExpanded), true, "展开按钮必须恢复完整 HUD");
+    const hudText = await petWindow.getByTestId("pet-hud").innerText();
+    assert(hudText.includes("Qoder CLI") && hudText.includes("Codex Desktop"), `HUD 必须前置显示 AI 软件名：${hudText}`);
+    assert(hudText.includes("清理界面乱码与提交历史") && hudText.includes("完善桌宠任务列表"), `HUD 必须显示具体任务内容：${hudText}`);
+    assert(hudText.includes("2 个任务") && hudText.includes("已完成"), `HUD 必须保留状态与任务数量：${hudText}`);
+    await petWindow.screenshot({ path: path.join(output, "pet-hud.png") });
+    const qoderPetTask = petWindow.getByTestId("pet-task-row").filter({ hasText: "清理界面乱码与提交历史" });
+    await qoderPetTask.click();
+    await qoderPetTask.getByTestId("pet-task-detail").waitFor();
+    await qoderPetTask.getByRole("button", { name: "定位", exact: true }).click();
+    await petWindow.getByRole("status").filter({ hasText: "已打开任务 sess-1" }).waitFor();
+    assert.deepEqual(await petWindow.evaluate(() => window.__fixtureOpenedTask), { toolId: "qoder", sessionId: "sess-1" }, "HUD 定位必须下发对应任务标识");
+    const codexPetTask = petWindow.getByTestId("pet-task-row").filter({ hasText: "完善桌宠任务列表" });
+    await codexPetTask.click();
+    await codexPetTask.getByTestId("pet-task-detail").waitFor();
+    await codexPetTask.getByRole("button", { name: "打开任务", exact: true }).click();
+    await petWindow.getByRole("status").filter({ hasText: "已打开任务 sess-codex" }).waitFor();
+    assert.deepEqual(await petWindow.evaluate(() => window.__fixtureOpenedTask), { toolId: "codex_desktop", sessionId: "sess-codex" }, "HUD 必须把指定 Codex 任务交给后端深链");
+    await codexPetTask.getByRole("button", { name: "项目", exact: true }).click();
+    await petWindow.getByRole("status").filter({ hasText: "已打开项目目录" }).waitFor();
+    assert.equal(await petWindow.evaluate(() => window.__fixtureOpenedProject), "D:\\Java\\GitHub\\llm-auto", "HUD 项目操作必须下发任务项目路径");
+    await qoderPetTask.click();
+    await qoderPetTask.getByTestId("pet-task-detail").waitFor();
+    await qoderPetTask.getByRole("button", { name: "结束", exact: true }).click();
+    await petWindow.getByRole("status").filter({ hasText: "已结束 qoder" }).waitFor();
+    assert.equal(await petWindow.evaluate(() => window.__fixtureStoppedTool), "qoder", "HUD 结束操作必须定向到任务对应的 AI 软件");
+    // 收起完整面板后回到气泡态。
+    await petWindow.getByTestId("pet-collapse-button").click();
+    await petWindow.getByTestId("pet-hud").waitFor({ state: "hidden" });
+    await petWindow.setViewportSize({ width: 468, height: 140 });
+    await petWindow.getByTestId("pet-bubble").waitFor();
+    assert.equal(await petWindow.evaluate(() => window.__fixturePetExpanded), false, "收起面板必须回到任务气泡");
+    await petWindow.getByTestId("pet-stage").click();
+    await petWindow.waitForTimeout(250);
+    assert.equal(await petWindow.evaluate(() => window.__fixtureFocusedSection), "stats", "单击宠物本体必须跳转到用量页");
     assert.equal(await petWindow.evaluate(() => window.__fixtureDragStarted ?? false), false, "短按点击不应触发窗口拖动");
+    // 轻移超过阈值必须立即开始拖动，不再依赖“按住 160ms 且指针不能离开宠物区域”。
+    await petWindow.evaluate(() => {
+      window.__fixturePetBubbleLeft = false;
+      window.__fixtureDragStarted = false;
+      window.__fixtureDragStarts = 0;
+    });
+    const dragBox = await petWindow.getByTestId("pet-stage").boundingBox();
+    assert(dragBox, "宠物区域必须可用于拖动回归");
+    const dragX = dragBox.x + dragBox.width / 2;
+    const dragY = dragBox.y + dragBox.height / 2;
+    await petWindow.mouse.move(dragX, dragY);
+    await petWindow.mouse.down();
+    await petWindow.mouse.move(dragX + 8, dragY, { steps: 2 });
+    await petWindow.waitForTimeout(50);
+    assert.equal(await petWindow.evaluate(() => window.__fixtureDragStarted), true, "移动超过阈值必须启动拖动");
+    assert.equal(await petWindow.evaluate(() => window.__fixtureDragStarts), 1, "一次拖动只能发起一次 start_dragging");
+    // 拖动期间即使后端返回左右切换，也要等窗口停稳后再应用，避免桌宠来回闪动。
+    await petWindow.evaluate(() => {
+      window.__fixturePetBubbleLeft = true;
+      window.__fixtureEventHandlers["pet-layout-changed"]({ payload: window.__fixturePetLayout() });
+    });
+    assert.equal(
+      await petWindow.getByTestId("pet-root").evaluate((element) => element.classList.contains("is-bubble-left")),
+      false,
+      "拖动过程中不得切换气泡方向",
+    );
+    await petWindow.mouse.up();
+    await petWindow.waitForTimeout(260);
+    assert.equal(
+      await petWindow.getByTestId("pet-root").evaluate((element) => element.classList.contains("is-bubble-left")),
+      true,
+      "拖动停止后必须应用最终左右布局",
+    );
+    await petWindow.evaluate(() => {
+      window.__fixturePetBubbleLeft = false;
+      window.__fixtureEventHandlers["pet-layout-changed"]({ payload: window.__fixturePetLayout() });
+    });
     // 右键弹出的是系统原生菜单（由 Rust 侧构建与消费），这里断言请求参数正确。
     await petWindow.getByTestId("pet-root").click({ button: "right" });
     await petWindow.waitForTimeout(250);
@@ -710,6 +1517,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     assert(menuRequest !== null, "右键必须请求原生菜单（页面内菜单在极小窗口会显示不全）");
     assert.equal(menuRequest.slug, "snow-plum-lillia", "菜单必须带上当前宠物以便勾选");
     assert.equal(menuRequest.paused, false, "菜单必须带上暂停状态以显示正确文案");
+    assert.equal(menuRequest.expanded, false, "菜单必须带上气泡/面板状态以显示正确文案");
     // 模拟原生菜单动作：切换宠物 → 持久化并重新加载资源。
     await petWindow.evaluate(() => {
       window.__fixturePetStatus.installed_pets.push({ slug: "moon-rabbit", display_name: "Moon Rabbit", description: null, version: "0.9.0", spritesheet_file: "spritesheet.webp", directory: "C:/Users/fixture/.petdex/pets/moon-rabbit" });
@@ -724,6 +1532,6 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await preview.goto(baseUrl);
     await preview.getByRole("heading", { name: "浏览器预览已隔离", exact: true }).waitFor();
     assert.equal(await preview.locator(".provider-card").count(), 0);
-    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, first-use guidance, persisted skip/completion, manual search, offline HTML, themes, responsive layouts and preview isolation; screenshots=${output}`);
+    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, first-use guidance, persisted skip/completion, manual search, offline HTML, themes, startup splash, pet HUD/actions, responsive layouts and preview isolation; screenshots=${output}`);
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
