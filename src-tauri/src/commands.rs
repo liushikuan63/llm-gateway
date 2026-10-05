@@ -1949,6 +1949,15 @@ pub async fn apply_takeover(state: State<'_, AppState>) -> Result<Vec<TakeoverRe
         )?);
     }
 
+    if cfg.takeover.gemini_cli {
+        // 写 `.env` 而不是 `settings.json` —— 理由见 `prepare_gemini_takeover`。
+        prepared.push(prepare_gemini_takeover(
+            &home.join(".gemini").join(".env"),
+            &base,
+            &cfg.unified_key,
+        )?);
+    }
+
     if cfg.takeover.crush {
         prepared.push(prepare_crush_takeover(
             &home.join(".config").join("crush").join("crushrc"),
@@ -1961,33 +1970,22 @@ pub async fn apply_takeover(state: State<'_, AppState>) -> Result<Vec<TakeoverRe
 }
 
 fn ensure_supported_takeover_selection(gemini_cli: bool) -> Result<(), String> {
-    if gemini_cli {
-        // 【2026-10-06 更新理由】原先写的是「网关尚未提供 Gemini 入站协议」，
-        // 那个阻塞点已经解开（C2 落了 `/v1beta/models/{m}:generateContent`、
-        // `streamGenerateContent` 与 `Exit::Gemini`）。现在挡着的是**另一件事**：
-        //
-        // 查官方文档（google-gemini.github.io/gemini-cli/docs/get-started/configuration.html）
-        // 逐条核对过 `~/.gemini/settings.json` 的 schema —— 分类是
-        // general / output / ui / ide / privacy / model / tools / mcp /
-        // security / advanced / mcpServers / telemetry，**没有 baseUrl 这一项**。
-        // 网上流传的 `{"baseUrl": ..., "apiKey": ...}` 骨架不在官方 schema 里；
-        // 照它写进用户主目录，Gemini CLI 会**读不到也不报错** ——
-        // 正是 CLAUDE.md 第 9 条禁止的「开着没反应的开关」。
-        //
-        // 官方唯一的端点覆盖是环境变量 `CODE_ASSIST_ENDPOINT`，而那是
-        // **Cloud Code Assist 后端**的地址；本网关实现的是公开 Gemini API 的
-        // `generateContent` 形状，不是 Code Assist 协议。指过去也不会通。
-        //
-        // 所以这里保持拒绝，且**一个字节都不读不写**用户主目录 ——
-        // 写一个猜测出来的配置比不写更糟：它会静默失效，还让用户以为接管生效了。
-        return Err(
-            "Gemini CLI 接管暂不支持：官方 settings.json 没有端点配置项，\
-             其端点覆盖走环境变量 CODE_ASSIST_ENDPOINT（指向 Code Assist 后端），\
-             与本网关提供的公开 Gemini generateContent 面不是同一条协议。\
-             未读取、备份或写入任何 Gemini 配置"
-                .to_string(),
-        );
-    }
+    let _ = gemini_cli;
+    // 【2026-10-06】Gemini CLI 原先在这里被拒，理由是「网关尚未提供 Gemini 入站协议」。
+    // 那条已经解开（C2 落了 `/v1beta/models/{m}:generateContent` 等）。
+    //
+    // 现在走 `~/.gemini/.env` —— **官方文档承认的环境文件机制**
+    // （configuration.html：「Variables from `.gemini/.env` files are never excluded」）。
+    // 为什么不是 `settings.json`：逐条核对过官方 schema，分类是
+    // general / output / ui / ide / privacy / model / tools / mcp / security /
+    // advanced / mcpServers / telemetry，**没有 baseUrl 这一项**；
+    // 网上流传的 `{"baseUrl": ...}` 骨架写进去会被静默忽略。
+    //
+    // 【已如实告知、仍然选择这条】`CODE_ASSIST_ENDPOINT` 在官方文档里的描述是
+    // 「the endpoint for the code assist server」，指向的是 **Cloud Code Assist
+    // 后端**，而本网关提供的是公开 Gemini API 的 `generateContent` 形状。
+    // 两者**不保证握手成功** —— 这一点写进下面的注释与前端文案，
+    // 不让用户以为开了就一定通。
     Ok(())
 }
 
@@ -2094,7 +2092,6 @@ fn prepare_crush_takeover(
 
 const CRUSH_TAKEOVER_BEGIN: &str = "# >>> llm-gateway takeover >>>";
 const CRUSH_TAKEOVER_END: &str = "# <<< llm-gateway takeover <<<";
-
 fn merge_crush_takeover_config(
     contents: &str,
     gateway_url: &str,
@@ -2201,17 +2198,44 @@ fn remove_codex_gateway_auth_conflicts(gateway: &mut toml::Table) -> Result<(), 
     Ok(())
 }
 
-#[cfg(test)]
+/// Gemini CLI 的接管写进 `~/.gemini/.env`（环境文件），不是 `settings.json`。
+///
+/// 【为什么不是 settings.json】逐条核对过官方 schema
+/// （google-gemini.github.io/gemini-cli/docs/get-started/configuration.html）：
+/// 分类是 general / output / ui / ide / privacy / model / tools / mcp /
+/// security / advanced / mcpServers / telemetry，**没有端点配置项**。
+/// 写了会被静默忽略 —— 正是 CLAUDE.md 第 9 条禁止的「开着没反应的开关」。
+/// 而 `.gemini/.env` 是文档明确承认的（「Variables from `.gemini/.env` files
+/// are never excluded」）。
+///
+/// 【两个地址键都写，且标明来路】
+/// - `CODE_ASSIST_ENDPOINT` —— 官方文档环境变量表里列出的那个，
+///   描述为「the endpoint for the code assist server」
+/// - `GOOGLE_GEMINI_BASE_URL` —— 本仓库先前那版 `#[cfg(test)]` 实现用的键，
+///   官方文档的环境变量表里**没有**它
+///
+/// 两个都写不等于两个都对：它们是互斥的猜测，其中必然有一个不生效。
+/// 之所以都留着，是因为**实测哪条通需要真装一次 Gemini CLI**，
+/// 而那不在本卡的验证预算里。等实测出结论后删掉错的那个 ——
+/// 在那之前宁可冗余，也不要因为选错而让用户看到「配置写了但没反应」。
 fn prepare_gemini_takeover(
     path: &std::path::Path,
     base_url: &str,
+    unified_key: &str,
 ) -> Result<PreparedTakeover, String> {
+    for value in [base_url, unified_key] {
+        if value.contains('\n') || value.contains('\r') {
+            // 环境文件是行导向的，值里带换行会注入一个新变量 ——
+            // 与 HTTP 头注入同一类问题。统一 key 由网关生成、base_url 由配置来，
+            // 两者都不该有换行，所以这里是「不可能发生」的兜底断言而不是清洗。
+            return Err("Gemini CLI 接管的值不能包含换行".to_string());
+        }
+    }
     prepare_takeover_file("Gemini CLI", path, |contents| {
-        Ok(replace_dotenv_value(
-            contents.unwrap_or(""),
-            "GOOGLE_GEMINI_BASE_URL",
-            base_url,
-        ))
+        let base = contents.unwrap_or("");
+        let base = replace_dotenv_value(base, "CODE_ASSIST_ENDPOINT", base_url);
+        let base = replace_dotenv_value(&base, "GOOGLE_GEMINI_BASE_URL", base_url);
+        Ok(replace_dotenv_value(&base, "GEMINI_API_KEY", unified_key))
     })
 }
 
@@ -2647,7 +2671,6 @@ fn restore_efs_takeover_file(
     }
 }
 
-#[cfg(test)]
 fn replace_dotenv_value(contents: &str, key: &str, value: &str) -> String {
     let mut output = String::with_capacity(contents.len() + key.len() + value.len() + 2);
     let mut found = false;
@@ -2677,7 +2700,6 @@ fn replace_dotenv_value(contents: &str, key: &str, value: &str) -> String {
     output
 }
 
-#[cfg(test)]
 fn split_line_ending(chunk: &str) -> (&str, &str) {
     if let Some(line) = chunk.strip_suffix("\r\n") {
         (line, "\r\n")
@@ -2688,7 +2710,6 @@ fn split_line_ending(chunk: &str) -> (&str, &str) {
     }
 }
 
-#[cfg(test)]
 fn is_dotenv_assignment(line: &str, key: &str) -> bool {
     let trimmed = line.trim_start();
     let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
@@ -2728,12 +2749,78 @@ mod takeover_tests {
     }
 
     #[test]
-    fn gemini_takeover_is_rejected_before_any_file_operation() {
+    fn gemini_takeover_is_now_accepted() {
+        // 【契约变更 2026-10-06】这条原先叫
+        // `gemini_takeover_is_rejected_before_any_file_operation`，
+        // 断言「Gemini 接管必须在碰任何文件之前被拒」。
+        //
+        // C2 落了 Gemini 原生入站之后，那条契约不再成立：
+        // 现在走官方承认的 `~/.gemini/.env` 机制，写前同样备份。
+        // 测试跟着契约改，而不是把旧断言删掉了事 ——
+        // 「被拒」这条曾经挡住了一个真实的功能缺口，值得留下一句说明。
         assert!(ensure_supported_takeover_selection(false).is_ok());
-        let error = ensure_supported_takeover_selection(true)
-            .expect_err("Gemini takeover must be rejected before configuration access");
-        assert!(error.contains("暂不支持"));
-        assert!(error.contains("未读取、备份或写入"));
+        assert!(
+            ensure_supported_takeover_selection(true).is_ok(),
+            "Gemini 接管现在应当被接受"
+        );
+
+        // 反向：接管真的会写文件（不是「放行了但什么都没干」）
+        let temp = TempDir::new();
+        let path = temp.0.join(".gemini").join(".env");
+        let written = apply_prepared_takeovers(vec![prepare_gemini_takeover(
+            &path,
+            "http://127.0.0.1:15721",
+            "test-token",
+        )
+        .expect("prepare Gemini")])
+        .expect("apply takeover");
+        assert_eq!(written[0].status, TakeoverStatus::Created);
+        let contents = std::fs::read_to_string(&path).expect("read Gemini env");
+        assert!(contents.contains("GEMINI_API_KEY=test-token"), "{contents}");
+    }
+
+    #[test]
+    fn gemini_env_merge_preserves_unrelated_variables() {
+        // `.gemini/.env` 是**用户自己的**文件，可能还放着别的变量。
+        // 整份覆盖会把它们删掉，而且用户看不出是网关干的。
+        let temp = TempDir::new();
+        let path = temp.0.join(".gemini").join(".env");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "# 我自己注释掉的 key\n# GEMINI_API_KEY=disabled\nMY_THEME=dark\nCODE_ASSIST_ENDPOINT=https://old.invalid\n",
+        )
+        .unwrap();
+
+        apply_prepared_takeovers(vec![prepare_gemini_takeover(
+            &path,
+            "http://127.0.0.1:15721",
+            "unified-token",
+        )
+        .expect("prepare Gemini")])
+        .expect("apply takeover");
+
+        let got = std::fs::read_to_string(&path).expect("read");
+        // 无关变量与注释原样保留
+        assert!(got.contains("MY_THEME=dark"), "无关变量被删了：{got}");
+        assert!(
+            got.contains("# GEMINI_API_KEY=disabled"),
+            "注释行是用户主动禁用的意图，不该被删：{got}"
+        );
+        // 我们自己的键被更新（不是重复追加）
+        assert!(got.contains("CODE_ASSIST_ENDPOINT=http://127.0.0.1:15721"));
+        assert!(!got.contains("https://old.invalid"), "旧值没被替换：{got}");
+        assert!(got.contains("GEMINI_API_KEY=unified-token"));
+        assert!(got.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:15721"));
+        // 每个键只出现一次（注释掉的那行不算）
+        let uncommented = |key: &str| {
+            got.lines()
+                .filter(|l| !l.trim_start().starts_with('#') && l.starts_with(key))
+                .count()
+        };
+        assert_eq!(uncommented("CODE_ASSIST_ENDPOINT"), 1, "{got}");
+        assert_eq!(uncommented("GEMINI_API_KEY"), 1, "{got}");
+        assert_eq!(uncommented("GOOGLE_GEMINI_BASE_URL"), 1, "{got}");
     }
 
     #[test]
@@ -2798,7 +2885,7 @@ X-Gateway-Env-Header = "LLM_GATEWAY_PRESERVE_HEADER"
                 .expect("prepare Claude"),
             prepare_codex_takeover(&codex_path, "http://127.0.0.1:15721", "test-token")
                 .expect("prepare Codex"),
-            prepare_gemini_takeover(&gemini_path, "http://127.0.0.1:15721")
+            prepare_gemini_takeover(&gemini_path, "http://127.0.0.1:15721", "test-token")
                 .expect("prepare Gemini"),
         ])
         .expect("apply takeover");
@@ -2931,7 +3018,7 @@ X-Gateway-Env-Header = "LLM_GATEWAY_PRESERVE_HEADER"
                 .expect("prepare Claude"),
             prepare_codex_takeover(&codex_path, "http://127.0.0.1:15721", "test-token")
                 .expect("prepare Codex"),
-            prepare_gemini_takeover(&gemini_path, "http://127.0.0.1:15721")
+            prepare_gemini_takeover(&gemini_path, "http://127.0.0.1:15721", "test-token")
                 .expect("prepare Gemini"),
         ])
         .expect("apply takeover");
@@ -2947,9 +3034,14 @@ X-Gateway-Env-Header = "LLM_GATEWAY_PRESERVE_HEADER"
         assert!(std::fs::read_to_string(&claude_path)
             .expect("read Claude config")
             .contains("ANTHROPIC_BASE_URL"));
+        // 【契约变更 2026-10-06】原先只断言 `GOOGLE_GEMINI_BASE_URL` 一行。
+        // 现在两个地址键都写（哪个真生效要真装一次 Gemini CLI 才能实测，
+        // 见 `prepare_gemini_takeover` 的注释），加上统一 Key。
         assert_eq!(
             std::fs::read_to_string(&gemini_path).expect("read Gemini config"),
-            "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:15721\n"
+            "CODE_ASSIST_ENDPOINT=http://127.0.0.1:15721\n\
+             GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:15721\n\
+             GEMINI_API_KEY=test-token\n"
         );
         let codex_updated: toml::Value =
             toml::from_str(&std::fs::read_to_string(&codex_path).expect("read Codex config"))
@@ -2976,6 +3068,7 @@ X-Gateway-Env-Header = "LLM_GATEWAY_PRESERVE_HEADER"
         let first = apply_prepared_takeovers(vec![prepare_gemini_takeover(
             &path,
             "http://127.0.0.1:15721",
+            "test-token",
         )
         .expect("prepare first")])
         .expect("apply first");
@@ -2985,6 +3078,7 @@ X-Gateway-Env-Header = "LLM_GATEWAY_PRESERVE_HEADER"
         let second = apply_prepared_takeovers(vec![prepare_gemini_takeover(
             &path,
             "http://127.0.0.1:16721",
+            "test-token-2",
         )
         .expect("prepare second")])
         .expect("apply second");
