@@ -58,11 +58,15 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 async-trait = "0.1"
 dashmap = "6"
 parking_lot = "0.12"
 dirs = "5"
+opentelemetry = "0.33.0"
+opentelemetry-otlp = { version = "0.33.0", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.34.0"
+opentelemetry_sdk = "0.33.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

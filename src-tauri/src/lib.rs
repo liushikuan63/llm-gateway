@@ -27,6 +27,7 @@ pub mod proxy;
 pub mod router;
 pub mod search;
 pub mod stale_models;
+pub mod telemetry;
 pub mod trace;
 
 use crate::config::AppConfig;
@@ -135,6 +136,28 @@ pub fn run() {
             )),
         )
         .init();
+
+    // B4 第二笔：OTLP 导出。
+    //
+    // `endpoint` 为空（默认）时 `init` 立即返回 `None` ——
+    // **不构造 exporter、不起后台线程、不发任何网络包**。
+    // 这条判据在 `tests/trace.rs` 与 `telemetry` 的单元测试里都能失败。
+    //
+    // 这里**独立读一次配置**而不是复用后面 `initialize_backend` 里那份：
+    // 日志与遥测必须在任何业务逻辑之前就绪，否则启动阶段的事件会丢。
+    // 读失败就用默认值 —— 默认是「不导出」，与「配置坏了」同向，
+    // 不会因为读不到配置就往某个地址发包。
+    let telemetry_cfg = crate::config::AppConfig::load_or_init_with_warning()
+        .map(|(cfg, _warning)| cfg.telemetry)
+        .unwrap_or_default();
+    //
+    // 守卫**故意泄漏**：`SdkTracerProvider` 一旦 drop，后台导出线程与批处理
+    // 队列就一起没了，表现为「配置对了却一条都收不到」且没有任何报错。
+    // 本进程的寿命就是遥测的寿命，所以这里不释放。
+    let telemetry_guard = telemetry::init(&telemetry_cfg);
+    if telemetry_guard.is_some() {
+        std::mem::forget(telemetry_guard);
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

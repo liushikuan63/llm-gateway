@@ -488,6 +488,70 @@ async fn otlp_配置为空时_判定为不导出() {
     assert!(cfg.telemetry.should_export(), "给了地址就该导出");
 }
 
+#[test]
+fn otlp_关闭时_init_返回_none_且没有初始化痕迹() {
+    // 判据是**可观测的**：`init` 返回 None，且 `initialized_endpoint()` 为 None。
+    // 不靠「等一个网络超时看有没有连接」—— 那种判据既慢又不稳。
+    let guard = llm_gateway_lib::telemetry::init(&AppConfig::default().telemetry);
+    assert!(guard.is_none(), "默认配置下 init 必须返回 None");
+    assert!(
+        llm_gateway_lib::telemetry::initialized_endpoint().is_none(),
+        "默认配置下不该留下任何初始化痕迹"
+    );
+}
+
+#[test]
+fn otlp_导出内容不含_prompt_全文() {
+    // 这条在**类型层面**就成立：`SpanRecord` 里根本没有正文字段。
+    // 这里把一段特征明显的假正文放在手边，断言它不出现在导出形态里。
+    let secret_prompt = "用户的原话：我的身份证号是 110101199001011234";
+    let rec = llm_gateway_lib::trace::SpanRecord {
+        trace_id: "t".into(),
+        attempt: 0,
+        system: "openai".into(),
+        request_model: "gpt-4o".into(),
+        response_model: Some("gpt-4o".into()),
+        input_tokens: Some(11),
+        output_tokens: Some(2),
+        server_address: Some("api.openai.com".into()),
+        error_type: None,
+        latency_ms: Some(410),
+        status: Some(200),
+    };
+    for (_, value) in rec.attributes() {
+        assert!(
+            !value.contains("身份证号") && !value.contains(secret_prompt),
+            "导出属性里出现了正文：{value}"
+        );
+    }
+    let json = serde_json::to_string(&rec).unwrap();
+    assert!(
+        !json.contains("身份证号"),
+        "序列化后的 span 里出现了正文：{json}"
+    );
+}
+
+#[test]
+fn 开启后_span_属性名符合_genai_语义约定() {
+    // 逐个比对官方注册表；写错一个就红。
+    let names = llm_gateway_lib::telemetry::attribute_names();
+    for expected in [
+        "gen_ai.system",
+        "gen_ai.operation.name",
+        "gen_ai.request.model",
+        "gen_ai.response.model",
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+        "server.address",
+        "error.type",
+    ] {
+        assert!(names.contains(&expected), "缺少属性名 {expected}");
+    }
+    assert_eq!(names.len(), 8, "多一个少一个都算错：{names:?}");
+    // span 名用官方操作名，不自造
+    assert_eq!(llm_gateway_lib::telemetry::span_name(), "chat");
+}
+
 // ------------------------------ 按 traceId 过滤 ------------------------------
 
 #[tokio::test]
