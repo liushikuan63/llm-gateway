@@ -30,7 +30,7 @@
 | 已知端点：`openrouter /key`、`deepseek /user/balance`、`NewAPI /api/usage/token`、`Sub2API /v1/usage` | 同上 `:176-185` |
 | 网关**没有任何定时器**；只有 `server.rs:230` 一个 300 秒的维护 tick | `src-tauri/src/proxy/server.rs:230` |
 | Qoder「每日 100 Credits」规则原文：窗口每天 10:00（UTC+8）开启、次日前夕关闭；**每窗口限领一次，必须手动领、错过不补、不结转**；**仅限在 Qoder 桌面端领取**；有效期 30 天、先到期先扣；个人用户适用、Teams/Enterprise 不适用 | <https://docs.qoder.com/events/100credits.md>（2026-10-05 取） |
-| Qoder 的额度可以**官方读取**：`getUsageInfo()` 返回 `userQuota` / `addOnQuota` / `isQuotaExceeded` | <https://docs.qoder.com/cli/sdk/cost-usage.md> |
+| Qoder 的额度可以**官方读取**：CLI `/usage` 面板（Plan / Plan Expiration Date / Plan Credits Used / Add-on Credits Used），Agent SDK 另有 `getUsageInfo()` | <https://docs.qoder.com/cli/usage.md>；`/usage` **需要已登录或已设 Access Token** |
 | 本机已配置的 8 家平台：commandcode、openrouter、zai-coding-cn、sensenova、maas-api、geeknow、shitapi、agentrouter（+ 本地 Ollama） | 2026-10-05 探测结果，见 `2026-10-05-导入DSH供应商与模型.md` |
 
 ### 2.2 平台核验结论（C1 实测，2026-10-05）
@@ -39,7 +39,7 @@
 
 | 平台 | 族别证据 | 签到/领取端点 | 每日额度机制 | 所需凭据 | 分层结论 |
 |---|---|---|---|---|---|
-| **geeknow.ai**（GeekAI） | `/api/status` 200，85 字段，`quota_per_unit=500000` | ✅ `POST /api/user/checkin` → 401 `invalid access token`（**路由存在**）；`/api/status` 含 **`checkin_enabled`** | 每日签到 | **控制台 access token**（与登录用的账号密码是两套） | **L2 可自动领取** |
+| **geeknow.ai**（GeekAI） | `/api/status` 200，85 字段，`quota_per_unit=500000` | ⚠️ `POST /api/user/checkin` 路由**存在**（401 `invalid access token`），但**功能开关关闭**：**`checkin_enabled = false`**（2026-10-05 23:52 实时取值）；官方文档站 [docs.geeknow.ai](https://docs.geeknow.ai) 目录中**无签到章节**；站点公告中也无签到条目 | **当前没有每日签到** | — | **不可领取**（曾一度误判为 L2，见 §8.1 教训 3） |
 | **agentrouter**（Agent Router） | `/api/status` 200，`version=init-20260918-…` | ❌ `POST /api/user/checkin` → 404 `Invalid URL`；`/api/status` **无** `checkin_enabled` | **每日登录**（用户 2026-10-05 告知：每天要重新发登录请求才能领额度）。`POST /api/user/login` → 200「用户名或密码错误」= **登录端点存在** | **账号密码**（非 access token） | **L3**：登录是写操作且要账号密码，可能叠加验证码/风控 |
 | **commandcode** | `api.commandcode.ai/` → `{"success":true,"message":"Command Code API","link":"https://commandcode.ai/docs"}`；**无** `/api/status`、**无** `/api/user/checkin` | 未确认 | 未确认 | — | **定位已改变**（见 §2.4） |
 | shitapi | `/api/status` → 404 `page not found`（不是 new-api 的响应形状）；根页是 `lang=zh-CN` 的前端 SPA | ❌ `POST /api/user/checkin` → 404 | 未确认（控制台内可能有签到） | — | 待核验 |
@@ -47,7 +47,7 @@
 | sensenova | 商汤官方 | ❌ 404 `NOT_FOUND` | — | — | 未发现 |
 | maas-api | 讯飞官方 | ❌ 404 `no Route matched with those values` | — | — | 未发现 |
 | openrouter | 官方 | — | 促销 credits（网页端） | — | 未发现接口 |
-| Qoder | 官方 | ❌ 官方明确「**只能手动领、且仅限桌面端**」 | 每日 100 Credits，窗口 10:00（UTC+8），错过不补 | 桌面端登录态 | **L1 提醒 + 余额**；自动领取属 L3 |
+| Qoder | 官方 | ❌ 官方明确「**只能手动领、且仅限桌面端**」（Usage panel → gift icon）；`/claim` **经双向取证不存在**（见 §2.3.2） | 每日 100 Credits，窗口 10:00（UTC+8），错过不补 | 桌面端登录态 | **L1 提醒 + 余额**；自动领取属 L3 |
 
 ### 2.3 判据修正：**401 不足以证明端点存在**（这条差点写错）
 
@@ -65,6 +65,62 @@ geeknow      POST /api/user/checkin -> 401    ← new-api 鉴权中间件对所�
 2. `POST` 返回 401 / 400 这类业务错误 ⇒ 路由存在且方法匹配；
 3. 每轮探测必须带**一个已知不存在的路径**做阴性对照（本轮用 `/api/user/claim` → 404），
    否则"全都 404"与"路径写错所以全都 404"分不开。
+4. **端点存在 ≠ 功能开启**（本卡最贵的一条教训，见 §8.1）。判断某站是否支持签到，
+   **先读 `/api/status` 里开关字段的值**，再决定要不要去试端点：
+   `checkin_enabled == true` 才值得试；为 false 时端点即使存在也只是残留代码路径。
+
+### 2.3.1 geeknow 现状（2026-10-05 23:52 实测，三条独立证据一致）
+
+```text
+/api/status → data.checkin_enabled = false        ← 功能开关：关
+/api/status → data.turnstile_check  = false        （注册需 register_captcha = true）
+docs.geeknow.ai 目录                 → 只有「账户管理（认证方式 / 余额与用量）」，无签到章节
+站点公告 35 条                       → 无任何签到条目
+```
+
+**结论：geeknow 当前没有每日签到。**
+
+#### 带真实凭据的实测（2026-10-05 23:5x）
+
+拿本机 DSH 里**真实的 geeknow 推理 Key**（51 字符，进程内使用、不落盘、不打印）打签到端点：
+
+```text
+POST /api/user/checkin  Authorization: Bearer <sk-推理Key>                  -> 401 invalid access token
+POST /api/user/checkin  Authorization: Bearer <sk-推理Key> + New-Api-User: 1 -> 401 invalid access token
+```
+
+**这条实测证明的是「推理 Key 不能用于签到」**（鉴权在功能判定之前就拦下，
+所以**不能**用它反推签到开关状态）——即 §2.2 表里"所需凭据 = 控制台 access token"这句，
+从推断升级为实测。要真正确认"该用户能否签到"必须用**控制台 access token** 再打一次，
+**本轮没有该凭据**。
+
+### 2.3.2 Qoder CLI `/claim`：双向取证**不存在**
+
+用户提出「Qoder CLI 应该能用 `/claim` 领奖励」。两条独立证据都否定：
+
+```text
+官方完整 slash 命令表 /cli/slash-reference  → Account and Status 组只有
+        /login /logout /status /profile /usage /upgrade /insights /privacy /permissions
+        Conditional Commands（feature flag 隐藏的那批）里也没有 claim
+本机 ~/.qoder/commands/                   → 只有 clean-disk.md / clean-temp.md / edge-net-check.md
+```
+
+`/claim` 既不是内置命令，也不是本机自定义命令。Qoder 官方给的领取入口是
+**桌面端 Usage panel 左下角的礼物图标**（见 §2.1 引用的 100credits.md 原文），
+CLI 侧只能 `/usage` **查看**额度、不能领取——且 `/usage` 需要已登录或已设
+Access Token（本机当前 `qoder status` = **Not logged in**，故 CLI 侧也测不了）。
+
+> 这次差点又犯同一个错：先看到「常见命令表里没有 claim」就下结论。
+> 是官方文档自己提示"完整列表见 Slash Commands Reference"才去查了权威页——
+> **凡是说"某命令/某功能没有"，必须找到那份权威完整清单 + 本机实际状态两处都查。**
+
+顺带记录两条与本机导入配置直接相关的站点动态（公告原文）：
+
+- 「geeknow.top 域名目前智能海外访问，可切换 geeknow.ai，部分视频和图片存储也受到
+  影响，海外区域可正常访问。**codex 渠道官方封控**」
+  → 域名在 `.top` / `.ai` 间迁移；`codex` 渠道已被上游封控，
+  与探测时 `gpt-image-2-vip` 返回 `no available channel found` 属同一类渠道问题。
+  **导入的 5 个图像模型仍全部保留**（属配置事实），但要在界面标注渠道风险。
 
 ### 2.4 定位改变：commandcode 不是普通中转站
 
@@ -218,7 +274,7 @@ agentrouter 是 L2' 的典型：**端点有，但凭据是账号密码**——�
 | 3 | 自动领取的时间 | 甲：每天固定时刻（可配）｜乙：只在该平台自己的窗口开启后首次运行时 | **乙**：各平台窗口不同，跟平台走更不容易漏领或白跑 |
 | 4 | 平台凭据从哪来 | 甲：用户在界面粘贴（存 `app_secrets`）｜乙：从本地客户端目录读取 | **甲**：与「不读第三方凭据文件」的硬不变量一致 |
 | 5 | agentrouter 的每日登录要不要自动化 | 甲：不代登录，只在到点时提醒 + 一键打开登录页（推荐）｜乙：网关持账号密码自动登录 | **甲**：长期保存第三方账号密码的风险远大于每天点一次 |
-| 6 | 先做哪个平台 | 甲：geeknow（唯一已确认有官方签到端点）｜乙：先把 Qoder 的提醒与余额做掉 | **甲**：有可验证接口才谈得上自动领取；Qoder 只有提醒可做 |
+| 6 | 先做哪个平台 | 甲：geeknow（端点存在，但需 access token 才能验）｜乙：先做 L1 权益可见 + 提醒（当前**没有任何平台可自动领取**） | **乙**：C1 做完的结论是"暂无平台够格做自动领取"，先把 L1 做完才是有产出的路径 |
 
 ---
 
@@ -226,9 +282,9 @@ agentrouter 是 L2' 的典型：**端点有，但凭据是账号密码**——�
 
 | 卡 | 状态 | 备注 |
 |---|---|---|
-| C1 | **部分完成** | 9 个平台逐个探针核验：geeknow ✅ 有官方签到端点、agentrouter ✅ 有登录端点（但要账号密码）、Qoder ✅ 有官方规则原文、commandcode ✅ 定位为账号型 Agent 产品；shitapi / zai / sensenova / maas / openrouter 未发现端点。**取证方式是不带凭据的路由探测**，比博客二手结论可靠 |
-| C2 | 未开始 | |
-| C3 | 未开始 | 依赖 C1 结论；当前只有 geeknow 够格 |
+| C1 | **部分完成** | 9 个平台逐个核验：**geeknow 端点存在但功能开关关闭**（`checkin_enabled=false`）；agentrouter 有登录端点（要账号密码）；Qoder 有官方规则原文且 `/claim` 经双向取证不存在；commandcode 定位为账号型 Agent 产品；shitapi / zai / sensenova / maas / openrouter 未发现端点。**当前没有任何平台可自动领取** |
+| C2 | 未开始 | 已解除阻塞：Qoder `/usage` 面板字段（Plan / 到期 / Plan Credits / Add-on Credits）已核到官方文档 |
+| C3 | 未开始 | **暂无可做对象**——geeknow 开关关闭，其余平台无端点；等有平台开了再说 |
 | C4 | 未开始 | |
 | C5 | 未开始 | |
 
