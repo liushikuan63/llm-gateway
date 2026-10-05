@@ -319,6 +319,23 @@ impl UpstreamClient {
 
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            // 上下文超限要单独识别成 ContextLengthExceeded 并标记**可重试**。
+            //
+            // 实测（2026-10-05）：请求 258091 tokens 打到一个上限 256000 的模型，
+            // 上游回400 INVALID_REQUEST + "maximum context length is 256000
+            // tokens. However, you requested about 258091 tokens"。原来一律
+            // 当成不可重试的 4xx，于是请求**没有落到任何供应商**就直接失败，
+            // 而候选链里明明还有窗口更大的模型。
+            //
+            // 判据用「错误体里是否在讲上下文超限」，而不是状态码：各家上游
+            // 对这件事的 HTTP 码不统一（400/413/422 都见过），按码判会漏。
+            if looks_like_context_length_error(&text) {
+                let (required, available) = parse_context_length_error(&text).unwrap_or((0, 0));
+                return Err(GatewayError::ContextLengthExceeded {
+                    required,
+                    available,
+                });
+            }
             return Err(GatewayError::Upstream {
                 provider: p.name.clone(),
                 model: model.into(),
@@ -1099,6 +1116,105 @@ fn ensure_successful_response(
         });
     }
     Ok(())
+}
+
+/// 上游错误体是否在说「上下文超了」。
+///
+/// 不能按 HTTP 码判：实测同一件事各家给 400/413/422 都有，所以只认文案。
+/// 匹配的都是上游原文里的固定说法（中英文各覆盖几种），并且都要求**同时**
+/// 出现「上下文/长度」与「超过/超限」两个语义，避免把别的 400 误判成超限
+/// —— 误判的代价是本该失败的请求被静默重试到下一家。
+pub fn looks_like_context_length_error(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let mentions_context = lower.contains("context length")
+        || lower.contains("context_length")
+        || lower.contains("maximum context")
+        || lower.contains("context window")
+        || lower.contains("too many tokens")
+        // Anthropic 口径：它不说 context，说 "prompt is too long"。
+        || lower.contains("prompt is too long")
+        || lower.contains("input is too long")
+        || body.contains("上下文");
+    let mentions_exceeded = lower.contains("exceed")
+        || lower.contains("maximum")
+        || lower.contains("too long")
+        || lower.contains("reduce the length")
+        || body.contains("超")
+        || body.contains("过长");
+    mentions_context && mentions_exceeded
+}
+
+/// 从错误体里抠出「实际要了多少 / 只允许多少」。
+///
+/// 上游文案实测形如：`This endpoint's maximum context length is 256000 tokens.
+/// However, you requested about 258091 tokens (...)`。
+/// 抠不出来就返回 None —— 调用方会退化成 0/0，只影响错误文案，
+/// 不影响「要不要换一家」这个判定（那由`looks_like_context_length_error` 决定）。
+pub fn parse_context_length_error(body: &str) -> Option<(u32, u32)> {
+    let mut required = None;
+    let mut available = None;
+    let chars: Vec<char> = body.chars().collect();
+
+    // 关键词必须**紧邻**数字，不能只看「同一段文字里有没有」。
+    // 实测踩过：报文 `...maximum context length is 256000 tokens. However,
+    // you requested about 258091 tokens...` 里，用 64 字符窗口时两个关键词
+    // 会同时落进每个数字的窗口，于是 256000 被误判成「实际请求量」。
+    // 改成只看数字**前面** 48 个字符：「上限」一定写在数字之前，
+    // 「请求量」则既可能在前（`requested: 258091`）也在后（`requested about
+    // 258091`），所以两边都看但要求更近。
+    let before_of = |i: usize| -> String {
+        let from = i.saturating_sub(48);
+        chars[from..i]
+            .iter()
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let after_of = |j: usize| -> String {
+        let to = (j + 32).min(chars.len());
+        chars[j..to].iter().collect::<String>().to_ascii_lowercase()
+    };
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let mut digits = String::new();
+        let mut j = i;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            digits.push(chars[j]);
+            j += 1;
+        }
+        // 解析失败就跳过：错误文案里出现年份、版本号很常见，
+        // 不能因此让整段返回 None。
+        if let Ok(value) = digits.parse::<u32>() {
+            let before = before_of(i);
+            let after = after_of(j);
+            let is_limit = before.contains("maximum context")
+                || before.contains("maximum number of tokens")
+                || before.contains("context length is")
+                || before.contains("context window")
+                || before.contains("最大");
+            let is_requested = before.contains("requested")
+                || before.contains("需要")
+                || before.contains("prompt is too long")
+                || after.starts_with(" tokens")
+                || after.contains(" requested");
+            // 先判上限：「上限」的前置词更明确，命中就不要再当成请求量。
+            if is_limit {
+                available.get_or_insert(value);
+            } else if is_requested {
+                required.get_or_insert(value);
+            }
+        }
+        i = j.max(i + 1);
+    }
+
+    match (required, available) {
+        (Some(r), Some(a)) => Some((r, a)),
+        _ => None,
+    }
 }
 
 fn map_reqwest_err(provider: &str, model: &str, e: reqwest::Error) -> GatewayError {

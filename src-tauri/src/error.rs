@@ -53,7 +53,11 @@ impl GatewayError {
             GatewayError::Timeout(_) => true,
             GatewayError::Protocol(_) => false, // 转换失败换家也没用
             GatewayError::Unauthorized(_) => false,
-            GatewayError::ContextLengthExceeded { .. } => false,
+            // 上下文超限**值得换一家**：候选链里往往还有窗口更大的模型。
+            // 判 false 会让整条请求在第一个候选上就死掉，用户看到的现象是
+            // 「自动切换完全没生效」。实测（2026-10-05）请求 258091 tokens
+            // 打到 256000 上限的模型，正是因此没能回落到更大的窗口。
+            GatewayError::ContextLengthExceeded { .. } => true,
             // 候选链已按模态过滤过，换家不会有别的结果。
             GatewayError::CapabilityUnavailable { .. } => false,
             _ => true,
