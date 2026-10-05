@@ -30,8 +30,6 @@ pub struct LocalEndpoint {
 pub struct LocalModelConfig {
     /// 本地模型是否参与路由。关掉时本地 Provider 仍可手动指定，只是不进 `auto` 候选链。
     pub enabled: bool,
-    /// 扫描到未登记的本地模型时是否自动登记为 Provider。
-    pub auto_register: bool,
     /// 单端点探测超时。
     pub probe_timeout_ms: u64,
     pub endpoints: Vec<LocalEndpoint>,
@@ -52,7 +50,6 @@ impl Default for LocalModelConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            auto_register: false,
             probe_timeout_ms: 1500,
             endpoints: default_local_endpoints(),
         }
@@ -385,8 +382,6 @@ pub struct AppConfig {
     pub compact_keep_recent: usize,
     /// 请求日志保留天数
     pub analytics_retention_days: u32,
-    /// 是否记录请求体（调试用，默认关闭以省空间/隐私）
-    pub log_request_body: bool,
     /// 系统代理（可选，公司网络环境需要）
     pub http_proxy: Option<String>,
     /// 自动故障转移开关
@@ -471,7 +466,6 @@ impl Default for AppConfig {
             compact_threshold_tokens: 60_000,
             compact_keep_recent: 12,
             analytics_retention_days: 30,
-            log_request_body: false,
             http_proxy: None,
             failover_enabled: true,
             catalog_auto_update: false,

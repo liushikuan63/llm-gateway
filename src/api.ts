@@ -133,7 +133,6 @@ export interface AppConfig {
   compact_threshold_tokens: number;
   compact_keep_recent: number;
   analytics_retention_days: number;
-  log_request_body: boolean;
   http_proxy: string | null;
   failover_enabled: boolean;
   catalog_auto_update: boolean;
@@ -161,7 +160,6 @@ export interface LocalEndpoint {
 
 export interface LocalModelConfig {
   enabled: boolean;
-  auto_register: boolean;
   probe_timeout_ms: number;
   endpoints: LocalEndpoint[];
 }

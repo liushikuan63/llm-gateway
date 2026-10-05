@@ -64,7 +64,7 @@
 | C2 | **无 OTLP / OpenTelemetry 导出** | `src-tauri/src` grep `tracing_subscriber|EnvFilter` 仅 2 处命中（`lib.rs:100,102`），且是 `fmt()` 文件 writer，**没有 OTel 层** | 审计只进本地 SQLite，出问题只能翻数据库；无法接 Grafana / Collector |
 | C3 | **无 CI**（A3） | 三个 CI 路径均不存在 | 所有验证靠人记得手动跑；改权重没有任何自动拦 |
 | C4 | **`gateway.log` 无轮转、无上限** | `src-tauri/src/lib.rs:105-111` 用 `File::options().append(true)` 打开固定文件；全仓 grep `(?i)rotat\|max_size\|truncate_log` 在 `src/` 下**零命中** | 桌面应用长期常驻，日志无界增长 |
-| C5 | **`log_request_body` 是只写不读的字段** | 全仓（含 `*.rs`/`*.ts`/`*.tsx`）grep `log_request_body` **只有 3 处**：`src-tauri/src/config.rs:344`（声明）、`config.rs:427`（默认 false）、`src/api.ts:136`（TS 类型）。**后端无读取、前端无控件** | 直接违反 `CLAUDE.md:122-125` 第 9 条「不留只写不读的字段；开着没反应的开关比没有更糟」 |
+| C5 | ~~**`log_request_body` 是只写不读的字段**~~ **已清理（2026-10-05）** | 该字段原先 3 处定义（`config.rs` 声明 + Default + `api.ts` 类型）、零读取点。2026-10-05 连同 `local_models.auto_register` 一并删除，全仓代码零命中。A1 另扫出 `auto_register` 是同款病：声称「扫描到未登记的本地模型时自动登记」，但**该行为根本没实现**，四方向清扫后仅此一处真只写不读 | 违反 CLAUDE.md 第 9 条「不留只写不读的字段」；已修正 |
 | C6 | **无预算 / 额度闸门** | `requests` 表有 `cost`/`currency`（`migrations.rs:108-109`），但全仓无「预算 / budget / 阈值 / 超额」判定；`remote_access_keys` 表只有 `label/key_hash/enabled/rpm_limit/created_at/updated_at`（`migrations.rs:148-161`），**无模型白名单、无累计花费列** | LiteLLM 把「虚拟 Key + 预算 + 花费追踪」列为核心 OSS 能力，本项目只做到 `rpm_limit` 一半 |
 | C7 | **审计不可检索、不可导出** | `commands.rs` 65 个命令里与审计相关的只有 `recent_requests` 与 `stats_overview`；**无按 provider/model/状态/时间区间筛选，无 JSONL/CSV 导出** | 「上周哪次降级失败了」只能手写 SQL |
 | C8 | **Gemini 原生入站未做** | `README.md:100`「尚无 Gemini 原生入站路由，因此暂不开放 Gemini CLI 自动接管」；`docs/0.3.0验证记录.md:634` 同款 | Gemini CLI 只能被排除在自动接管之外 |

@@ -26,7 +26,6 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     provider("multimodal", "多模态服务", "openai", "https://example.test/v1", [model("vision-model", 65536, peakValleyPrice, { supports_vision: true, supports_audio: true, supports_video: true })]),
     { ...provider("disabled", "备用服务", "openai", "https://example.test/v1", [model("backup-chat")]), enabled: false },
   ];
-  window.__fixtureConfig = { bind: "127.0.0.1", port: 15721, allow_lan: false, unified_key: "fixture-only", routing_strategy: "balanced", custom_rules: [], max_fallback_attempts: 3, upstream_timeout_secs: 90, sticky_ttl_secs: 1800, compact_threshold_tokens: 60000, compact_keep_recent: 12, analytics_retention_days: 30, log_request_body: false, http_proxy: null, failover_enabled: true, catalog_auto_update: false, catalog_feed_url: null, remote_mode: { enabled: false, public_url: null }, takeover: { claude_code: false, codex: false, gemini_cli: false, opencode: false, crush: false },
     smart_routing: {
       enabled: true, classifier: "jev",
       jev: { base_url: "http://127.0.0.1:8009/v1/systemone", model: "rl-agent", timeout_ms: 1200, max_state_chars: 4000,
@@ -38,7 +37,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     },
     search: { enabled: true, backend: "tavily", searxng_url: null, max_results: 5, timeout_ms: 8000, inject_as: "text" },
     local_models: {
-      enabled: true, auto_register: false, probe_timeout_ms: 2000,
+      enabled: true, probe_timeout_ms: 2000,
       endpoints: [
         { id: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434", kind: "ollama" },
         { id: "lmstudio", label: "LM Studio", base_url: "http://127.0.0.1:1234", kind: "open_ai_compatible" },
