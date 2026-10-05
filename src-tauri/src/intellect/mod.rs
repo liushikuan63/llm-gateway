@@ -32,8 +32,9 @@ pub mod refine;
 pub use crate::router::score::TaskClass;
 pub use autostart::SpawnOutcome;
 pub use bench::{
-    diff, load_jsonl, render, score, AlwaysSimpleClassifier, BenchClassifier, BenchReport,
-    BenchSample, BenchSource, DiffReport, HeuristicClassifier, PrecomputedClassifier,
+    completeness, count_unlabeled, diff, labeled_only, load_jsonl, render, render_completeness,
+    score, AlwaysSimpleClassifier, BenchClassifier, BenchReport, BenchSample, BenchSource,
+    Completeness, DiffReport, HeuristicClassifier, PrecomputedClassifier, SourceCount,
     StrategyReport, ALL_CLASSES,
 };
 pub use calibrate::{build_report, CalibrationReport, LabeledSample, SampleOutcome};

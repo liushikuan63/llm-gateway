@@ -9,15 +9,46 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use llm_gateway_lib::intellect::bench::{
-    diff, load_jsonl, render, score, AlwaysSimpleClassifier, BenchClassifier, BenchSample,
-    BenchSource, HeuristicClassifier, PrecomputedClassifier, ALL_CLASSES,
+    completeness, diff, labeled_only, load_jsonl, render, render_completeness, score,
+    AlwaysSimpleClassifier, BenchClassifier, BenchSample, BenchSource, HeuristicClassifier,
+    PrecomputedClassifier, ALL_CLASSES,
 };
 use llm_gateway_lib::intellect::TaskClass;
 
 const BENCH_JSONL: &str = include_str!("fixtures/classify_bench.jsonl");
 
+/// owner 样本**单独一个文件**，不并进上面那份。
+///
+/// 卡片原文是「写进同一份 jsonl 的 source: "owner" 行」。这里刻意分成两份，
+/// 理由是：seeded 那份由 `scripts/gen-classify-bench.py` 生成，
+/// 重跑生成器会整文件覆写 —— 如果 owner 行也在里面，本人手写的标注
+/// 会被下一次重生成**无声抹掉**。分文件之后，重跑生成器碰不到 owner 文件。
+///
+/// 卡片要的「用 source 字段区分」没有丢：两边都带 source，合并后照常分组统计。
+const OWNER_JSONL: &str = include_str!("fixtures/classify_bench_owner.jsonl");
+
+/// 全部样本，含未标注的。覆盖度统计用它。
+fn all_samples() -> Vec<BenchSample> {
+    let mut all = load_jsonl(BENCH_JSONL).expect("classify_bench.jsonl 必须是合法 JSONL");
+    let owner = load_jsonl(OWNER_JSONL).expect("classify_bench_owner.jsonl 必须是合法 JSONL");
+    all.extend(owner);
+
+    // id 不能跨文件撞车：它是 diff() 与 PrecomputedClassifier 的主键，
+    // 撞了会让两条样本共用一份预测，把准确率算歪。
+    let mut seen = BTreeSet::new();
+    for s in &all {
+        assert!(
+            seen.insert(s.id.as_str()),
+            "样本 id 跨文件重复：{} —— seeded 用 b 前缀、owner 用 o 前缀",
+            s.id
+        );
+    }
+    all
+}
+
+/// 只取已标注的。评分类断言用它 —— score() 拒收未标注样本。
 fn samples() -> Vec<BenchSample> {
-    load_jsonl(BENCH_JSONL).expect("classify_bench.jsonl 必须是合法 JSONL")
+    labeled_only(&all_samples())
 }
 
 fn code(c: TaskClass) -> &'static str {
@@ -73,7 +104,7 @@ fn 四类标签都至少有_5_条() {
         counts.insert(code(c), 0);
     }
     for s in &got {
-        *counts.entry(code(s.label)).or_insert(0) += 1;
+        *counts.entry(code(s.label())).or_insert(0) += 1;
     }
     let min = counts.values().copied().min().unwrap_or(0);
     assert!(
@@ -106,7 +137,7 @@ fn 三组反直觉场景都真的被覆盖了() {
     // 极短指令 → simple
     let short_simple = got
         .iter()
-        .filter(|s| s.prompt.chars().count() <= 20 && s.label == TaskClass::Simple)
+        .filter(|s| s.prompt.chars().count() <= 20 && s.label() == TaskClass::Simple)
         .count();
     assert!(short_simple >= 3, "极短指令样本只有 {short_simple} 条");
 
@@ -115,7 +146,7 @@ fn 三组反直觉场景都真的被覆盖了() {
     let triage = got
         .iter()
         .filter(|s| {
-            s.label == TaskClass::Reasoning && triage_words.iter().any(|w| s.prompt.contains(w))
+            s.label() == TaskClass::Reasoning && triage_words.iter().any(|w| s.prompt.contains(w))
         })
         .count();
     assert!(
@@ -129,11 +160,11 @@ fn 三组反直觉场景都真的被覆盖了() {
     assert!(vision >= 5, "带图片样本只有 {vision} 条");
     for s in got.iter().filter(|s| s.has_image) {
         assert_eq!(
-            s.label,
+            s.label(),
             TaskClass::Vision,
             "样本 {} 带图片却标了 {} —— 硬规则是 image → vision，标注不该与它冲突",
             s.id,
-            code(s.label)
+            code(s.label())
         );
     }
 
@@ -298,8 +329,9 @@ fn 双策略对比能表达_启发式错而另一策略对() {
             requested_model: "auto",
         };
         let guess = llm_gateway_lib::intellect::classify_by_heuristic(&input).class;
+        let truth = s.label();
         // 启发式判对的照抄，判错的改成正确答案 —— 这正是「Jev 对而启发式错」
-        answers.insert(s.id.clone(), if guess == s.label { guess } else { s.label });
+        answers.insert(s.id.clone(), if guess == truth { guess } else { truth });
     }
     let jev_like = PrecomputedClassifier::new("jev-fixture", answers);
 
@@ -478,35 +510,66 @@ fn owner_样本达到_20_条才算完成() {
 /// 导致缺口从报告里消失。
 #[test]
 fn owner_样本计数必须被如实报告() {
-    let got = samples();
-    let h = HeuristicClassifier;
-    let report = score(&got, &[&h as &dyn BenchClassifier]);
+    // 覆盖度看**全部**样本（含未标注的）；质量才看已标注的。
+    // 用 samples() 会看不见「owner 有 30 条待标注」这个事实。
+    let all = all_samples();
+    let c = completeness(&all);
 
-    // by_source 必须同时能表达两种来源，哪怕 owner 现在是 0
+    // by_source 必须同时能表达两种来源，哪怕 owner 一条都还没标
     assert!(
-        report.by_source.contains_key("seeded"),
-        "报告里没有 seeded 计数"
+        c.by_source.contains_key("seeded"),
+        "覆盖度报告里没有 seeded 计数"
     );
-    let owner = report.by_source.get("owner").copied().unwrap_or(0);
-    let seeded = report.by_source["seeded"];
-    assert!(seeded >= 30, "seeded 只有 {seeded} 条，卡片要求 >= 30");
+    let seeded = c.by_source.get("seeded").expect("seeded 计数应在");
+    let owner = c.by_source.get("owner");
 
+    let seeded_labeled = seeded.labeled;
+    let owner_labeled = owner.map(|o| o.labeled).unwrap_or(0);
+    let owner_pending = owner.map(|o| o.unlabeled).unwrap_or(0);
+
+    assert!(
+        seeded_labeled >= 30,
+        "seeded 已标注只有 {seeded_labeled} 条，卡片要求 >= 30"
+    );
+
+    println!("{}", render_completeness(&c));
     println!(
-        "A4 完成度：seeded {seeded} 条（要求 >= 30，{}），owner {owner} 条（要求 >= 20，{}）",
-        if seeded >= 30 { "达标" } else { "不足" },
-        if owner >= 20 {
+        "A4 完成度：seeded {} 条（要求 >= 30，{}），owner 已标注 {} 条（要求 >= 20，{}），owner 待标注 {} 条",
+        seeded_labeled,
+        if seeded_labeled >= 30 { "达标" } else { "不足" },
+        owner_labeled,
+        if owner_labeled >= 20 {
             "达标"
         } else {
             "**不足 —— A4 只能标进行中**"
-        }
+        },
+        owner_pending
     );
 
-    // owner 若存在，必须真的带标签、且不能与 seeded 混在一份计数里
-    for s in got.iter().filter(|s| s.source == BenchSource::Owner) {
+    // owner 若有已标注的，必须真的带内容
+    for s in all
+        .iter()
+        .filter(|s| s.source == BenchSource::Owner && s.is_labeled())
+    {
         assert!(!s.id.trim().is_empty(), "owner 样本缺 id");
         assert!(!s.prompt.trim().is_empty(), "owner 样本 {} 缺 prompt", s.id);
     }
-    // 两份计数之和必须等于总数（防漏算）
-    let sum: u32 = report.by_source.values().sum();
-    assert_eq!(sum, report.total, "by_source 求和应等于总条数");
+    // 待标注的也必须至少有 id 与 prompt，否则本人都不知道要标什么
+    for s in all.iter().filter(|s| !s.is_labeled()) {
+        assert!(!s.id.trim().is_empty(), "待标注样本缺 id");
+        assert!(
+            !s.prompt.trim().is_empty(),
+            "待标注样本 {} 缺 prompt —— 没题干就标不了",
+            s.id
+        );
+    }
+
+    // 已标注 + 待标注 = 总数（防漏算）
+    assert_eq!(
+        c.labeled + c.unlabeled,
+        c.total,
+        "labeled + unlabeled 应等于 total"
+    );
+    let sum: u32 = c.by_source.values().map(|s| s.labeled + s.unlabeled).sum();
+    assert_eq!(sum, c.total, "by_source 求和应等于总条数");
 }

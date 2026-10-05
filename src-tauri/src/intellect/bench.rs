@@ -66,11 +66,18 @@ impl BenchSource {
 ///
 /// `label` 是**人的判断**，不是任何分类器的输出。生成 fixture 时不许从
 /// `classify_by_heuristic` 抄——那样这个基准集就退化成它本该取代的那套自证。
+///
+/// `label` 是 `Option`：**「待标注」是一个真实状态**，不是错误。
+/// owner 样本由本人逐条补，中间态必然存在；把它建模成必填字段，
+/// 要么逼着人先写个假标签（污染参照系），要么让整份文件解析失败
+/// （把「还没填」报成「坏了」）。两种都在掩盖事实。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchSample {
     pub id: String,
     pub prompt: String,
-    pub label: TaskClass,
+    /// `None` = 待标注。`score()` / `diff()` 拒绝接收未标注的样本。
+    #[serde(default)]
+    pub label: Option<TaskClass>,
     #[serde(default = "default_source")]
     pub source: BenchSource,
     #[serde(default)]
@@ -95,6 +102,23 @@ fn default_source() -> BenchSource {
 }
 
 impl BenchSample {
+    /// 已标注？
+    pub fn is_labeled(&self) -> bool {
+        self.label.is_some()
+    }
+
+    /// 取标签。未标注时 panic 并说清是哪一条 ——
+    /// `score()` 拿未标注样本算准确率等于把「没测」算成「测了」。
+    pub fn label(&self) -> TaskClass {
+        self.label.unwrap_or_else(|| {
+            panic!(
+                "样本 {} 还没有人工标签，不能参与评分。\
+                 请先在 src-tauri/tests/fixtures/classify_bench_owner.jsonl 里补上 label",
+                self.id
+            )
+        })
+    }
+
     /// 按样本重建分类输入。`requested_model` 固定为 `auto`——
     /// 点名了具体模型就不该分类，那不是本基准集要测的路径。
     pub fn to_input(&self) -> (Vec<Message>, Media) {
@@ -106,6 +130,17 @@ impl BenchSample {
         };
         (messages, media)
     }
+}
+
+/// 未标注的条数。报告里必须如实显示 ——
+/// 「还没标」与「标了 0 条」在数字上一样，在含义上完全不同。
+pub fn count_unlabeled(samples: &[BenchSample]) -> usize {
+    samples.iter().filter(|s| !s.is_labeled()).count()
+}
+
+/// 只保留已标注的。`score()` / `diff()` 的入参必须是它的输出。
+pub fn labeled_only(samples: &[BenchSample]) -> Vec<BenchSample> {
+    samples.iter().filter(|s| s.is_labeled()).cloned().collect()
 }
 
 /// 解析 JSONL。空行忽略；坏行报错并带上行号——
@@ -217,6 +252,24 @@ impl BenchClassifier for PrecomputedClassifier {
     }
 }
 
+/// 评分入口的守卫：未标注样本绝不能进评分。
+///
+/// 静默跳过它们会把「还没标」变成「不存在」，准确率的分母凭空变小、
+/// 数字看起来更好 —— 而那正是本模块要防的事。
+fn assert_unlabeled_absent(samples: &[BenchSample], who: &str) {
+    let pending: Vec<&str> = samples
+        .iter()
+        .filter(|s| !s.is_labeled())
+        .map(|s| s.id.as_str())
+        .collect();
+    assert!(
+        pending.is_empty(),
+        "{who}() 收到了 {} 条还没有人工标签的样本（{:?}）—— \
+         请先用 labeled_only() 过滤，或先补上 label",
+        pending.len(),
+        pending
+    );
+}
 /// 全部三类标签，用于把混淆矩阵铺满九格。
 pub const ALL_CLASSES: [TaskClass; 3] =
     [TaskClass::Simple, TaskClass::Vision, TaskClass::Reasoning];
@@ -244,36 +297,80 @@ pub struct StrategyReport {
 }
 
 /// 整份报告。
+///
+/// 只讲**质量**（已标注样本上判得准不准）。覆盖度是另一件事，见 [`completeness`]。
+/// 两者刻意分开：混在一起会让「owner 一条没标」看起来像「准确率 100%」。
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchReport {
     pub total: u32,
-    /// 按来源分组的条数（seeded / owner）。
-    pub by_source: BTreeMap<String, u32>,
-    /// 每个来源下每类各有多少条。用于回答
-    /// 「owner 样本补够了没有」而不只是「总共有多少条」。
-    pub per_source_per_class: BTreeMap<String, BTreeMap<String, u32>>,
     pub strategies: Vec<StrategyReport>,
 }
 
-/// 跑一遍基准集。`classifiers` 里每个策略都会得到一份独立报告。
-pub fn score(samples: &[BenchSample], classifiers: &[&dyn BenchClassifier]) -> BenchReport {
-    let mut by_source: BTreeMap<String, u32> = BTreeMap::new();
-    let mut per_source_per_class: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+/// 一个来源的覆盖度。
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCount {
+    pub labeled: u32,
+    pub unlabeled: u32,
+    /// 已标注样本里每类各多少条。
+    pub by_class: BTreeMap<String, u32>,
+}
+
+/// 基准集的覆盖度。回答的是「够不够」，不是「准不准」。
+#[derive(Debug, Clone, Serialize)]
+pub struct Completeness {
+    pub total: u32,
+    pub labeled: u32,
+    pub unlabeled: u32,
+    pub by_source: BTreeMap<String, SourceCount>,
+}
+
+/// 数一遍覆盖度。**接受全部样本，包括未标注的** ——
+/// 这正是它与 `score()` 的区别：`score()` 拒收未标注样本，
+/// 而这里必须把它们数出来，否则「还没标」就等于「不存在」。
+pub fn completeness(samples: &[BenchSample]) -> Completeness {
+    let mut by_source: BTreeMap<String, SourceCount> = BTreeMap::new();
+    let mut labeled = 0u32;
+    let mut unlabeled = 0u32;
+
     for s in samples {
-        *by_source.entry(s.source.code().to_string()).or_insert(0) += 1;
-        *per_source_per_class
+        let entry = by_source
             .entry(s.source.code().to_string())
-            .or_default()
-            .entry(class_code(s.label).to_string())
-            .or_insert(0) += 1;
+            .or_insert(SourceCount {
+                labeled: 0,
+                unlabeled: 0,
+                by_class: BTreeMap::new(),
+            });
+        match s.label {
+            Some(c) => {
+                entry.labeled += 1;
+                *entry.by_class.entry(class_code(c).to_string()).or_insert(0) += 1;
+                labeled += 1;
+            }
+            None => {
+                entry.unlabeled += 1;
+                unlabeled += 1;
+            }
+        }
     }
+
+    Completeness {
+        total: samples.len() as u32,
+        labeled,
+        unlabeled,
+        by_source,
+    }
+}
+
+/// 跑一遍基准集。`classifiers` 里每个策略都会得到一份独立报告。
+///
+/// 入参必须是**已标注**的样本（用 [`labeled_only`] 过滤）。
+pub fn score(samples: &[BenchSample], classifiers: &[&dyn BenchClassifier]) -> BenchReport {
+    assert_unlabeled_absent(samples, "score");
 
     let strategies = classifiers.iter().map(|c| score_one(samples, *c)).collect();
 
     BenchReport {
         total: samples.len() as u32,
-        by_source,
-        per_source_per_class,
         strategies,
     }
 }
@@ -310,7 +407,7 @@ fn score_one(samples: &[BenchSample], classifier: &dyn BenchClassifier) -> Strat
             }
         };
         covered += 1;
-        let row = class_code(s.label);
+        let row = class_code(s.label());
         let col = class_code(actual);
         *matrix
             .entry(row.to_string())
@@ -318,7 +415,7 @@ fn score_one(samples: &[BenchSample], classifier: &dyn BenchClassifier) -> Strat
             .entry(col.to_string())
             .or_insert(0) += 1;
         *per_class_total.entry(row.to_string()).or_insert(0) += 1;
-        if s.label == actual {
+        if s.label() == actual {
             correct += 1;
             *per_class_correct.entry(row.to_string()).or_insert(0) += 1;
         }
@@ -391,6 +488,7 @@ pub fn diff(
     a: &dyn BenchClassifier,
     b: &dyn BenchClassifier,
 ) -> DiffReport {
+    assert_unlabeled_absent(samples, "diff");
     let mut a_wins = Vec::new();
     let mut b_wins = Vec::new();
     let mut skipped = Vec::new();
@@ -402,7 +500,7 @@ pub fn diff(
             skipped.push(s.id.clone());
             continue;
         };
-        match (pa == s.label, pb == s.label) {
+        match (pa == s.label(), pb == s.label()) {
             (true, true) => both_right += 1,
             (false, false) => both_wrong += 1,
             (true, false) => a_wins.push(s.id.clone()),
@@ -426,14 +524,41 @@ pub fn class_code(c: TaskClass) -> &'static str {
     c.code()
 }
 
+/// 把覆盖度渲染成人能读的文本。
+///
+/// 单独一个函数而不是并进 `render()`：覆盖度与质量是两件事，
+/// 分开读才不会把「owner 一条没标」误读成「准确率 100%」。
+pub fn render_completeness(c: &Completeness) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "基准集覆盖度：共 {} 条，已标注 {} 条，待标注 {} 条\n",
+        c.total, c.labeled, c.unlabeled
+    ));
+    for (src, count) in &c.by_source {
+        out.push_str(&format!(
+            "  {src}: 已标注 {} 条，待标注 {} 条",
+            count.labeled, count.unlabeled
+        ));
+        if !count.by_class.is_empty() {
+            out.push('（');
+            for (k, v) in &count.by_class {
+                out.push_str(&format!("{k} {v} "));
+            }
+            out.pop();
+            out.push('）');
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// 把报告渲染成人能读的文本，供 `--nocapture` 与界面共用。
+///
+/// 只渲染**质量**。覆盖度走 [`render_completeness`] —— 两者混在一起会让
+/// 「owner 一条没标」看起来像「准确率 100%」。
 pub fn render(report: &BenchReport) -> String {
     let mut out = String::new();
-    out.push_str(&format!("基准集共 {} 条\n", report.total));
-    for (src, n) in &report.by_source {
-        out.push_str(&format!("  {src}: {n} 条\n"));
-    }
-    out.push('\n');
+    out.push_str(&format!("已标注样本 {} 条\n\n", report.total));
 
     for s in &report.strategies {
         out.push_str(&format!(
@@ -491,7 +616,7 @@ mod tests {
         BenchSample {
             id: id.into(),
             prompt: format!("prompt-{id}"),
-            label,
+            label: Some(label),
             source: BenchSource::Seeded,
             note: None,
             has_tools: false,
