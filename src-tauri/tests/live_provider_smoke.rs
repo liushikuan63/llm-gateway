@@ -78,6 +78,9 @@ async fn assert_live_provider(provider: &Provider) {
             &smoke_request(model),
             model,
             Duration::from_secs(45),
+            // 真机烟测要带上网关默认的 num_ctx，否则本地 Ollama 会被
+            // 默认的 4096 卡住（prompt 与输出共用），正文可能为 0。
+            &llm_gateway_lib::config::OllamaOptionsConfig::default(),
         )
         .await
         .unwrap_or_else(|error| {

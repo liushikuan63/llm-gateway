@@ -138,6 +138,7 @@ async fn openai_sse_reassembles_an_event_split_across_tcp_writes() {
             &chat_request(),
             "local-model",
             Duration::from_secs(2),
+            &llm_gateway_lib::config::OllamaOptionsConfig::default(),
         )
         .await
         .expect("empty api_key local OpenAI provider should be callable");
@@ -222,6 +223,7 @@ async fn ollama_ndjson_emits_incremental_tool_calls_and_completion_events() {
             &chat_request(),
             "local-model",
             Duration::from_secs(2),
+            &llm_gateway_lib::config::OllamaOptionsConfig::default(),
         )
         .await
         .expect("empty api_key local Ollama provider should be callable");
@@ -439,6 +441,7 @@ async fn successful_http_with_invalid_or_error_payload_is_retryable_bad_gateway(
                 &chat_request(),
                 "local-model",
                 Duration::from_secs(2),
+                &llm_gateway_lib::config::OllamaOptionsConfig::default(),
             )
             .await
             .expect_err("HTTP 200 with malformed JSON must not be accepted");
@@ -475,6 +478,7 @@ async fn upstream_redirects_are_not_followed() {
             &chat_request(),
             "local-model",
             Duration::from_secs(2),
+            &llm_gateway_lib::config::OllamaOptionsConfig::default(),
         )
         .await
         .expect_err("307 must be surfaced instead of being followed");
@@ -551,7 +555,7 @@ async fn model_overrides_apply_after_gateway_normalization_and_skip_protected_fi
 
     let client = UpstreamClient::new();
     let response = client
-        .call(&provider, &req, "local-model", Duration::from_secs(5))
+        .call(&provider, &req, "local-model", Duration::from_secs(5), &llm_gateway_lib::config::OllamaOptionsConfig::default())
         .await
         .expect("带覆盖配置的请求应成功");
 
@@ -587,7 +591,7 @@ async fn model_overrides_apply_after_gateway_normalization_and_skip_protected_fi
     req2.temperature = Some(0.9);
     req2.max_tokens = Some(1000);
     let _ = client
-        .call(&provider2, &req2, "local-model", Duration::from_secs(5))
+        .call(&provider2, &req2, "local-model", Duration::from_secs(5), &llm_gateway_lib::config::OllamaOptionsConfig::default())
         .await
         .expect("第二次覆盖请求应成功");
 

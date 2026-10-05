@@ -288,10 +288,11 @@ pub async fn test_provider(
     };
 
     let started = std::time::Instant::now();
+    let defaults = state.config.read().clone().ollama_options;
     let res = state
         .gateway
         .upstream
-        .call(&p, &req, &model, std::time::Duration::from_secs(30))
+        .call(&p, &req, &model, std::time::Duration::from_secs(30), &defaults)
         .await;
     let ms = started.elapsed().as_millis() as u64;
 

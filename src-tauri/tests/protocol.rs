@@ -373,7 +373,7 @@ fn gemini_converts_openai_tools_and_function_calls() {
 #[test]
 fn ollama_uses_only_explicit_options_and_reports_total_usage() {
     let req = request(vec![Message::user("hi")]);
-    let body = ollama::to_ollama_body(&req, "qwen");
+    let body = ollama::to_ollama_body(&req, "qwen", None);
     assert!(body.get("options").is_none());
 
     let response = ollama::from_ollama_response(&json!({
@@ -531,7 +531,7 @@ fn ollama_options_里的_num_ctx_必须透传() {
     });
     let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body)
         .expect("应能解析");
-    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "qwen3.8:27b-q4_K_M");
+    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "qwen3.8:27b-q4_K_M", None);
     let opts = out.get("options").expect("options 必须存在");
     assert_eq!(
         opts.get("num_ctx").and_then(|v| v.as_u64()),
@@ -553,7 +553,7 @@ fn ollama_options_不得覆盖显式的_max_tokens() {
     });
     body["options"] = serde_json::json!({"num_predict": 999, "num_ctx": 16384});
     let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body).expect("解析");
-    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "m");
+    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "m", None);
     let opts = out.get("options").expect("options");
     assert_eq!(opts.get("num_predict").and_then(|v| v.as_u64()), Some(2048), "max_tokens 应覆盖 num_predict");
     assert_eq!(opts.get("num_ctx").and_then(|v| v.as_u64()), Some(16384), "其余键仍要透传");
@@ -599,4 +599,77 @@ fn ollama_没有缓存字段时不得凭空造数() {
         .expect("usage");
     assert_eq!(u.cache_read_tokens, 0, "字段缺失时必须是 0 而不是别的数");
     assert_eq!(u.total_tokens, 110);
+}
+#[test]
+fn 网关默认_必须能补上客户端表达不了的_num_ctx() {
+    // 这是整个修复的落点。num_ctx 是 Ollama 专属旋钮，Anthropic 与
+    // Responses 协议里**没有**这个字段——Claude Code 与 Codex CLI
+    // 不可能知道要发它。所以网关不注入的话，那两条路就是「正文输出 0」。
+    //
+    // 症状极其隐蔽：没有任何错误，只是回答到一半断了。
+    let body = serde_json::json!({
+        "model": "qwen3.8:27b-q4_K_M",
+        "messages": [{"role": "user", "content": "你好"}],
+    });
+    let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body).expect("解析");
+    let defaults = llm_gateway_lib::config::OllamaOptionsConfig::default();
+    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "qwen3.8:27b-q4_K_M", Some(&defaults));
+    let opts = out.get("options").expect("options 必须存在");
+    assert_eq!(
+        opts.get("num_ctx").and_then(|v| v.as_u64()),
+        Some(32768),
+        "网关必须注入 num_ctx，否则 Ollama 用默认 4096，thinking 吃光预算后正文为 0"
+    );
+    assert_eq!(opts.get("num_think").and_then(|v| v.as_u64()), Some(8192));
+    // default_num_predict 默认为 0 = 不限制，由客户端的 max_tokens 决定
+    assert!(
+        opts.get("num_predict").is_none(),
+        "default_num_predict=0 时不得注入，否则会覆盖客户端的 max_tokens"
+    );
+}
+
+#[test]
+fn 客户端显式值_必须压过网关默认() {
+    // 优先级：IR 正式字段 > 客户端 options > 网关默认。
+    // 顺序反了会让「我在客户端特意调小了 num_ctx」不生效。
+    let mut body = serde_json::json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "options": {"num_ctx": 8192},
+    });
+    body["max_tokens"] = serde_json::json!(2048);
+    let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body).expect("解析");
+    let defaults = llm_gateway_lib::config::OllamaOptionsConfig::default();
+    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "m", Some(&defaults));
+    let opts = out.get("options").expect("options");
+    assert_eq!(
+        opts.get("num_ctx").and_then(|v| v.as_u64()),
+        Some(8192),
+        "客户端显式 num_ctx 应当压过默认值 32768"
+    );
+    assert_eq!(
+        opts.get("num_predict").and_then(|v| v.as_u64()),
+        Some(2048),
+        "IR 的 max_tokens 应当压过 options.num_predict"
+    );
+}
+
+#[test]
+fn 不传默认值时行为与改动前完全一致() {
+    // 模式隔离：`None` 路径不得引入任何新字段，
+    // 否则没开网关配置的部署会静默改变行为。
+    let body = serde_json::json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 512,
+    });
+    let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body).expect("解析");
+    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "m", None);
+    let opts = out.get("options").expect("options");
+    assert_eq!(opts.get("num_predict").and_then(|v| v.as_u64()), Some(512));
+    assert!(
+        opts.get("num_ctx").is_none(),
+        "None 时不得注入 num_ctx"
+    );
+    assert!(opts.get("num_think").is_none(), "None 时不得注入 num_think");
 }

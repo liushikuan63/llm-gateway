@@ -62,7 +62,11 @@ pub fn ollama_request_to_internal(body: &serde_json::Value) -> Result<ChatReques
     request.to_internal()
 }
 
-pub fn to_ollama_body(req: &ChatRequest, model: &str) -> serde_json::Value {
+pub fn to_ollama_body(
+    req: &ChatRequest,
+    model: &str,
+    defaults: Option<&crate::config::OllamaOptionsConfig>,
+) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
@@ -112,17 +116,35 @@ pub fn to_ollama_body(req: &ChatRequest, model: &str) -> serde_json::Value {
             options.insert("stop".into(), json!(stop));
         }
     }
-    // 透传客户端显式给的 `options`（num_ctx / num_thread / seed …）。
+    // 注入顺序即优先级，从低到高：
     //
-    // **漏掉 num_ctx 会表现为「回答到一半被截断」，而且完全看不出原因**：
-    // Ollama 的 `num_ctx` 默认只有 4096，prompt 与输出**共用**这 4096。
-    // 推理模型（thinking）会把预算吃掉大半 —— 实测 qwen3.8:27b 思考用了
-    // 4064 token，正文只剩 0 字符，`done_reason: length`。
-    // 而客户端传 `max_tokens: 65536` 完全无效，因为瓶颈是 num_ctx 不是
-    // num_predict：直连 Ollama 带 `num_ctx: 8192` 时能正常输出 12309 字符。
+    //   1) 网关默认值（`OllamaOptionsConfig`）—— 客户端**没有能力表达**的旋钮
+    //      只能由这里给。`num_ctx` 尤其重要：Ollama 默认只有 4096，且
+    //      prompt 与输出**共用**这 4096。推理模型（thinking）会把预算吃掉
+    //      大半 —— 实测 qwen3.8:27b 思考用了 4064 token，正文剩 0 字符、
+    //      `done_reason: length`。而 `max_tokens` 传得再大也没用，因为瓶颈
+    //      是 num_ctx 不是 num_predict：直连 Ollama 带 `num_ctx: 8192`
+    //      才能正常输出 12309 字符。
+    //      注意 Anthropic / Responses 协议里**没有** num_ctx 这个字段，
+    //      Claude Code 与 Codex CLI 不可能知道要发 —— 这正是它必须由网关注入
+    //      而不是靠客户端的原因。
     //
-    // 放在显式字段**之后** merge：`max_tokens` 是 IR 的正式字段，
-    // 应当覆盖 options 里的同名项，否则会出现两处打架。
+    //   2) 客户端显式给的 `options`（num_ctx / num_thread / seed …）——
+    //      显式选择应当压过默认。
+    //
+    //   3) IR 正式字段（`max_tokens` → `num_predict`）—— 最高。
+    //      上面第 111 行已经写入，这里只需防止被 1)/2) 覆盖。
+    if let Some(d) = defaults {
+        if d.default_num_ctx > 0 {
+            options.insert("num_ctx".into(), json!(d.default_num_ctx));
+        }
+        if d.default_num_predict > 0 {
+            options.insert("num_predict".into(), json!(d.default_num_predict));
+        }
+        if d.num_think > 0 {
+            options.insert("num_think".into(), json!(d.num_think));
+        }
+    }
     if let Some(extra) = req.extra.get("options").and_then(|v| v.as_object()) {
         for (key, value) in extra {
             if key == "num_predict" && req.max_tokens.is_some() {

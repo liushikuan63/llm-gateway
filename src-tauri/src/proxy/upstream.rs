@@ -162,14 +162,28 @@ impl UpstreamClient {
     }
 
     /// 组装上游请求体（按方言）
-    pub fn build_body(p: &Provider, req: &ChatRequest, model: &str) -> serde_json::Value {
+    ///
+    /// `defaults` 是网关侧要注入的方言专属旋钮（目前只有 Ollama 的
+    /// `num_ctx`）。**必须由网关注入而不是靠客户端传**：`num_ctx` 是
+    /// Ollama 专属字段，Anthropic / Responses 协议里没有地方放它，
+    /// Claude Code 与 Codex CLI 不可能知道要发。缺了它的症状是
+    /// 「回答到一半被截断且看不出原因」——Ollama 默认 num_ctx 只有 4096，
+    /// prompt 与输出共用这一份，推理模型的 thinking 吃光预算后正文为 0。
+    pub fn build_body(
+        p: &Provider,
+        req: &ChatRequest,
+        model: &str,
+        defaults: &crate::config::OllamaOptionsConfig,
+    ) -> serde_json::Value {
         match p.dialect {
             Dialect::OpenAI => crate::protocol::openai::to_upstream_body(req, model),
             Dialect::Anthropic => {
                 crate::protocol::anthropic::internal_to_anthropic_body(req, model)
             }
             Dialect::Gemini => crate::protocol::gemini::to_gemini_body(req),
-            Dialect::Ollama => crate::protocol::ollama::to_ollama_body(req, model),
+            Dialect::Ollama => {
+                crate::protocol::ollama::to_ollama_body(req, model, Some(defaults))
+            }
             Dialect::Responses => crate::protocol::responses::to_responses_body(req, model),
         }
     }
@@ -181,10 +195,11 @@ impl UpstreamClient {
         req: &ChatRequest,
         model: &str,
         timeout: Duration,
+        defaults: &crate::config::OllamaOptionsConfig,
     ) -> Result<ChatResponse> {
         let url = Self::build_url(p, model, false)?;
         let key = decrypt_provider_key(p)?;
-        let mut body = Self::build_body(p, req, model);
+        let mut body = Self::build_body(p, req, model, defaults);
         if body.get("stream").is_none() {
             body["stream"] = serde_json::Value::Bool(false);
         }
@@ -343,12 +358,13 @@ impl UpstreamClient {
         req: &ChatRequest,
         model: &str,
         timeout: Duration,
+        defaults: &crate::config::OllamaOptionsConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UpstreamEvent>> + Send>>> {
         use futures_util::StreamExt;
 
         let url = Self::build_url(p, model, true)?;
         let key = decrypt_provider_key(p)?;
-        let mut body = Self::build_body(p, req, model);
+        let mut body = Self::build_body(p, req, model, defaults);
         body["stream"] = serde_json::Value::Bool(true);
         crate::protocol::convert::strip_thinking(&mut body);
         Self::apply_overrides(&mut body, overrides(model, p).as_ref());

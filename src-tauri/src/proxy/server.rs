@@ -977,7 +977,8 @@ async fn dispatch_remote_compaction(
             |provider, model| {
                 let upstream = upstream.clone();
                 let request = upstream_req.clone();
-                async move { upstream.call(&provider, &request, &model, timeout).await }
+                let defaults = cfg.ollama_options.clone();
+                async move { upstream.call(&provider, &request, &model, timeout, &defaults).await }
             },
             |provider, model, error| {
                 if let GatewayError::Upstream { status: 429, .. } = error {
@@ -2771,7 +2772,8 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             |provider, model| {
                 let up = upstream.clone();
                 let r = req_arc.clone();
-                async move { up.call(&provider, &r, &model, timeout).await }
+                let defaults = state.cfg_snapshot().ollama_options;
+                async move { up.call(&provider, &r, &model, timeout, &defaults).await }
             },
             |provider, model, err| {
                 // 429 额外打满本地额度窗口，避免连续撞墙
@@ -3024,6 +3026,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 &req,
                 &candidate.model.upstream,
                 timeout,
+                &cfg.ollama_options,
             )
             .await
         {
@@ -4192,6 +4195,7 @@ impl GatewayState {
         let up = self.upstream.clone();
         let timeout = Duration::from_secs(60);
         let r = Arc::new(req);
+let defaults = self.cfg_snapshot().ollama_options;
 
         // 摘要调用同样走候选链，但它的尝试明细不写审计：这不是用户请求。
         let mut records = Vec::new();
@@ -4201,7 +4205,8 @@ impl GatewayState {
                 |p, m| {
                     let up = up.clone();
                     let r = r.clone();
-                    async move { up.call(&p, &r, &m, timeout).await }
+                    let defaults = defaults.clone();
+                    async move { up.call(&p, &r, &m, timeout, &defaults).await }
                 },
                 |p, m, e| self.health.record_failure(&p.id, m, e),
             )
