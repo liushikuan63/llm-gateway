@@ -459,6 +459,121 @@ async fn successful_http_with_invalid_or_error_payload_is_retryable_bad_gateway(
     server.abort();
 }
 
+// ─── 上游 400 的两种含义必须分开 ────────────────────────────────────────────
+//
+// 2026-10-05 实测事故：openrouter 的 free 模型在上下文超限时回
+// `400 INVALID_REQUEST`，网关把它当成不可重试的客户端错误，于是整条候选链
+// 在第一个候选上就死掉，而链上明明还有 922000 窗口的 gpt-6-astra 能接住。
+// 修复只加在了 `call_passthrough` 上，`call` 与 `call_stream` 两条路径都漏了，
+// 而 DSH 走的正是 `call_stream`。
+//
+// 这里同时钉住两条判据：
+//   ① 上下文超限 → ContextLengthExceeded 且 retryable()==true；
+//   ② 别的 400   → 仍是 Upstream{400} 且 retryable()==false。
+// 只写 ① 的话，① 可能仅仅因为「程序把所有 400 都当成可重试」而成立。
+
+/// openrouter / OneAPI 口径的上下文超限原文，2026-10-05 实测抓取。
+const CONTEXT_OVERFLOW_BODY: &str = r#"{"error":{"message":"This endpoint's maximum context length is 256000 tokens. However, you requested about 263152 tokens (248347 of text input, 14804 of tool input, 1 in the output). Please reduce the length of either one, or use the context-...","type":"invalid_request_error"}}"#;
+
+/// 对照组：同样是 400，但与上下文无关（来自 commandcode 实测报文）。
+const PLAIN_BAD_REQUEST_BODY: &str = r#"{"error":{"message":"Invalid 'max_output_tokens': integer below minimum value. Expected a value >= 16, but got 1 instead.","type":"AI_APICallError"}}"#;
+
+async fn context_overflow_response() -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(CONTEXT_OVERFLOW_BODY))
+        .unwrap()
+}
+
+async fn plain_bad_request_response() -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(PLAIN_BAD_REQUEST_BODY))
+        .unwrap()
+}
+
+/// `call_stream` 的 Ok 值不是 Debug，用 `expect_err` 编不过，只能显式 match。
+async fn stream_error(client: &UpstreamClient, provider: &Provider, why: &str) -> GatewayError {
+    match client
+        .call_stream(
+            provider,
+            &chat_request(),
+            "local-model",
+            Duration::from_secs(2),
+            &llm_gateway_lib::config::OllamaOptionsConfig::default(),
+        )
+        .await
+    {
+        Ok(_) => panic!("{why}"),
+        Err(error) => error,
+    }
+}
+
+fn assert_context_overflow(error: &GatewayError, path: &str) {
+    assert!(
+        error.retryable(),
+        "{path}: 上下文超限必须可重试，否则不会回退到窗口更大的模型"
+    );
+    match error {
+        GatewayError::ContextLengthExceeded {
+            required,
+            available,
+        } => {
+            // 抠不出数字只影响文案，但这两个值能被抠出来，就不能放过。
+            assert_eq!(*available, 256000, "{path}: 上限没抠出来");
+            assert_eq!(*required, 263152, "{path}: 请求量没抠出来");
+        }
+        other => panic!("{path}: 期望 ContextLengthExceeded，实际 {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_and_plain_call_treat_context_overflow_as_retryable() {
+    let app = Router::new()
+        .route(
+            "/overflow/chat/completions",
+            post(context_overflow_response),
+        )
+        .route("/plain/chat/completions", post(plain_bad_request_response));
+    let (base_url, server) = spawn_axum(app).await;
+    let client = UpstreamClient::new();
+    let defaults = llm_gateway_lib::config::OllamaOptionsConfig::default();
+
+    // ① 流式路径 —— DSH 实际走的就是这条，修之前它是漏的。
+    let provider = local_provider(Dialect::OpenAI, format!("{base_url}/overflow"));
+    let error = stream_error(&client, &provider, "流式路径遇到上下文超限必须报错").await;
+    assert_context_overflow(&error, "call_stream");
+
+    // ② 非流式 call 路径 —— 同样漏过。
+    let error = client
+        .call(
+            &provider,
+            &chat_request(),
+            "local-model",
+            Duration::from_secs(2),
+            &defaults,
+        )
+        .await
+        .expect_err("call 路径遇到上下文超限必须报错而不是成功");
+    assert_context_overflow(&error, "call");
+
+    // ③ 对照组：同样 400、同样流式，但与上下文无关 —— 必须仍是不可重试。
+    let plain = local_provider(Dialect::OpenAI, format!("{base_url}/plain"));
+    let error = stream_error(&client, &plain, "普通 400 也必须报错").await;
+    assert!(
+        !error.retryable(),
+        "普通 400 被误判成可重试会把请求静默甩到下一家：{error:?}"
+    );
+    match error {
+        GatewayError::Upstream { status, .. } => assert_eq!(status, 400),
+        other => panic!("期望保留 Upstream{{400}}，实际 {other:?}"),
+    }
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn upstream_redirects_are_not_followed() {
     let hits = Arc::new(AtomicUsize::new(0));

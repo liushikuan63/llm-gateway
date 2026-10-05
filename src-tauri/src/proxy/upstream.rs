@@ -110,6 +110,34 @@ impl UpstreamClient {
         Ok(())
     }
 
+    /// 把上游的非成功响应归类成错误。三条调用路径（`call` / `call_passthrough`
+    /// / `call_stream`）共用它，避免某一路径漏掉判断。
+    ///
+    /// 上下文超限必须单独识别成 [`GatewayError::ContextLengthExceeded`]：
+    /// 它在 `error.rs` 的 `retryable()` 里返回 **true**，因为候选链里往往还有
+    /// 窗口更大的模型。漏掉这一步，400 会被当成不可重试的客户端错误，
+    /// 整条候选链在第一个候选上就死掉，用户看到的现象是「自动切换完全没生效」。
+    ///
+    /// 2026-10-05 实测：`call` 与 `call_stream` 两条路径都缺这段判断，只有
+    /// `call_passthrough` 有。DSH 走 `call_stream`，因此 263152 token 的请求
+    /// 打到上限 256000 的 free 模型后**整轮失败**，而候选链里明明还有
+    /// 922000 窗口的 gpt-6-astra 能接住。
+    fn classify_upstream_error(p: &Provider, model: &str, status: u16, text: &str) -> GatewayError {
+        if looks_like_context_length_error(text) {
+            let (required, available) = parse_context_length_error(text).unwrap_or((0, 0));
+            return GatewayError::ContextLengthExceeded {
+                required,
+                available,
+            };
+        }
+        GatewayError::Upstream {
+            provider: p.name.clone(),
+            model: model.to_string(),
+            status,
+            body: truncate(text, 800),
+        }
+    }
+
     /// 在协议整流之后应用模型级覆盖：先覆盖采样参数，再合并额外请求体。
     /// 额外请求体在保存期已校验为对象且不含受保护键，这里的合并是浅合并。
     fn apply_overrides(body: &mut serde_json::Value, overrides: Option<&ModelOverrides>) {
@@ -224,12 +252,12 @@ impl UpstreamClient {
         let text = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
-            return Err(GatewayError::Upstream {
-                provider: p.name.clone(),
-                model: model.into(),
-                status: status.as_u16(),
-                body: truncate(&text, 800),
-            });
+            return Err(Self::classify_upstream_error(
+                p,
+                model,
+                status.as_u16(),
+                &text,
+            ));
         }
 
         // HTTP 200 并不等于上游真的成功：反向代理、WAF 和过载节点常会返回
@@ -319,29 +347,12 @@ impl UpstreamClient {
 
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            // 上下文超限要单独识别成 ContextLengthExceeded 并标记**可重试**。
-            //
-            // 实测（2026-10-05）：请求 258091 tokens 打到一个上限 256000 的模型，
-            // 上游回400 INVALID_REQUEST + "maximum context length is 256000
-            // tokens. However, you requested about 258091 tokens"。原来一律
-            // 当成不可重试的 4xx，于是请求**没有落到任何供应商**就直接失败，
-            // 而候选链里明明还有窗口更大的模型。
-            //
-            // 判据用「错误体里是否在讲上下文超限」，而不是状态码：各家上游
-            // 对这件事的 HTTP 码不统一（400/413/422 都见过），按码判会漏。
-            if looks_like_context_length_error(&text) {
-                let (required, available) = parse_context_length_error(&text).unwrap_or((0, 0));
-                return Err(GatewayError::ContextLengthExceeded {
-                    required,
-                    available,
-                });
-            }
-            return Err(GatewayError::Upstream {
-                provider: p.name.clone(),
-                model: model.into(),
-                status: status.as_u16(),
-                body: truncate(&text, 800),
-            });
+            return Err(Self::classify_upstream_error(
+                p,
+                model,
+                status.as_u16(),
+                &text,
+            ));
         }
 
         if expect_json {
@@ -402,12 +413,7 @@ impl UpstreamClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::Upstream {
-                provider: p.name.clone(),
-                model: model.into(),
-                status,
-                body: truncate(&text, 800),
-            });
+            return Err(Self::classify_upstream_error(p, model, status, &text));
         }
 
         let dialect = p.dialect;
