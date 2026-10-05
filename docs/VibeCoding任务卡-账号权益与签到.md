@@ -274,7 +274,55 @@ agentrouter 是 L2' 的典型：**端点有，但凭据是账号密码**——�
    （当前 `qoder status` = **Not logged in**，所以现在连 `/usage` 都不可用）；
 2. 抓包必须发生在**领取窗口内**（每天 10:00 至次日 09:59，UTC+8）且**当天还没领**，
    否则抓不到那次请求；
-3. 抓包方式先拍板（见 §七 裁决点 7），因为它决定要不要动系统级设置。
+3. 抓包方式先拍板（见 §七 裁决点 7）——**已定：甲**。
+
+#### C6 前置取证：静态扫客户端（2026-10-06 00:2x，不用登录、不用抓包）
+
+甲方案的可行性已验：`D:\Program Files\Qoder\Qoder.exe` **9/9 Electron 标志全中**
+（`app.asar` / `app.asar.unpacked` / `icudtl.dat` / `snapshot_blob.bin` /
+`v8_context_snapshot.bin` / `chrome_100_percent.pak` / `ffmpeg.dll` /
+`LICENSES.chromium.html` / `resources\elevate.exe`），版本 **0.4.3.0**，
+且 `resources\app.asar.unpacked\node_modules\@qoder-ai\qoder-agent-sdk` 在包里。
+当前**没有 Qoder 进程在运行**，现在时间在窗口内（窗口 10-05 10:00 → 10-06 10:00）。
+
+直接扫 `app.asar`（134.8 MB）拿到 **170 条接口路径**，其中与额度有关的全部是**只读**的：
+
+```text
+/sash/api/v1/ai-conversations/credits-summary      ← 额度汇总
+/sash/api/v1/ai-conversations/credits-heatmap      ← 用量热力图
+/sash/api/v2/me/usage
+/api/v2/quota/usage                                ← 配额用量（同处出现 usageLogLink / purchaseLink）
+/api/v2/user/plan                                  ← 套餐
+/api/v1/me/partner_plans  /api/v1/partner_plan/authorize | revoke
+```
+
+**没有扫到任何 claim / checkin / reward / bonus / gift 形式的领取路径**
+（170 条全表逐条过，领取类关键词零命中）。这条证据**支持**与**不支持**什么，必须分清：
+
+- ✅ **支持**：Qoder 的额度可以用 REST 读——**C2（L1 权益可见）有路可走，且这条线索比抓包先到手**；
+- ❌ **不支持**任何关于"领取"的结论。原因是三种可能**尚未区分**：
+  1. 领取走的是**另一个 host / 服务**（不在 `/api/` 或 `/sash/api/` 前缀内）；
+  2. 路径是**运行时拼**出来的，字面量不在包里；
+  3. 领取入口是**内嵌 webview 打开的活动页**（官方文档写入口是 "Usage panel → gift icon"，
+     这类入口常常就是 webview 而不是原生请求）。
+- 顺带证伪一条：包里**没有**客户端指纹/签名模板的迹象，但也**不能**据此说没有——
+  签名逻辑通常在**主进程**（Node 侧），asar 里看到的是渲染层代码。
+
+#### 因此甲方案要带兜底（**关键风险，先说清**）
+
+Electron 里**渲染层**发的请求能在 CDP 的 Network 域看到，**主进程**（Node 侧 `net`/`fetch`）
+发的**看不到**。所以：
+
+```text
+首选：Qoder.exe --remote-debugging-port=<port>   → 连 CDP，看主窗口 / webview 各 target 的 Network
+兜底：Qoder.exe --log-net-log=<临时路径> --net-log-capture-mode=IncludeSensitive
+      ← Chromium netlog，主进程 + 渲染层全收，同样不需要证书、不需要改系统代理
+```
+
+若两者都被应用屏蔽（起不来调试端口、netlog 为空），才转 §七 的**乙**（系统代理抓包）。
+
+> **netlog 含 token/cookie 等敏感数据**：写到临时路径、用完即删，不进仓库、
+> 不贴进对话（`verify:plan` 会查疑似凭据）。
 
 **三种抓法（侵入性从低到高）**
 
@@ -321,7 +369,7 @@ agentrouter 是 L2' 的典型：**端点有，但凭据是账号密码**——�
 | 4 | 平台凭据从哪来 | 甲：用户在界面粘贴（存 `app_secrets`）｜乙：从本地客户端目录读取 | **甲**：与「不读第三方凭据文件」的硬不变量一致 |
 | 5 | agentrouter 的每日登录要不要自动化 | 甲：不代登录，只在到点时提醒 + 一键打开登录页（推荐）｜乙：网关持账号密码自动登录 | **甲**：长期保存第三方账号密码的风险远大于每天点一次 |
 | 6 | 先做哪个平台 | 甲：geeknow（端点存在，但需 access token 才能验）｜乙：先做 L1 权益可见 + 提醒（当前**没有任何平台可自动领取**） | **乙**：C1 做完的结论是"暂无平台够格做自动领取"，先把 L1 做完才是有产出的路径 |
-| 7 | C6 抓包用哪种方式 | 甲：不开证书（Electron 调试端口 / CDP，推荐）｜乙：系统代理抓包（要装根证书 + 改系统代理）｜丙：先只查公开 API | **甲**：不碰系统级设置就能拿到请求；乙留作甲失败时的后备 |
+| 7 | C6 抓包用哪种方式 | **已定：甲**（不开证书：Electron 调试端口 / CDP，netlog 兜底）｜乙：系统代理抓包（要装根证书 + 改系统代理）｜丙：先只查公开 API | 用户 2026-10-06 选定**甲**；乙留作甲被屏蔽时的后备 |
 
 ---
 
@@ -330,7 +378,8 @@ agentrouter 是 L2' 的典型：**端点有，但凭据是账号密码**——�
 | 卡 | 状态 | 备注 |
 |---|---|---|
 | C1 | **部分完成** | 9 个平台逐个核验：**geeknow 端点存在但功能开关关闭**（`checkin_enabled=false`）；agentrouter 有登录端点（要账号密码）；Qoder 有官方规则原文且 `/claim` 经双向取证不存在；commandcode 定位为账号型 Agent 产品；shitapi / zai / sensenova / maas / openrouter 未发现端点。**当前没有任何平台可自动领取** |
-| C2 | 未开始 | 已解除阻塞：Qoder `/usage` 面板字段（Plan / 到期 / Plan Credits / Add-on Credits）已核到官方文档 |
+| C2 | **部分取证完成**（代码未开始） | Qoder 额度读取有**实测路径**：客户端包里写死的 `/sash/api/v1/ai-conversations/credits-summary`、`/api/v2/quota/usage`、`/api/v2/user/plan`（见 C6 前置取证）；CLI 侧 `/usage` 面板字段已核到官方文档 |
+| C6 | **前置已完成，待抓包** | 甲方案可行性已验（Electron 9/9、版本 0.4.3.0、当前无进程在跑、现在在窗口内）；静态扫包得 170 条路径、**无领取端点**、得 3 种未区分可能；已定 CDP + netlog 兜底。**下一步阻塞在外部条件**：需用户登录桌面端，然后在窗口内点一次礼物图标 |
 | C3 | 未开始 | **暂无可做对象**——geeknow 开关关闭，其余平台无端点；等有平台开了再说 |
 | C4 | 未开始 | |
 | C5 | 未开始 | |
