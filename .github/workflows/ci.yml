@@ -1,0 +1,89 @@
+# ⚠️ 改这份文件前，先看 scripts/ci-local.ps1
+#
+# 本地同款脚本是 `scripts/ci-local.ps1`，步骤顺序与参数**必须与本文件一致**。
+# 目的：让 CI 不是一条没在本地跑过的脚本路径 —— 本地跑红过的门禁才可信。
+# 任何一侧改动都要同步另一侧，否则两边会悄悄漂移。
+#
+# 本批不放进 CI 的东西（每条都有实测理由，不是保守）：
+#   - `npm run tauri:build`：MSI 那步 Tauri 会自动下 WiX，39MB 被它的下载器
+#     判超时（同一 URL 直连正常）。见 CLAUDE.md「本机编译环境」。
+#   - `npm run verify:ui`：需要先起 dev server，且本机 Vite 只绑 IPv6。
+#     留到 A3 之后单独评估。
+#   - `cargo test -- --ignored`：真实上游烟测要凭据，runner 上没有。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支的新 push 直接取消旧运行，避免排队浪费。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (fmt / clippy / check / test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 缓存 cargo registry 与 target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets --jobs 1
+
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --jobs 1
+
+  frontend:
+    name: Frontend (build / manual / release)
+    runs-on: windows-latest
+    # Rust 红了就没必要再跑前端。
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: npm run build
+        run: npm run build
+
+      - name: npm run verify:manual
+        run: npm run verify:manual
+
+      - name: npm run verify:release
+        run: npm run verify:release
+
+      - name: npm run verify:plan
+        run: npm run verify:plan
