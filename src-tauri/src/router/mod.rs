@@ -220,17 +220,18 @@ impl Router {
         // 权重，退化为稳定的 Balanced 排序，仍保留健康和回退链路。
         // Smart 同理：总开关关着时退化为 Balanced，绝不留下「只换权重不分类」的
         // 半吊子状态。两条共用同一个降级口径。
-        let strategy = if matches!(configured_strategy, RoutingStrategy::Custom)
-            && !custom_rules_active
-        {
-            RoutingStrategy::Balanced
-        } else if matches!(configured_strategy, RoutingStrategy::Smart)
-            && !cfg.smart_routing.enabled
-        {
-            RoutingStrategy::Balanced
-        } else {
-            configured_strategy
-        };
+        let strategy =
+            // 两个「总开关关着就退化为 Balanced」的条件合并成一个分支。
+            // 拆开写会有两个分支返回同一个值（clippy identical_blocks 会报），
+            // 而且读起来容易让人以为两条降级路径有区别 —— 其实没有。
+            if (matches!(configured_strategy, RoutingStrategy::Custom) && !custom_rules_active)
+                || (matches!(configured_strategy, RoutingStrategy::Smart)
+                    && !cfg.smart_routing.enabled)
+            {
+                RoutingStrategy::Balanced
+            } else {
+                configured_strategy
+            };
 
         // 4) 先按现有健康、额度、能力、延迟权重打分。显式 Boost 作为额外
         // 排序层级：同一层级仍完全沿用原有分数，避免规则吞掉正常的权重排序。

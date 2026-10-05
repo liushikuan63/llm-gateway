@@ -932,8 +932,10 @@ fn auth_headers(dialect: Dialect, api_key: &str) -> Result<HeaderMap, String> {
     }
 
     let header_value = match dialect {
-        Dialect::OpenAI | Dialect::Ollama | Dialect::Responses => HeaderValue::from_str(&format!("Bearer {api_key}"))
-            .map_err(|_| "API Key 格式无效".to_string())?,
+        Dialect::OpenAI | Dialect::Ollama | Dialect::Responses => {
+            HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|_| "API Key 格式无效".to_string())?
+        }
         Dialect::Anthropic | Dialect::Gemini => {
             HeaderValue::from_str(api_key).map_err(|_| "API Key 格式无效".to_string())?
         }
@@ -1026,8 +1028,14 @@ mod dialect_path_tests {
     fn responses_路径归一化只脱一段() {
         // Responses 的路径是单段（/responses），不是 OpenAI 的两段
         // （/chat/completions）。套错规则会让去重把不同模型判成同一个。
-        assert_eq!(normalized_path_len(Dialect::Responses, &["v1", "responses"]), 1);
-        assert_eq!(normalized_path_len(Dialect::Responses, &["v1", "models"]), 1);
+        assert_eq!(
+            normalized_path_len(Dialect::Responses, &["v1", "responses"]),
+            1
+        );
+        assert_eq!(
+            normalized_path_len(Dialect::Responses, &["v1", "models"]),
+            1
+        );
         // 未知尾段不动 —— 静默截断比不匹配更糟
         assert_eq!(normalized_path_len(Dialect::Responses, &["v1", "weird"]), 2);
     }
@@ -1035,9 +1043,15 @@ mod dialect_path_tests {
     #[test]
     fn openai_两段路径规则不得因新增方言而改变() {
         // 模式隔离：给 Dialect 加变体时，最容易误伤的���旧方言分支。
-        assert_eq!(normalized_path_len(Dialect::OpenAI, &["v1", "chat", "completions"]), 1);
+        assert_eq!(
+            normalized_path_len(Dialect::OpenAI, &["v1", "chat", "completions"]),
+            1
+        );
         assert_eq!(normalized_path_len(Dialect::OpenAI, &["v1", "models"]), 1);
-        assert_eq!(normalized_path_len(Dialect::Anthropic, &["v1", "messages"]), 1);
+        assert_eq!(
+            normalized_path_len(Dialect::Anthropic, &["v1", "messages"]),
+            1
+        );
         assert_eq!(normalized_path_len(Dialect::Ollama, &["api", "chat"]), 0);
     }
 }

@@ -37,7 +37,9 @@ pub async fn probe_all(
     endpoints: &[LocalEndpoint],
     timeout_ms: u64,
 ) -> Vec<ProbeOutcome> {
-    let futures = endpoints.iter().map(|endpoint| probe_one(http, endpoint, timeout_ms));
+    let futures = endpoints
+        .iter()
+        .map(|endpoint| probe_one(http, endpoint, timeout_ms));
     futures_util::future::join_all(futures).await
 }
 

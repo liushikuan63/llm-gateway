@@ -4,9 +4,11 @@
 //! 标错能力的后果是把图片发给看不懂的模型（静默丢内容），
 //! 比明确报「没有支持该模态的模型」严重得多。
 
-use llm_gateway_lib::local_models::{self, ollama_models_from_tags, openai_models_from_list, to_model_ref};
-use llm_gateway_lib::domain::{Dialect, ModelType, Provider};
 use llm_gateway_lib::db::{self, repo};
+use llm_gateway_lib::domain::{Dialect, ModelType, Provider};
+use llm_gateway_lib::local_models::{
+    self, ollama_models_from_tags, openai_models_from_list, to_model_ref,
+};
 
 /// 本机 Ollama 0.35.1 的真实响应形状（2026-10-04 实测）。
 fn real_tags() -> serde_json::Value {
@@ -105,13 +107,9 @@ fn capabilities_缺失时所有能力位都是_false() {
     assert!(!m.supports_vision);
     assert!(!m.supports_audio);
     assert!(!m.supports_thinking);
-    assert!(
-        !m.supports_stream,
-        "连 completion 都没有时不能假定支持流式"
-    );
+    assert!(!m.supports_stream, "连 completion 都没有时不能假定支持流式");
     assert_eq!(
-        m.context_window,
-        32768,
+        m.context_window, 32768,
         "缺 context_length 时用默认值，界面应标「待确认」"
     );
     assert!(m.meta.capabilities.is_empty());
@@ -185,7 +183,11 @@ fn 超大上下文长度不会溢出_i32() {
         "models": [{ "name": "huge", "details": { "context_length": 9_000_000_000i64 } }]
     });
     let models = ollama_models_from_tags(&json);
-    assert_eq!(models[0].context_window, i32::MAX, "应钳到 i32::MAX 而不是回绕");
+    assert_eq!(
+        models[0].context_window,
+        i32::MAX,
+        "应钳到 i32::MAX 而不是回绕"
+    );
 }
 
 #[test]
@@ -210,7 +212,8 @@ fn openai_兼容目录一律不猜能力() {
 
 #[test]
 fn openai_兼容目录忽略空_id() {
-    let json = serde_json::json!({ "data": [{ "id": "" }, { "object": "model" }, { "id": "real" }] });
+    let json =
+        serde_json::json!({ "data": [{ "id": "" }, { "object": "model" }, { "id": "real" }] });
     let models = openai_models_from_list(&json);
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].upstream, "real");
@@ -236,19 +239,40 @@ fn 目录项转成模型记录时带上全部能力位() {
 
 #[test]
 fn same_host_应识别同一台机器的不同路径() {
-    assert!(local_models::same_host("http://127.0.0.1:11434", "http://127.0.0.1:11434/v1"));
-    assert!(local_models::same_host("http://127.0.0.1:11434/", "http://127.0.0.1:11434/v1/api"));
+    assert!(local_models::same_host(
+        "http://127.0.0.1:11434",
+        "http://127.0.0.1:11434/v1"
+    ));
+    assert!(local_models::same_host(
+        "http://127.0.0.1:11434/",
+        "http://127.0.0.1:11434/v1/api"
+    ));
     // 主机名大小写与结尾斜杠不该影响判定
-    assert!(local_models::same_host("http://LocalHost:11434", "http://localhost:11434/v1"));
+    assert!(local_models::same_host(
+        "http://LocalHost:11434",
+        "http://localhost:11434/v1"
+    ));
     // IPv6 字面量
-    assert!(local_models::same_host("http://[::1]:8000", "http://[::1]:8000/v1"));
+    assert!(local_models::same_host(
+        "http://[::1]:8000",
+        "http://[::1]:8000/v1"
+    ));
 }
 
 #[test]
 fn same_host_不同机器必须为假_对照组() {
-    assert!(!local_models::same_host("http://127.0.0.1:11434", "http://127.0.0.1:1234"));
-    assert!(!local_models::same_host("http://127.0.0.1:11434", "http://192.168.1.10:11434"));
-    assert!(!local_models::same_host("https://api.openai.com/v1", "http://api.openai.com:443/v1"));
+    assert!(!local_models::same_host(
+        "http://127.0.0.1:11434",
+        "http://127.0.0.1:1234"
+    ));
+    assert!(!local_models::same_host(
+        "http://127.0.0.1:11434",
+        "http://192.168.1.10:11434"
+    ));
+    assert!(!local_models::same_host(
+        "https://api.openai.com/v1",
+        "http://api.openai.com:443/v1"
+    ));
     // 解析不出来时宁可不判同，绝不误删供应商
     assert!(!local_models::same_host("", ""));
     assert!(!local_models::same_host("not a url", "also not a url"));
@@ -291,7 +315,11 @@ async fn 端点地址变更后应清掉自动登记的旧供应商() {
         })
         .map(|p| p.id.clone())
         .collect();
-    assert_eq!(stale_ids, vec!["lp-stale".to_string()], "僵尸供应商应被识别出来");
+    assert_eq!(
+        stale_ids,
+        vec!["lp-stale".to_string()],
+        "僵尸供应商应被识别出来"
+    );
     for id in &stale_ids {
         repo::delete_provider(db.pool(), id).await.unwrap();
     }
@@ -339,6 +367,9 @@ async fn 用户手工建的供应商绝不被清理_对照组() {
         })
         .map(|p| p.id)
         .collect();
-    assert!(kept.is_empty(), "手工建的供应商不得被判定为僵尸，实际判定为 {kept:?}");
+    assert!(
+        kept.is_empty(),
+        "手工建的供应商不得被判定为僵尸，实际判定为 {kept:?}"
+    );
     assert_eq!(repo::list_providers(db.pool()).await.unwrap().len(), 1);
 }

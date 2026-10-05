@@ -27,8 +27,8 @@ pub mod executor;
 pub mod parse;
 
 pub use backend::{
-    BraveBackend, DuckDuckGoBackend, SearchBackend, SearchError, SearchQuery, SearchResult,
-    SearXngBackend, TavilyBackend,
+    BraveBackend, DuckDuckGoBackend, SearXngBackend, SearchBackend, SearchError, SearchQuery,
+    SearchResult, TavilyBackend,
 };
 pub use executor::{as_message, execute, prefetch, test_backend, SearchOutcome};
 pub use parse::{decode, duckduckgo_lite, render};
@@ -65,7 +65,8 @@ pub fn query_from(text: &str, max_chars: usize) -> String {
 /// 配置本身不需要它 —— serde 会自己处理。
 pub fn backend_serde_value(kind: &SearchBackendKind) -> String {
     // SearchBackendKind 的序列化就是那个 snake_case 字符串（枚举无自定义 Serialize）。
-    serde_json::to_value(kind.clone())
+    // 枚举是 Copy 的，解引用比 clone 便宜。
+    serde_json::to_value(*kind)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default()
@@ -144,12 +145,7 @@ pub fn validate(cfg: &SearchConfig) -> anyhow::Result<()> {
         }
     }
     if matches!(cfg.backend, SearchBackendKind::SearXng)
-        && cfg
-            .searxng_url
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .is_empty()
+        && cfg.searxng_url.as_deref().unwrap_or("").trim().is_empty()
     {
         anyhow::bail!("选择 SearXNG 后端时必须填写实例地址");
     }

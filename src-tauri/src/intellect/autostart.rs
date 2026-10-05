@@ -143,9 +143,7 @@ pub async fn ensure_running(cfg: &AutoStartConfig, base_url: &str) -> SpawnOutco
         let mut guard = CHILD.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(child) = guard.as_mut() {
             if matches!(child.try_wait(), Ok(None)) {
-                return SpawnOutcome::Started {
-                    pid: child.id(),
-                };
+                return SpawnOutcome::Started { pid: child.id() };
             }
             // 已退出，句柄作废。
             *guard = None;

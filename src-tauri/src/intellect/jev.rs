@@ -267,11 +267,8 @@ fn parse_result(text: &str) -> Result<JevResult, JevError> {
     for (name, raw) in envelope.answers {
         // 单题解析失败就整题丢掉由调用方兜底；但类型不认识必须报错，
         // 否则会静默把「noul」当成「choice」读出一个错的结论。
-        match parse_answer(&raw)? {
-            Some(answer) => {
-                answers.insert(name, answer);
-            }
-            None => {}
+        if let Some(answer) = parse_answer(&raw)? {
+            answers.insert(name, answer);
         }
     }
     if answers.is_empty() {
@@ -390,8 +387,8 @@ pub fn preview(result: &JevResult, min_confidence: f32, min_margin: f32) -> Vec<
             };
             let confidence = answer.confidence();
             let margin = answer.margin();
-            let adopted = confidence >= min_confidence
-                && margin.map(|m| m >= min_margin).unwrap_or(true);
+            let adopted =
+                confidence >= min_confidence && margin.map(|m| m >= min_margin).unwrap_or(true);
             JevPreviewRow {
                 name: name.clone(),
                 kind: kind.to_owned(),

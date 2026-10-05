@@ -37,7 +37,8 @@ pub const MINIMIZED_FLAG: &str = "--minimized";
 /// 当前进程的命令行。抽成函数是为了测试能替换掉它 ——
 /// 真实测试环境里 exe 路径因机器而异，写死断言必然在别的机器上失败。
 pub fn current_command() -> String {
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("llm-gateway.exe"));
+    let exe =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("llm-gateway.exe"));
     let quoted = quote_if_needed(&exe);
     format!("{quoted} {MINIMIZED_FLAG}")
 }
@@ -74,15 +75,7 @@ mod imp {
         let mut key: HKEY = std::ptr::null_mut();
         let path = wide(RUN_KEY_PATH);
         // SAFETY: `path` 与 `key` 都是有效的本地值；`RegOpenKeyExW` 只写 `key`。
-        let code = unsafe {
-            RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                path.as_ptr(),
-                0,
-                access,
-                &mut key,
-            )
-        };
+        let code = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut key) };
         match code {
             ERROR_SUCCESS => Ok(key),
             ERROR_FILE_NOT_FOUND => {
@@ -271,7 +264,10 @@ mod tests {
     #[test]
     fn 含空格的路径必须加引号() {
         let p = Path::new(r"C:\Program Files\LLM Gateway\llm-gateway.exe");
-        assert_eq!(quote_if_needed(p), r#""C:\Program Files\LLM Gateway\llm-gateway.exe""#);
+        assert_eq!(
+            quote_if_needed(p),
+            r#""C:\Program Files\LLM Gateway\llm-gateway.exe""#
+        );
         // 不含空格的不能加 —— 多余引号在某些 shell 下会被当成路径的一部分
         let q = Path::new(r"C:\tools\gw.exe");
         assert_eq!(quote_if_needed(q), r"C:\tools\gw.exe");
@@ -295,14 +291,22 @@ mod tests {
 
         enable(None).expect("开启自启");
         let now = status().expect("开启后读状态").expect("应已开启");
-        assert_eq!(now, current_command(), "注册表里的命令行要与 current_command 一致");
+        assert_eq!(
+            now,
+            current_command(),
+            "注册表里的命令行要与 current_command 一致"
+        );
 
         disable().expect("恢复：关闭");
         // 恢复原状：原来开着就按原命令写回。
         if let Some(cmd) = original.clone() {
             enable(Some(cmd)).expect("恢复原命令");
         }
-        assert_eq!(status().expect("恢复后读状态"), original, "必须恢复到测试前的状态");
+        assert_eq!(
+            status().expect("恢复后读状态"),
+            original,
+            "必须恢复到测试前的状态"
+        );
     }
 
     #[test]
@@ -314,9 +318,15 @@ mod tests {
         disable().ok();
         enable(Some(r"C:\a b\gw.exe --minimized".into())).expect("写测试值");
         let got = status().expect("读").expect("应存在");
-        assert_eq!(got, r"C:\a b\gw.exe --minimized", "读回值必须与写入值逐字相同");
+        assert_eq!(
+            got, r"C:\a b\gw.exe --minimized",
+            "读回值必须与写入值逐字相同"
+        );
         assert!(!got.ends_with('\0'), "读回值末尾不得有 NUL");
-        assert_eq!(got.chars().count(), r"C:\a b\gw.exe --minimized".chars().count());
+        assert_eq!(
+            got.chars().count(),
+            r"C:\a b\gw.exe --minimized".chars().count()
+        );
         disable().ok();
     }
 

@@ -292,7 +292,13 @@ pub async fn test_provider(
     let res = state
         .gateway
         .upstream
-        .call(&p, &req, &model, std::time::Duration::from_secs(30), &defaults)
+        .call(
+            &p,
+            &req,
+            &model,
+            std::time::Duration::from_secs(30),
+            &defaults,
+        )
         .await;
     let ms = started.elapsed().as_millis() as u64;
 
@@ -2995,9 +3001,10 @@ pub async fn register_local_model(
     }
     let (http, endpoint, probe_timeout, providers, now) = {
         let cfg = state.config.read().clone();
-        let endpoint = crate::local_models::find_endpoint(&cfg.local_models.endpoints, &input.endpoint_id)
-            .cloned()
-            .ok_or_else(|| format!("找不到本地端点 {}", input.endpoint_id))?;
+        let endpoint =
+            crate::local_models::find_endpoint(&cfg.local_models.endpoints, &input.endpoint_id)
+                .cloned()
+                .ok_or_else(|| format!("找不到本地端点 {}", input.endpoint_id))?;
         (
             crate::local_models::runtime::default_client(),
             endpoint,
@@ -3034,7 +3041,10 @@ pub async fn register_local_model(
     // 同一端点的模型共用一个 Provider；重复登记并入它。
     let mut provider = providers
         .iter()
-        .find(|p| p.base_url == endpoint.base_url && p.dialect == crate::local_models::dialect_of(endpoint.kind))
+        .find(|p| {
+            p.base_url == endpoint.base_url
+                && p.dialect == crate::local_models::dialect_of(endpoint.kind)
+        })
         .cloned();
     if provider.is_none() {
         provider = Some(Provider {
@@ -3100,7 +3110,9 @@ pub async fn register_local_model(
         if provider.models.iter().any(|m| m.upstream == info.upstream) {
             continue;
         }
-        provider.models.push(crate::local_models::to_model_ref(info));
+        provider
+            .models
+            .push(crate::local_models::to_model_ref(info));
         added += 1;
     }
     let target_ref = crate::local_models::to_model_ref(&target);
@@ -3154,9 +3166,15 @@ pub async fn pull_local_model(
     }
     let http = crate::local_models::runtime::default_client();
     let progress_app = app.clone();
-    crate::local_models::pull_ollama_model(&http, &endpoint.base_url, &model, 600_000, move |event| {
-        let _ = progress_app.emit("local-model://pull-progress", &event);
-    })
+    crate::local_models::pull_ollama_model(
+        &http,
+        &endpoint.base_url,
+        &model,
+        600_000,
+        move |event| {
+            let _ = progress_app.emit("local-model://pull-progress", &event);
+        },
+    )
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -3179,7 +3197,8 @@ pub async fn get_search_settings(
     state: State<'_, AppState>,
 ) -> Result<crate::search::SearchSettingsView, String> {
     let cfg = state.config.read().clone();
-    let api_key_masked = match repo::get_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY).await {
+    let api_key_masked = match repo::get_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY).await
+    {
         Ok(Some(encoded)) => crypto::decrypt(&encoded)
             .ok()
             .and_then(|key| crate::search::mask_key(&key)),
@@ -3235,7 +3254,12 @@ pub async fn update_search_settings(
             .await
             .map_err(|e| e.to_string())?;
     }
-    if let Some(key) = input.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+    if let Some(key) = input
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
         let encoded = crypto::encrypt(key).map_err(|e| e.to_string())?;
         repo::set_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY, &encoded)
             .await
@@ -3382,12 +3406,37 @@ pub async fn calibrate_default_samples(
 fn default_calibration_samples() -> Vec<crate::intellect::LabeledSample> {
     use crate::intellect::calibrate::LabeledSample as S;
     vec![
-        S { text: "把变量名 x 改成 userName".into(), expected: crate::intellect::TaskClass::Simple, has_image: false, has_tools: false },
-        S { text: "写一个快速排序算法".into(), expected: crate::intellect::TaskClass::Simple, has_image: false, has_tools: false },
-        S { text: "帮我设计一个分布式限流器，需要考虑故障转移和一致性".into(), expected: crate::intellect::TaskClass::Reasoning, has_image: false, has_tools: false },
+        S {
+            text: "把变量名 x 改成 userName".into(),
+            expected: crate::intellect::TaskClass::Simple,
+            has_image: false,
+            has_tools: false,
+        },
+        S {
+            text: "写一个快速排序算法".into(),
+            expected: crate::intellect::TaskClass::Simple,
+            has_image: false,
+            has_tools: false,
+        },
+        S {
+            text: "帮我设计一个分布式限流器，需要考虑故障转移和一致性".into(),
+            expected: crate::intellect::TaskClass::Reasoning,
+            has_image: false,
+            has_tools: false,
+        },
         // 已知错判样本：edgeJev 给 0.747 置信度判成 simple，而正确答案是 reasoning。
-        S { text: "线上服务 500 白屏，帮我定位根因".into(), expected: crate::intellect::TaskClass::Reasoning, has_image: false, has_tools: false },
-        S { text: "你好".into(), expected: crate::intellect::TaskClass::Simple, has_image: false, has_tools: false },
+        S {
+            text: "线上服务 500 白屏，帮我定位根因".into(),
+            expected: crate::intellect::TaskClass::Reasoning,
+            has_image: false,
+            has_tools: false,
+        },
+        S {
+            text: "你好".into(),
+            expected: crate::intellect::TaskClass::Simple,
+            has_image: false,
+            has_tools: false,
+        },
     ]
 }
 
@@ -3537,7 +3586,9 @@ pub struct AutostartView {
 pub fn get_autostart_state() -> AutostartView {
     // 读失败时返回未开启而不是报错：界面上的开关不该因为一个只读操作
     // 而变成红色错误条，用户会以为出事了。
-    AutostartView { command: crate::autostart::status().unwrap_or(None) }
+    AutostartView {
+        command: crate::autostart::status().unwrap_or(None),
+    }
 }
 
 #[tauri::command]
@@ -3547,5 +3598,7 @@ pub fn set_autostart(enabled: bool) -> Result<AutostartView, String> {
     } else {
         crate::autostart::disable()?;
     }
-    Ok(AutostartView { command: crate::autostart::status().unwrap_or(None) })
+    Ok(AutostartView {
+        command: crate::autostart::status().unwrap_or(None),
+    })
 }

@@ -28,12 +28,12 @@ pub mod classify;
 pub mod jev;
 pub mod refine;
 
+pub use crate::router::score::TaskClass;
 pub use autostart::SpawnOutcome;
 pub use calibrate::{build_report, CalibrationReport, LabeledSample, SampleOutcome};
 pub use classify::{
-    classify, classify_by_heuristic, classify_by_rules, ClassifyInput, ClassifierSource,
+    classify, classify_by_heuristic, classify_by_rules, ClassifierSource, ClassifyInput,
     TaskIntent, REASONING_THRESHOLD,
 };
 pub use jev::{JevAnswer, JevClient, JevError};
 pub use refine::{RefineOutcome, RefineTarget};
-pub use crate::router::score::TaskClass;

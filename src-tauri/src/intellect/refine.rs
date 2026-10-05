@@ -86,10 +86,7 @@ pub fn accept(raw: &str, original: &str, cfg: &PromptRefineConfig) -> Result<Str
     }
     let chars = stripped.chars().count();
     if chars > cfg.max_chars {
-        return Err(format!(
-            "改写结果 {chars} 字，超过上限 {}",
-            cfg.max_chars
-        ));
+        return Err(format!("改写结果 {chars} 字，超过上限 {}", cfg.max_chars));
     }
     let original_chars = original.chars().count();
     // 明显缩到没意义也算失败：一个 200 字的请求被压成 8 个字，
@@ -149,7 +146,10 @@ pub fn pick_target(
     cfg: &PromptRefineConfig,
     candidates: &[crate::router::score::Candidate],
 ) -> Option<RefineTarget> {
-    let want_provider = cfg.provider_id.as_deref().filter(|id| !id.trim().is_empty());
+    let want_provider = cfg
+        .provider_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty());
     let pool: Vec<&crate::router::score::Candidate> = candidates
         .iter()
         .filter(|c| match want_provider {
@@ -165,7 +165,7 @@ pub fn pick_target(
     let picked = pool
         .iter()
         .copied()
-        .find(|c| c.model.supports_thinking == false)
+        .find(|c| !c.model.supports_thinking)
         .or_else(|| pool.first().copied())?;
     let model = cfg
         .model
@@ -216,7 +216,11 @@ pub async fn refine(
                 {"role": "user", "content": format!("{}\n\n用户请求：\n{original}", instruction())},
             ]),
             // Anthropic 的文本在 content[0].text
-            &[PathStep::Key("content"), PathStep::Index(0), PathStep::Key("text")],
+            &[
+                PathStep::Key("content"),
+                PathStep::Index(0),
+                PathStep::Key("text"),
+            ],
         ),
         _ => (
             serde_json::json!([

@@ -36,7 +36,10 @@ async fn 真实_ollama_目录能被解析且能力位与上游逐条一致() {
     let models = match local_models::fetch_models(&client, &endpoint, 5000).await {
         Ok(models) => models,
         Err(error) => {
-            eprintln!("跳过：本机 Ollama（{}）不可用 —— {error}", endpoint.base_url);
+            eprintln!(
+                "跳过：本机 Ollama（{}）不可用 —— {error}",
+                endpoint.base_url
+            );
             return;
         }
     };
@@ -50,7 +53,10 @@ async fn 真实_ollama_目录能被解析且能力位与上游逐条一致() {
             !model.upstream.trim().is_empty(),
             "条目必须有名字：{model:?}"
         );
-        assert!(model.context_window > 0, "上下文窗口为 0 说明解析错了：{model:?}");
+        assert!(
+            model.context_window > 0,
+            "上下文窗口为 0 说明解析错了：{model:?}"
+        );
         assert!(
             model.meta.disk_bytes.unwrap_or(0) >= 0,
             "磁盘占用不该是负数：{model:?}"
@@ -173,7 +179,7 @@ async fn 不可达端点的探测结果如实报错而不是伪装成功() {
 /* edgeJev 真实接入                                                    */
 
 use llm_gateway_lib::config::JevConfig;
-use llm_gateway_lib::intellect::{classify, ClassifyInput, ClassifierSource, JevClient};
+use llm_gateway_lib::intellect::{classify, ClassifierSource, ClassifyInput, JevClient};
 use llm_gateway_lib::media::Media;
 
 #[tokio::test]
@@ -251,9 +257,15 @@ async fn edgejev_健康检查能返回结构化结果() {
                 "/health 返回 HTTP {}",
                 response.status()
             );
-            eprintln!("edgeJev /health: {}", response.text().await.unwrap_or_default());
+            eprintln!(
+                "edgeJev /health: {}",
+                response.text().await.unwrap_or_default()
+            );
         }
-        Err(error) => eprintln!("跳过：本机 edgeJev（{}）未运行 —— {error}", jev_cfg.base_url),
+        Err(error) => eprintln!(
+            "跳过：本机 edgeJev（{}）未运行 —— {error}",
+            jev_cfg.base_url
+        ),
     }
 }
 
@@ -278,7 +290,10 @@ async fn edgejev_对一组样本的原始判定可被观察() {
     let samples = [
         ("改变量名", "把变量名 x 改成 userName"),
         ("写快排", "写一个快速排序算法"),
-        ("架构设计", "帮我设计一个分布式限流器，需要考虑故障转移和一致性"),
+        (
+            "架构设计",
+            "帮我设计一个分布式限流器，需要考虑故障转移和一致性",
+        ),
         ("线上排查", "线上服务 500 白屏，帮我定位根因"),
         ("打招呼", "你好"),
     ];

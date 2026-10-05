@@ -60,7 +60,7 @@ pub fn decode_entities(input: &str) -> String {
             // 数字实体 `&#183;` / `&#0183;` / `&#xB7;`。
             // 必应摘要在日期后固定放一个 `&ensp;&#0183;` 当分隔符，
             // 不解的话这串字符会原样进注入上下文、进而进模型的眼睛。
-            if let Some((ch, len)) = numeric_entity(&input[i..]) { 
+            if let Some((ch, len)) = numeric_entity(&input[i..]) {
                 out.push(ch);
                 i += len;
                 continue;

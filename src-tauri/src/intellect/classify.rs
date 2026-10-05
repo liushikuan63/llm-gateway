@@ -166,12 +166,14 @@ pub fn classify_by_heuristic(input: &ClassifyInput) -> TaskIntent {
         || trimmed.contains("error TS")
         || trimmed.contains("Traceback")
         || trimmed.contains("Exception")
-        || trimmed.split_whitespace().any(|w| w.contains(".rs")
-            || w.contains(".ts")
-            || w.contains(".py")
-            || w.contains(".java")
-            || w.contains(".json")
-            || w.contains(".sql"));
+        || trimmed.split_whitespace().any(|w| {
+            w.contains(".rs")
+                || w.contains(".ts")
+                || w.contains(".py")
+                || w.contains(".java")
+                || w.contains(".json")
+                || w.contains(".sql")
+        });
     if looks_like_code {
         complexity += 15;
     }
@@ -239,32 +241,132 @@ pub fn classify_by_heuristic(input: &ClassifyInput) -> TaskIntent {
 /// 不满足就别加——关键词表越宽，误判越多，而误判的代价是把复杂任务派给不思考的模型。
 const REASONING_KEYWORDS: &[&str] = &[
     // 中文
-    "设计", "架构", "权衡", "取舍", "证明", "推导", "为什么", "原因", "根因", "重构", "优化方案",
-    "算法", "复杂度", "一致性", "分布式", "并发", "事务", "迁移", "方案", "步骤", "规划", "评估",
-    "对比", "比较", "排查", "定位", "解释一下", "讲清楚",
+    "设计",
+    "架构",
+    "权衡",
+    "取舍",
+    "证明",
+    "推导",
+    "为什么",
+    "原因",
+    "根因",
+    "重构",
+    "优化方案",
+    "算法",
+    "复杂度",
+    "一致性",
+    "分布式",
+    "并发",
+    "事务",
+    "迁移",
+    "方案",
+    "步骤",
+    "规划",
+    "评估",
+    "对比",
+    "比较",
+    "排查",
+    "定位",
+    "解释一下",
+    "讲清楚",
     // 英文：设计 / 推导 / 排错
-    "design", "architect", "architecture", "derive", "why", "trade-off", "tradeoff", "trade off",
-    "refactor", "redesign", "strategy", "algorithm", "complexity", "consistency", "distributed",
-    "concurrency", "concurrent", "transaction", "migration", "root cause", "debug", "troubleshoot",
-    "diagnose", "why does", "why is", "why are", "explain how", "explain why", "compare",
-    "evaluate", "plan for", "step by step", "step-by-step", "best practice", "tradeoffs",
+    "design",
+    "architect",
+    "architecture",
+    "derive",
+    "why",
+    "trade-off",
+    "tradeoff",
+    "trade off",
+    "refactor",
+    "redesign",
+    "strategy",
+    "algorithm",
+    "complexity",
+    "consistency",
+    "distributed",
+    "concurrency",
+    "concurrent",
+    "transaction",
+    "migration",
+    "root cause",
+    "debug",
+    "troubleshoot",
+    "diagnose",
+    "why does",
+    "why is",
+    "why are",
+    "explain how",
+    "explain why",
+    "compare",
+    "evaluate",
+    "plan for",
+    "step by step",
+    "step-by-step",
+    "best practice",
+    "tradeoffs",
     // 英文：验收 / 方案
-    "prove", "proof", "correctness", "scalability", "performance issue", "bottleneck",
+    "prove",
+    "proof",
+    "correctness",
+    "scalability",
+    "performance issue",
+    "bottleneck",
 ];
 
 /// 需要联网的信号词。同样中英双语。
 const WEB_KEYWORDS: &[&str] = &[
     // 中文
-    "最新", "新闻", "资讯", "现在", "目前", "今天", "近期", "版本", "更新", "发布", "股价", "汇率",
-    "天气", "查一下", "搜一下", "联网", "官方文档", "最新版",
+    "最新",
+    "新闻",
+    "资讯",
+    "现在",
+    "目前",
+    "今天",
+    "近期",
+    "版本",
+    "更新",
+    "发布",
+    "股价",
+    "汇率",
+    "天气",
+    "查一下",
+    "搜一下",
+    "联网",
+    "官方文档",
+    "最新版",
     // 「搜索一下 / 搜一搜 / 查一查」等说法不带上面的词根，实测
     // 「搜索一下 Rust 1.99 有什么新特性」曾是 needs_web=false —— 搜索没被触发，
     // 界面上看不出任何异常，只是默默少了一段上下文。
-    "搜索", "检索", "查找", "搜一搜", "查一查", "百度", "谷歌", "必应",
+    "搜索",
+    "检索",
+    "查找",
+    "搜一搜",
+    "查一查",
+    "百度",
+    "谷歌",
+    "必应",
     // 英文
-    "search", "look up", "look for", "latest", "current", "today", "news", "release",
-    "released", "version", "update", "changelog", "price", "stock", "weather", "forecast",
-    "docs", "documentation", "official", "up to date",
+    "search",
+    "look up",
+    "look for",
+    "latest",
+    "current",
+    "today",
+    "news",
+    "release",
+    "released",
+    "version",
+    "update",
+    "changelog",
+    "price",
+    "stock",
+    "weather",
+    "forecast",
+    "docs",
+    "documentation",
+    "official",
+    "up to date",
 ];
 
 fn count_hits(text: &str, needles: &[&str]) -> usize {

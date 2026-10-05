@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::intellect::classify::{classify_by_heuristic, ClassifyInput, ClassifierSource};
+use crate::intellect::classify::{classify_by_heuristic, ClassifierSource, ClassifyInput};
 use crate::intellect::jev::JevClient;
 use crate::intellect::TaskClass;
 

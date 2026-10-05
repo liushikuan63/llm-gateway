@@ -555,7 +555,13 @@ async fn model_overrides_apply_after_gateway_normalization_and_skip_protected_fi
 
     let client = UpstreamClient::new();
     let response = client
-        .call(&provider, &req, "local-model", Duration::from_secs(5), &llm_gateway_lib::config::OllamaOptionsConfig::default())
+        .call(
+            &provider,
+            &req,
+            "local-model",
+            Duration::from_secs(5),
+            &llm_gateway_lib::config::OllamaOptionsConfig::default(),
+        )
         .await
         .expect("带覆盖配置的请求应成功");
 
@@ -591,7 +597,13 @@ async fn model_overrides_apply_after_gateway_normalization_and_skip_protected_fi
     req2.temperature = Some(0.9);
     req2.max_tokens = Some(1000);
     let _ = client
-        .call(&provider2, &req2, "local-model", Duration::from_secs(5), &llm_gateway_lib::config::OllamaOptionsConfig::default())
+        .call(
+            &provider2,
+            &req2,
+            "local-model",
+            Duration::from_secs(5),
+            &llm_gateway_lib::config::OllamaOptionsConfig::default(),
+        )
         .await
         .expect("第二次覆盖请求应成功");
 

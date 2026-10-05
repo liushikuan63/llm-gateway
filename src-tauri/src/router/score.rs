@@ -198,11 +198,8 @@ pub fn score(c: &Candidate, input: &ScoreInput, w: &Weights) -> f32 {
         .map(|intent| intent_fit(intent, c).powf(w.intent))
         .unwrap_or(1.0);
 
-    let base = h.powf(w.health)
-        * hd.powf(w.headroom)
-        * cap.powf(w.capability)
-        * lat.powf(w.latency)
-        * fit;
+    let base =
+        h.powf(w.health) * hd.powf(w.headroom) * cap.powf(w.capability) * lat.powf(w.latency) * fit;
 
     // 精确命中模型名的候选加分：用户点名要 deepseek-chat 时，
     // 不该因为另一家刚好更快就悄悄换了模型

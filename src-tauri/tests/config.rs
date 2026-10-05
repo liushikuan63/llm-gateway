@@ -253,13 +253,7 @@ fn 七档策略的序列化取值都稳定() {
     // 走整份 AppConfig 往返，而不是单独 toml::to_string(&RoutingStrategy)：
     // TOML 的文档根只能是表，序列化一个裸枚举值会直接报 UnsupportedType。
     for expected in [
-        "priority",
-        "balanced",
-        "smartest",
-        "fastest",
-        "reliable",
-        "custom",
-        "smart",
+        "priority", "balanced", "smartest", "fastest", "reliable", "custom", "smart",
     ] {
         let text = format!("routing_strategy = \"{expected}\"");
         let parsed: AppConfig = toml::from_str(&text).expect("应当能解析");
@@ -289,7 +283,11 @@ fn 七档策略的序列化取值都稳定() {
 
 fn write_bad_config(dir: &std::path::Path) -> std::path::PathBuf {
     let p = dir.join("config.toml");
-    std::fs::write(&p, "bind = \"127.0.0.1\"\n\n[search]\nenabled = true\nbackend = \"duckduckgo\"\n").unwrap();
+    std::fs::write(
+        &p,
+        "bind = \"127.0.0.1\"\n\n[search]\nenabled = true\nbackend = \"duckduckgo\"\n",
+    )
+    .unwrap();
     p
 }
 
@@ -319,7 +317,11 @@ fn 坏配置_应回退默认且把原文件挪走() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("config.corrupt-"))
         .collect();
-    assert_eq!(quarantined.len(), 1, "应当恰好留下一份备份，实际：{quarantined:?}");
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "应当恰好留下一份备份，实际：{quarantined:?}"
+    );
     let kept = std::fs::read_to_string(dir.join(&quarantined[0])).unwrap();
     assert!(
         kept.contains("duckduckgo"),

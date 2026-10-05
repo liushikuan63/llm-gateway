@@ -6,6 +6,7 @@
 //! 每条用例都配了对照组：
 //! - 开：断言 `X-Route-Intent` / `X-Route-Classifier` 真的出现且取值合理；
 //! - 关：断言这五个头**一个都不出现**。
+//!
 //! 只有两边都断言，「关掉后没有变化」才不是一句空话。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -145,7 +146,10 @@ async fn spawn_gateway(
         &provider(
             "mock",
             upstream.to_owned(),
-            vec![model("vision-model", true, false), model("thinker", false, true)],
+            vec![
+                model("vision-model", true, false),
+                model("thinker", false, true),
+            ],
         ),
     )
     .await
@@ -176,11 +180,7 @@ fn client() -> reqwest::Client {
         .expect("构造 client")
 }
 
-async fn chat(
-    base_url: &str,
-    model: &str,
-    messages: serde_json::Value,
-) -> reqwest::Response {
+async fn chat(base_url: &str, model: &str, messages: serde_json::Value) -> reqwest::Response {
     let response = client()
         .post(format!("{base_url}/v1/chat/completions"))
         .bearer_auth(KEY)
@@ -206,7 +206,7 @@ fn header(response: &reqwest::Response, name: &str) -> Option<String> {
         .headers()
         .get(name)
         .and_then(|value| value.to_str().ok())
-        .map(|raw| decode_header_value(raw))
+        .map(decode_header_value)
 }
 
 /// 响应头里的非 ASCII 段是 `%XX` 编码的（见 `parse_header` / `encode_header_value`）。
@@ -436,12 +436,7 @@ async fn 搜索命中时结果被注入到上游请求的上下文里() {
     })
     .await;
 
-    let response = chat(
-        &base,
-        "auto",
-        text_messages("最新股价是多少？帮我查一下"),
-    )
-    .await;
+    let response = chat(&base, "auto", text_messages("最新股价是多少？帮我查一下")).await;
 
     assert_eq!(hits.load(Ordering::SeqCst), 1, "SearXNG mock 应被调用一次");
     assert_eq!(
@@ -729,11 +724,7 @@ fn last_user_text(upstream_state: &MockState) -> String {
         .expect("主上游应收到一条 user 消息")
 }
 
-async fn chat_with_tools(
-    base_url: &str,
-    model: &str,
-    text: &str,
-) -> reqwest::Response {
+async fn chat_with_tools(base_url: &str, model: &str, text: &str) -> reqwest::Response {
     let response = client()
         .post(format!("{base_url}/v1/chat/completions"))
         .bearer_auth(KEY)
@@ -752,8 +743,7 @@ async fn chat_with_tools(
 
 #[tokio::test]
 async fn 改写成功后上游收到的是新提示词() {
-    let (refine_base, refine_hits) =
-        spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
+    let (refine_base, refine_hits) = spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
     let jev = spawn_jev(0.10).await; // clarity 极低 ⇒ 需要改写
     let (_db, base, upstream_state) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
         cfg.smart_routing.prompt_refine.enabled = true;
@@ -782,8 +772,7 @@ async fn 改写成功后上游收到的是新提示词() {
 
 #[tokio::test]
 async fn 改写关闭时上游收到的是原文() {
-    let (refine_base, refine_hits) =
-        spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
+    let (refine_base, refine_hits) = spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
     let jev = spawn_jev(0.10).await;
     let (_db, base, upstream_state) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
         // Jev 说需要改写，但**开关关着**——这一条验的是开关本身。
@@ -804,14 +793,17 @@ async fn 改写关闭时上游收到的是原文() {
         None,
         "未触发改写时不得发这个头"
     );
-    assert_eq!(last_user_text(&upstream_state), original, "原文必须逐字送达");
+    assert_eq!(
+        last_user_text(&upstream_state),
+        original,
+        "原文必须逐字送达"
+    );
 }
 
 #[tokio::test]
 async fn jev_说清楚时不做改写() {
     // 反向对照：上一条可能因为「Jev 从来没说需要改写」而通过。
-    let (refine_base, refine_hits) =
-        spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
+    let (refine_base, refine_hits) = spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
     let jev = spawn_jev(0.95).await; // clarity 很高 ⇒ 提示词已经够清楚
     let (_db, base, upstream_state) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
         cfg.smart_routing.prompt_refine.enabled = true;
@@ -863,8 +855,12 @@ async fn 改写端点报错时请求照常走完且提示词未被污染() {
         "改写失败后请求仍必须发往主上游"
     );
     assert_eq!(header(&response, "x-route-refined").as_deref(), Some("0"));
-    let note = header(&response, "x-route-refine-note").expect("没改成也要写明原因，否则界面上是空白");
-    assert!(note.contains("HTTP 500"), "原因要具体到状态码，实际：{note}");
+    let note =
+        header(&response, "x-route-refine-note").expect("没改成也要写明原因，否则界面上是空白");
+    assert!(
+        note.contains("HTTP 500"),
+        "原因要具体到状态码，实际：{note}"
+    );
     assert_eq!(
         last_user_text(&upstream_state),
         original,
@@ -898,7 +894,9 @@ async fn 没有可用改写目标时明确说明而不是沉默() {
             .into_iter()
             .find(|row| row["route_refine_note"].is_string())
         {
-            saw_note = row["route_refine_note"].as_str().is_some_and(|s| !s.is_empty());
+            saw_note = row["route_refine_note"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty());
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -908,8 +906,7 @@ async fn 没有可用改写目标时明确说明而不是沉默() {
 
 #[tokio::test]
 async fn 审计记录了改写前后的长度() {
-    let (refine_base, _hits) =
-        spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
+    let (refine_base, _hits) = spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
     let jev = spawn_jev(0.10).await;
     let (db, base, _state) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
         cfg.smart_routing.prompt_refine.enabled = true;
@@ -920,7 +917,9 @@ async fn 审计记录了改写前后的长度() {
 
     let mut note: Option<String> = None;
     for _ in 0..60 {
-        let rows = repo::recent_requests(db.pool(), 10).await.unwrap_or_default();
+        let rows = repo::recent_requests(db.pool(), 10)
+            .await
+            .unwrap_or_default();
         if let Some(row) = rows
             .into_iter()
             .find(|row| row["route_refined"].is_boolean())
@@ -931,8 +930,5 @@ async fn 审计记录了改写前后的长度() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let note = note.expect("改写结果必须落审计，否则事后无法核对改写了什么");
-    assert!(
-        note.contains('→'),
-        "审计应记录改写前后的长度，实际：{note}"
-    );
+    assert!(note.contains('→'), "审计应记录改写前后的长度，实际：{note}");
 }

@@ -529,8 +529,8 @@ fn ollama_options_里的_num_ctx_必须透传() {
         "messages": [{"role": "user", "content": "hi"}],
         "options": {"num_ctx": 32768, "num_thread": 8},
     });
-    let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body)
-        .expect("应能解析");
+    let req =
+        llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body).expect("应能解析");
     let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "qwen3.8:27b-q4_K_M", None);
     let opts = out.get("options").expect("options 必须存在");
     assert_eq!(
@@ -555,8 +555,16 @@ fn ollama_options_不得覆盖显式的_max_tokens() {
     let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body).expect("解析");
     let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "m", None);
     let opts = out.get("options").expect("options");
-    assert_eq!(opts.get("num_predict").and_then(|v| v.as_u64()), Some(2048), "max_tokens 应覆盖 num_predict");
-    assert_eq!(opts.get("num_ctx").and_then(|v| v.as_u64()), Some(16384), "其余键仍要透传");
+    assert_eq!(
+        opts.get("num_predict").and_then(|v| v.as_u64()),
+        Some(2048),
+        "max_tokens 应覆盖 num_predict"
+    );
+    assert_eq!(
+        opts.get("num_ctx").and_then(|v| v.as_u64()),
+        Some(16384),
+        "其余键仍要透传"
+    );
 }
 
 #[test]
@@ -613,7 +621,11 @@ fn 网关默认_必须能补上客户端表达不了的_num_ctx() {
     });
     let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body).expect("解析");
     let defaults = llm_gateway_lib::config::OllamaOptionsConfig::default();
-    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "qwen3.8:27b-q4_K_M", Some(&defaults));
+    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(
+        &req,
+        "qwen3.8:27b-q4_K_M",
+        Some(&defaults),
+    );
     let opts = out.get("options").expect("options 必须存在");
     assert_eq!(
         opts.get("num_ctx").and_then(|v| v.as_u64()),
@@ -667,9 +679,6 @@ fn 不传默认值时行为与改动前完全一致() {
     let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "m", None);
     let opts = out.get("options").expect("options");
     assert_eq!(opts.get("num_predict").and_then(|v| v.as_u64()), Some(512));
-    assert!(
-        opts.get("num_ctx").is_none(),
-        "None 时不得注入 num_ctx"
-    );
+    assert!(opts.get("num_ctx").is_none(), "None 时不得注入 num_ctx");
     assert!(opts.get("num_think").is_none(), "None 时不得注入 num_think");
 }

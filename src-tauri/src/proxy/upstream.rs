@@ -181,9 +181,7 @@ impl UpstreamClient {
                 crate::protocol::anthropic::internal_to_anthropic_body(req, model)
             }
             Dialect::Gemini => crate::protocol::gemini::to_gemini_body(req),
-            Dialect::Ollama => {
-                crate::protocol::ollama::to_ollama_body(req, model, Some(defaults))
-            }
+            Dialect::Ollama => crate::protocol::ollama::to_ollama_body(req, model, Some(defaults)),
             Dialect::Responses => crate::protocol::responses::to_responses_body(req, model),
         }
     }

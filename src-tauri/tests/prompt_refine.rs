@@ -4,7 +4,7 @@
 //! 而是「不该改的时候绝不能改」。所有危险分支都要有对应用例：
 //!
 //! | 危险 | 对应用例 |
-//! | --- | --- | 
+//! | --- | --- |
 //! | 模型返回空串 | `空结果判失败并用原文` |
 //! | 模型加了前言 | `剥掉常见包装前缀` |
 //! | 模型把提示词膨胀十倍 | `超过上限判失败` |
@@ -34,8 +34,15 @@ fn cfg() -> PromptRefineConfig {
 #[test]
 fn 正常的改写结果被接受() {
     let original = "帮我看下这个函数为什么不工作";
-    let ok = refine::accept("请分析以下函数未按预期工作的原因，并指出具体的失效点：", original, &cfg());
-    assert_eq!(ok.unwrap(), "请分析以下函数未按预期工作的原因，并指出具体的失效点：");
+    let ok = refine::accept(
+        "请分析以下函数未按预期工作的原因，并指出具体的失效点：",
+        original,
+        &cfg(),
+    );
+    assert_eq!(
+        ok.unwrap(),
+        "请分析以下函数未按预期工作的原因，并指出具体的失效点："
+    );
 }
 
 #[test]
@@ -158,10 +165,7 @@ fn candidate(id: &str, thinking: bool, priority: i32) -> Candidate {
 
 #[test]
 fn 改写优先挑不思考的模型() {
-    let candidates = vec![
-        candidate("thinker", true, 10),
-        candidate("cheap", false, 0),
-    ];
+    let candidates = vec![candidate("thinker", true, 10), candidate("cheap", false, 0)];
     let target = refine::pick_target(&cfg(), &candidates).expect("应当挑得出目标");
     assert_eq!(
         target.model, "cheap-model",
@@ -173,10 +177,7 @@ fn 改写优先挑不思考的模型() {
 fn 指定_provider_时只在该家里面挑() {
     let mut c = cfg();
     c.provider_id = Some("cheap".into());
-    let candidates = vec![
-        candidate("thinker", true, 10),
-        candidate("cheap", false, 0),
-    ];
+    let candidates = vec![candidate("thinker", true, 10), candidate("cheap", false, 0)];
     let target = refine::pick_target(&c, &candidates).expect("应当挑得出目标");
     assert_eq!(target.base_url, "http://cheap.local");
 }
@@ -211,7 +212,9 @@ fn 覆盖模型名优先生效() {
 
 /* -------------------------- 真发请求 -------------------------- */
 
-async fn spawn_upstream(behavior: Upstream) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+async fn spawn_upstream(
+    behavior: Upstream,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = hits.clone();
     let app = Router::new().fallback(any(move || {
@@ -270,7 +273,8 @@ fn http() -> reqwest::Client {
         .expect("构造 client")
 }
 
-const LONG_PROMPT: &str = "帮我看看这个函数为什么不工作，它在生产环境里偶发返回空值，日志里什么都看不到";
+const LONG_PROMPT: &str =
+    "帮我看看这个函数为什么不工作，它在生产环境里偶发返回空值，日志里什么都看不到";
 
 #[tokio::test]
 async fn 改写成功时提示词被替换() {
@@ -282,7 +286,11 @@ async fn 改写成功时提示词被替换() {
     assert!(outcome.applied, "应当改写成功，实际：{:?}", outcome.reason);
     assert_ne!(outcome.prompt, LONG_PROMPT);
     assert!(outcome.prompt.contains("排查步骤"));
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "只该调一次");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "只该调一次"
+    );
 }
 
 #[tokio::test]
@@ -305,11 +313,8 @@ async fn 端点超时时用原文且不重试() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let mut held = Vec::new();
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => held.push(stream),
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
         }
     });
 
@@ -320,7 +325,11 @@ async fn 端点超时时用原文且不重试() {
     assert!(!outcome.applied, "超时后不得改写");
     assert_eq!(outcome.prompt, LONG_PROMPT, "超时后必须用原文");
     assert!(
-        outcome.reason.as_deref().unwrap_or_default().contains("超时"),
+        outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("超时"),
         "必须写明是超时，实际：{:?}",
         outcome.reason
     );
@@ -332,7 +341,11 @@ async fn 端点报错时用原文() {
     let outcome = refine::refine(&http(), &target(&base), None, LONG_PROMPT, &cfg()).await;
     assert!(!outcome.applied);
     assert_eq!(outcome.prompt, LONG_PROMPT);
-    assert!(outcome.reason.as_deref().unwrap_or_default().contains("HTTP 500"));
+    assert!(outcome
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("HTTP 500"));
 }
 
 #[tokio::test]
@@ -340,7 +353,10 @@ async fn 响应结构不符时用原文而不是空提示词() {
     let (base, _hits) = spawn_upstream(Upstream::Garbage).await;
     let outcome = refine::refine(&http(), &target(&base), None, LONG_PROMPT, &cfg()).await;
     assert!(!outcome.applied, "解析不出文本时不得改写");
-    assert_eq!(outcome.prompt, LONG_PROMPT, "必须用原文，不能给上游一个空提示词");
+    assert_eq!(
+        outcome.prompt, LONG_PROMPT,
+        "必须用原文，不能给上游一个空提示词"
+    );
 }
 
 #[tokio::test]
@@ -348,10 +364,7 @@ async fn 改写把提示词清空时判失败() {
     let (base, _hits) = spawn_upstream(Upstream::Text("")).await;
     let outcome = refine::refine(&http(), &target(&base), None, LONG_PROMPT, &cfg()).await;
     assert!(!outcome.applied);
-    assert_eq!(
-        outcome.prompt, LONG_PROMPT,
-        "空改写绝不能替换掉原文"
-    );
+    assert_eq!(outcome.prompt, LONG_PROMPT, "空改写绝不能替换掉原文");
 }
 
 #[tokio::test]

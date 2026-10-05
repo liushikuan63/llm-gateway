@@ -18,12 +18,15 @@
 //! cargo test --test live_functional -- --nocapture --test-threads=1
 //! ```
 
+// 本文件的「先取默认配置、再逐字段改」是测试的正常写法，clippy 的
+// field_reassign_with_default 在这里属于误报：结构更新语法（..Default::default()）
+// 反而更难读——未涉及的字段被藏进展开里，改测试时要先数清有几个字段。
+// 故只在此处关闭；生产代码（src/）不受影响，仍保持该检查。
+#![allow(clippy::field_reassign_with_default)]
 use std::sync::Arc;
 use std::time::Duration;
 
-use llm_gateway_lib::config::{
-    AppConfig, RoutingStrategy, SmartClassifier, SmartRoutingConfig,
-};
+use llm_gateway_lib::config::{AppConfig, RoutingStrategy, SmartClassifier, SmartRoutingConfig};
 use llm_gateway_lib::db::{self, repo};
 use llm_gateway_lib::domain::{Dialect, ModelRef, ModelType, Provider};
 use llm_gateway_lib::proxy::server::{serve, GatewayState};
@@ -79,7 +82,11 @@ async fn pick_ollama_model() -> Result<String, String> {
         .map_err(|e| format!("解析 /api/tags 失败：{e}"))?;
     let names: Vec<String> = body["models"]
         .as_array()
-        .map(|a| a.iter().filter_map(|m| m["name"].as_str().map(str::to_owned)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m["name"].as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
     if names.is_empty() {
         return Err("Ollama 上一个模型都没有".into());
@@ -110,7 +117,10 @@ async fn pick_ollama_model() -> Result<String, String> {
     }
     // Ollama 明明在跑却一个模型都用不了 —— 这是**真问题**，不是「环境不具备」。
     // 所以这里返回 Err，调用方要 panic 而不是跳过。
-    Err(format!("Ollama 在跑，但 {} 个模型一个都没能完成对话", names.len()))
+    Err(format!(
+        "Ollama 在跑，但 {} 个模型一个都没能完成对话",
+        names.len()
+    ))
 }
 
 /* ------------------------------ 网关夹具 ------------------------------ */
@@ -166,9 +176,12 @@ async fn start_gateway(
     drop(listener);
 
     let db = db::Db::connect_in_memory().await.unwrap();
-    repo::upsert_provider(db.pool(), &ollama_provider("local", vec![ollama_model(model, true)]))
-        .await
-        .unwrap();
+    repo::upsert_provider(
+        db.pool(),
+        &ollama_provider("local", vec![ollama_model(model, true)]),
+    )
+    .await
+    .unwrap();
 
     let mut smart = SmartRoutingConfig::default();
     smart.enabled = true;
@@ -277,7 +290,8 @@ async fn 真机_ollama_能力位与上游逐条一致() {
         base_url: OLLAMA.into(),
         kind: llm_gateway_lib::config::LocalRuntimeKind::Ollama,
     };
-    let probe = llm_gateway_lib::local_models::runtime::probe_one(&client(), &endpoint, 10_000).await;
+    let probe =
+        llm_gateway_lib::local_models::runtime::probe_one(&client(), &endpoint, 10_000).await;
     assert!(probe.reachable, "探测应成功：{:?}", probe.error);
     assert!(probe.model_count > 0, "应至少扫到一个模型");
 
@@ -361,7 +375,11 @@ async fn 真机_edgejev_健康检查可用() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["ok"], serde_json::json!(true), "健康检查应返回 ok=true");
+    assert_eq!(
+        body["ok"],
+        serde_json::json!(true),
+        "健康检查应返回 ok=true"
+    );
     eprintln!("实测通过：edgeJev /health = {body}");
 }
 
@@ -396,9 +414,7 @@ async fn 真机_edgejev_原始判定可观察() {
     );
     eprintln!(
         "实测通过：complexity = {}（置信度 {}）、clarity = {}",
-        complexity["choice"],
-        complexity["confidence"],
-        body["answers"]["clarity"]["noul"]
+        complexity["choice"], complexity["confidence"], body["answers"]["clarity"]["noul"]
     );
 }
 
@@ -424,16 +440,14 @@ async fn 真机_真实请求拿到内容且带诊断头() {
     eprintln!("实测使用模型：{model}");
 
     let (base, _db, task) = start_gateway(&model, |_, _| {}).await;
-    let response = chat(
-        &base,
-        "限流是做什么的，一句话",
-    )
-    .await;
+    let response = chat(&base, "限流是做什么的，一句话").await;
 
     let intent = header(&response, "x-route-intent").expect("智能模式开着时必须给出判定");
     let classifier = header(&response, "x-route-classifier").expect("必须给出判定来源");
     let body: serde_json::Value = response.json().await.unwrap();
-    let content = body["choices"][0]["message"]["content"].as_str().unwrap_or_default();
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default();
     let tokens = body["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
 
     eprintln!(
@@ -502,7 +516,11 @@ async fn 真机_预优化走通真模型且失败时用原文() {
     })
     .await;
 
-    let response = chat(&base, "写一个函数，输入一个列表返回里面的最大值，遇到空列表返回0").await;
+    let response = chat(
+        &base,
+        "写一个函数，输入一个列表返回里面的最大值，遇到空列表返回0",
+    )
+    .await;
     let refined = header(&response, "x-route-refined");
     let note = header(&response, "x-route-refine-note");
     eprintln!("实测：X-Route-Refined = {refined:?}，note = {note:?}");

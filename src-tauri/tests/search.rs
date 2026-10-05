@@ -6,15 +6,20 @@
 //! 2. **搜索失败不阻断请求**——失败只体现在 `error` 与响应头上；
 //! 3. **注入内容是纯文本**，不会破坏 `ContextStore` 对工具调用成对处理的不变量。
 
+// 本文件的「先取默认配置、再逐字段改」是测试的正常写法，clippy 的
+// field_reassign_with_default 在这里属于误报：结构更新语法（..Default::default()）
+// 反而更难读——未涉及的字段被藏进展开里，改测试时要先数清有几个字段。
+// 故只在此处关闭；生产代码（src/）不受影响，仍保持该检查。
+#![allow(clippy::field_reassign_with_default)]
 use std::time::Duration;
 
 use llm_gateway_lib::config::{SearchBackendKind, SearchConfig, SearchInjectFormat};
 use llm_gateway_lib::domain::{Message, Role};
-use llm_gateway_lib::search::parse;
 use llm_gateway_lib::search::backend::{
-    BraveBackend, DuckDuckGoBackend, SearchBackend, SearchError, SearchQuery,
-    SearchResult, SearXngBackend, TavilyBackend,
+    BraveBackend, DuckDuckGoBackend, SearXngBackend, SearchBackend, SearchError, SearchQuery,
+    SearchResult, TavilyBackend,
 };
+use llm_gateway_lib::search::parse;
 use llm_gateway_lib::search::parse::{decode, duckduckgo_lite, render};
 
 use axum::routing::any;
@@ -71,23 +76,30 @@ async fn tavily_响应映射到统一结构() {
         ]}"#,
     )
     .await;
-    let results = TavilyBackend { base_url: base.clone() }
-        .search(&client, &query(5), Some("key"))
-        .await
-        .expect("应当解析成功");
+    let results = TavilyBackend {
+        base_url: base.clone(),
+    }
+    .search(&client, &query(5), Some("key"))
+    .await
+    .expect("应当解析成功");
     assert_eq!(results.len(), 1, "没有 URL 的条目必须被过滤掉");
     assert_eq!(results[0].title, "Rust 1.99");
     assert_eq!(results[0].snippet, "新特性", "content 映射为摘要");
-    assert!((results[0].score - 0.87).abs() < 1e-6, "Tavily 给了分就要保留");
+    assert!(
+        (results[0].score - 0.87).abs() < 1e-6,
+        "Tavily 给了分就要保留"
+    );
 }
 
 #[tokio::test]
 async fn tavily_缺结果字段时报错而不是给空列表() {
     let (base, client) = mock(200, r#"{"ok":true}"#).await;
-    let error = TavilyBackend { base_url: base.clone() }
-        .search(&client, &query(5), Some("key"))
-        .await
-        .expect_err("结构不符必须报错");
+    let error = TavilyBackend {
+        base_url: base.clone(),
+    }
+    .search(&client, &query(5), Some("key"))
+    .await
+    .expect_err("结构不符必须报错");
     assert!(matches!(error, SearchError::Malformed(_)), "实际 {error:?}");
 }
 
@@ -98,10 +110,12 @@ async fn brave_响应映射到统一结构() {
         r#"{"web":{"results":[{"title":"标题","url":"https://example.com","description":"摘要"}]}}"#,
     )
     .await;
-    let results = BraveBackend { base_url: base.clone() }
-        .search(&client, &query(5), Some("token"))
-        .await
-        .expect("应当解析成功");
+    let results = BraveBackend {
+        base_url: base.clone(),
+    }
+    .search(&client, &query(5), Some("token"))
+    .await
+    .expect("应当解析成功");
     assert_eq!(results[0].snippet, "摘要", "description 映射为摘要");
     assert_eq!(results[0].score, 0.0, "Brave 不给分就不要编一个");
 }
@@ -113,10 +127,12 @@ async fn searxng_响应映射到统一结构() {
         r#"{"results":[{"title":"T","url":"https://e.com","content":"C","score":0.5}]}"#,
     )
     .await;
-    let results = SearXngBackend { base_url: base.clone() }
-        .search(&client, &query(5), None)
-        .await
-        .expect("应当解析成功");
+    let results = SearXngBackend {
+        base_url: base.clone(),
+    }
+    .search(&client, &query(5), None)
+    .await
+    .expect("应当解析成功");
     assert_eq!(results[0].snippet, "C");
 }
 
@@ -137,12 +153,16 @@ async fn searxng_拒绝非_http_地址() {
 async fn 缺少凭据时需要_key_的后端直接报错() {
     let http = reqwest::Client::new();
     assert!(matches!(
-        TavilyBackend::default().search(&http, &query(5), None).await,
+        TavilyBackend::default()
+            .search(&http, &query(5), None)
+            .await,
         Err(SearchError::MissingCredential)
     ));
     assert!(
         matches!(
-            TavilyBackend::default().search(&http, &query(5), Some("   ")).await,
+            TavilyBackend::default()
+                .search(&http, &query(5), Some("   "))
+                .await,
             Err(SearchError::MissingCredential)
         ),
         "空白串不算已配置"
@@ -156,10 +176,12 @@ async fn 缺少凭据时需要_key_的后端直接报错() {
 #[tokio::test]
 async fn http_401_被标记为凭据失效以便调用方停止回落() {
     let (base, client) = mock(401, r#"{"error":"bad key"}"#).await;
-    let error = TavilyBackend { base_url: base.clone() }
-        .search(&client, &query(5), Some("k"))
-        .await
-        .expect_err("401 必须报错");
+    let error = TavilyBackend {
+        base_url: base.clone(),
+    }
+    .search(&client, &query(5), Some("k"))
+    .await
+    .expect_err("401 必须报错");
     assert!(
         matches!(error, SearchError::CredentialRejected),
         "401/403 必须与网络错误区分开，否则调用方会继续拿错凭据重试"
@@ -178,10 +200,12 @@ async fn 结果条数上限被遵守() {
         ]}"#,
     )
     .await;
-    let results = TavilyBackend { base_url: base.clone() }
-        .search(&client, &query(2), Some("k"))
-        .await
-        .expect("应当解析成功");
+    let results = TavilyBackend {
+        base_url: base.clone(),
+    }
+    .search(&client, &query(2), Some("k"))
+    .await
+    .expect("应当解析成功");
     assert_eq!(results.len(), 2, "max_results 必须真的限制条数");
 }
 
@@ -220,10 +244,7 @@ fn lite_html_解析出标题_链接_摘要三元组() {
     );
     assert_eq!(results[1].snippet, "摘要二 <转义>", "摘要里的实体要解码");
     assert_eq!(results[2].title, "第三个");
-    assert_eq!(
-        results[2].snippet, "",
-        "没有摘要时留空而不是编一个"
-    );
+    assert_eq!(results[2].snippet, "", "没有摘要时留空而不是编一个");
 }
 
 #[test]
@@ -250,7 +271,8 @@ fn 跳转链接被解包成真实地址() {
 
 #[test]
 fn 非_http_跳转链接被丢弃而不是当成结果() {
-    let html = r#"<a href="//duckduckgo.com/l/?uddg=javascript:alert(1)" class='result-link'>标题</a>"#;
+    let html =
+        r#"<a href="//duckduckgo.com/l/?uddg=javascript:alert(1)" class='result-link'>标题</a>"#;
     assert!(duckduckgo_lite(html, 5).is_empty());
 }
 
@@ -277,7 +299,11 @@ fn 只有_data_href_时取不到_url_整条丢弃() {
 #[test]
 fn 解析条数受_limit_限制() {
     assert_eq!(duckduckgo_lite(&lite_html(), 2).len(), 2);
-    assert_eq!(duckduckgo_lite(&lite_html(), 0).len(), 0, "limit=0 时不返回任何结果");
+    assert_eq!(
+        duckduckgo_lite(&lite_html(), 0).len(),
+        0,
+        "limit=0 时不返回任何结果"
+    );
 }
 
 #[test]
@@ -297,7 +323,11 @@ fn 实体与百分号解码各自成立() {
     assert_eq!(decode("&quot;x&quot;"), "\"x\"");
     assert_eq!(decode("&#39;"), "'");
     assert_eq!(decode("&nbsp;"), " ");
-    assert_eq!(decode("%E4%B8%AD%E6%96%87"), "中文", "多字节百分号序列要按 UTF-8 还原");
+    assert_eq!(
+        decode("%E4%B8%AD%E6%96%87"),
+        "中文",
+        "多字节百分号序列要按 UTF-8 还原"
+    );
     assert_eq!(decode("100%"), "100%", "落单的百分号必须原样保留");
     assert_eq!(decode("a%zzb"), "a%zzb", "非法转义原样保留");
     assert_eq!(decode("普通文本"), "普通文本");
@@ -305,7 +335,10 @@ fn 实体与百分号解码各自成立() {
 
 #[tokio::test]
 async fn 免_key_后端永远不要求凭据() {
-    let http = reqwest::Client::builder().no_proxy().build().expect("client");
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client");
     let backend = DuckDuckGoBackend {
         // 指向一个不存在的本地端口，让它快速失败而不是去打真实网络。
         base_url: "http://127.0.0.1:1".into(),
@@ -348,10 +381,8 @@ fn 渲染为空结果时如实写零() {
 #[test]
 fn 注入内容是纯文本_不会破坏工具调用的成对处理() {
     let cfg = SearchConfig::default();
-    let message = llm_gateway_lib::search::executor::as_message(
-        &cfg,
-        render("q", "duckduckgo", &[]),
-    );
+    let message =
+        llm_gateway_lib::search::executor::as_message(&cfg, render("q", "duckduckgo", &[]));
     assert_eq!(message.role, Role::System);
     assert!(message.tool_calls.is_none(), "注入消息绝不能带 tool_calls");
     assert!(message.content_text().contains("联网搜索结果"));
@@ -381,7 +412,10 @@ fn 检索词超长时保留尾部() {
     let text = format!("前置{}", "填充".repeat(500));
     let cut = llm_gateway_lib::search::query_from(&text, 100);
     assert!(cut.chars().count() <= 100, "必须被截断到上限");
-    assert!(text.ends_with("填充") && cut.ends_with("填充"), "要保留尾部");
+    assert!(
+        text.ends_with("填充") && cut.ends_with("填充"),
+        "要保留尾部"
+    );
 }
 
 #[test]
@@ -419,7 +453,8 @@ fn searxng_后端必须填地址() {
     cfg.searxng_url = Some("ftp://x".into());
     assert!(
         llm_gateway_lib::search::validate(&cfg).is_err(),
-        "非 http/https 必须拒绝"    );
+        "非 http/https 必须拒绝"
+    );
 }
 
 #[test]
@@ -490,7 +525,10 @@ fn 必应_真实样本能解析出标题与地址() {
     let results = parse::bing_cn(&html, 5);
     assert!(!results.is_empty(), "真实样本必须能解析出结果");
     let first = &results[0];
-    assert_eq!(first.url, "https://rust-lang.org/", "地址应从 <h2><a href> 里取出");
+    assert_eq!(
+        first.url, "https://rust-lang.org/",
+        "地址应从 <h2><a href> 里取出"
+    );
     assert!(
         !first.title.is_empty(),
         "标题不能为空（样本里 <a> 内含 favicon 等嵌套标签）"
@@ -501,7 +539,10 @@ fn 必应_真实样本能解析出标题与地址() {
         first.title
     );
     assert!(
-        first.title.chars().any(|c| c.is_ascii_alphabetic() || c == '中' as char),
+        first
+            .title
+            .chars()
+            .any(|c| c.is_ascii_alphabetic() || c == '中'),
         "标题应留下文字，实际：{:?}",
         first.title
     );
@@ -541,8 +582,13 @@ fn 必应_多个结果块按顺序取出且不超过_limit() {
 fn 必应_锚点地址为空或井号时跳过该条() {
     let html = "<li class=\"b_algo\"><h2><a href=\"#\">跳转到别处</a></h2></li>\
                 <li class=\"b_algo\"><h2><a href=\"https://ok.example/\">真结果</a></h2></li>";
-    let results = parse::bing_cn(&html, 10);
-    assert_eq!(results.len(), 1, "空/井号地址必须跳过，实际 {}", results.len());
+    let results = parse::bing_cn(html, 10);
+    assert_eq!(
+        results.len(),
+        1,
+        "空/井号地址必须跳过，实际 {}",
+        results.len()
+    );
     assert_eq!(results[0].url, "https://ok.example/");
 }
 
@@ -586,7 +632,10 @@ fn 实体_必应摘要里的_ensp_与数字实体要解掉() {
     // 没有分号 / 空内容 / 超长，都必须原样保留而不是瞎解
     assert_eq!(parse::decode_entities("&#183"), "&#183");
     assert_eq!(parse::decode_entities("&#;"), "&#;");
-    assert_eq!(parse::decode_entities("&#999999999999999;"), "&#999999999999999;");
+    assert_eq!(
+        parse::decode_entities("&#999999999999999;"),
+        "&#999999999999999;"
+    );
     // 控制字符不该被解进来（会污染界面与日志）
     assert_eq!(parse::decode_entities("&#0;"), "&#0;");
 }
@@ -640,17 +689,32 @@ fn 后端码_响应头用的必须是展示拼法() {
     //   展示值 = 手写 backend_code：`searxng` / `duckduckgo`
     // 写混的后果是不对称的：配置值写错 → 应用打不开；展示值写错 → 日志难读但不影响功能。
     // 这里钉的是展示值，配置值那一侧由 tests/config.rs 的前后端一致性测试负责。
-    assert_eq!(llm_gateway_lib::search::backend_code(SearchBackendKind::Tavily), "tavily");
-    assert_eq!(llm_gateway_lib::search::backend_code(SearchBackendKind::Brave), "brave");
-    assert_eq!(llm_gateway_lib::search::backend_code(SearchBackendKind::SearXng), "searxng");
-    assert_eq!(llm_gateway_lib::search::backend_code(SearchBackendKind::DuckDuckGo), "duckduckgo");
-    assert_eq!(llm_gateway_lib::search::backend_code(SearchBackendKind::BingCn), "bing_cn");
+    assert_eq!(
+        llm_gateway_lib::search::backend_code(SearchBackendKind::Tavily),
+        "tavily"
+    );
+    assert_eq!(
+        llm_gateway_lib::search::backend_code(SearchBackendKind::Brave),
+        "brave"
+    );
+    assert_eq!(
+        llm_gateway_lib::search::backend_code(SearchBackendKind::SearXng),
+        "searxng"
+    );
+    assert_eq!(
+        llm_gateway_lib::search::backend_code(SearchBackendKind::DuckDuckGo),
+        "duckduckgo"
+    );
+    assert_eq!(
+        llm_gateway_lib::search::backend_code(SearchBackendKind::BingCn),
+        "bing_cn"
+    );
 
     // **对照组**：展示值不得等于配置值，否则两套字符串会在下一次维护时被合并成一个，
     // 而配置侧会随之解析失败。BingCn 恰好同形，必须显式豁免而不是默认成立。
     for kind in [SearchBackendKind::SearXng, SearchBackendKind::DuckDuckGo] {
         assert_ne!(
-            llm_gateway_lib::search::backend_code(kind.clone()),
+            llm_gateway_lib::search::backend_code(kind),
             llm_gateway_lib::search::backend_serde_value(&kind),
             "展示值与配置值对 {:?} 同形，两套字符串会在维护中被误合并",
             kind
@@ -669,13 +733,21 @@ fn searxng_只有它自己要求地址_对照组() {
         SearchBackendKind::BingCn,
         SearchBackendKind::DuckDuckGo,
     ] {
-        let cfg = SearchConfig { backend: kind.clone(), searxng_url: None, ..SearchConfig::default() };
+        let cfg = SearchConfig {
+            backend: kind,
+            searxng_url: None,
+            ..SearchConfig::default()
+        };
         assert!(
             llm_gateway_lib::search::validate(&cfg).is_ok(),
             "{kind:?} 不该要求 searxng_url —— 否则界面选中它却存不下去",
         );
     }
     // 组对照：同一个 searxng_url=None，SearXng 必须失败。
-    let searx = SearchConfig { backend: SearchBackendKind::SearXng, searxng_url: None, ..SearchConfig::default() };
+    let searx = SearchConfig {
+        backend: SearchBackendKind::SearXng,
+        searxng_url: None,
+        ..SearchConfig::default()
+    };
     assert!(llm_gateway_lib::search::validate(&searx).is_err());
 }

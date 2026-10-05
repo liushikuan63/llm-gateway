@@ -978,7 +978,11 @@ async fn dispatch_remote_compaction(
                 let upstream = upstream.clone();
                 let request = upstream_req.clone();
                 let defaults = cfg.ollama_options.clone();
-                async move { upstream.call(&provider, &request, &model, timeout, &defaults).await }
+                async move {
+                    upstream
+                        .call(&provider, &request, &model, timeout, &defaults)
+                        .await
+                }
             },
             |provider, model, error| {
                 if let GatewayError::Upstream { status: 429, .. } = error {
@@ -1654,8 +1658,7 @@ async fn run_routing_preflight(
             cfg.smart_routing.jev.max_state_chars,
         )
         .ok();
-        let intent =
-            crate::intellect::classify(&input, &cfg.smart_routing, jev.as_ref()).await;
+        let intent = crate::intellect::classify(&input, &cfg.smart_routing, jev.as_ref()).await;
         tracing::info!(
             intent = intent.class.code(),
             classifier = intent.classifier.code(),
@@ -1682,9 +1685,7 @@ async fn run_routing_preflight(
             .map(|intent| intent.needs_refine)
             .unwrap_or(false);
         if wants_refine {
-            if let Some(outcome) =
-                run_prompt_refine(state, cfg, &user_text).await
-            {
+            if let Some(outcome) = run_prompt_refine(state, cfg, &user_text).await {
                 if outcome.applied {
                     effective_text = outcome.prompt.clone();
                     apply_refined_prompt(&mut req.messages, &outcome.prompt);
@@ -1739,7 +1740,8 @@ async fn run_prompt_refine(
         required,
         None,
     );
-    let mut target = crate::intellect::refine::pick_target(&cfg.smart_routing.prompt_refine, &ranked)?;
+    let mut target =
+        crate::intellect::refine::pick_target(&cfg.smart_routing.prompt_refine, &ranked)?;
     // 解密放在选目标之后：没选中就不用解密，避免白读一次密钥。
     let provider = providers
         .iter()
@@ -1796,7 +1798,11 @@ impl DispatchInput {
     /// 智能模式 + 联网搜索的审计视图。关掉任一功能时对应字段为 `None`，
     /// 这与「判定为 false / 空结果」是两件事，界面上要分开显示。
     fn route_trace(&self) -> repo::RouteTrace {
-        route_trace_of(self.intent.as_ref(), self.search.as_ref(), self.refine.as_ref())
+        route_trace_of(
+            self.intent.as_ref(),
+            self.search.as_ref(),
+            self.refine.as_ref(),
+        )
     }
 }
 
@@ -2429,10 +2435,12 @@ async fn dispatch(
     // 总开关关着时，虚拟模型名 `smart` 不产生任何效果——否则会出现
     // 「不分类、不搜索，但排序已经换成 Smart 权重」的半吊子状态。
     let smart_enabled = smart_mode_enabled(&cfg);
-    let candidates = match state
-        .router
-        .resolve_typed_with(&req.model, &providers, ModelType::Chat, smart_enabled)
-    {
+    let candidates = match state.router.resolve_typed_with(
+        &req.model,
+        &providers,
+        ModelType::Chat,
+        smart_enabled,
+    ) {
         Ok(c) => c,
         Err(e) => return error_response(&e),
     };
@@ -4124,7 +4132,9 @@ fn parse_header(s: &str) -> axum::http::HeaderValue {
 /// 抽成纯函数是为了能单独打测——「中文会不会被吞掉」在端到端测试里
 /// 只表现为「头读不出来」，很容易被当成测试写错而放过。
 fn encode_header_value(s: &str) -> String {
-    if s.bytes().all(|byte| (0x20..=0x7E).contains(&byte) && byte != b'"' && byte != b'\\') {
+    if s.bytes()
+        .all(|byte| (0x20..=0x7E).contains(&byte) && byte != b'"' && byte != b'\\')
+    {
         return s.to_owned();
     }
     let mut out = String::with_capacity(s.len());
@@ -4195,7 +4205,7 @@ impl GatewayState {
         let up = self.upstream.clone();
         let timeout = Duration::from_secs(60);
         let r = Arc::new(req);
-let defaults = self.cfg_snapshot().ollama_options;
+        let defaults = self.cfg_snapshot().ollama_options;
 
         // 摘要调用同样走候选链，但它的尝试明细不写审计：这不是用户请求。
         let mut records = Vec::new();

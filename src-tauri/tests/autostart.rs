@@ -10,14 +10,21 @@
 //! | 杀用户自己起的服务 | 只停自己拉起的 | `没拉起过时停止返回_false` |
 //! | 等就绪拖慢首包 | 不等待 | `启动后立刻返回而不等待就绪` |
 
+// 本文件的「先取默认配置、再逐字段改」是测试的正常写法，clippy 的
+// field_reassign_with_default 在这里属于误报：结构更新语法（..Default::default()）
+// 反而更难读——未涉及的字段被藏进展开里，改测试时要先数清有几个字段。
+// 故只在此处关闭；生产代码（src/）不受影响，仍保持该检查。
+#![allow(clippy::field_reassign_with_default)]
 use std::time::Duration;
 
 use axum::response::IntoResponse;
 use axum::routing::any;
 use axum::{Json, Router};
 use llm_gateway_lib::config::AutoStartConfig;
-use llm_gateway_lib::intellect::autostart::{command_args, endpoint_alive, preflight, SpawnOutcome};
 use llm_gateway_lib::intellect::autostart;
+use llm_gateway_lib::intellect::autostart::{
+    command_args, endpoint_alive, preflight, SpawnOutcome,
+};
 use tokio::net::TcpListener;
 
 /* ------------------------------ 纯函数 ------------------------------ */
@@ -40,7 +47,7 @@ fn 未启用时拒绝拉起且不碰文件系统() {
     assert!(error.contains("未启用"), "实际：{error}");
     // 反向断言：路径检查在开关之后——开关关着时哪怕路径真的存在也不能放行，
     // 否则「默认关闭」就成了一句空话。
-    assert_eq!(preflight(&AutoStartConfig::default()).is_err(), true);
+    assert!(preflight(&AutoStartConfig::default()).is_err());
 }
 
 #[test]
@@ -108,9 +115,18 @@ fn 命令行参数与_edgejev_的_cli_一致() {
         Some(1),
         "--model 是必填项，必须紧跟 serve"
     );
-    assert_eq!(args[args.iter().position(|a| a == "--model").unwrap() + 1], valid_cfg().model_dir);
-    assert_eq!(args[args.iter().position(|a| a == "--port").unwrap() + 1], "18099");
-    assert_eq!(args[args.iter().position(|a| a == "--threads").unwrap() + 1], "4");
+    assert_eq!(
+        args[args.iter().position(|a| a == "--model").unwrap() + 1],
+        valid_cfg().model_dir
+    );
+    assert_eq!(
+        args[args.iter().position(|a| a == "--port").unwrap() + 1],
+        "18099"
+    );
+    assert_eq!(
+        args[args.iter().position(|a| a == "--threads").unwrap() + 1],
+        "4"
+    );
 }
 
 #[test]
@@ -134,9 +150,11 @@ fn 参数里不出现_api_key() {
 
 /// 起一个只答 `/health` 的假决策端点。
 async fn spawn_fake_health() -> String {
-    let app: Router = Router::new().fallback(any(|_request: axum::http::Request<axum::body::Body>| async {
-        Json(serde_json::json!({"ok": true, "model": "rl-agent"})).into_response()
-    }));
+    let app: Router = Router::new().fallback(any(
+        |_request: axum::http::Request<axum::body::Body>| async {
+            Json(serde_json::json!({"ok": true, "model": "rl-agent"})).into_response()
+        },
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -149,7 +167,10 @@ async fn spawn_fake_health() -> String {
 #[tokio::test]
 async fn 端点在响应时探活为真() {
     let base = spawn_fake_health().await;
-    assert!(endpoint_alive(&base, 2000).await, "/health 200 应判定为存活");
+    assert!(
+        endpoint_alive(&base, 2000).await,
+        "/health 200 应判定为存活"
+    );
 }
 
 #[tokio::test]
@@ -160,21 +181,21 @@ async fn 端点没人监听时探活为假() {
     assert!(!endpoint_alive(&format!("http://{addr}"), 600).await);
 }
 
-async fn spawn_probe_recorder(
-    hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> String {
+async fn spawn_probe_recorder(hits: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> String {
     let counter = hits.clone();
-    let app: Router = Router::new().fallback(any(move |request: axum::http::Request<axum::body::Body>| {
-        let counter = counter.clone();
-        async move {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if request.uri().path() == "/health" {
-                Json(serde_json::json!({"ok": true})).into_response()
-            } else {
-                Json(serde_json::json!({"choices": []})).into_response()
+    let app: Router = Router::new().fallback(any(
+        move |request: axum::http::Request<axum::body::Body>| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if request.uri().path() == "/health" {
+                    Json(serde_json::json!({"ok": true})).into_response()
+                } else {
+                    Json(serde_json::json!({"choices": []})).into_response()
+                }
             }
-        }
-    }));
+        },
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -249,7 +270,10 @@ async fn 配置无效时返回拒绝并写明原因() {
 
     // 起点是可执行文件缺失；补上之后下一个坑必须是模型目录。
     // 少了这条断言，第一条就可能是因为模型目录而不是 exe 被拒。
-    cfg.exe_path = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+    cfg.exe_path = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     match autostart::ensure_running(&cfg, &format!("http://{addr}")).await {
         SpawnOutcome::Refused(reason) => assert!(reason.contains("模型目录"), "实际：{reason}"),
         other => panic!("模型目录无效时绝不能启动，得到 {other:?}"),
@@ -259,7 +283,7 @@ async fn 配置无效时返回拒绝并写明原因() {
 #[tokio::test]
 async fn 没拉起过时停止返回_false() {
     // 绝不能去杀用户手动启动的 edgeJev：没有句柄就什么都不做。
-    assert_eq!(autostart::stop(), false, "没有自己拉起过的进程时不得声称停了");
+    assert!(!autostart::stop(), "没有自己拉起过的进程时不得声称停了");
 }
 
 /* --------------------------- 真实 edgeJev 的配置 --------------------------- */
@@ -315,7 +339,10 @@ fn 本机_edgejev_的路径约定与命令构造一致() {
     };
     preflight(&cfg).expect("本机真实布局必须能通过校验");
     let args = command_args(&cfg);
-    assert_eq!(args[args.iter().position(|a| a == "--port").unwrap() + 1], "8009");
+    assert_eq!(
+        args[args.iter().position(|a| a == "--port").unwrap() + 1],
+        "8009"
+    );
 }
 
 #[test]
@@ -344,7 +371,10 @@ fn 脚本入口_不得带_serve_且脚本必须是第一个参数() {
     );
 
     // 对照组：exe 入口仍要带 serve —— 两边各自判，才不会被上一条带偏。
-    let exe_only = AutoStartConfig { script_path: String::new(), ..base.clone() };
+    let exe_only = AutoStartConfig {
+        script_path: String::new(),
+        ..base.clone()
+    };
     let exe_args = command_args(&exe_only);
     assert_eq!(exe_args.first().map(String::as_str), Some("serve"));
 }
@@ -361,7 +391,10 @@ fn 脚本路径填错必须报错() {
         boot_wait_ms: 20_000,
     };
     let err = preflight(&cfg).expect_err("脚本不存在必须拒绝");
-    assert!(err.contains("入口脚本不存在"), "错误信息要指出是脚本的问题：{err}");
+    assert!(
+        err.contains("入口脚本不存在"),
+        "错误信息要指出是脚本的问题：{err}"
+    );
 
     // 对照组：脚本清空就只校验 exe，模型目录不存在仍要拦。
     let mut no_script = cfg.clone();

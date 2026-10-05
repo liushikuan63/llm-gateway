@@ -480,7 +480,7 @@ impl Default for AppConfig {
             local_models: LocalModelConfig::default(),
             smart_routing: SmartRoutingConfig::default(),
             search: SearchConfig::default(),
-        ollama_options: OllamaOptionsConfig::default(),
+            ollama_options: OllamaOptionsConfig::default(),
         }
     }
 }
@@ -642,7 +642,8 @@ impl AppConfig {
         self.smart_routing.jev.timeout_ms = self.smart_routing.jev.timeout_ms.clamp(100, 30_000);
         // edgeJev 的 max_len 是 1024 token；留 0 会让 state 不受控地膨胀，
         // 而上游会静默截断到开头——真实诉求通常写在最后。
-        self.smart_routing.jev.max_state_chars = self.smart_routing.jev.max_state_chars.clamp(64, 16_000);
+        self.smart_routing.jev.max_state_chars =
+            self.smart_routing.jev.max_state_chars.clamp(64, 16_000);
         for endpoint in &mut self.local_models.endpoints {
             endpoint.base_url = endpoint.base_url.trim().trim_end_matches('/').to_owned();
         }
@@ -667,10 +668,14 @@ impl AppConfig {
         if let Some(url) = self.search.searxng_url.as_deref() {
             validate_http_url(url)?;
         }
-        if matches!(
-            self.search.backend,
-            SearchBackendKind::SearXng
-        ) && self.search.searxng_url.as_deref().unwrap_or("").trim().is_empty()
+        if matches!(self.search.backend, SearchBackendKind::SearXng)
+            && self
+                .search
+                .searxng_url
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
         {
             anyhow::bail!("选择 SearXNG 后端时必须填写实例地址");
         }
@@ -750,8 +755,7 @@ impl AppConfig {
 /// 只放行 http/https 并要求带主机名，避免把任意字符串拼进请求 URL。
 pub fn validate_http_url(raw: &str) -> anyhow::Result<()> {
     let raw = raw.trim();
-    let url = reqwest::Url::parse(raw)
-        .map_err(|error| anyhow::anyhow!("地址无效：{error}"))?;
+    let url = reqwest::Url::parse(raw).map_err(|error| anyhow::anyhow!("地址无效：{error}"))?;
     if url.scheme() != "http" && url.scheme() != "https" {
         anyhow::bail!("地址只允许 http 或 https，实际是 {}", url.scheme());
     }

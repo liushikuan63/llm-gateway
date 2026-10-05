@@ -1,14 +1,13 @@
 //! Search backends.
-///
-/// Four adapters behind one trait. They differ only in endpoint, credential and
-/// response shape; everything above them (normalisation, injection, failure
-/// handling) is shared.
-///
-/// **Credentials stay out of the config file.** Tavily and Brave need a key; it
-/// lives in SQLite `app_secrets` as AES-256-GCM ciphertext and is passed in per
-/// call. `None` means "no credential configured", which for those two backends is
-/// a hard error rather than a silent retry.
-
+//!
+//! Four adapters behind one trait. They differ only in endpoint, credential and
+//! response shape; everything above them (normalisation, injection, failure
+//! handling) is shared.
+//!
+//! **Credentials stay out of the config file.** Tavily and Brave need a key; it
+//! lives in SQLite `app_secrets` as AES-256-GCM ciphertext and is passed in per
+//! call. `None` means "no credential configured", which for those two backends is
+//! a hard error rather than a silent retry.
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -168,7 +167,10 @@ impl SearchBackend for BraveBackend {
             .get(join_path(&self.base_url, "/res/v1/web/search"))
             .header("X-Subscription-Token", key)
             .header("Accept", "application/json")
-            .query(&[("q", query.text.as_str()), ("count", &query.max_results.to_string())])
+            .query(&[
+                ("q", query.text.as_str()),
+                ("count", &query.max_results.to_string()),
+            ])
             .send()
             .await
             .map_err(map_transport)?;
@@ -219,7 +221,9 @@ impl SearchBackend for SearXngBackend {
         let root = self.base_url.trim().trim_end_matches('/');
         // 地址由用户填写，保存期已校验过协议；这里再挡一次是因为它会被拼进 URL。
         if !(root.starts_with("http://") || root.starts_with("https://")) {
-            return Err(SearchError::Malformed("SearXNG 地址必须是 http/https".into()));
+            return Err(SearchError::Malformed(
+                "SearXNG 地址必须是 http/https".into(),
+            ));
         }
         let response = http
             .get(format!("{root}/search"))
@@ -245,10 +249,7 @@ impl SearchBackend for SearXngBackend {
                 title: string_field(item, "title"),
                 url: string_field(item, "url"),
                 snippet: string_field(item, "content"),
-                score: item
-                    .get("score")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0) as f32,
+                score: item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
             })
             .filter(|r| !r.url.is_empty())
             .collect())
@@ -293,7 +294,10 @@ impl SearchBackend for DuckDuckGoBackend {
         if !status.is_success() {
             return Err(status_error(status, &body));
         }
-        Ok(crate::search::parse::duckduckgo_lite(&body, query.max_results as usize))
+        Ok(crate::search::parse::duckduckgo_lite(
+            &body,
+            query.max_results as usize,
+        ))
     }
 }
 

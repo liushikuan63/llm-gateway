@@ -89,7 +89,7 @@ fn ollama_upstream_body_keeps_tools_options_and_tool_call_history() {
         name: None,
     });
 
-// None = 不注入网关默认值，验证纯转换逻辑。
+    // None = 不注入网关默认值，验证纯转换逻辑。
     let body = ollama::to_ollama_body(&request, "llama3.3", None);
     assert_eq!(body["tools"][0]["function"]["name"], "weather");
     assert!((body["options"]["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);

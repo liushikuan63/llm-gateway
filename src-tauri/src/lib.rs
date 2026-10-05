@@ -1,5 +1,5 @@
-pub mod boot;
 pub mod autostart;
+pub mod boot;
 pub mod bundle;
 pub mod cli_tools;
 mod commands;
@@ -355,7 +355,7 @@ mod tests {
     /// 判定逻辑抽成可测的纯函数：直接读 `std::env::args()` 没法在测试里
     /// 换掉参数，而「有/无 --minimized」这两个分支都必须被覆盖。
     fn starts_hidden_with(args: &[&str]) -> bool {
-        args.iter().any(|a| *a == crate::autostart::MINIMIZED_FLAG)
+        args.contains(&crate::autostart::MINIMIZED_FLAG)
     }
 
     #[test]
@@ -372,7 +372,10 @@ mod tests {
         assert!(!starts_hidden_with(&["llm-gateway.exe", "--MINIMIZED"]));
         assert!(starts_hidden_with(&["--minimized", "llm-gateway.exe"]));
         // 相近参数不得误判
-        assert!(!starts_hidden_with(&["llm-gateway.exe", "--minimized=false"]));
+        assert!(!starts_hidden_with(&[
+            "llm-gateway.exe",
+            "--minimized=false"
+        ]));
         assert!(!starts_hidden_with(&["llm-gateway.exe", "-m"]));
     }
 

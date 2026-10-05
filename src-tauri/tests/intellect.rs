@@ -6,15 +6,20 @@
 //! 1. `intent` 为 `None` 时，旧六档策略的排序结果与改动前**逐位相同**；
 //! 2. 分类链路任何一级失败都不允许影响请求——决策端点挂掉时必须有结果。
 
+// 本文件的「先取默认配置、再逐字段改」是测试的正常写法，clippy 的
+// field_reassign_with_default 在这里属于误报：结构更新语法（..Default::default()）
+// 反而更难读——未涉及的字段被藏进展开里，改测试时要先数清有几个字段。
+// 故只在此处关闭；生产代码（src/）不受影响，仍保持该检查。
+#![allow(clippy::field_reassign_with_default)]
 use std::time::Duration;
 
 use llm_gateway_lib::config::{
     AppConfig, JevConfig, RoutingStrategy, SmartClassifier, SmartRoutingConfig,
 };
 use llm_gateway_lib::domain::{Dialect, Message, ModelRef, Provider};
-use llm_gateway_lib::intellect::{classify};
+use llm_gateway_lib::intellect::classify;
 use llm_gateway_lib::intellect::classify::{
-    classify_by_heuristic, classify_by_rules, ClassifyInput, ClassifierSource, REASONING_THRESHOLD,
+    classify_by_heuristic, classify_by_rules, ClassifierSource, ClassifyInput, REASONING_THRESHOLD,
 };
 use llm_gateway_lib::intellect::jev::JevAnswer;
 use llm_gateway_lib::media::Media;
@@ -119,7 +124,10 @@ fn reasoning_意图下不支持_thinking_的候选得_045() {
 fn reasoning_意图按智能分给思考模型加分() {
     let strong = intent_fit(TaskClass::Reasoning, &candidate("a", "t", true, 90));
     let weak = intent_fit(TaskClass::Reasoning, &candidate("a", "t", true, 20));
-    assert!((strong - 1.0).abs() < 1e-6, "强模型应封顶 1.0，实际 {strong}");
+    assert!(
+        (strong - 1.0).abs() < 1e-6,
+        "强模型应封顶 1.0，实际 {strong}"
+    );
     assert!((weak - 0.82).abs() < 1e-4, "弱模型实际 {weak}");
     assert!(strong > weak, "同一个模型，智能分高必须得分更高");
 }
@@ -225,8 +233,15 @@ fn input<'s>(messages: &'s [Message], media: Media, has_tools: bool) -> Classify
 #[test]
 fn 含图片的请求被硬规则判为_vision() {
     let messages = vec![Message::user("这个报错是什么意思")];
-    let got = classify_by_rules(&input(&messages, Media { image: true, ..Default::default() }, false))
-        .expect("含图片必须由硬规则直接判定");
+    let got = classify_by_rules(&input(
+        &messages,
+        Media {
+            image: true,
+            ..Default::default()
+        },
+        false,
+    ))
+    .expect("含图片必须由硬规则直接判定");
     assert_eq!(got.class, TaskClass::Vision);
     assert_eq!(got.classifier, ClassifierSource::Rule);
 }
@@ -234,16 +249,30 @@ fn 含图片的请求被硬规则判为_vision() {
 #[test]
 fn 含视频同样归_vision() {
     let messages = vec![Message::user("总结一下")];
-    let got = classify_by_rules(&input(&messages, Media { video: true, ..Default::default() }, false))
-        .expect("含视频必须判定");
+    let got = classify_by_rules(&input(
+        &messages,
+        Media {
+            video: true,
+            ..Default::default()
+        },
+        false,
+    ))
+    .expect("含视频必须判定");
     assert_eq!(got.class, TaskClass::Vision);
 }
 
 #[test]
 fn 含音频归_reasoning() {
     let messages = vec![Message::user("录音里在讲什么")];
-    let got = classify_by_rules(&input(&messages, Media { audio: true, ..Default::default() }, false))
-        .expect("含音频必须判定");
+    let got = classify_by_rules(&input(
+        &messages,
+        Media {
+            audio: true,
+            ..Default::default()
+        },
+        false,
+    ))
+    .expect("含音频必须判定");
     assert_eq!(got.class, TaskClass::Reasoning);
 }
 
@@ -254,7 +283,8 @@ fn 长上下文带工具归_reasoning() {
     for _ in 0..8 {
         messages.push(Message::assistant("好的"));
     }
-    let got = classify_by_rules(&input(&messages, Media::default(), true)).expect("长上下文带工具必须判定");
+    let got = classify_by_rules(&input(&messages, Media::default(), true))
+        .expect("长上下文带工具必须判定");
     assert_eq!(got.class, TaskClass::Reasoning);
 }
 
@@ -293,7 +323,12 @@ fn 启发式对空输入也返回非空结果() {
 fn 简单改名被判为_simple() {
     let messages = vec![Message::user("把变量名 x 改成 userName")];
     let intent = classify_by_heuristic(&input(&messages, Media::default(), false));
-    assert_eq!(intent.class, TaskClass::Simple, "复杂度 {}", intent.complexity);
+    assert_eq!(
+        intent.class,
+        TaskClass::Simple,
+        "复杂度 {}",
+        intent.complexity
+    );
     assert!(!intent.needs_web);
 }
 
@@ -303,14 +338,24 @@ fn 复杂设计被判为_reasoning() {
         "为千万级用户的系统设计一套限流、降级、熔断方案，并给出容量估算与一致性证明",
     )];
     let intent = classify_by_heuristic(&input(&messages, Media::default(), false));
-    assert_eq!(intent.class, TaskClass::Reasoning, "复杂度 {}", intent.complexity);
+    assert_eq!(
+        intent.class,
+        TaskClass::Reasoning,
+        "复杂度 {}",
+        intent.complexity
+    );
 }
 
 #[test]
 fn 带代码块的提问被判为_reasoning() {
     let messages = vec![Message::user("这段为什么报错\n```rust\nfn main() {}\n```")];
     let intent = classify_by_heuristic(&input(&messages, Media::default(), false));
-    assert_eq!(intent.class, TaskClass::Reasoning, "复杂度 {}", intent.complexity);
+    assert_eq!(
+        intent.class,
+        TaskClass::Reasoning,
+        "复杂度 {}",
+        intent.complexity
+    );
 }
 
 #[test]
@@ -339,7 +384,12 @@ fn 英文架构设计被判为_reasoning() {
         "Design a rate limiter architecture for 10M users, with tradeoffs and a capacity estimate",
     )];
     let intent = classify_by_heuristic(&input(&messages, Media::default(), false));
-    assert_eq!(intent.class, TaskClass::Reasoning, "复杂度 {}", intent.complexity);
+    assert_eq!(
+        intent.class,
+        TaskClass::Reasoning,
+        "复杂度 {}",
+        intent.complexity
+    );
 }
 
 #[test]
@@ -348,7 +398,12 @@ fn 英文排错提问被判为_reasoning() {
         "Production API returns 500 on every request. Please diagnose the root cause and explain why",
     )];
     let intent = classify_by_heuristic(&input(&messages, Media::default(), false));
-    assert_eq!(intent.class, TaskClass::Reasoning, "复杂度 {}", intent.complexity);
+    assert_eq!(
+        intent.class,
+        TaskClass::Reasoning,
+        "复杂度 {}",
+        intent.complexity
+    );
 }
 
 #[test]
@@ -357,19 +412,30 @@ fn 英文调试提问被判为_reasoning() {
         "Help me debug this flaky test and figure out the concurrency issue",
     )];
     let intent = classify_by_heuristic(&input(&messages, Media::default(), false));
-    assert_eq!(intent.class, TaskClass::Reasoning, "复杂度 {}", intent.complexity);
+    assert_eq!(
+        intent.class,
+        TaskClass::Reasoning,
+        "复杂度 {}",
+        intent.complexity
+    );
 }
 
 #[test]
 fn 英文时效词会标记需要联网() {
     let messages = vec![Message::user("What is the latest release of Rust?")];
     let intent = classify_by_heuristic(&input(&messages, Media::default(), false));
-    assert!(intent.needs_web, "英文时效词也应当触发联网，复杂度 {}", intent.complexity);
+    assert!(
+        intent.needs_web,
+        "英文时效词也应当触发联网，复杂度 {}",
+        intent.complexity
+    );
 }
 
 #[test]
 fn 英文查文档会标记需要联网() {
-    let messages = vec![Message::user("Look up the official documentation for this flag")];
+    let messages = vec![Message::user(
+        "Look up the official documentation for this flag",
+    )];
     let intent = classify_by_heuristic(&input(&messages, Media::default(), false));
     assert!(intent.needs_web, "「official documentation」应当触发联网");
 }
@@ -390,7 +456,12 @@ fn 英文简单请求仍然判为_simple() {
     // `update` / `version` 之类的词带成 reasoning。
     let messages = vec![Message::user("Rename the variable x to userName")];
     let intent = classify_by_heuristic(&input(&messages, Media::default(), false));
-    assert_eq!(intent.class, TaskClass::Simple, "复杂度 {}", intent.complexity);
+    assert_eq!(
+        intent.class,
+        TaskClass::Simple,
+        "复杂度 {}",
+        intent.complexity
+    );
     assert!(!intent.needs_web, "改名不该触发联网");
 }
 
@@ -441,8 +512,8 @@ async fn systemone_响应解析出_choice_与置信度() {
         r#"{"model":"rl-agent","answers":{"complexity":{"type":"choice","choice":"complex","probabilities":{"complex":0.9,"simple":0.1},"confidence":0.88}},"usage":{"input_tokens":10,"output_tokens":0}}"#,
     )
     .await;
-    let client =
-        llm_gateway_lib::intellect::JevClient::new(&base, "rl-agent", 2000, 2000).expect("端点应合法");
+    let client = llm_gateway_lib::intellect::JevClient::new(&base, "rl-agent", 2000, 2000)
+        .expect("端点应合法");
     let body = serde_json::json!({
         "model": "rl-agent",
         "state": {"prompt": "设计一个分布式限流器"},
@@ -452,15 +523,22 @@ async fn systemone_响应解析出_choice_与置信度() {
     let answer = result.get("complexity").expect("complexity 必须有答案");
     assert_eq!(answer.choice(), Some("complex"));
     let margin = answer.margin().expect("choice 必须能算出边际");
-    assert!((margin - 0.8).abs() < 1e-4, "边际应按概率差算，实际 {margin}");
+    assert!(
+        (margin - 0.8).abs() < 1e-4,
+        "边际应按概率差算，实际 {margin}"
+    );
     assert!((answer.confidence() - 0.88).abs() < 1e-6);
 }
 
 #[tokio::test]
 async fn 模型未安装的_404_被映射成可回落错误() {
-    let base = spawn_mock(404, r#"{"error":"model \"nimble\" not found, try pulling it first"}"#).await;
-    let client =
-        llm_gateway_lib::intellect::JevClient::new(&base, "nimble", 2000, 2000).expect("端点应合法");
+    let base = spawn_mock(
+        404,
+        r#"{"error":"model \"nimble\" not found, try pulling it first"}"#,
+    )
+    .await;
+    let client = llm_gateway_lib::intellect::JevClient::new(&base, "nimble", 2000, 2000)
+        .expect("端点应合法");
     let body = serde_json::json!({ "model": "nimble", "state": {"prompt":"x"}, "questions": {} });
     let error = client.decide(body).await.expect_err("404 必须报错");
     assert!(
@@ -471,17 +549,17 @@ async fn 模型未安装的_404_被映射成可回落错误() {
 
 #[tokio::test]
 async fn 未知_question_type_返回_err_而不是默认值() {
-    let base = spawn_mock(
-        200,
-        r#"{"answers":{"x":{"type":"quantum","value":1}}}"#,
-    )
-    .await;
-    let client = llm_gateway_lib::intellect::JevClient::new(&base, "m", 2000, 2000).expect("端点应合法");
+    let base = spawn_mock(200, r#"{"answers":{"x":{"type":"quantum","value":1}}}"#).await;
+    let client =
+        llm_gateway_lib::intellect::JevClient::new(&base, "m", 2000, 2000).expect("端点应合法");
     let error = client
         .decide(serde_json::json!({ "model": "m", "state": {}, "questions": {} }))
         .await
         .expect_err("未知类型必须报错");
-    assert!(matches!(error, llm_gateway_lib::intellect::JevError::Malformed(_)));
+    assert!(matches!(
+        error,
+        llm_gateway_lib::intellect::JevError::Malformed(_)
+    ));
 }
 
 #[tokio::test]
@@ -509,8 +587,8 @@ async fn jev_高置信度_说简单也不许降级启发式的推理判定() {
     })
     .to_string();
     let base = spawn_mock(200, Box::leak(body.into_boxed_str())).await;
-    let client = llm_gateway_lib::intellect::JevClient::new(&base, "m", 2000, 2000)
-        .expect("端点应合法");
+    let client =
+        llm_gateway_lib::intellect::JevClient::new(&base, "m", 2000, 2000).expect("端点应合法");
 
     let text = "线上服务 500 白屏，帮我定位根因";
     let messages = vec![Message::user(text)];
@@ -567,8 +645,8 @@ async fn jev_说简单且启发式本来就不认为复杂时才允许降级() {
     })
     .to_string();
     let base = spawn_mock(200, Box::leak(body.into_boxed_str())).await;
-    let client = llm_gateway_lib::intellect::JevClient::new(&base, "m", 2000, 2000)
-        .expect("端点应合法");
+    let client =
+        llm_gateway_lib::intellect::JevClient::new(&base, "m", 2000, 2000).expect("端点应合法");
 
     let messages = vec![Message::user("把变量名 x 改成 userName")];
     let inp = input(&messages, Media::default(), false);
@@ -589,7 +667,8 @@ async fn jev_说简单且启发式本来就不认为复杂时才允许降级() {
 #[tokio::test]
 async fn http_401_被映射成凭据错误而不是未就绪() {
     let base = spawn_mock(401, r#"{"error":"bad key"}"#).await;
-    let client = llm_gateway_lib::intellect::JevClient::new(&base, "m", 2000, 2000).expect("端点应合法");
+    let client =
+        llm_gateway_lib::intellect::JevClient::new(&base, "m", 2000, 2000).expect("端点应合法");
     let error = client
         .decide(serde_json::json!({ "model": "m", "state": {}, "questions": {} }))
         .await
@@ -610,7 +689,9 @@ async fn 决策端点超时后分类仍返回结果且标记为启发式() {
             axum::Json(serde_json::json!({}))
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("绑定");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定");
     let addr = listener.local_addr().expect("地址");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -639,9 +720,21 @@ async fn 决策端点超时后分类仍返回结果且标记为启发式() {
     .expect("端点应合法");
     let messages = vec![Message::user("帮我设计一个分布式限流器")];
     let started = std::time::Instant::now();
-    let intent = llm_gateway_lib::intellect::classify(&input(&messages, Media::default(), false), &cfg, Some(&client)).await;
-    assert!(started.elapsed() < Duration::from_secs(3), "超时必须真的生效");
-    assert_eq!(intent.classifier, ClassifierSource::Heuristic, "超时应回落启发式");
+    let intent = llm_gateway_lib::intellect::classify(
+        &input(&messages, Media::default(), false),
+        &cfg,
+        Some(&client),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "超时必须真的生效"
+    );
+    assert_eq!(
+        intent.classifier,
+        ClassifierSource::Heuristic,
+        "超时应回落启发式"
+    );
     assert!(intent.jev_note.is_some(), "回落原因要可解释");
     assert_eq!(intent.class, TaskClass::Reasoning, "启发式仍应判对复杂任务");
 }
@@ -672,9 +765,17 @@ async fn 低置信度时_jev_被弃权() {
     )
     .expect("端点应合法");
     let messages = vec![Message::user("帮我设计一个分布式限流器")];
-    let intent =
-        llm_gateway_lib::intellect::classify(&input(&messages, Media::default(), false), &cfg, Some(&client)).await;
-    assert_eq!(intent.classifier, ClassifierSource::Heuristic, "低置信度必须弃权");
+    let intent = llm_gateway_lib::intellect::classify(
+        &input(&messages, Media::default(), false),
+        &cfg,
+        Some(&client),
+    )
+    .await;
+    assert_eq!(
+        intent.classifier,
+        ClassifierSource::Heuristic,
+        "低置信度必须弃权"
+    );
     assert!(intent.class == TaskClass::Reasoning, "弃权后用启发式的结论");
     let note = intent.jev_note.unwrap_or_default();
     assert!(note.contains("置信度"), "要说明弃权原因，实际 {note}");
@@ -689,7 +790,11 @@ async fn 高置信度且边际够时_jev_被采纳() {
     .await;
     let cfg = SmartRoutingConfig {
         enabled: true,
-        jev: JevConfig { base_url: base, model: "m".into(), ..JevConfig::default() },
+        jev: JevConfig {
+            base_url: base,
+            model: "m".into(),
+            ..JevConfig::default()
+        },
         ..SmartRoutingConfig::default()
     };
     let client = llm_gateway_lib::intellect::JevClient::new(
@@ -700,8 +805,12 @@ async fn 高置信度且边际够时_jev_被采纳() {
     )
     .expect("端点应合法");
     let messages = vec![Message::user("把这个函数改一下")];
-    let intent =
-        llm_gateway_lib::intellect::classify(&input(&messages, Media::default(), false), &cfg, Some(&client)).await;
+    let intent = llm_gateway_lib::intellect::classify(
+        &input(&messages, Media::default(), false),
+        &cfg,
+        Some(&client),
+    )
+    .await;
     assert_eq!(intent.classifier, ClassifierSource::Jev);
     assert_eq!(intent.class, TaskClass::Reasoning);
     assert!(intent.jev_evidence.is_some(), "采纳时要留下证据");
@@ -710,7 +819,11 @@ async fn 高置信度且边际够时_jev_被采纳() {
 #[test]
 fn 边际计算按概率排序后的前两名之差() {
     let ranked = vec![("a".to_string(), 0.5f32), ("b".to_string(), 0.5)];
-    let answer = JevAnswer::Choice { value: "a".into(), ranked, confidence: 0.9 };
+    let answer = JevAnswer::Choice {
+        value: "a".into(),
+        ranked,
+        confidence: 0.9,
+    };
     assert_eq!(answer.margin(), Some(0.0), "完全均匀时边际为 0，会被弃权");
 
     let ranked = vec![("a".to_string(), 0.6f32), ("b".to_string(), 0.4)];
@@ -737,7 +850,7 @@ fn state_超长时按上限截断且保留尾部() {
     assert!(cut.chars().count() <= 200 + 20, "截断后不能超上限太多");
     assert!(cut.starts_with('开'), "要保留开头一点，便于定位");
     assert!(cut.ends_with("结尾诉求在这里"), "必须保留尾部");
-    assert!(!cut.contains("省略") == false, "截断处应有明确标记");
+    assert!(cut.contains("省略"), "截断处应有明确标记");
 }
 
 #[test]
@@ -751,7 +864,10 @@ fn state_未超长时原样返回() {
 fn base_url_带非_http_协议被拒绝() {
     let error = llm_gateway_lib::intellect::JevClient::new("file:///etc/password", "m", 1000, 2000)
         .expect_err("必须拒绝");
-    assert!(matches!(error, llm_gateway_lib::intellect::JevError::InvalidEndpoint(_)));
+    assert!(matches!(
+        error,
+        llm_gateway_lib::intellect::JevError::InvalidEndpoint(_)
+    ));
     assert!(llm_gateway_lib::intellect::JevClient::new("not s url", "m", 1000, 2000).is_err());
 }
 
@@ -873,12 +989,13 @@ fn auto_虚拟名行为未改变() {
     let limiter = std::sync::Arc::new(llm_gateway_lib::router::ratelimit::RateLimiter::new());
     let health = std::sync::Arc::new(llm_gateway_lib::proxy::health::HealthRegistry::new());
     let router = llm_gateway_lib::router::Router::new(limiter, health);
-    let candidates = router.resolve("auto", std::slice::from_ref(&p)).expect("auto 应可用");
+    let candidates = router
+        .resolve("auto", std::slice::from_ref(&p))
+        .expect("auto 应可用");
     for candidate in &candidates {
         assert_eq!(candidate.virtual_strategy, None, "auto 不带策略覆盖");
         assert!(!candidate.exact_match);
     }
-    
 }
 
 /* -------------------- needs_web 触发词的覆盖与误报 -------------------- */
@@ -897,7 +1014,8 @@ fn needsweb_常见中文搜索说法都要触发() {
         "百度一下这个错误",
         "查一查今天的新闻",
     ] {
-        let out = classify::classify_by_heuristic(&input(&[Message::user(q)], Media::default(), false));
+        let out =
+            classify::classify_by_heuristic(&input(&[Message::user(q)], Media::default(), false));
         assert!(
             out.needs_web,
             "「{q}」应当触发联网搜索，实际 needs_web=false"
@@ -911,7 +1029,8 @@ fn needsweb_英文说法要触发() {
         "search for the latest rust release",
         "look up the changelog",
     ] {
-        let out = classify::classify_by_heuristic(&input(&[Message::user(q)], Media::default(), false));
+        let out =
+            classify::classify_by_heuristic(&input(&[Message::user(q)], Media::default(), false));
         assert!(out.needs_web, "「{q}」应当触发联网搜索");
     }
 }
@@ -925,7 +1044,8 @@ fn needsweb_纯本地任务不得误触发() {
         "这段代码为什么报错 NullPointerException",
         "优化这个函数的性能",
     ] {
-        let out = classify::classify_by_heuristic(&input(&[Message::user(q)], Media::default(), false));
+        let out =
+            classify::classify_by_heuristic(&input(&[Message::user(q)], Media::default(), false));
         assert!(
             !out.needs_web,
             "「{q}」不该触发联网搜索，实际触发了 —— 会给每条普通请求白加一次网络往返"

@@ -10,8 +10,8 @@ use serde::Serialize;
 use crate::config::{SearchBackendKind, SearchConfig};
 use crate::domain::{Content, Message, Role};
 use crate::search::backend::{
-    BingCnBackend, BraveBackend, DuckDuckGoBackend, SearchBackend, SearchError, SearchQuery,
-    SearchResult, SearXngBackend, TavilyBackend,
+    BingCnBackend, BraveBackend, DuckDuckGoBackend, SearXngBackend, SearchBackend, SearchError,
+    SearchQuery, SearchResult, TavilyBackend,
 };
 
 /// 一次搜索的结果与它的可观测字段。
@@ -125,10 +125,15 @@ pub async fn prefetch(
             results: Vec::new(),
         };
     }
-    let outcome = execute(http, cfg, key, &SearchQuery {
-        text: query.clone(),
-        max_results: cfg.normalized_max_results(),
-    })
+    let outcome = execute(
+        http,
+        cfg,
+        key,
+        &SearchQuery {
+            text: query.clone(),
+            max_results: cfg.normalized_max_results(),
+        },
+    )
     .await;
 
     if outcome.results.is_empty() {

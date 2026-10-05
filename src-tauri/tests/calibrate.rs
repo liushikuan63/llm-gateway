@@ -14,6 +14,11 @@
 //! 另有**对照用例**：Jev 判错而启发式判对、Jev 判对而启发式判错各一条，
 //! 两者必须被分开统计——把它们合并成一个「总正确率」会让报告失去意义。
 
+// 本文件的「先取默认配置、再逐字段改」是测试的正常写法，clippy 的
+// field_reassign_with_default 在这里属于误报：结构更新语法（..Default::default()）
+// 反而更难读——未涉及的字段被藏进展开里，改测试时要先数清有几个字段。
+// 故只在此处关闭；生产代码（src/）不受影响，仍保持该检查。
+#![allow(clippy::field_reassign_with_default)]
 use llm_gateway_lib::intellect::calibrate::{
     build_report, CalibrationReport, LabeledSample, SampleOutcome,
 };
@@ -83,13 +88,23 @@ fn jev_采纳后确实更好时净收益为正() {
         // 启发式判错（把改名当推理），Jev 判对 → 采纳后多对一条。
         jev_right(),
         // 双方都对 → 不影响净收益。
-        outcome(TaskClass::Simple, TaskClass::Simple, TaskClass::Simple, false, 0.2),
+        outcome(
+            TaskClass::Simple,
+            TaskClass::Simple,
+            TaskClass::Simple,
+            false,
+            0.2,
+        ),
     ]);
     assert_eq!(report.heuristic_correct, 1, "启发式只对了第二条");
     assert_eq!(report.adopted_count, 1);
     assert_eq!(report.adopted_correct, 1, "Jev 采纳的那条判对了");
     assert_eq!(report.net_gain, 1, "采纳后比不采纳多对一条");
-    assert!(report.verdict.contains("可以适度放宽阈值"), "{}", report.verdict);
+    assert!(
+        report.verdict.contains("可以适度放宽阈值"),
+        "{}",
+        report.verdict
+    );
 }
 
 #[test]
@@ -100,7 +115,10 @@ fn jev_自信判错时净收益为负并点名错法() {
     assert_eq!(report.net_gain, -1, "采纳它反而少对一条");
     assert_eq!(report.adopted_wrong, 1);
     assert_eq!(report.heuristic_correct, 1, "启发式本来是对的");
-    let worst = report.worst_wrong.as_ref().expect("必须点名最危险的那条错法");
+    let worst = report
+        .worst_wrong
+        .as_ref()
+        .expect("必须点名最危险的那条错法");
     assert_eq!(worst.confidence, 0.75);
     assert!(
         report.verdict.contains("阈值挡不住"),
@@ -127,15 +145,16 @@ fn jev_全被弃权时明确说它不参与决策() {
     );
     // 弃权不是「没干活」，是一条样本里它保护对了多少也要看得见。
     assert_eq!(report.net_gain, 0, "全弃权时采纳与不采纳等价");
-    assert_eq!(report.adopted_accuracy(), None, "分母为 0 时必须返回 None 而不是 0 或 1");
+    assert_eq!(
+        report.adopted_accuracy(),
+        None,
+        "分母为 0 时必须返回 None 而不是 0 或 1"
+    );
 }
 
 #[test]
 fn 净收益为零时结论是别增加复杂度() {
-    let report = build_report(vec![
-        jev_right(),
-        jev_wrong(),
-    ]);
+    let report = build_report(vec![jev_right(), jev_wrong()]);
     assert_eq!(report.net_gain, 0, "一条对一条错，正好抵消");
     assert!(
         report.verdict.contains("打平"),
@@ -156,12 +175,7 @@ fn jev_判对而启发式判错计入净收益正方向() {
 
 #[test]
 fn 采纳与弃权必须分开计数() {
-    let report = build_report(vec![
-        jev_right(),
-        jev_wrong(),
-        abstained(),
-        abstained(),
-    ]);
+    let report = build_report(vec![jev_right(), jev_wrong(), abstained(), abstained()]);
     assert_eq!(report.adopted_count, 2, "只有两条真的被采纳");
     assert_eq!(report.abstained_count, 2);
     assert_eq!(report.adopted_correct, 1);
@@ -186,7 +200,10 @@ fn 混淆矩阵按真实类别分行() {
         .get("reasoning")
         .expect("真实为 reasoning 的行必须存在");
     assert_eq!(row.get("simple"), Some(&1), "行=真实，列=系统判定");
-    let row = report.matrix.get("simple").expect("真实为 simple 的行必须存在");
+    let row = report
+        .matrix
+        .get("simple")
+        .expect("真实为 simple 的行必须存在");
     assert_eq!(row.get("simple"), Some(&1));
     // 对角线之和必须等于采纳后的正确数——矩阵和计数是两条独立路径，
     // 它们对不上就说明其中一处统计错了。
@@ -206,12 +223,7 @@ fn 混淆矩阵按真实类别分行() {
 
 #[test]
 fn 矩阵每一行的和等于该类样本总数() {
-    let outcomes = vec![
-        jev_wrong(),
-        jev_wrong(),
-        jev_right(),
-        abstained(),
-    ];
+    let outcomes = vec![jev_wrong(), jev_wrong(), jev_right(), abstained()];
     let report = build_report(outcomes);
     // 真实 reasoning：3 条（两条被误判成 simple，一条弃权后判对）
     let reasoning = report.matrix.get("reasoning").expect("缺 reasoning 行");
@@ -220,7 +232,11 @@ fn 矩阵每一行的和等于该类样本总数() {
     let simple = report.matrix.get("simple").expect("缺 simple 行");
     assert_eq!(simple.values().sum::<u32>(), 1);
     // 所有行加起来等于总数。
-    let grand: u32 = report.matrix.values().map(|c| c.values().sum::<u32>()).sum();
+    let grand: u32 = report
+        .matrix
+        .values()
+        .map(|c| c.values().sum::<u32>())
+        .sum();
     assert_eq!(grand, report.total);
 }
 
@@ -228,9 +244,27 @@ fn 矩阵每一行的和等于该类样本总数() {
 
 #[test]
 fn 错判按置信度降序且最危险的那条被点名() {
-    let low = outcome(TaskClass::Reasoning, TaskClass::Reasoning, TaskClass::Simple, true, 0.40);
-    let high = outcome(TaskClass::Reasoning, TaskClass::Reasoning, TaskClass::Simple, true, 0.92);
-    let mid = outcome(TaskClass::Reasoning, TaskClass::Reasoning, TaskClass::Simple, true, 0.61);
+    let low = outcome(
+        TaskClass::Reasoning,
+        TaskClass::Reasoning,
+        TaskClass::Simple,
+        true,
+        0.40,
+    );
+    let high = outcome(
+        TaskClass::Reasoning,
+        TaskClass::Reasoning,
+        TaskClass::Simple,
+        true,
+        0.92,
+    );
+    let mid = outcome(
+        TaskClass::Reasoning,
+        TaskClass::Reasoning,
+        TaskClass::Simple,
+        true,
+        0.61,
+    );
     let report = build_report(vec![low, high, mid]);
     assert_eq!(report.wrong_confidences, vec![0.92, 0.61, 0.40]);
     assert_eq!(
@@ -247,7 +281,8 @@ fn 没有错判时最危险错法为空() {
     assert!(report.wrong_confidences.is_empty());
     assert!(
         report.verdict.contains("没有出现错判"),
-        "{}", report.verdict
+        "{}",
+        report.verdict
     );
 }
 
@@ -282,7 +317,10 @@ fn 准确率分母非零时算对() {
     let accuracy = report.adopted_accuracy().expect("分母非零");
     assert!((accuracy - 0.5).abs() < 1e-6, "实际 {accuracy}");
     let heuristic = report.heuristic_accuracy().expect("分母非零");
-    assert!((heuristic - 0.5).abs() < 1e-6, "启发式只对了 jev_wrong 那条，实际 {heuristic}");
+    assert!(
+        (heuristic - 0.5).abs() < 1e-6,
+        "启发式只对了 jev_wrong 那条，实际 {heuristic}"
+    );
 }
 
 #[test]
@@ -345,7 +383,10 @@ async fn spawn_jev_by_text(answers: Vec<(String, &'static str)>) -> (String, Arc
         let answers = answers.clone();
         async move {
             counter.fetch_add(1, Ordering::SeqCst);
-            let state = body["state"]["prompt"].as_str().unwrap_or_default().to_owned();
+            let state = body["state"]["prompt"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
             let choice = answers
                 .iter()
                 .find(|(key, _)| state.contains(key.as_str()))
@@ -404,7 +445,11 @@ async fn 端到端_采纳与弃权都被如实统计() {
     ];
     let report = calibrate(samples, SmartRoutingConfig::default(), jev.as_ref()).await;
 
-    assert_eq!(hits.load(Ordering::SeqCst), 3, "每条样本都要真打一次决策端点");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        3,
+        "每条样本都要真打一次决策端点"
+    );
     assert_eq!(report.total, 3);
     assert_eq!(report.adopted_count, 2, "两条被采纳，一条弃权");
     assert_eq!(report.abstained_count, 1);
@@ -433,11 +478,27 @@ async fn 端到端_每条样本都留下可核对的原始证据() {
 
     let only = report.per_sample.first().expect("每条样本都要留痕");
     assert_eq!(only.expected, TaskClass::Reasoning);
-    assert_eq!(only.adopted, TaskClass::Reasoning, "complex 映射成 reasoning");
+    assert_eq!(
+        only.adopted,
+        TaskClass::Reasoning,
+        "complex 映射成 reasoning"
+    );
     assert!(only.adopted_from_jev);
-    assert_eq!(only.raw_choice.as_deref(), Some("complex"), "原始选择必须留档");
-    assert!(only.confidence > 0.7, "置信度应从响应里读出来，实际 {}", only.confidence);
-    assert!(only.margin > 0.4, "边际应从分布里算出来，实际 {}", only.margin);
+    assert_eq!(
+        only.raw_choice.as_deref(),
+        Some("complex"),
+        "原始选择必须留档"
+    );
+    assert!(
+        only.confidence > 0.7,
+        "置信度应从响应里读出来，实际 {}",
+        only.confidence
+    );
+    assert!(
+        only.margin > 0.4,
+        "边际应从分布里算出来，实际 {}",
+        only.margin
+    );
     assert!(only.abstain_reason.is_none());
 }
 
@@ -474,9 +535,16 @@ async fn 端到端_没有决策端点时全部弃权而不是报错() {
     assert_eq!(report.total, 1);
     assert_eq!(report.adopted_count, 0);
     assert_eq!(report.abstained_count, 1);
-    let reason = report.per_sample[0].abstain_reason.as_deref().expect("写明原因");
+    let reason = report.per_sample[0]
+        .abstain_reason
+        .as_deref()
+        .expect("写明原因");
     assert!(reason.contains("未配置决策端点"), "实际：{reason}");
-    assert!(report.verdict.contains("一次都没被采纳"), "{}", report.verdict);
+    assert!(
+        report.verdict.contains("一次都没被采纳"),
+        "{}",
+        report.verdict
+    );
 }
 
 #[tokio::test]
@@ -495,7 +563,10 @@ async fn 端到端_决策端点不可达时报告仍然产出() {
     )
     .await;
     assert_eq!(report.abstained_count, 1, "端点挂了必须全部弃权");
-    let reason = report.per_sample[0].abstain_reason.as_deref().expect("写明原因");
+    let reason = report.per_sample[0]
+        .abstain_reason
+        .as_deref()
+        .expect("写明原因");
     assert!(
         reason.contains("超时") || reason.contains("不可用"),
         "原因要指向端点而不是分类失败：{reason}"

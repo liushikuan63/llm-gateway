@@ -142,9 +142,13 @@ async fn local_model_metadata_and_thinking_flag_survive_a_round_trip() {
         disk_bytes: Some(8_021_618_941),
         capabilities: vec!["vision".into(), "tools".into(), "thinking".into()],
     });
-    repo::upsert_provider(db.pool(), &p).await.expect("写入应成功");
+    repo::upsert_provider(db.pool(), &p)
+        .await
+        .expect("写入应成功");
 
-    let models = repo::list_models_of(db.pool(), "provider-a").await.expect("读取应成功");
+    let models = repo::list_models_of(db.pool(), "provider-a")
+        .await
+        .expect("读取应成功");
     assert_eq!(models.len(), 1);
     assert!(models[0].supports_thinking, "思维链能力位必须往返");
     let local = models[0].local.as_ref().expect("本地元数据必须往返");
@@ -158,16 +162,23 @@ async fn local_model_metadata_and_thinking_flag_survive_a_round_trip() {
 async fn 坏的本地元数据被静默降级而不是让查询失败() {
     // 手工改库能塞进坏 JSON；一次坏模型不该让整条候选链查不出来。
     let db = Db::connect_in_memory().await.expect("内存库应可用");
-    repo::upsert_provider(db.pool(), &provider()).await.expect("写入应成功");
+    repo::upsert_provider(db.pool(), &provider())
+        .await
+        .expect("写入应成功");
     sqlx::query("UPDATE models SET local_json = '{不是合法 JSON' WHERE provider_id = ?")
         .bind("provider-a")
         .execute(db.pool())
         .await
         .expect("应当能写入坏数据");
 
-    let models = repo::list_models_of(db.pool(), "provider-a").await.expect("查询必须成功");
+    let models = repo::list_models_of(db.pool(), "provider-a")
+        .await
+        .expect("查询必须成功");
     assert_eq!(models.len(), 1);
-    assert!(models[0].local.is_none(), "坏 JSON 应降级为 None 而不是报错");
+    assert!(
+        models[0].local.is_none(),
+        "坏 JSON 应降级为 None 而不是报错"
+    );
 }
 
 #[tokio::test]
@@ -203,11 +214,20 @@ async fn 应用密钥可写入_覆盖_删除_且不与_meta_表混用() {
     );
 
     // 反向对照：meta 表是明文配置，密钥绝不能落到那里。
-    assert_eq!(repo::meta_get(db.pool(), repo::SECRET_SEARCH_API_KEY).await.expect("查询"), None);
+    assert_eq!(
+        repo::meta_get(db.pool(), repo::SECRET_SEARCH_API_KEY)
+            .await
+            .expect("查询"),
+        None
+    );
 
-    assert!(repo::delete_secret(db.pool(), repo::SECRET_SEARCH_API_KEY).await.expect("删除应成功"));
+    assert!(repo::delete_secret(db.pool(), repo::SECRET_SEARCH_API_KEY)
+        .await
+        .expect("删除应成功"));
     assert!(
-        !repo::delete_secret(db.pool(), repo::SECRET_SEARCH_API_KEY).await.expect("重复删除不应报错"),
+        !repo::delete_secret(db.pool(), repo::SECRET_SEARCH_API_KEY)
+            .await
+            .expect("重复删除不应报错"),
         "第二次删除应当返回 false，让调用方区分"
     );
 }
@@ -417,6 +437,8 @@ fn 单个问号不误报_对照组() {
     assert!(!repo::looks_like_encoding_loss("??"));
     // 正常中文与英文一律不报。
     assert!(!repo::looks_like_encoding_loss("限流是做什么的，一句话"));
-    assert!(!repo::looks_like_encoding_loss("2026年最新的 Rust 1.99 有什么新特性"));
+    assert!(!repo::looks_like_encoding_loss(
+        "2026年最新的 Rust 1.99 有什么新特性"
+    ));
     assert!(!repo::looks_like_encoding_loss(""));
 }

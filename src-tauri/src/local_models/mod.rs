@@ -16,7 +16,7 @@ pub mod manage;
 pub mod runtime;
 
 pub use catalog::{
-    find_by_upstream, openai_models_from_list, ollama_models_from_tags, to_model_ref,
+    find_by_upstream, ollama_models_from_tags, openai_models_from_list, to_model_ref,
     LocalModelInfo,
 };
 pub use manage::{delete_ollama_model, pull_ollama_model, PullProgress};
@@ -95,12 +95,10 @@ pub fn same_host(a: &str, b: &str) -> bool {
         }
         // IPv6 字面量 `[::1]:11434`
         if let Some(rest) = host_port.strip_prefix('[') {
-            return rest
-                .split_once(']')
-                .map(|(h, tail)| {
-                    let port = tail.strip_prefix(':').unwrap_or("");
-                    format!("[{}]:{port}", h.to_ascii_lowercase())
-                });
+            return rest.split_once(']').map(|(h, tail)| {
+                let port = tail.strip_prefix(':').unwrap_or("");
+                format!("[{}]:{port}", h.to_ascii_lowercase())
+            });
         }
         let mut parts = host_port.splitn(2, ':');
         let host = parts.next().unwrap_or("").to_ascii_lowercase();

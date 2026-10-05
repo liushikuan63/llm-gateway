@@ -56,18 +56,18 @@ pub fn to_responses_body(req: &ChatRequest, model: &str) -> Value {
     for message in &req.messages {
         match message.role {
             Role::System => {
-                let t = plain_text(&message);
+                let t = plain_text(message);
                 if !t.trim().is_empty() {
                     instructions.push(t);
                 }
             }
             Role::User | Role::Tool => input.push(json!({
                 "role": "user",
-                "content": [{ "type": "input_text", "text": plain_text(&message) }],
+                "content": [{ "type": "input_text", "text": plain_text(message) }],
             })),
             Role::Assistant => input.push(json!({
                 "role": "assistant",
-                "content": [{ "type": "output_text", "text": plain_text(&message) }],
+                "content": [{ "type": "output_text", "text": plain_text(message) }],
             })),
         }
     }
@@ -142,8 +142,16 @@ pub fn from_responses_response(v: &Value, model: &str) -> ChatResponse {
     });
 
     ChatResponse {
-        id: v.get("id").and_then(Value::as_str).unwrap_or_default().to_owned(),
-        model: v.get("model").and_then(Value::as_str).unwrap_or(model).to_owned(),
+        id: v
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        model: v
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(model)
+            .to_owned(),
         content: text,
         tool_calls: None,
         finish_reason: finish_reason_of(v),
@@ -164,7 +172,11 @@ fn finish_reason_of(v: &Value) -> Option<String> {
                 .and_then(|d| d.get("reason"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            Some(if reason == "max_output_tokens" { "length".to_owned() } else { reason.to_owned() })
+            Some(if reason == "max_output_tokens" {
+                "length".to_owned()
+            } else {
+                reason.to_owned()
+            })
         }
         _ => None,
     }
@@ -178,7 +190,13 @@ mod tests {
     // Message / ChatRequest 都没实现 Default，所以显式列全字段 ——
     // 用 `..Default::default()` 会编译失败，且将来加字段时也不会提醒。
     fn m(role: Role, text: &str) -> Message {
-        Message { role, content: Content::Text(text.into()), tool_calls: None, tool_call_id: None, name: None }
+        Message {
+            role,
+            content: Content::Text(text.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
     }
 
     fn req(messages: Vec<Message>, max_tokens: Option<u32>) -> ChatRequest {
@@ -199,7 +217,10 @@ mod tests {
 
     #[test]
     fn system_提到顶层_instructions_而不是_input() {
-        let r = req(vec![m(Role::System, "你是助手"), m(Role::User, "你好")], None);
+        let r = req(
+            vec![m(Role::System, "你是助手"), m(Role::User, "你好")],
+            None,
+        );
         let b = to_responses_body(&r, "m");
         assert_eq!(
             b.get("instructions").and_then(Value::as_str),
@@ -216,8 +237,14 @@ mod tests {
         // 用错字段名的症状是「上游静默忽略上限」——
         // Responses 只有 max_output_tokens。
         let b = to_responses_body(&req(vec![], Some(4096)), "m");
-        assert_eq!(b.get("max_output_tokens").and_then(Value::as_u64), Some(4096));
-        assert!(b.get("max_tokens").is_none(), "不得出现 max_tokens（会被静默忽略）");
+        assert_eq!(
+            b.get("max_output_tokens").and_then(Value::as_u64),
+            Some(4096)
+        );
+        assert!(
+            b.get("max_tokens").is_none(),
+            "不得出现 max_tokens（会被静默忽略）"
+        );
     }
 
     #[test]
@@ -233,7 +260,10 @@ mod tests {
         assert_eq!(r.content, "答案");
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
         let u = r.usage.expect("usage");
-        assert_eq!((u.prompt_tokens, u.completion_tokens, u.total_tokens), (10, 20, 30));
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            (10, 20, 30)
+        );
     }
 
     #[test]
@@ -243,7 +273,10 @@ mod tests {
             "incomplete_details":{"reason":"max_output_tokens"},
             "output":[{"content":[{"type":"output_text","text":"被截断"}]}],
         });
-        assert_eq!(from_responses_response(&v, "m").finish_reason.as_deref(), Some("length"));
+        assert_eq!(
+            from_responses_response(&v, "m").finish_reason.as_deref(),
+            Some("length")
+        );
     }
 
     #[test]
@@ -253,7 +286,13 @@ mod tests {
             "usage":{"input_tokens":100,"output_tokens":5,"total_tokens":105,
                      "input_tokens_details":{"cached_tokens":80}},
         });
-        assert_eq!(from_responses_response(&v, "m").usage.expect("usage").cache_read_tokens, 80);
+        assert_eq!(
+            from_responses_response(&v, "m")
+                .usage
+                .expect("usage")
+                .cache_read_tokens,
+            80
+        );
     }
 
     #[test]
