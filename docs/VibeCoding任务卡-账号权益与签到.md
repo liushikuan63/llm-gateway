@@ -425,6 +425,42 @@ UI 再据此显示「已领取」+ 按钮禁用。所以"打开活动页"这个�
 3. **Cookie 不在基础事件里**：`Network.requestWillBeSent` 的 `request.headers` 看不到 Cookie，
    必须读 `Network.requestWillBeSentExtraInfo`——否则会错误地得出"这个请求没有鉴权"。
 
+#### C6 收尾准备：重放脚本已就绪并干跑通过（2026-10-06 01:1x）
+
+脚本在**仓库外**（不随产品交付）：`D:\Software\qoder-claim-verify\replay.mjs`
+
+```powershell
+# 默认 dry-run：只抓头部、只打印头部名称，不在客户端外发 claim
+node D:\Software\qoder-claim-verify\replay.mjs
+# 最终验证：抓头部 + 中止客户端的 claim + 客户端外重放 + 两组负向对照
+node D:\Software\qoder-claim-verify\replay.mjs --claim
+```
+
+脚本会自己用 `--remote-debugging-port` 拉起 Qoder（无需手工准备），红线和注意事项都写在文件头。
+
+**干跑已验证的四件事**（2026-10-06 01:1x，当天已领、无副作用）：
+
+1. 活动页 iframe target 可定位，把 Network 域挂**它自己身上**能拿到注入后的完整头部；
+2. `Fetch` 拦截**在该 target 上生效**——`GET /me/campaigns` 与 `POST …/claim` 都被暂停，
+   这同时证明**即使在已领状态下客户端每次打开活动页仍会发 claim**（就是那个重放尝试）；
+3. 拦截 claim 并 `failRequest` 中止 = **不产生领取动作**，可以把当天额度留给
+   "客户端外重放"去证明——这是判据 1 能成立的前提；
+4. `campaignId` 与重放头部来源均可拿到，报告会显式写出用的是哪一组头。
+
+**新发现（差点导致误判，必须记住）**：`authorization` 与 `cosy-machine*`
+是**网络栈注入**的，不是活动页自己发出的：
+
+| 视角 | 事件 | 能看到 `authorization` / `cosy-*`？ |
+|---|---|---|
+| 注入后（网络栈） | `Network.requestWillBeSentExtraInfo` | ✅ 有（完整 8 个 `cosy-*`） |
+| 注入前（渲染层提交） | `Fetch.requestPaused.request.headers` | ❌ **没有**，只有 `Accept/Origin/Referer/User-Agent/sec-ch-*` |
+
+拿 Fetch 那组头去重放会得到 401，然后会**误判成"客户端外领不了"**。重放必须用网络层头部。
+脚本里这两个视角分开存（`netHeaders` / `fetchHeaders`），并显式报告用的是哪一个。
+
+**判据状态**：判据 1 待下个窗口执行；判据 2/3 的执行方式已确定（脚本内建对照组 A/B）；
+判据 3 已提前通过（服务端 `replayed:true`）。
+
 
 ## 七、待裁决（写文档时未定，实现前必须拍板）
 
@@ -446,7 +482,7 @@ UI 再据此显示「已领取」+ 按钮禁用。所以"打开活动页"这个�
 |---|---|---|
 | C1 | **部分完成** | 9 个平台逐个核验：**geeknow 端点存在但功能开关关闭**（`checkin_enabled=false`）；agentrouter 有登录端点（要账号密码）；Qoder 有官方规则原文且 `/claim` 经双向取证不存在；commandcode 定位为账号型 Agent 产品；shitapi / zai / sensenova / maas / openrouter 未发现端点。**当前没有任何平台可自动领取** |
 | C2 | **部分取证完成**（代码未开始） | Qoder 额度读取有**实测路径**：客户端包里写死的 `/sash/api/v1/ai-conversations/credits-summary`、`/api/v2/quota/usage`、`/api/v2/user/plan`（见 C6 前置取证）；CLI 侧 `/usage` 面板字段已核到官方文档 |
-| C6 | **主体已完成**（2026-10-06 00:4x） | 甲方案跑通：抓到领取端点 `POST openapi.qoder.sh/sash/api/v1/me/campaigns/{id}/claim`、鉴权 = `authorization` + `cosy-machine*` 设备组头（无 Cookie）、响应含 `replayed:true`。**结论：可在客户端外领取，但需复制设备绑定的机器令牌。** 剩一格：下个窗口在客户端外用同组头重放（要用户授权读令牌） |
+| C6 | **主体 + 收尾准备已完成**（2026-10-06 01:1x） | 甲方案跑通：领取端点 `POST openapi.qoder.sh/sash/api/v1/me/campaigns/{id}/claim`、鉴权 = `authorization` + `cosy-machine*` 设备组头（无 Cookie、由网络栈注入）、响应含 `replayed:true`。**结论：可在客户端外领取，但需复制设备绑定的机器令牌。** 重放脚本已就绪并干跑通过（在仓库外 `D:\Software\qoder-claim-verify\replay.mjs`）。**只剩判据 1**：下个窗口（2026-10-06 10:00 后）跑 `--claim` |
 | C3 | 未开始 | **暂无可做对象**——geeknow 开关关闭，其余平台无端点；等有平台开了再说 |
 | C4 | 未开始 | |
 | C5 | 未开始 | |
