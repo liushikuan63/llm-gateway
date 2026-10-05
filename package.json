@@ -14,6 +14,7 @@
     "verify:ui": "node scripts/ui-smoke.cjs",
     "docs:manual": "node scripts/generate-manual.mjs",
     "verify:manual": "node scripts/generate-manual.mjs --check",
+    "verify:plan": "node scripts/check-plan-refs.mjs",
     "icons": "node scripts/generate-icons.mjs"
   },
   "dependencies": {

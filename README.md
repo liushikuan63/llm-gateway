@@ -11,6 +11,8 @@
 | --- | --- |
 | 本地开发或使用应用 | 按下面的「快速开始」运行 Rust/Tauri 网关 |
 | 第一次安装与日常使用 | [完整使用手册](docs/使用手册.md)、[离线 HTML / 打印版](docs/使用手册.html)，或应用顶部「使用帮助」 |
+| **规划下一步开发（本批已排好的 13 张任务卡）** | **[VibeCoding 任务卡 · 后续完善方案](docs/VibeCoding任务卡-后续完善方案.md)** —— 0.4.0 / 0.5.0 / 0.6.0 三批，缺什么、为什么这么排、每张卡怎么验收 |
+| 想查某条「现状」是从哪来的 | [事实源 · 后续完善方案](docs/_FACTS-后续完善方案.md) —— 18 条缺口各带 `路径:行号` 与可失败判据 |
 | 用本机模型 / 智能选模 / 联网搜索 | [`docs/智能路由与本地模型设计方案.md`](docs/智能路由与本地模型设计方案.md)（原理与实测）、[任务卡](docs/VibeCoding任务卡-本地模型与智能模式.md)（开发） |
 | 第一次在本机编译 | [`docs/安装Rust工具链.md`](docs/安装Rust工具链.md)、`scripts/cargo-env.ps1` |
 | 查看维护与回归边界 | [`docs/VibeCoding实现手册.md`](docs/VibeCoding实现手册.md) |
@@ -279,7 +281,9 @@ foreach ($llmgwKeyName in @('LLMGW_LIVE_OPENROUTER_KEY', 'LLMGW_LIVE_SENSENOVA_K
 cargo test --manifest-path src-tauri/Cargo.toml --test live_provider_smoke -- --ignored
 ```
 
-常规回归不需要上游凭据：在 `src-tauri` 目录运行 `cargo test --jobs 1`；前端与发布配置分别运行 `npm run build`、`npm run verify:release`。
+常规回归不需要上游凭据：在 `src-tauri` 目录运行 `cargo test --jobs 1`；前端与发布配置分别运行 `npm run build`、`npm run verify:release`。文档体系的自洽性运行 `npm run verify:plan`（校验事实源与任务卡里引用的路径、行号、内链、疑似凭据，退出码 0 为全绿）。
+
+> **本机开工提示**：`cargo` 不在 PATH 上（rustup shim 已消失），每条命令前先执行 `& '.\scripts\cargo-env.ps1'`；它会顺带把工作目录切到 `src-tauri`。
 
 使用手册以 `src/content/user-manual.json` 为单一内容来源，内置阅读器直接使用它；执行 `npm run docs:manual` 生成 Markdown 与离线 HTML。提交前运行 `npm run verify:manual` 检查三个入口内容一致。
 

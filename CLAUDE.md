@@ -7,9 +7,11 @@
 你在帮我实现一个「统一 LLM 网关」桌面应用：Rust + Tauri 2 + React，打包成 Windows exe。
 下面的内容是硬约束，每次改动前都要遵守。
 
-- 任务拆解：`docs/VibeCoding任务卡-本地模型与智能模式.md`（当前批次）、`docs/VibeCoding实现手册.md`（历史）
+- 任务拆解：`docs/VibeCoding任务卡-后续完善方案.md`（**当前批次：0.4.0 / 0.5.0 / 0.6.0 共 13 张卡**）、`docs/VibeCoding任务卡-本地模型与智能模式.md`（上一批）、`docs/VibeCoding实现手册.md`（历史）
+- 事实源：`docs/_FACTS-后续完善方案.md` —— 每条现状陈述都要能追到它的一行；改代码后它会过期，**过期时先复验再改**
 - 设计原理：`docs/智能路由与本地模型设计方案.md`（本地模型/智能路由/搜索）、`docs/统一LLM网关设计方案.md`（整体架构）
 - **行为基准：`src-tauri/tests/` 下的集成测试**，不是 `../llm-gateway-node/`（该目录未随本仓库交付）
+- 文档体系校验：`npm run verify:plan`（退出码 0 = 路径存在 / 行号未越界 / 内链可达 / 无疑似凭据）
 
 ---
 
