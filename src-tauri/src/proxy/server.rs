@@ -463,6 +463,52 @@ async fn auth(
             )
                 .into_response();
         }
+
+        // B2 预算闸门。放在这里（鉴权通过、占用 RPM 之后，路由打分之前）：
+        // 前两步都不改数据，所以被预算拦下的请求不会留下任何痕迹。
+        //
+        // **被拦的请求不扣费、不进 requests 表** —— requests 只记真实发生的
+        // 消费，把拒绝也写进去会让「本月花了多少」被自己的拒绝记录污染。
+        if cfg.budget.enabled && key.monthly_budget_micros > 0 {
+            let since = crate::budget::month_start_secs(chrono::Utc::now().timestamp());
+            // 已知边界（卡片要求在注释里写明，不引数据库锁）：判定与记账之间
+            // 有窗口，并发请求可能同时观察到同一份「未超」的累计值，
+            // 于是极小概率超支一次。真要严格就用 requests 自增 id 做乐观扣减，
+            // 那要事务；本卡按卡片口径接受这个窗口。
+            let spent_rows = repo::sum_cost_by_currency_for_key(state.db.pool(), &key.id, since)
+                .await
+                .unwrap_or_default();
+            let used = crate::budget::spent_in_currency(&spent_rows, &key.budget_currency);
+            if let crate::budget::GateDecision::BudgetExceeded {
+                used,
+                limit,
+                currency,
+            } =
+                crate::budget::check_budget(used, key.monthly_budget_micros, &key.budget_currency)
+            {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": {
+                            // 报具体的已用与上限，不返回笼统的「限流」——
+                            // 用户看到 used/limit 才知道该充值还是该换 Key。
+                            "message": format!(
+                                "该访问 Key 的月度预算已用完：已用 {:.6} / 上限 {:.6} {currency}",
+                                used as f64 / crate::budget::MICROS_PER_UNIT as f64,
+                                limit as f64 / crate::budget::MICROS_PER_UNIT as f64,
+                            ),
+                            "type": "budget_exceeded",
+                            "code": "budget_exceeded",
+                            "used": used,
+                            "limit": limit,
+                            "currency": currency,
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+
         AuthContext {
             client: Some(format!("remote-key:{}", key.id)),
         }
@@ -2478,6 +2524,44 @@ async fn dispatch(
     exit: Exit,
 ) -> Response {
     let cfg = state.cfg_snapshot();
+
+    // B2 模型白名单闸门。放在**路由打分之前**，卡片点名的位置。
+    //
+    // 为什么预算在中间件判、白名单在这里判：白名单要比的是**请求的模型名**，
+    // 而那在 body 里，中间件阶段还没解析 body。两处都在「鉴权之后、
+    // 打分之前」，符合卡片的位置要求。
+    //
+    // 被拒的请求**不扣费、不进 requests 表** —— 与预算闸门同一口径。
+    if cfg.budget.enabled {
+        if let Some(key_id) = crate::budget::access_key_id_of(client.as_deref()) {
+            let whitelist = state
+                .remote_access_keys
+                .read()
+                .iter()
+                .find(|k| k.id == key_id)
+                .map(|k| k.allowed_models.clone())
+                .unwrap_or_default();
+            if !crate::budget::model_allowed(&whitelist, &req.model) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": format!(
+                                "该访问 Key 不允许使用模型 {}（白名单：{}）",
+                                req.model,
+                                whitelist.join(", "),
+                            ),
+                            "type": "model_not_allowed",
+                            "code": "model_not_allowed",
+                            // 写明被拒的模型名，客户端才知道该换哪一个
+                            "model": req.model,
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // 1) 会话定位
     let header_sid = headers

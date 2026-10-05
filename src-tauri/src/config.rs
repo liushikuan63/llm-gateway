@@ -403,6 +403,10 @@ pub struct AppConfig {
     pub auth_failure: AuthFailureConfig,
     /// 精确响应缓存。**默认关闭** —— 关闭时 dispatch 路径与改动前逐位等价。
     pub cache: crate::cache::CacheConfig,
+    /// B2 预算闸门与模型白名单的总开关。默认开 —— Key 上设了预算就该生效，
+    /// 否则就是「开着没反应的开关」。默认路径零成本靠的是
+    /// 「Key 的 monthly_budget_micros == 0 直接跳过」，不是把总开关关掉。
+    pub budget: crate::budget::BudgetConfig,
 }
 
 /// 上游鉴权失败的处理档位。
@@ -566,6 +570,7 @@ impl Default for AppConfig {
             ollama_options: OllamaOptionsConfig::default(),
             auth_failure: AuthFailureConfig::default(),
             cache: crate::cache::CacheConfig::default(),
+            budget: crate::budget::BudgetConfig::default(),
         }
     }
 }
