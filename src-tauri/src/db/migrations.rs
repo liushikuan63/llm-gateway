@@ -244,6 +244,37 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_column(pool, "requests", "route_search_hits", "INTEGER").await?;
     ensure_column(pool, "requests", "route_refined", "INTEGER").await?;
     ensure_column(pool, "requests", "route_refine_note", "TEXT").await?;
+    // B2 预算闸门：把一次消费归因到某个远程 Key。
+    //
+    // 历史行一律 NULL，语义是「这次消费不属于任何远程 Key，是本机统一 Key 发的」。
+    // **不要按 client 字段猜着回填** —— client 是客户端自报的字符串
+    // （`remote-key:<id>` 只是网关自己写的格式），不是 Key 身份；
+    // 猜错了会把别人的钱算到这个 Key 头上，而且算错了没有任何报错。
+    ensure_column(pool, "requests", "access_key_id", "TEXT").await?;
+    ensure_column(
+        pool,
+        "remote_access_keys",
+        "monthly_budget_micros",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    // 币种与额度必须成对：多币种的数字加在一起是没有意义的。
+    ensure_column(
+        pool,
+        "remote_access_keys",
+        "budget_currency",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    // JSON 数组字符串。空 = 不限。存 TEXT 而不是关联表：
+    // 一个 Key 的模型白名单只有几十条，建表反而要多一次 join 与一套增删改。
+    ensure_column(
+        pool,
+        "remote_access_keys",
+        "allowed_models",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
     ensure_column(pool, "sessions", "token_ratio", "REAL").await?;
     migrate_usage_daily_currency(pool).await?;
     Ok(())

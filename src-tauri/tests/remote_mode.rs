@@ -165,6 +165,10 @@ async fn remote_proxy_uses_individual_keys_hides_management_and_audits_key_id() 
             key_hash: key_hash(secret),
             enabled: true,
             rpm_limit: 1,
+            // B2 新增：默认不限预算、不限模型。闸门是 opt-in 的。
+            monthly_budget_micros: 0,
+            budget_currency: String::new(),
+            allowed_models: Vec::new(),
             created_at: now,
             updated_at: now,
         },
@@ -343,6 +347,10 @@ async fn remote_access_keys_cannot_share_a_logical_session_namespace() {
                 key_hash: key_hash(secret),
                 enabled: true,
                 rpm_limit: 20,
+                // B2 新增：默认不限预算、不限模型。闸门是 opt-in 的。
+                monthly_budget_micros: 0,
+                budget_currency: String::new(),
+                allowed_models: Vec::new(),
                 created_at: now,
                 updated_at: now,
             },
@@ -440,6 +448,10 @@ async fn remote_key_rpm_reservation_allows_only_one_concurrent_request() {
             key_hash: key_hash(secret),
             enabled: true,
             rpm_limit: 1,
+            // B2 新增：默认不限预算、不限模型。闸门是 opt-in 的。
+            monthly_budget_micros: 0,
+            budget_currency: String::new(),
+            allowed_models: Vec::new(),
             created_at: now,
             updated_at: now,
         },

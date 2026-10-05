@@ -430,6 +430,12 @@ pub struct RemoteAccessKeyView {
     pub label: String,
     pub enabled: bool,
     pub rpm_limit: u32,
+    /// 月度预算，micros。0 = 不限。
+    pub monthly_budget_micros: i64,
+    /// 预算币种。空 = 没设预算。
+    pub budget_currency: String,
+    /// 模型白名单。空数组 = 不限。
+    pub allowed_models: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -441,6 +447,9 @@ impl From<RemoteAccessKey> for RemoteAccessKeyView {
             label: key.label,
             enabled: key.enabled,
             rpm_limit: key.rpm_limit,
+            monthly_budget_micros: key.monthly_budget_micros,
+            budget_currency: key.budget_currency,
+            allowed_models: key.allowed_models,
             created_at: key.created_at,
             updated_at: key.updated_at,
         }
@@ -459,6 +468,15 @@ pub struct UpdateRemoteAccessKeyInput {
     pub label: String,
     pub enabled: bool,
     pub rpm_limit: u32,
+    /// 下面三项都是 `Option`：**不传表示「不改」**。
+    /// 用非 Option 的话，前端只想改 label 就必须把预算一起回传，
+    /// 漏传一次就把用户设的预算清空了 —— 而界面上看不出任何异常。
+    #[serde(default)]
+    pub monthly_budget_micros: Option<i64>,
+    #[serde(default)]
+    pub budget_currency: Option<String>,
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -527,6 +545,11 @@ pub async fn create_remote_access_key(
         key_hash: sha256_hex(&secret),
         enabled: true,
         rpm_limit,
+        // 新建的 Key 默认不限预算、不限模型：闸门是**opt-in** 的，
+        // 新建时不带任何限制，用户设了才生效。
+        monthly_budget_micros: 0,
+        budget_currency: String::new(),
+        allowed_models: Vec::new(),
         created_at: now,
         updated_at: now,
     };
@@ -567,9 +590,32 @@ pub async fn update_remote_access_key(
         return Err("远程 HTTPS 反代模式已启用，不能停用最后一个访问 Key".into());
     }
 
-    if !repo::update_remote_access_key(state.db.pool(), &input.id, &label, input.enabled, rpm_limit)
-        .await
-        .map_err(|e| e.to_string())?
+    // 预算三件套从输入进来；没传时沿用现值，避免「只想改 label」把预算清空。
+    let budget = (
+        input
+            .monthly_budget_micros
+            .unwrap_or(current.monthly_budget_micros)
+            .max(0),
+        input
+            .budget_currency
+            .clone()
+            .unwrap_or_else(|| current.budget_currency.clone()),
+        input
+            .allowed_models
+            .clone()
+            .unwrap_or_else(|| current.allowed_models.clone()),
+    );
+
+    if !repo::update_remote_access_key(
+        state.db.pool(),
+        &input.id,
+        &label,
+        input.enabled,
+        rpm_limit,
+        (budget.0, &budget.1, &budget.2),
+    )
+    .await
+    .map_err(|e| e.to_string())?
     {
         return Err("远程访问 Key 不存在".into());
     }

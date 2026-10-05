@@ -919,6 +919,9 @@ async fn passthrough_dispatch(
                     repo::RequestLog {
                         session_id: None,
                         client: audit_client.as_deref(),
+                        // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
+                        // 与 client 同源派生，不另写一套前缀解析。
+                        access_key_id: crate::budget::access_key_id_of(audit_client.as_deref()),
                         requested_model: &audit_requested_model,
                         routed_provider: Some(&audit_provider),
                         routed_model: Some(&audit_model),
@@ -981,6 +984,9 @@ async fn passthrough_dispatch(
                     repo::RequestLog {
                         session_id: None,
                         client: audit_client.as_deref(),
+                        // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
+                        // 与 client 同源派生，不另写一套前缀解析。
+                        access_key_id: crate::budget::access_key_id_of(audit_client.as_deref()),
                         requested_model: &audit_requested_model,
                         routed_provider: None,
                         routed_model: None,
@@ -1151,6 +1157,9 @@ async fn dispatch_remote_compaction(
                     repo::RequestLog {
                         session_id: Some(&audit_session_id),
                         client: audit_client.as_deref(),
+                        // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
+                        // 与 client 同源派生，不另写一套前缀解析。
+                        access_key_id: crate::budget::access_key_id_of(audit_client.as_deref()),
                         requested_model: &requested_model,
                         routed_provider: Some(&routed_provider),
                         routed_model: Some(&routed_model),
@@ -1257,6 +1266,9 @@ async fn dispatch_remote_compaction(
                     repo::RequestLog {
                         session_id: Some(&audit_session_id),
                         client: audit_client.as_deref(),
+                        // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
+                        // 与 client 同源派生，不另写一套前缀解析。
+                        access_key_id: crate::budget::access_key_id_of(audit_client.as_deref()),
                         requested_model: &requested_model,
                         routed_provider: None,
                         routed_model: None,
@@ -3113,6 +3125,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     repo::RequestLog {
                         session_id: Some(&audit_session_id),
                         client: audit_client.as_deref(),
+                        // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
+                        // 与 client 同源派生，不另写一套前缀解析。
+                        access_key_id: crate::budget::access_key_id_of(audit_client.as_deref()),
                         requested_model: &audit_requested_model,
                         routed_provider: Some(&audit_pid),
                         routed_model: Some(&audit_mid),
@@ -3202,6 +3217,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     repo::RequestLog {
                         session_id: Some(&sid),
                         client: audit_client.as_deref(),
+                        // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
+                        // 与 client 同源派生，不另写一套前缀解析。
+                        access_key_id: crate::budget::access_key_id_of(audit_client.as_deref()),
                         requested_model: &requested_model,
                         routed_provider: None,
                         routed_model: None,
@@ -3675,6 +3693,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 repo::RequestLog {
                     session_id: Some(&audit_session_id),
                     client: audit_client.as_deref(),
+                    // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
+                    // 与 client 同源派生，不另写一套前缀解析。
+                    access_key_id: crate::budget::access_key_id_of(audit_client.as_deref()),
                     requested_model: &audit_requested_model,
                     routed_provider: Some(&audit_provider_id),
                     routed_model: Some(&audit_model),
@@ -3944,6 +3965,9 @@ fn spawn_failed_stream_audit(state: Arc<GatewayState>, audit: FailedStreamAudit<
             repo::RequestLog {
                 session_id: Some(&session_id),
                 client: client.as_deref(),
+                // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
+                // 与 client 同源派生，不另写一套前缀解析。
+                access_key_id: crate::budget::access_key_id_of(client.as_deref()),
                 requested_model: &requested_model,
                 routed_provider: None,
                 routed_model: None,

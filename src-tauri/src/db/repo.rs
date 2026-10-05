@@ -225,7 +225,9 @@ pub async fn delete_provider(pool: &SqlitePool, id: &str) -> Result<()> {
 
 pub async fn list_remote_access_keys(pool: &SqlitePool) -> Result<Vec<RemoteAccessKey>> {
     let rows = sqlx::query(
-        "SELECT id, label, key_hash, enabled, rpm_limit, created_at, updated_at
+        "SELECT id, label, key_hash, enabled, rpm_limit,
+                monthly_budget_micros, budget_currency, allowed_models,
+                created_at, updated_at
          FROM remote_access_keys ORDER BY created_at ASC",
     )
     .fetch_all(pool)
@@ -239,6 +241,13 @@ pub async fn list_remote_access_keys(pool: &SqlitePool) -> Result<Vec<RemoteAcce
             key_hash: row.get("key_hash"),
             enabled: row.get::<i64, _>("enabled") == 1,
             rpm_limit: row.get::<i64, _>("rpm_limit").max(1) as u32,
+            monthly_budget_micros: row.get::<i64, _>("monthly_budget_micros").max(0),
+            budget_currency: row.get("budget_currency"),
+            // 存的是 JSON 数组字符串，空串与坏 JSON 都当「不限」。
+            // 判定口径与 `budget::parse_allowed_models` 同源，不在这里另写一套。
+            allowed_models: crate::budget::parse_allowed_models(
+                &row.get::<String, _>("allowed_models"),
+            ),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
@@ -247,14 +256,20 @@ pub async fn list_remote_access_keys(pool: &SqlitePool) -> Result<Vec<RemoteAcce
 
 pub async fn create_remote_access_key(pool: &SqlitePool, key: &RemoteAccessKey) -> Result<()> {
     sqlx::query(
-        "INSERT INTO remote_access_keys (id, label, key_hash, enabled, rpm_limit, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO remote_access_keys
+           (id, label, key_hash, enabled, rpm_limit,
+            monthly_budget_micros, budget_currency, allowed_models,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&key.id)
     .bind(&key.label)
     .bind(&key.key_hash)
     .bind(key.enabled as i64)
     .bind(key.rpm_limit as i64)
+    .bind(key.monthly_budget_micros)
+    .bind(&key.budget_currency)
+    .bind(crate::budget::serialize_allowed_models(&key.allowed_models))
     .bind(key.created_at)
     .bind(key.updated_at)
     .execute(pool)
@@ -262,21 +277,31 @@ pub async fn create_remote_access_key(pool: &SqlitePool, key: &RemoteAccessKey) 
     Ok(())
 }
 
+/// 更新一个远程 Key。`budget` 三件套一起传：拆成三个参数会让
+/// 「改了额度忘了改币种」变成可能，而那种状态的判定是没有意义的
+/// （拿 USD 的累计值去比 CNY 的上限）。
 pub async fn update_remote_access_key(
     pool: &SqlitePool,
     id: &str,
     label: &str,
     enabled: bool,
     rpm_limit: u32,
+    budget: (i64, &str, &[String]),
 ) -> Result<bool> {
+    let (monthly_budget_micros, budget_currency, allowed_models) = budget;
     let changed = sqlx::query(
         "UPDATE remote_access_keys
-         SET label = ?, enabled = ?, rpm_limit = ?, updated_at = ?
+         SET label = ?, enabled = ?, rpm_limit = ?,
+             monthly_budget_micros = ?, budget_currency = ?, allowed_models = ?,
+             updated_at = ?
          WHERE id = ?",
     )
     .bind(label)
     .bind(enabled as i64)
     .bind(rpm_limit as i64)
+    .bind(monthly_budget_micros.max(0))
+    .bind(budget_currency)
+    .bind(crate::budget::serialize_allowed_models(allowed_models))
     .bind(Utc::now())
     .bind(id)
     .execute(pool)
@@ -286,6 +311,47 @@ pub async fn update_remote_access_key(
     Ok(changed)
 }
 
+/// 某个远程 Key 从 `since_ts` 起的消费，**按币种分组**。
+///
+/// 返回 `(currency, cost)` 的列表而不是一个总数：多币种的数字加在一起
+/// 是没有意义的（USD 100 + CNY 100 ≠ 200）。判定方按 Key 自己的
+/// `budget_currency` 去取对应那一组，见 `budget::spent_in_currency`。
+///
+/// 只统计**成功**的请求：失败的请求没有真实消费，把 4xx/5xx 的
+/// `cost` 也算进去会让预算被"幽灵消费"顶满。
+/// 但要保留 `cost IS NOT NULL` 这一条 —— 没配价格的请求 cost 为 NULL，
+/// 它们本来就不该参与金额累计（它们也没花钱）。
+pub async fn sum_cost_by_currency_for_key(
+    pool: &SqlitePool,
+    key_id: &str,
+    since_ts: i64,
+) -> Result<Vec<(String, f64)>> {
+    let rows = sqlx::query(
+        "SELECT COALESCE(currency, '') AS currency, COALESCE(SUM(cost), 0.0) AS total
+         FROM requests
+         WHERE access_key_id = ? AND ts >= ? AND cost IS NOT NULL
+         GROUP BY COALESCE(currency, '')",
+    )
+    .bind(key_id)
+    .bind(since_ts)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get::<String, _>("currency"), row.get::<f64, _>("total")))
+        .collect())
+}
+
+/// 统计某个 Key 在 `since_ts` 之后的请求条数。给测试与排查用。
+pub async fn count_requests_for_key(pool: &SqlitePool, key_id: &str, since_ts: i64) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE access_key_id = ? AND ts >= ?")
+            .bind(key_id)
+            .bind(since_ts)
+            .fetch_one(pool)
+            .await?,
+    )
+}
 pub async fn delete_remote_access_key(pool: &SqlitePool, id: &str) -> Result<bool> {
     Ok(sqlx::query("DELETE FROM remote_access_keys WHERE id = ?")
         .bind(id)
@@ -941,6 +1007,11 @@ pub struct RequestLog<'a> {
     pub attempts_json: Option<&'a str>,
     /// 智能模式与联网搜索的可观测信息。未启用时整块为默认值。
     pub route: RouteTrace,
+    /// 这次消费归属的远程 Key。本机统一 Key 发的请求是 `None`。
+    ///
+    /// 回填口径：历史行一律 NULL。**不按 `client` 猜** ——
+    /// client 是客户端自报的字符串，不是 Key 身份。
+    pub access_key_id: Option<&'a str>,
 }
 
 /// 智能模式 + 联网搜索在审计里的落点。
@@ -972,8 +1043,8 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
               latency_ms, prompt_tokens, completion_tokens, fallback_attempts, error,
               cost, currency, rate_label, estimated_prompt_tokens, attempts_json,
               route_intent, route_classifier, route_search, route_search_hits,
-              route_refined, route_refine_note)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+              route_refined, route_refine_note, access_key_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
     )
     .bind(ts)
     .bind(log.session_id)
@@ -998,6 +1069,11 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
     .bind(log.route.search_hits)
     .bind(log.route.refined)
     .bind(log.route.refine_note.as_deref())
+    // 最后一位：绑定顺序必须与列顺序一致，`access_key_id` 是第 24 列。
+    // 第一版把它跟在 `rate_label` 后面，于是 24 个绑定对 23 个占位符 +
+    // 错位 —— 症状是「失败请求也应记录尝试链」这类断言红，而错误里
+    // 看不出是顺序问题。
+    .bind(log.access_key_id)
     .execute(pool)
     .await?;
 

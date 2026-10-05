@@ -566,6 +566,89 @@ async fn malformed_successful_upstreams_are_retryable_and_fall_back_at_gateway_b
     }
 }
 
+/// 上游 **404「我这儿没这个模型」** 是「换一家」的典型理由，不是客户端错：
+/// 候选链按别名**跨供应商**组装，同名模型常常另一家还有。
+///
+/// 2026-10-05 实测事故：`openrouter/stealth/space-bunny-alpha` 回 404 被判
+/// 不可重试（`fallback_attempts=0`），链上 `commandcode` 的同名模型**一次都
+/// 没被试**，整个会话直接失败。
+///
+/// 这条同时钉住同一次修复的两面：
+///   ① 404 必须继续试下一家 —— 两家各命中一次才算数；
+///   ② **全部候选都失败**时，审计里的 `fallback_attempts` 必须是真实回退数。
+///      修前它恒为 0：候选耗尽后 failover 返回的是**最后一个上游错误**，
+///      `AllProvidersFailed{attempts}` 成了走不到的死分支，审计只能从错误里
+///      反推出 1，于是「切换了但都失败」与「切换完全没生效」在审计里长得一样。
+#[tokio::test]
+async fn upstream_404_falls_back_and_failed_chain_reports_real_fallback_count() {
+    let (first_url, first_state, first_task) =
+        spawn_openai_upstream(OpenAiBehavior::Status(StatusCode::NOT_FOUND)).await;
+    let (second_url, second_state, second_task) =
+        spawn_openai_upstream(OpenAiBehavior::Status(StatusCode::NOT_FOUND)).await;
+
+    let (db, config, gateway_task, base_url) = spawn_gateway(vec![
+        provider("gone-a", first_url, Dialect::OpenAI, 1),
+        provider("gone-b", second_url, Dialect::OpenAI, 2),
+    ])
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&config.unified_key)
+        .json(&openai_body("integration-model"))
+        .send()
+        .await
+        .unwrap();
+
+    // 两家都 404 ⇒ 整体失败，**但两家都必须被试过**。
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        first_state.hits.load(Ordering::SeqCst),
+        1,
+        "第一家必须被试 —— 404 若判不可重试，这里就是死路"
+    );
+    assert_eq!(
+        second_state.hits.load(Ordering::SeqCst),
+        1,
+        "404 之后必须换第二家；命中 0 次说明第一家的 404 直接把链掐断了"
+    );
+
+    // 审计写入是异步的；轮询等待那条失败记录出现。
+    let mut logged = None;
+    for _ in 0..80 {
+        let rows = repo::recent_requests(db.pool(), 10).await.unwrap();
+        if let Some(row) = rows.into_iter().find(|r| r["status"].as_i64() == Some(404)) {
+            logged = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let logged = logged.expect("失败请求也必须写审计日志");
+    assert_eq!(
+        logged["fallback_attempts"].as_i64(),
+        Some(1),
+        "试了 2 家就是 1 次回退；写成 0 会把「切换了但都失败」误报成「切换没生效」"
+    );
+    // 注意字段名：`recent_requests` 把 `attempts_json` 列映射成 `attempts`，
+    // 且已经是数组，不需要再 parse 一次字符串。
+    let chain = logged["attempts"]
+        .as_array()
+        .expect("失败请求也应记录尝试链");
+    assert_eq!(
+        chain.len(),
+        2,
+        "尝试链必须同时记下这两家，否则事后无法判断到底试过谁"
+    );
+    assert!(
+        chain.iter().all(|a| a["retryable"].as_bool() == Some(true)),
+        "两家都是 404，必须都记为可重试：{chain:?}"
+    );
+
+    gateway_task.abort();
+    first_task.abort();
+    second_task.abort();
+}
+
 /// 鉴权失败的新契约（用户 2026-10-05 定）：先复测确认，确认不可用才换下一家。
 ///
 /// 旧契约是「一次 401 就原样返回、不碰备选」——它对应的是 `strict` 档，
@@ -1304,6 +1387,7 @@ async fn spend_tables_separate_currencies_and_report_unpriced_requests() {
             RequestLog {
                 session_id: None,
                 client: Some("local-unified-key"),
+                access_key_id: llm_gateway_lib::budget::access_key_id_of(Some("local-unified-key")),
                 requested_model: "auto",
                 routed_provider: Some(provider),
                 routed_model: Some(model),
