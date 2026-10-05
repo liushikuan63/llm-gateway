@@ -1,6 +1,7 @@
 pub mod autostart;
 pub mod boot;
 pub mod bundle;
+pub mod cache;
 pub mod cli_tools;
 mod commands;
 pub mod config;

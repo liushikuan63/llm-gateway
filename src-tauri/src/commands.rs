@@ -380,6 +380,10 @@ pub async fn update_config(
         .gateway
         .router
         .set_custom_rules(cfg.custom_rules.clone());
+    // 配置变更必须清缓存。`reload_providers` 覆盖供应商/模型/价格三类变更，
+    // 但那条路走不到这里（本命令改的是 cfg，不是 providers 表）。
+    // 漏掉它的症状是「改了策略但答案还是旧的」，而界面显示保存成功。
+    state.gateway.cache.invalidate_all();
     Ok(ConfigUpdateResult {
         config: cfg,
         restart_required: !restart_reasons.is_empty(),

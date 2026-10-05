@@ -401,6 +401,8 @@ pub struct AppConfig {
     pub ollama_options: OllamaOptionsConfig,
     /// 上游鉴权失败（401/403）时的处理策略
     pub auth_failure: AuthFailureConfig,
+    /// 精确响应缓存。**默认关闭** —— 关闭时 dispatch 路径与改动前逐位等价。
+    pub cache: crate::cache::CacheConfig,
 }
 
 /// 上游鉴权失败的处理档位。
@@ -563,6 +565,7 @@ impl Default for AppConfig {
             search: SearchConfig::default(),
             ollama_options: OllamaOptionsConfig::default(),
             auth_failure: AuthFailureConfig::default(),
+            cache: crate::cache::CacheConfig::default(),
         }
     }
 }

@@ -126,6 +126,8 @@ pub struct GatewayState {
     /// 压缩会修改摘要和多条消息的 compacted 标记，必须串行化以避免较旧摘要覆盖
     /// 较新摘要。压缩是低频后台工作，使用全局锁可避免按会话锁表无限增长。
     compaction_lock: tokio::sync::Mutex<()>,
+    /// 精确响应缓存。**默认关**：关着时 dispatch 不做哈希、不查表、不加头。
+    pub cache: Arc<crate::cache::ResponseCache>,
     /// 只有实际 listener 位于回环地址时才会激活远程反代认证逻辑。
     listener_is_loopback: AtomicBool,
 }
@@ -140,6 +142,7 @@ impl GatewayState {
             cfg.custom_rules.clone(),
         ));
         let ctx = ContextStore::new(db.clone());
+        let cache = Arc::new(crate::cache::ResponseCache::new(cfg.cache.clone()));
 
         Self {
             db,
@@ -150,6 +153,7 @@ impl GatewayState {
             router,
             upstream: Arc::new(UpstreamClient::new()),
             ctx,
+            cache,
             providers: Arc::new(parking_lot::RwLock::new(Vec::new())),
             active: Arc::new(parking_lot::RwLock::new(None)),
             remote_access_keys: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -170,6 +174,17 @@ impl GatewayState {
         let remote_keys = repo::list_remote_access_keys(self.db.pool()).await?;
         *self.providers.write() = list;
         *self.remote_access_keys.write() = remote_keys;
+
+        // 缓存失效挂在这里，而不是散在各个命令里。
+        //
+        // 理由：`reload_providers` 是供应商启停、模型增删改、价格刷新三类变更的
+        // **唯一共同入口**（commands.rs 里 9 处 + pricing_refresh 都走它）。
+        // 散着写就要维护一份「哪些命令会改路由」的清单，漏一个的症状是
+        // 「改了配置却不生效」——缓存还在返回旧答案，而界面显示保存成功。
+        //
+        // 唯一不在它覆盖范围内的是 `update_config`（改的是 cfg 不是 providers），
+        // 那里单独调一次。
+        self.cache.invalidate_all();
         Ok(())
     }
 
@@ -948,7 +963,13 @@ async fn passthrough_dispatch(
         Err(error) => {
             let status = error.http_status().as_u16() as i64;
             let kind = classify(&error);
-            let attempts = attempt_count_from_error(&error);
+            // 用**尝试记录数**，不要从错误里反推：候选耗尽时 failover 返回的是
+            // 最后一个上游错误（`Err(last_err.unwrap_or(AllProvidersFailed…))`），
+            // `AllProvidersFailed` 成了走不到的死分支，反推恒得 1，于是审计里
+            // `fallback_attempts` 恒为 0 —— 恰好抹掉「自动切换到底有没有生效」
+            // 这个唯一的诊断信号。实测 2026-10-06 #94：链上试了 2 家（attempts_json
+            // 有 2 条），fallback_attempts 却是 0。
+            let attempts = attempt_records.len();
             let audit_state = state.clone();
             let audit_client = client.clone();
             let audit_requested_model = requested_model.clone();
@@ -1217,7 +1238,13 @@ async fn dispatch_remote_compaction(
         Err(error) => {
             let status = error.http_status().as_u16() as i64;
             let kind = classify(&error);
-            let attempts = attempt_count_from_error(&error);
+            // 用**尝试记录数**，不要从错误里反推：候选耗尽时 failover 返回的是
+            // 最后一个上游错误（`Err(last_err.unwrap_or(AllProvidersFailed…))`），
+            // `AllProvidersFailed` 成了走不到的死分支，反推恒得 1，于是审计里
+            // `fallback_attempts` 恒为 0 —— 恰好抹掉「自动切换到底有没有生效」
+            // 这个唯一的诊断信号。实测 2026-10-06 #94：链上试了 2 家（attempts_json
+            // 有 2 条），fallback_attempts 却是 0。
+            let attempts = attempt_records.len();
             let audit_state = state.clone();
             let audit_session_id = response_session_id.clone();
             let audit_client = client.clone();
@@ -1649,6 +1676,15 @@ struct DispatchInput {
     search: Option<crate::search::executor::SearchOutcome>,
     /// 提示词预优化的结果。未开启或未触发时为 `None`。
     refine: Option<crate::intellect::RefineOutcome>,
+    /// **客户端**提供的会话 id。没提供时是空串。
+    ///
+    /// 缓存键用它而不是 `session_id`：后者在客户端没提供时由网关随机生成，
+    /// 每次请求都不同 —— 拿它做键会让每一条缓存都独一无二，
+    /// 表现为「缓存永远不命中」，而功能看起来只是「没生效」。
+    /// 卡片原文是「会话 id（**若有**）」，这个「若有」就是它。
+    /// 实测证据：修之前两次完全相同的请求拿到
+    /// `a-4ec77332-…` 与 `a-e4826059-…` 两个 session，键必然不同。
+    cache_session: String,
 }
 
 /// 智能模式 + 联网搜索在路由前的预处理结果。
@@ -2630,6 +2666,7 @@ async fn dispatch(
         intent: preflight.intent,
         search: preflight.search,
         refine: preflight.refine,
+        cache_session: header_sid.clone().unwrap_or_default(),
     };
     if dispatch_input.req.stream {
         stream_dispatch(state.clone(), dispatch_input).await
@@ -2818,6 +2855,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     // 所以下面的后台任务要用的是一份克隆，原变量留给响应头。
     let audit_route = route.clone();
     let DispatchInput {
+        cache_session,
         req,
         new_messages,
         response_session_id,
@@ -2839,6 +2877,90 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     };
     let chain = FailoverChain::new(&ranked, max_attempts, &flag);
     let chain = chain.with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
+
+    // 缓存键的 provider/model 用**本轮路由的首选**（ranked[0]）。
+    //
+    // 为什么不用实际命中的那家：查表必须发生在跑上游**之前**，那时还不知道
+    // 会不会失败转移。用首选做键是确定性的（同样的请求 + 同样的配置 ⇒ 同样的首选），
+    // 代价是「发生了失败转移」的那次响应不会被回填 —— 见下面回填处的路由一致性检查。
+    // 宁可少缓存，也不要让键与内容不符。
+    let intended_route = ranked
+        .first()
+        .map(|c| (c.provider.id.clone(), c.model.upstream.clone()));
+    let cache_cfg = cfg.cache.clone();
+    let cache_miss_key = match (&intended_route, cache_cfg.enabled) {
+        (Some((pid, mid)), true) => {
+            let request_value = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let key_input = crate::cache::CacheKeyInput {
+                provider_id: pid,
+                routed_model: mid,
+                request: &request_value,
+                // 用客户端提供的会话 id，不是网关自动生成的那个 ——
+                // 后者每次请求都不同，会让每一条缓存都独一无二。
+                session_id: &cache_session,
+                stream: false,
+                // 多模态看重建后的完整上下文，与 required_capabilities 同源
+                multimodal: crate::media::Media::of(&req).any(),
+                // 触发过搜索预取就不缓存：把当时的检索结果固化成「模型的记忆」
+                // 是错误的信息来源，今天查到的和昨天不一样。
+                search_injected: _search.is_some(),
+                upstream_status: None,
+                response_has_tool_calls: false,
+            };
+            match state.cache.lookup(&cache_cfg, &key_input) {
+                crate::cache::Lookup::Hit(value) => {
+                    // 存的是协议中立的 `ChatResponse`，命中时按本次 exit 重新编码 ——
+                    // 这样 OpenAI / Anthropic / Responses 三个出口能共用一份缓存。
+                    // 若直接存编码后的 body，同一个逻辑请求来自不同客户端就会串格式。
+                    let cached: crate::domain::ChatResponse =
+                        serde_json::from_value(value).unwrap_or_default();
+                    let body = encode_response(&cached, mid, exit);
+                    let mut resp = Json(body).into_response();
+                    apply_route_headers(&route, resp.headers_mut());
+                    let h = resp.headers_mut();
+                    h.insert(
+                        "x-cache",
+                        parse_header(crate::cache::CacheOutcome::Hit.code()),
+                    );
+                    h.insert(
+                        "x-cache-key",
+                        parse_header(&crate::cache::key_prefix(&crate::cache::cache_key(
+                            &key_input,
+                        ))),
+                    );
+                    h.insert("x-session-id", parse_header(&response_session_id));
+                    return resp;
+                }
+                crate::cache::Lookup::Miss(key) => Some(key),
+                crate::cache::Lookup::Bypass(_) => None,
+            }
+        }
+        _ => None,
+    };
+    // 绕过原因：缓存开着、但这次请求落在明确不缓存的场景里。
+    // 关闭时是 None —— 一个头都不加（铁律 2）。
+    let cache_bypass = if cache_cfg.enabled && cache_miss_key.is_none() {
+        match &intended_route {
+            Some((pid, mid)) => {
+                let request_value = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+                let probe = crate::cache::CacheKeyInput {
+                    provider_id: pid,
+                    routed_model: mid,
+                    request: &request_value,
+                    session_id: &cache_session,
+                    stream: false,
+                    multimodal: crate::media::Media::of(&req).any(),
+                    search_injected: _search.is_some(),
+                    upstream_status: None,
+                    response_has_tool_calls: false,
+                };
+                probe.bypass_reason_code().map(|r| r.code())
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
 
     let upstream = state.upstream.clone();
     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
@@ -3021,6 +3143,47 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             );
             h.insert("x-fallback-attempts", parse_header(&o.attempts.to_string()));
             h.insert("x-session-id", parse_header(&response_session_id));
+
+            // 回填。三条前置：拿到过键、路由与首选一致、响应不含 tool_calls。
+            //
+            // 「路由与首选一致」这条是关键：键是按 ranked[0] 算的，
+            // 若这次实际是失败转移到第二家拿到的答案，用它回填会让
+            // 「provider_id=首选」这个键指向第二家的输出 —— 键与内容不符。
+            // 宁可少缓存一次。
+            if let Some(key) = cache_miss_key.as_deref() {
+                let routed_as_intended = intended_route
+                    .as_ref()
+                    .is_some_and(|(pid, mid)| *pid == o.provider_id && *mid == o.model);
+                let has_tool_calls = o.value.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+                if routed_as_intended && !has_tool_calls {
+                    if let Ok(serialized) = serde_json::to_value(&o.value) {
+                        state.cache.store(key, serialized);
+                    }
+                    h.insert(
+                        "x-cache",
+                        parse_header(crate::cache::CacheOutcome::Miss.code()),
+                    );
+                    h.insert("x-cache-key", parse_header(&crate::cache::key_prefix(key)));
+                } else if has_tool_calls {
+                    // 响应带工具调用：从「本来要缓存」降级为绕过，并说明原因
+                    h.insert(
+                        "x-cache",
+                        parse_header(crate::cache::CacheOutcome::Bypass.code()),
+                    );
+                    h.insert(
+                        "x-cache-reason",
+                        parse_header(crate::cache::BypassReason::ResponseHasToolCalls.code()),
+                    );
+                }
+            } else if let Some(reason) = cache_bypass {
+                // 缓存开着但这次场景明确不缓存。关闭时 cache_bypass 是 None，
+                // 一个头都不加。
+                h.insert(
+                    "x-cache",
+                    parse_header(crate::cache::CacheOutcome::Bypass.code()),
+                );
+                h.insert("x-cache-reason", parse_header(reason));
+            }
             resp
         }
         Err(e) => {
@@ -3030,7 +3193,8 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             let status = e.http_status().as_u16() as i64;
             let requested_model = req.model.clone();
             let audit_client = client.clone();
-            let audit_fallback_attempts = fallback_count(attempt_count_from_error(&e));
+            // 同 963 行：尝试次数取真实记录数，不从错误里反推。
+            let audit_fallback_attempts = fallback_count(attempt_records.len());
             let audit_attempts = attempts_json(&attempt_records);
             tokio::spawn(async move {
                 let _ = repo::log_request(
@@ -3070,6 +3234,8 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
     let route = input.route_trace();
     let DispatchInput {
+        // 流式一律 BYPASS，用不到缓存键里的会话 id。
+        cache_session: _cache_session,
         req,
         new_messages,
         response_session_id,
@@ -3544,6 +3710,22 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     h.insert("x-routed-via", parse_header(&routed_via));
     h.insert("x-fallback-attempts", parse_header(&attempts.to_string()));
     h.insert("x-accel-buffering", parse_header("no"));
+    // 流式请求明确不缓存，并说明原因。
+    //
+    // 为什么要在流式路径也发这个头：卡片要求「流式请求返回 BYPASS」。
+    // 流式走的是另一条分支、根本不碰缓存，所以如果不在这儿显式发一个头，
+    // 客户端看到的就是「什么都没有」——那与「缓存功能没生效」无法区分。
+    // 缓存关着时一个头都不加（铁律 2）。
+    if cfg.cache.enabled {
+        h.insert(
+            "x-cache",
+            parse_header(crate::cache::CacheOutcome::Bypass.code()),
+        );
+        h.insert(
+            "x-cache-reason",
+            parse_header(crate::cache::BypassReason::Streaming.code()),
+        );
+    }
     h.insert(
         "content-type",
         parse_header(match exit {
@@ -3727,13 +3909,6 @@ fn attempts_json(records: &[crate::router::failover::AttemptRecord]) -> Option<S
         return None;
     }
     serde_json::to_string(records).ok()
-}
-
-fn attempt_count_from_error(error: &GatewayError) -> usize {
-    match error {
-        GatewayError::AllProvidersFailed { attempts } => *attempts,
-        _ => 1,
-    }
 }
 
 /// 首个流式事件之前整体失败的请求（所有候选都试过或不可重试）的审计上下文。
