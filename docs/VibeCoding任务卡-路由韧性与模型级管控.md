@@ -165,7 +165,7 @@ model=auto  status=401  error=auth_failed  fallback_attempts=0  routed_provider=
 
 | 卡 | 状态 | 备注 |
 |---|---|---|
-| R1 | 实现中（`config.rs` + `failover.rs` 已改，待共享工作树可编译后接线 `server.rs` 与测试） | 与另一批并行工作共用同一棵树，构建被对方未完成改动阻塞过 |
-| R2 | 另一批并行实现中 | 本卡只做回归用例与接线 |
-| R3 | 未开始 | |
-| R4 | 未开始 | |
+| R1 | **已实现并通过测试**（commit `900bb7d`） | `config.rs` 加 `[auth_failure]`；`failover.rs` 加复测 + 跳链 + 免 Key 保护；`server.rs` 三个入口接线 + 自动停用后台任务；`tests/auth_failover.rs` 6 例 + `server_e2e.rs` 新旧两档各一例。21 个测试二进制全绿。**未做**：设置页开关（见 R4），当前只能改 `config.toml`；真机生效需等下一次 `cargo build --release` + 重启 |
+| R2 | 另一批并行实现中 | 本卡只做回归用例与接线；实测确认它独立发现了 `upsert_provider` 整表替换会抹掉禁用状态这个陷阱 |
+| R3 | 未开始 | 设计见 §四 |
+| R4 | 未开始 | 需真跑 `verify:ui` 并产出截图 |
