@@ -514,6 +514,28 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.waitForTimeout(150);
     await page.keyboard.press("Escape");
     await page.getByRole("button", { name: "刷新列表" }).click().catch(() => {});
+    // 「更多」菜单互斥：原生 <details> 各自独立，实测可同时展开多个互相压盖。
+    // 判据是「同时最多一个菜单可见」，而不是「点开的那张有菜单」——
+    // 后者在没有互斥时同样成立，两边都算过。
+    const menuSummaries = page.locator(".provider-more > summary");
+    const menuCount = await menuSummaries.count();
+    assert(menuCount >= 2, `至少要有两张卡片才能验互斥，实际 ${menuCount}`);
+    await menuSummaries.nth(0).click();
+    await page.waitForTimeout(150);
+    assert.equal(await page.locator(".provider-more[open]").count(), 1, "点开一张后只应有一个菜单展开");
+    await menuSummaries.nth(1).click();
+    await page.waitForTimeout(150);
+    assert.equal(await page.locator(".provider-more[open]").count(), 1, "再点开第二张时，第一个必须自动收起（互斥）");
+    await menuSummaries.nth(1).click();
+    await page.waitForTimeout(150);
+    assert.equal(await page.locator(".provider-more[open]").count(), 0, "再点一次当前这张应全部收起");
+    // 置顶 / 置底必须在菜单里
+    await menuSummaries.nth(0).click();
+    await page.waitForTimeout(150);
+    const menuText = await page.locator(".provider-more[open] .provider-more-menu").innerText();
+    assert(menuText.includes("置顶") && menuText.includes("置底"), `菜单应有置顶与置底，实际：${menuText.replace(/\n/g, "|")}`);
+    await page.keyboard.press("Escape");
+    await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
     // 失效模型扫描：面板必须能分清「可删」与「不可删」。
     // 反向断言是重点 —— 若「目录不可用」的项也能勾选，用户一次网络抖动
     // 就能误删整家供应商的全部模型。
