@@ -3602,3 +3602,114 @@ pub fn set_autostart(enabled: bool) -> Result<AutostartView, String> {
         command: crate::autostart::status().unwrap_or(None),
     })
 }
+
+/// 扫描失效模型。**只读**，不改任何数据。
+///
+/// 判定口径见 `stale_models`：先与上游目录做差集，拉不到目录的一律判
+/// 「无法判定」而不是失效 —— 否则一次网络抖动就能让用户误删整家供应商。
+#[tauri::command]
+pub async fn scan_stale_models(
+    state: State<'_, AppState>,
+) -> Result<crate::stale_models::StaleScanResult, String> {
+    let providers = repo::list_providers(state.db.pool())
+        .await
+        .map_err(|e| format!("无法读取已保存的 Provider：{e}"))?;
+
+    let mut entries = Vec::new();
+    let mut catalog_unavailable = Vec::new();
+
+    for provider in providers {
+        if provider.models.is_empty() {
+            continue;
+        }
+        // 拿上游目录。拿不到就整家标为「无法判定」。
+        let catalog = fetch_catalog(&provider).await;
+        if catalog.is_none() {
+            catalog_unavailable.push(provider.name.clone());
+        }
+        entries.extend(crate::stale_models::scan_by_catalog(
+            &provider,
+            catalog.as_ref(),
+        ));
+    }
+
+    let removable = entries.iter().filter(|e| e.is_removable()).count();
+    tracing::info!(
+        扫描总数 = entries.len(),
+        可删除 = removable,
+        目录不可用 = catalog_unavailable.len(),
+        "失效模型扫描完成"
+    );
+
+    Ok(crate::stale_models::StaleScanResult {
+        entries,
+        catalog_unavailable,
+        probed: false,
+    })
+}
+
+/// 拉取某供应商的上游模型目录。失败返回 `None`（不是 `Err`）——
+/// 调用方要把「拉不到」与「拉到但为空」区分开。
+async fn fetch_catalog(provider: &Provider) -> Option<std::collections::BTreeSet<String>> {
+    // 只有目录可信的方言才走这条路；Anthropic 的 /v1/models 只列自家模型，
+    // 拿它判别家聚合站会把所有模型误判成失效。
+    if !crate::stale_models::catalog_is_authoritative(provider.dialect) {
+        return None;
+    }
+    let input = crate::model_catalog::DiscoveryInput {
+        provider_id: Some(provider.id.clone()),
+        dialect: provider.dialect,
+        base_url: provider.base_url.clone(),
+        api_key: String::new(),
+    };
+    let saved = provider.clone();
+    crate::model_catalog::discover(&input, Some(&saved), None)
+        .await
+        .ok()
+        .map(|response| response.models.into_iter().map(|m| m.id).collect())
+}
+
+/// 删除指定供应商下的若干模型（按 alias 精确匹配）。
+///
+/// 走 `upsert_provider` 整体回写而不是新加一条 DELETE —— providers 与 models
+/// 本来就是整体替换的语义（见 `repo::upsert_provider` 的注释），另开一条
+/// 删除路径只会让「删模型」与「改模型」有两套行为。
+#[tauri::command]
+pub async fn delete_models(
+    state: State<'_, AppState>,
+    provider_id: String,
+    aliases: Vec<String>,
+) -> Result<usize, String> {
+    if aliases.is_empty() {
+        return Ok(0);
+    }
+    let mut providers = repo::list_providers(state.db.pool())
+        .await
+        .map_err(|e| format!("无法读取已保存的 Provider：{e}"))?;
+    let provider = providers
+        .iter_mut()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| "供应商不存在".to_string())?;
+
+    let before = provider.models.len();
+    let targets: std::collections::HashSet<&str> = aliases.iter().map(|a| a.trim()).collect();
+    provider
+        .models
+        .retain(|m| !targets.contains(m.alias.trim()));
+    let removed = before - provider.models.len();
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    let updated = provider.clone();
+    repo::upsert_provider(state.db.pool(), &updated)
+        .await
+        .map_err(|e| format!("删除模型失败：{e}"))?;
+    state
+        .gateway
+        .reload_providers()
+        .await
+        .map_err(|e| format!("删除模型失败：{e}"))?;
+    tracing::info!(供应商 = %provider_id, 删除数量 = removed, "已删除失效模型");
+    Ok(removed)
+}

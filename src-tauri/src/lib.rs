@@ -22,6 +22,7 @@ pub mod provider_quota;
 pub mod proxy;
 pub mod router;
 pub mod search;
+pub mod stale_models;
 
 use crate::config::AppConfig;
 use crate::proxy::server::GatewayState;
@@ -257,9 +258,13 @@ pub fn run() {
             commands::jev_probe,
             commands::calibrate_classifier,
             commands::calibrate_default_samples,
+            commands::scan_stale_models,
+            commands::delete_models,
             commands::get_autostart_state,
             commands::set_autostart,
             commands::calibrate_default_samples,
+            commands::scan_stale_models,
+            commands::delete_models,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

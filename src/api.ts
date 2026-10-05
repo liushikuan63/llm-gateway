@@ -868,6 +868,10 @@ export const api = {
     invoke<SelfCheckResult>("run_gateway_self_check"),
 
   getAutostartState: () => invoke<{ command: string | null }>("get_autostart_state"),
+
+  scanStaleModels: () => invoke<StaleScanResult>("scan_stale_models"),
+  deleteModels: (providerId: string, aliases: string[]) =>
+    invoke<number>("delete_models", { providerId, aliases }),
   setAutostart: (enabled: boolean) =>
     invoke<{ command: string | null }>("set_autostart", { enabled }),
 
@@ -939,6 +943,14 @@ export const SEARCH_BACKEND_LABEL: Record<SearchBackendKind, string> = {
   duck_duck_go: "DuckDuckGo（免 Key，可用性无保证）",
 };
 
+
+/** 失效扫描的判定结果。`catalog_unavailable` 不算失效 —— 拉不到目录时无法判断。 */
+export type StaleVerdict = "missing_from_catalog" | "catalog_unavailable" | "probe_failed" | "probe_rejected" | "healthy";
+export interface StaleEntry {
+  provider_id: string; provider_name: string; alias: string; upstream: string;
+  verdict: StaleVerdict; detail: string;
+}
+export interface StaleScanResult { entries: StaleEntry[]; catalog_unavailable: string[]; probed: boolean; }
 export const DIALECT_LABEL: Record<Dialect, string> = {
   openai: "OpenAI 兼容",
   anthropic: "Anthropic",

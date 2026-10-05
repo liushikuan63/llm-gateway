@@ -394,6 +394,19 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       }
       case "jev_probe": return structuredClone(window.__fixtureJevProbe);
       case "classify_preview": return structuredClone(window.__fixtureJevProbe.intent);
+      // 失效模型扫描：夹具必须给出**三种判定**都要覆盖，
+      // 否则前端里「可删」与「不可删」的渲染差异测不出来。
+      case "scan_stale_models":
+        return {
+          probed: false,
+          catalog_unavailable: ["目录不可用的供应商"],
+          entries: [
+            { provider_id: "openrouter", provider_name: "openrouter", alias: "vendor/dead-model", upstream: "vendor/dead-model", verdict: "missing_from_catalog", detail: "上游目录中已无此 id" },
+            { provider_id: "openrouter", provider_name: "openrouter", alias: "vendor/live-model", upstream: "vendor/live-model", verdict: "healthy", detail: "上游目录中仍存在" },
+            { provider_id: "undetectable", provider_name: "undetectable", alias: "vendor/undetected", upstream: "vendor/undetected", verdict: "catalog_unavailable", detail: "上游目录不可用，无法判定是否失效" },
+          ],
+        };
+      case "delete_models": return 1;
       case "get_search_settings": return searchSettings();
       case "update_search_settings": {
         // 必须同时改夹具配置，否则「保存后回到页面设置被还原」这条断言能通过。
@@ -484,6 +497,18 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.screenshot({ path: path.join(output, "provider-dialect-options.png"), fullPage: true });
     await page.keyboard.press("Escape");
     await page.getByRole("button", { name: "刷新列表" }).click().catch(() => {});
+    // 失效模型扫描：面板必须能分清「可删」与「不可删」。
+    // 反向断言是重点 —— 若「目录不可用」的项也能勾选，用户一次网络抖动
+    // 就能误删整家供应商的全部模型。
+    await page.getByRole("button", { name: "扫描失效模型" }).click();
+    await page.locator(".stale-panel").waitFor({ timeout: 5000 });
+    const staleBoxes = page.locator(".stale-list input[type=checkbox]");
+    assert.equal(await staleBoxes.count(), 3, "夹具给了 3 条扫描结果");
+    assert.equal(await staleBoxes.nth(1).isDisabled(), true, "healthy 项不可勾选");
+    assert.equal(await staleBoxes.nth(2).isDisabled(), true, "目录不可用的项不可勾选");
+    await staleBoxes.nth(0).check();
+    assert((await page.locator(".stale-panel").innerText()).includes("目录不可用"), "面板要说明哪些供应商未能判定");
+    await page.screenshot({ path: path.join(output, "stale-models.png"), fullPage: true });
 
     await page.screenshot({ path: path.join(output, "providers-desktop.png"), fullPage: true });
 
@@ -492,7 +517,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     // 第二行右侧留下空档。`.row` 是 flex-wrap: wrap，只靠它自己必然折行。
     const toolbarButtons = page.locator(".providers-toolbar .row > button");
     const btnCount = await toolbarButtons.count();
-    assert.equal(btnCount, 3, `工具栏应有 3 个按钮，实际 ${btnCount}`);
+    assert.equal(btnCount, 4, `工具栏应有 4 个按钮，实际 ${btnCount}`);
     const tops = [];
     for (let i = 0; i < btnCount; i++) {
       tops.push((await toolbarButtons.nth(i).boundingBox()).y);
@@ -654,7 +679,7 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
       // 所以只断言「都在视口内」。
       const barButtons = page.locator(".providers-toolbar .row > button");
       const barCount = await barButtons.count();
-      assert.equal(barCount, 3, `工具栏应有 3 个按钮，实际 ${barCount} @${viewport.width}`);
+      assert.equal(barCount, 4, `工具栏应有 4 个按钮（刷新列表/刷新定价/扫描失效模型/添加供应商），实际 ${barCount} @${viewport.width}`);
       const ys = [];
       const boxes = [];
       for (let i = 0; i < barCount; i++) {

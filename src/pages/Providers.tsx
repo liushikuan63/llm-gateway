@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, AppConfig, DIALECT_LABEL, HEALTH_LABEL, PricingRefreshOutcome, PricingStatus, ProviderInput, ProviderView } from "../api";
+import { api, AppConfig, DIALECT_LABEL, HEALTH_LABEL, PricingRefreshOutcome, PricingStatus, ProviderInput, ProviderView, StaleScanResult } from "../api";
 import ProviderEditor from "./ProviderEditor";
 import ProviderQuota from "./ProviderQuota";
 import { blankForm, errorText, formatContext, ProviderForm } from "./providerPresets";
@@ -21,6 +21,19 @@ function refreshSummary(outcome: PricingRefreshOutcome) {
   return `${parts.join("，")}${suffix}`;
 }
 
+/** 一个模型在扫描结果里的唯一键：同一家供应商下 alias 才唯一。 */
+function staleKey(e: { provider_id: string; alias: string }): string {
+  return e.provider_id + "::" + e.alias;
+}
+
+const STALE_LABEL: Record<string, string> = {
+  missing_from_catalog: "上游已下架",
+  probe_rejected: "实调被拒",
+  probe_failed: "实调失败",
+  catalog_unavailable: "目录不可用（未判定）",
+  healthy: "正常",
+};
+
 export default function ProvidersPage() {
   const [list, setList] = useState<ProviderView[]>([]);
   const [cfg, setCfg] = useState<AppConfig | null>(null);
@@ -33,6 +46,9 @@ export default function ProvidersPage() {
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [testResult, setTestResult] = useState<{ id: string; latency: number } | null>(null);
   const [pricing, setPricing] = useState<PricingStatus | null>(null);
+    const [stale, setStale] = useState<StaleScanResult | null>(null);
+    const [stalePicked, setStalePicked] = useState<Set<string>>(new Set());
+    const [scanning, setScanning] = useState(false);
   const loadVersion = useRef(0);
   const load = async (propagateError = false) => {
     const version = ++loadVersion.current;
@@ -65,6 +81,44 @@ export default function ProvidersPage() {
       setMessage({ kind: "err", text: `刷新定价失败：${errorText(error)}` });
     } finally { setBusy(null); }
   };
+
+    /** 扫描失效模型。只读，不改任何数据。 */
+    const scanStale = async () => {
+      setScanning(true); setMessage(null); setStalePicked(new Set());
+      try {
+        const result = await api.scanStaleModels();
+        setStale(result);
+        const removable = result.entries.filter(e => e.verdict === "missing_from_catalog" || e.verdict === "probe_rejected");
+        if (result.catalog_unavailable.length) {
+          setMessage({ kind: "err", text: `有 ${result.catalog_unavailable.length} 家供应商的上游目录不可用（${result.catalog_unavailable.join("、")}），它们下面的模型**未参与判定**，不会被列入可删除。` });
+        } else if (!removable.length) {
+          setMessage({ kind: "ok", text: `扫描了 ${result.entries.length} 个模型，没有发现失效项。` });
+        }
+      } catch (error) {
+        setMessage({ kind: "err", text: `扫描失败：${errorText(error)}` });
+      } finally { setScanning(false); }
+    };
+
+    const removeStale = async () => {
+      if (!stale || !stalePicked.size) return;
+      const picked = stale.entries.filter(e => stalePicked.has(staleKey(e)));
+      const byProvider = new Map<string, string[]>();
+      for (const e of picked) {
+        const cur = byProvider.get(e.provider_id) ?? [];
+        cur.push(e.alias); byProvider.set(e.provider_id, cur);
+      }
+      if (!window.confirm(`即将从 ${byProvider.size} 家供应商中删除 ${picked.length} 个失效模型。此操作不可撤销，确认继续？`)) return;
+      setBusy("stale"); setMessage(null);
+      try {
+        let removed = 0;
+        for (const [providerId, aliases] of byProvider) removed += await api.deleteModels(providerId, aliases);
+        await load();
+        setStale(null); setStalePicked(new Set());
+        setMessage({ kind: "ok", text: `已删除 ${removed} 个失效模型。` });
+      } catch (error) {
+        setMessage({ kind: "err", text: `删除失败：${errorText(error)}` });
+      } finally { setBusy(null); }
+    };
   const test = (p: ProviderView) => run(p.id, async () => {
     const result = await api.testProvider(p.id);
     if (!result.ok) throw new Error(`连接失败：${result.error ?? "上游未返回详情"}`);
@@ -87,8 +141,39 @@ export default function ProvidersPage() {
       <div><span className="overview-label">模型映射</span><strong>{list.reduce((n, p) => n + p.models.length, 0)}<small>个模型</small></strong></div>
       <div className="overview-current"><span className="overview-label">当前主用</span><strong title={active?.name}>{active?.name ?? "自动选择"}</strong><small>{cfg ? STRATEGIES[cfg.routing_strategy as keyof typeof STRATEGIES] ?? cfg.routing_strategy : "读取配置中"}</small></div>
     </section>
-    <div className="providers-toolbar"><div><h2>模型供应商 <span className="count-badge">{list.length}</span></h2><p>统一管理服务与模型，让每一次请求都有合适的去处。{pricing && <span className="muted"> 定价上次刷新：{new Date(pricing.at).toLocaleString()}（更新 {pricing.updated} 个，跳过手工价 {pricing.skipped_manual} 个）</span>}</p></div><div className="row"><button disabled={loading || busy !== null} onClick={() => void load()}>{loading ? "加载中…" : "刷新列表"}</button><button disabled={loading || busy !== null || !list.length} onClick={() => void refreshPrices()} title="从公开定价源获取最新单价；手工填写的价格不会被覆盖">{busy === "pricing" ? "刷新定价中…" : "刷新定价"}</button><button className="primary" onClick={() => setEditor(blankForm())}>＋ 添加供应商</button></div></div>
+    <div className="providers-toolbar"><div><h2>模型供应商 <span className="count-badge">{list.length}</span></h2><p>统一管理服务与模型，让每一次请求都有合适的去处。{pricing && <span className="muted"> 定价上次刷新：{new Date(pricing.at).toLocaleString()}（更新 {pricing.updated} 个，跳过手工价 {pricing.skipped_manual} 个）</span>}</p></div><div className="row"><button disabled={loading || busy !== null} onClick={() => void load()}>{loading ? "加载中…" : "刷新列表"}</button><button disabled={loading || busy !== null || !list.length} onClick={() => void refreshPrices()} title="从公开定价源获取最新单价；手工填写的价格不会被覆盖">{busy === "pricing" ? "刷新定价中…" : "刷新定价"}</button><button className="ghost" disabled={loading || busy !== null} onClick={() => void scanStale()} title="对照上游目录找出已下架的模型；只读，不改任何数据">{scanning ? "扫描中…" : "扫描失效模型"}</button><button className="primary" onClick={() => setEditor(blankForm())}>＋ 添加供应商</button></div></div>
     {message && <div className={`msg ${message.kind}`} role={message.kind === "err" ? "alert" : "status"}>{message.text}<button className="ghost icon-button" aria-label="关闭提示" onClick={() => setMessage(null)}>×</button></div>}
+{stale && <section className="stale-panel" aria-label="失效模型扫描结果">
+      <header>
+        <strong>失效模型扫描结果</strong>
+        <div className="row">
+          <button className="ghost" disabled={busy !== null} onClick={() => void scanStale()}>{scanning ? "重新扫描中…" : "重新扫描"}</button>
+          <button className="primary" disabled={busy !== null || !stalePicked.size} onClick={() => void removeStale()}>删除选中的 {stalePicked.size || ""} 项</button>
+        </div>
+      </header>
+      {stale.catalog_unavailable.length > 0 && <p className="muted">目录不可用（未判定、不可删除）：{stale.catalog_unavailable.join("、")}</p>}
+      <ul className="stale-list">
+        {stale.entries.map(e => {
+          const key = staleKey(e);
+          const removable = e.verdict === "missing_from_catalog" || e.verdict === "probe_rejected";
+          return <li key={key}>
+            <label>
+              <input
+                type="checkbox"
+                disabled={!removable || busy !== null}
+                checked={stalePicked.has(key)}
+                onChange={ev => setStalePicked(prev => { const next = new Set(prev); if (ev.target.checked) next.add(key); else next.delete(key); return next; })}
+              />
+              <span className="mono breakable">{e.upstream}</span>
+            </label>
+            <span className="muted">{e.provider_name}</span>
+            <span className={"tag" + (e.verdict === "healthy" ? " ok" : removable ? " err" : "")}>{STALE_LABEL[e.verdict] ?? e.verdict}</span>
+            <small className="muted">{e.detail}</small>
+          </li>;
+        })}
+      </ul>
+      {stale.entries.length === 0 && <p className="muted">没有可扫描的模型。</p>}
+    </section>}
     {list.length > 0 && <div className="provider-search-row"><input aria-label="搜索供应商" placeholder="搜索名称、地址或模型…" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="供应商状态筛选" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><span className="muted">{filtered.length} 个结果</span></div>}
     {loading && !list.length ? <div className="provider-empty" role="status"><strong>正在加载供应商…</strong></div> : !list.length ? <section className="provider-empty">
       <svg width="100" height="68" viewBox="0 0 100 68" fill="none" aria-hidden="true"><path d="M25 19L50 34L75 19M25 49L50 34L75 49" stroke="currentColor" strokeWidth="2"/><rect x="36" y="20" width="28" height="28" rx="9" fill="currentColor" opacity=".14"/><rect x="5" y="5" width="30" height="22" rx="6" stroke="currentColor"/><rect x="65" y="5" width="30" height="22" rx="6" stroke="currentColor"/><rect x="5" y="41" width="30" height="22" rx="6" stroke="currentColor"/><rect x="65" y="41" width="30" height="22" rx="6" stroke="currentColor"/><circle cx="50" cy="34" r="4" fill="currentColor"/></svg>
