@@ -308,6 +308,10 @@ agentrouter 是 L2' 的典型：**端点有，但凭据是账号密码**——�
 - 顺带证伪一条：包里**没有**客户端指纹/签名模板的迹象，但也**不能**据此说没有——
   签名逻辑通常在**主进程**（Node 侧），asar 里看到的是渲染层代码。
 
+> 以上三种可能**已由抓包区分**（见本卡末尾「C6 结果」）：答案是**第 3 种**——
+> 跨源 **iframe** 打开的活动页；而且它确实用的是**另一个 host**（`openapi.qoder.sh`），
+> 即第 1 种也同时成立。静态扫包扫不到的真正原因就是这两条叠加。
+
 #### 因此甲方案要带兜底（**关键风险，先说清**）
 
 Electron 里**渲染层**发的请求能在 CDP 的 Network 域看到，**主进程**（Node 侧 `net`/`fetch`）
@@ -359,6 +363,69 @@ Electron 里**渲染层**发的请求能在 CDP 的 Network 域看到，**主进
 
 ---
 
+#### C6 结果：**能，但有一道设备绑定门槛**（2026-10-06 00:3x 实测抓包完成）
+
+甲方案（CDP，不装证书、不改系统代理）成功抓到全部相关请求。整个活动页只发**两条**业务请求：
+
+```text
+GET  https://openapi.qoder.sh/sash/api/v1/me/campaigns
+POST https://openapi.qoder.sh/sash/api/v1/me/campaigns/{campaignId}/claim     ← 领取
+```
+
+**鉴权构成（关键）**——`requestWillBeSentExtraInfo` 里读到的头，**没有 Cookie**：
+
+```text
+authorization            ← 账号令牌
+cosy-clienttype   cosy-version        cosy-machineos
+cosy-machineid    cosy-machinetoken   cosy-machinetype
+cosy-machinecode  cosy-machinehostname
+```
+
+那组 `cosy-machine*` 是**设备标识 / 机器令牌**，它决定了这件事的性质：
+
+| 结论 | 依据 |
+|---|---|
+| 领取**不是**原生私有协议，就是普通 REST + JSON | 抓到的是标准 `POST` + `application/json` |
+| **可以**在客户端之外完成——前提是同时具备 `authorization` 与 `cosy-machinetoken` | 两者都是普通请求头，没有签名体、没有加密载荷 |
+| `cosy-machinetoken` 是**设备绑定**，不是账号凭据 | 名字与字段构成（machineid + machinetoken + machinecode + machinehostname + machineos + machinetype） |
+| 因此"脱离客户端"= **把本机已登录状态下的这组头复制出去**，而不是凭账号密码重新换取 | 本机已登录，这组头当下就存在 |
+
+**判据验证结果**
+
+- **判据 3（服务端幂等）✅ 通过，而且证据比预期更强**：今天这个活动已领，抓到的响应是
+  `{"status":"CLAIMED","replayed":true,…,"claimedAt":"2026-09-02T05:20:18Z"}` ——
+  **服务端明确把重复领取标记为 `replayed` 而不是再发一次**。这直接印证了 C3 幂等键的设计前提：
+  拦重复的可靠性在服务端，客户端只做体验。
+- **判据 2（去掉鉴权必须失败）⏳ 未做**：需要在客户端外重放才谈得上做对照。
+- **判据 1（客户端外重放成功）⏳ 未做**：今天已领，重放只能得到 `replayed:true`；
+  真正能证明"能领"必须在**下一个窗口**（明天 10:00 后）重放一次。
+
+**另一个发现：领取不需要点按钮。** 活动页加载后 1 秒内自动发出 `GET campaigns` → 紧接着
+自动 `POST …/claim`（因为该活动处于可领状态），服务端用 `replayed` 兜住重复，
+UI 再据此显示「已领取」+ 按钮禁用。所以"打开活动页"这个动作本身就等价于"尝试领取"。
+
+**今天的状态（实测）**：`claimable: false`、`claimStatus: "CLAIMED"`；
+权益形态 `{"kind":"CREDITS","amount":100,"validity":{"mode":"RELATIVE_DAYS","days":30}}`、
+`modelScope.modelSeries.key = "ALL_MODELS"`、`actionType = "CLAIM_BENEFIT"`。
+`claimable` / `claimStatus` / `benefit.amount` 这三个字段就是 C2 要显示的东西，**全部可读**。
+
+**本轮实测的副作用：零。** 因为今天已领，服务端把所有重放都判成 `replayed`，没有重复发放。
+
+**剩下的唯一未验证格**（C6 收尾项）：下个窗口开启时，在客户端之外用同一组头重放一次
+`POST …/claim`。这需要把 `authorization` 与 `cosy-machinetoken` 读出来用——**属"要凭据"，
+须用户本人授权**；且按红线，令牌只进 `app_secrets`、不进文档与日志。
+
+**方法教训（三条，都是踩过的）**
+
+1. **关键词表会骗人**：第一版监听器按 `claim|credit|reward` 过滤，而这个活动页的接口用的是
+   `campaigns` 词根，**一条都没命中**，看起来像"应用不发请求"。宽口径（记录全部 host+path）
+   才是找未知接口的正确起点。
+2. **`Page.reload` 对 OOPIF target 无效**：跨源 iframe 作为独立 target 出现，
+   但 `Page.reload` 不会真的重载它；要在 iframe 内 `location.reload()`。
+3. **Cookie 不在基础事件里**：`Network.requestWillBeSent` 的 `request.headers` 看不到 Cookie，
+   必须读 `Network.requestWillBeSentExtraInfo`——否则会错误地得出"这个请求没有鉴权"。
+
+
 ## 七、待裁决（写文档时未定，实现前必须拍板）
 
 | # | 裁决点 | 选项 | 倾向 |
@@ -379,7 +446,7 @@ Electron 里**渲染层**发的请求能在 CDP 的 Network 域看到，**主进
 |---|---|---|
 | C1 | **部分完成** | 9 个平台逐个核验：**geeknow 端点存在但功能开关关闭**（`checkin_enabled=false`）；agentrouter 有登录端点（要账号密码）；Qoder 有官方规则原文且 `/claim` 经双向取证不存在；commandcode 定位为账号型 Agent 产品；shitapi / zai / sensenova / maas / openrouter 未发现端点。**当前没有任何平台可自动领取** |
 | C2 | **部分取证完成**（代码未开始） | Qoder 额度读取有**实测路径**：客户端包里写死的 `/sash/api/v1/ai-conversations/credits-summary`、`/api/v2/quota/usage`、`/api/v2/user/plan`（见 C6 前置取证）；CLI 侧 `/usage` 面板字段已核到官方文档 |
-| C6 | **前置已完成，待抓包** | 甲方案可行性已验（Electron 9/9、版本 0.4.3.0、当前无进程在跑、现在在窗口内）；静态扫包得 170 条路径、**无领取端点**、得 3 种未区分可能；已定 CDP + netlog 兜底。**下一步阻塞在外部条件**：需用户登录桌面端，然后在窗口内点一次礼物图标 |
+| C6 | **主体已完成**（2026-10-06 00:4x） | 甲方案跑通：抓到领取端点 `POST openapi.qoder.sh/sash/api/v1/me/campaigns/{id}/claim`、鉴权 = `authorization` + `cosy-machine*` 设备组头（无 Cookie）、响应含 `replayed:true`。**结论：可在客户端外领取，但需复制设备绑定的机器令牌。** 剩一格：下个窗口在客户端外用同组头重放（要用户授权读令牌） |
 | C3 | 未开始 | **暂无可做对象**——geeknow 开关关闭，其余平台无端点；等有平台开了再说 |
 | C4 | 未开始 | |
 | C5 | 未开始 | |
