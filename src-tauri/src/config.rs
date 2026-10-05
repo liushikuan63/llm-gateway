@@ -404,7 +404,7 @@ pub struct AppConfig {
 }
 
 /// 上游鉴权失败的处理档位。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthFailureMode {
     /// 维持旧行为：一次 401/403 立刻终止整条候选链，错误原样返回客户端。
@@ -417,13 +417,8 @@ pub enum AuthFailureMode {
     /// 返回的是 401/403，网关把它当不可重试 → 整条链当场终止，
     /// 于是**一家坏供应商就能让「自动分流」整体失败**，而客户端看到的报错是
     /// 「API 密钥无效」，指向自己而不是真正原因。
+    #[default]
     SkipAndDisable,
-}
-
-impl Default for AuthFailureMode {
-    fn default() -> Self {
-        AuthFailureMode::SkipAndDisable
-    }
 }
 
 impl AuthFailureMode {
