@@ -574,6 +574,66 @@ async fn stream_and_plain_call_treat_context_overflow_as_retryable() {
     server.abort();
 }
 
+// ─── 402 额度耗尽必须回退，401 凭据错不得回退 ──────────────────────────────
+//
+// 2026-10-05 实测：agentrouter 返回 402 "Budget pool quota has been exhausted"，
+// 而 `error.rs` 的 retryable() 只认 408/409/429/5xx，402 被判成不可重试，
+// 于是请求死在第一家，而链上还有能用的供应商。
+//
+// 对照组必须用 401：凭据错换 provider 也没用（同一把废 key），额度耗尽才换得动。
+// 只断言「402 可重试」的话，它可能仅仅因为「所有 4xx 都可重试」而成立。
+
+async fn quota_exhausted_response() -> Response {
+    Response::builder()
+        .status(StatusCode::PAYMENT_REQUIRED)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"error":{"message":"Budget pool quota has been exhausted. Please ask an administrator to increase the limit or select another budget pool.","type":"bad_response_status_code"}}"#,
+        ))
+        .unwrap()
+}
+
+async fn unauthorized_response() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"error":{"message":"invalid api key","type":"unauthorized_client_error"}}"#,
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn quota_exhausted_falls_back_but_unauthorized_does_not() {
+    let app = Router::new()
+        .route("/quota/chat/completions", post(quota_exhausted_response))
+        .route("/unauth/chat/completions", post(unauthorized_response));
+    let (base_url, server) = spawn_axum(app).await;
+    let client = UpstreamClient::new();
+
+    // ① 402 额度耗尽 —— 换 provider 有戏，必须可重试。
+    let quota = local_provider(Dialect::OpenAI, format!("{base_url}/quota"));
+    let error = stream_error(&client, &quota, "402 必须报错").await;
+    assert!(
+        error.retryable(),
+        "402 额度耗尽必须回退到别的 provider，否则请求死在第一家：{error:?}"
+    );
+    match &error {
+        GatewayError::Upstream { status, .. } => assert_eq!(*status, 402),
+        other => panic!("期望保留 Upstream{{402}} 以便 UI 显示，实际 {other:?}"),
+    }
+
+    // ② 对照组：401 凭据错 —— 换 provider 同样没戏，不得回退。
+    let unauth = local_provider(Dialect::OpenAI, format!("{base_url}/unauth"));
+    let error = stream_error(&client, &unauth, "401 必须报错").await;
+    assert!(
+        !error.retryable(),
+        "401 凭据错不该回退：换 provider 也是同一把废 key：{error:?}"
+    );
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn upstream_redirects_are_not_followed() {
     let hits = Arc::new(AtomicUsize::new(0));

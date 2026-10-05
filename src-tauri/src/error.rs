@@ -48,7 +48,17 @@ impl GatewayError {
     pub fn retryable(&self) -> bool {
         match self {
             GatewayError::Upstream { status, .. } => {
-                *status == 408 || *status == 409 || *status == 429 || *status >= 500
+                // 402 是**额度/计费**耗尽，不是凭据错。Key 本身还有效（401/403
+                // 才是），只是这个池子没钱了 —— 换一家 provider 完全还有戏，
+                // 判不可重试会让整条候选链在第一家就死掉。
+                // 2026-10-05 实测：agentrouter 返回 402 "Budget pool quota has
+                // been exhausted" 后 `retryable=false`，请求没有回退到链上的
+                // sensenova / openrouter。
+                *status == 402
+                    || *status == 408
+                    || *status == 409
+                    || *status == 429
+                    || *status >= 500
             }
             GatewayError::Timeout(_) => true,
             GatewayError::Protocol(_) => false, // 转换失败换家也没用
