@@ -26,6 +26,23 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     provider("multimodal", "多模态服务", "openai", "https://example.test/v1", [model("vision-model", 65536, peakValleyPrice, { supports_vision: true, supports_audio: true, supports_video: true })]),
     { ...provider("disabled", "备用服务", "openai", "https://example.test/v1", [model("backup-chat")]), enabled: false },
   ];
+  // B2 远程 Key 夹具：两条 —— 一条设了预算+白名单、一条全不限，
+  // 这样「不限」与「已设」两种渲染都能被断言到。
+  // 必须带预算三件套：给空数组的话新列永远不渲染，
+  // 漏字段导致的白屏也永远不会被发现（卡片点名过这个坑）。
+  window.__fixtureRemoteKeys = [
+    {
+      id: "rk-fixture-limited", label: "受限设备", enabled: true, rpm_limit: 60,
+      monthly_budget_micros: 5000000, budget_currency: "USD",
+      allowed_models: ["gpt-4o", "claude-*"],
+      created_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z",
+    },
+    {
+      id: "rk-fixture-open", label: "不限额设备", enabled: false, rpm_limit: 120,
+      monthly_budget_micros: 0, budget_currency: "", allowed_models: [],
+      created_at: "2026-09-02T00:00:00Z", updated_at: "2026-09-02T00:00:00Z",
+    },
+  ];
   window.__fixtureConfig = { bind: "127.0.0.1", port: 15721, allow_lan: false, unified_key: "fixture-only", routing_strategy: "balanced", custom_rules: [], max_fallback_attempts: 3, upstream_timeout_secs: 90, sticky_ttl_secs: 1800, compact_threshold_tokens: 60000, compact_keep_recent: 12, analytics_retention_days: 30, http_proxy: null, failover_enabled: true, catalog_auto_update: false, catalog_feed_url: null, remote_mode: { enabled: false, public_url: null }, takeover: { claude_code: false, codex: false, gemini_cli: false, opencode: false, crush: false },
     smart_routing: {
       enabled: true, classifier: "jev",
@@ -272,7 +289,41 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       }
       case "update_config": window.__fixtureConfig = structuredClone(args.cfg); return { config: args.cfg, restart_required: false, restart_reasons: [] };
       case "test_provider": return { ok: true, latency_ms: 42, model: "sample/chat" };
-      case "list_snapshots": case "list_remote_access_keys": return [];
+      case "list_snapshots": return [];
+      // B2：远程 Key 夹具**必须带预算三件套**。给空数组的话新列永远不渲染，
+      // 漏字段导致的白屏也永远不会被发现 —— 卡片点名过这个坑。
+      case "list_remote_access_keys": return structuredClone(window.__fixtureRemoteKeys);
+      case "create_remote_access_key": {
+        const created = {
+          id: "rk-created", label: args.input.label, enabled: true,
+          rpm_limit: args.input.rpm_limit,
+          monthly_budget_micros: 0, budget_currency: "", allowed_models: [],
+          created_at: "2026-09-12T00:00:00Z", updated_at: "2026-09-12T00:00:00Z",
+        };
+        window.__fixtureRemoteKeys = [...window.__fixtureRemoteKeys, created];
+        return { key: created, secret: "rk-fixture-secret" };
+      }
+      case "update_remote_access_key": {
+        // 与后端同口径：未传（undefined）表示不改，传了就更新。
+        // 夹具若把 undefined 当成「清空」，界面上「只改个名字」就会丢预算，
+        // 而测试还会全绿。
+        const idx = window.__fixtureRemoteKeys.findIndex(k => k.id === args.input.id);
+        if (idx < 0) throw new Error("远程访问 Key 不存在");
+        const prev = window.__fixtureRemoteKeys[idx];
+        window.__fixtureRemoteKeys[idx] = {
+          ...prev,
+          label: args.input.label, enabled: args.input.enabled, rpm_limit: args.input.rpm_limit,
+          monthly_budget_micros: args.input.monthly_budget_micros ?? prev.monthly_budget_micros,
+          budget_currency: args.input.budget_currency ?? prev.budget_currency,
+          allowed_models: args.input.allowed_models ?? prev.allowed_models,
+          updated_at: "2026-09-12T01:00:00Z",
+        };
+        return structuredClone(window.__fixtureRemoteKeys[idx]);
+      }
+      case "delete_remote_access_key": {
+        window.__fixtureRemoteKeys = window.__fixtureRemoteKeys.filter(k => k.id !== args.id);
+        return null;
+      }
       case "recent_requests": return structuredClone(window.__fixtureRequests);
       case "stats_overview": return structuredClone(window.__fixtureStats);
       case "import_bundle": {
@@ -1125,6 +1176,53 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await page.screenshot({ path: path.join(output, "providers-dark.png"), fullPage: true });
     await page.getByRole("button", { name: "切换到浅色主题", exact: true }).click();
     await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
+    // B2 预算闸门与模型白名单：列表必须先能显示出这两列。
+    // 反向断言是重点 —— 夹具漏字段时前端读 `undefined.length` 会整页白屏，
+    // 而「页面还在、表还在」这件事本身要能被断言到。
+    // 用夹具里唯一的行标签定位，而不是按卡片标题文本找 ——
+    // 表格所在的那张卡里并没有「远程访问 Key」这几个字（实测定位器超时）。
+    const keyCard = page.locator("table").filter({ hasText: "受限设备" });
+    await keyCard.waitFor({ timeout: 5000 });
+    const keyText = await keyCard.innerText();
+    assert(keyText.includes("月度预算") && keyText.includes("模型白名单"),
+      `远程 Key 表必须有预算与白名单两列，实际：${keyText.replace(/\n/g, "|")}`);
+    // micros 要按元显示，不能把 5000000 直接印出来
+    assert(keyText.includes("5 USD"), `预算要按元显示，实际：${keyText.replace(/\n/g, "|")}`);
+    assert(keyText.includes("gpt-4o, claude-*"), `白名单要逐条显示，实际：${keyText.replace(/\n/g, "|")}`);
+    // 「不限」必须显示成不限，而不是 0
+    const openRow = keyCard.locator("tr").filter({ hasText: "不限额设备" });
+    assert((await openRow.innerText()).includes("不限"),
+      "未设预算的 Key 要显示「不限」，显示 0 会让人以为上限是 0");
+    await page.screenshot({ path: path.join(output, "remote-key-budget.png"), fullPage: true });
+
+    // 打开编辑器：三个新字段都要在，且要把 micros 还原成元
+    await keyCard.locator("tr").filter({ hasText: "受限设备" })
+      .getByRole("button", { name: "编辑", exact: true }).click();
+    const budgetInput = page.locator("#remote-key-budget");
+    await budgetInput.waitFor({ timeout: 5000 });
+    assert.equal(await budgetInput.inputValue(), "5",
+      "5000000 micros 必须回填成 5（元），直接印 micros 会让用户改错量级");
+    assert.equal(await page.locator("#remote-key-currency").inputValue(), "USD");
+    assert.equal(await page.locator("#remote-key-models").inputValue(),
+      "gpt-4o, claude-*");
+    await page.screenshot({ path: path.join(output, "remote-key-budget-editor.png"), fullPage: true });
+
+    // 改预算后保存，列表要跟着变 —— 证明 change 真的落到了夹具（= 后端）。
+    await budgetInput.fill("12.5");
+    await page.getByRole("button", { name: "保存更改", exact: true }).click();
+    await page.waitForTimeout(300);
+    assert((await keyCard.innerText()).includes("12.5 USD"),
+      `保存后列表要显示新预算，实际：${(await keyCard.innerText()).replace(/\n/g, "|")}`);
+    // 反向：清空预算表示「不限」，不能变成 0
+    await keyCard.locator("tr").filter({ hasText: "受限设备" })
+      .getByRole("button", { name: "编辑", exact: true }).click();
+    await page.locator("#remote-key-budget").fill("");
+    await page.getByRole("button", { name: "保存更改", exact: true }).click();
+    await page.waitForTimeout(300);
+    const clearedRow = keyCard.locator("tr").filter({ hasText: "受限设备" });
+    assert((await clearedRow.innerText()).includes("不限"),
+      "清空预算必须回到「不限」，而不是变成 0 元上限");
+
     assert.equal(await page.getByLabel("OpenCode", { exact: true }).count(), 1, "接管面板必须提供 OpenCode");
     assert.equal(await page.getByLabel("Crush", { exact: true }).count(), 1, "接管面板必须提供 Crush");
     await page.getByRole("button", { name: "备份并写入配置", exact: true }).click();

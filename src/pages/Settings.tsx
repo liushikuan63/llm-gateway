@@ -67,6 +67,11 @@ export default function SettingsPage() {
   const [editingRemoteKey, setEditingRemoteKey] = useState<RemoteAccessKeyView | null>(null);
   const [editingRemoteKeyLabel, setEditingRemoteKeyLabel] = useState("");
   const [editingRemoteKeyRpmLimit, setEditingRemoteKeyRpmLimit] = useState(60);
+  // B2 预算三件套。金额用「元」在界面上编辑，提交前乘 1e6 转 micros ——
+  // 后端用整数 micros 比对，界面用元更直观，换算只在这一处发生。
+  const [editingRemoteKeyBudget, setEditingRemoteKeyBudget] = useState("");
+  const [editingRemoteKeyCurrency, setEditingRemoteKeyCurrency] = useState("USD");
+  const [editingRemoteKeyModels, setEditingRemoteKeyModels] = useState("");
   const [lanConfirmationOpen, setLanConfirmationOpen] = useState(false);
   const [remoteConfirmationOpen, setRemoteConfirmationOpen] = useState(false);
   const [oneTimeSecretLabel, setOneTimeSecretLabel] = useState<string | null>(null);
@@ -174,7 +179,16 @@ export default function SettingsPage() {
 
   const updateRemoteAccessKey = async (
     key: RemoteAccessKeyView,
-    changes: Pick<RemoteAccessKeyView, "label" | "enabled" | "rpm_limit">,
+    // 前三项必填（改名/启停/RPM 是常规操作），预算三项可选：
+    // 只想启停一个 Key 时不必回传预算，漏传不会被当成「清空预算」——
+    // 后端把 `None` 解释为「不改」，两端口径一致。
+    changes: Pick<RemoteAccessKeyView, "label" | "enabled" | "rpm_limit"> &
+      Partial<
+        Pick<
+          RemoteAccessKeyView,
+          "monthly_budget_micros" | "budget_currency" | "allowed_models"
+        >
+      >,
   ) => {
     if (!changes.label.trim()) {
       setMsg({ kind: "err", text: "访问 Key 名称不能为空" });
@@ -540,6 +554,8 @@ ${keyInfo.ollama_endpoint}`}
                   <th>名称</th>
                   <th>状态</th>
                   <th>RPM</th>
+                  <th>月度预算</th>
+                  <th>模型白名单</th>
                   <th>创建时间</th>
                   <th style={{ width: 230 }}>操作</th>
                 </tr>
@@ -554,6 +570,16 @@ ${keyInfo.ollama_endpoint}`}
                       </span>
                     </td>
                     <td>{key.rpm_limit}</td>
+                    <td className="muted">
+                      {key.monthly_budget_micros > 0
+                        ? `${key.monthly_budget_micros / 1_000_000} ${key.budget_currency || "—"}`
+                        : "不限"}
+                    </td>
+                    <td className="muted" style={{ fontSize: 11 }}>
+                      {key.allowed_models.length > 0
+                        ? key.allowed_models.join(", ")
+                        : "不限"}
+                    </td>
                     <td className="muted" style={{ fontSize: 11 }}>{formatDate(key.created_at)}</td>
                     <td>
                       <div className="row compact-actions">
@@ -564,6 +590,15 @@ ${keyInfo.ollama_endpoint}`}
                             setEditingRemoteKey(key);
                             setEditingRemoteKeyLabel(key.label);
                             setEditingRemoteKeyRpmLimit(key.rpm_limit);
+                            // micros -> 元。0 显示成空串（= 不限），
+                            // 不要显示 "0"，否则用户会以为自己设了 0 元上限。
+                            setEditingRemoteKeyBudget(
+                              key.monthly_budget_micros > 0
+                                ? String(key.monthly_budget_micros / 1_000_000)
+                                : "",
+                            );
+                            setEditingRemoteKeyCurrency(key.budget_currency || "USD");
+                            setEditingRemoteKeyModels(key.allowed_models.join(", "));
                           }}
                         >
                           编辑
@@ -1297,6 +1332,47 @@ ${keyInfo.ollama_endpoint}`}
             <div className="sub">
               编辑不会显示或轮换原始 Key。若需要更换凭据，请创建新 Key，确认客户端迁移后再停用旧 Key。
             </div>
+            {/* B2 预算闸门。留空 = 不限，不是「上限为 0」—— */}
+            {/* 后端用 0 表示不限，界面上用空串表达同一件事，免得用户以为设了 0 元上限。 */}
+            <div className="field">
+              <label htmlFor="remote-key-budget">月度预算（留空 = 不限）</label>
+              <input
+                id="remote-key-budget"
+                type="number"
+                min={0}
+                step="0.01"
+                placeholder="不限"
+                value={editingRemoteKeyBudget}
+                disabled={busy !== null}
+                onChange={(event) => setEditingRemoteKeyBudget(event.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="remote-key-currency">预算币种</label>
+              <input
+                id="remote-key-currency"
+                value={editingRemoteKeyCurrency}
+                maxLength={8}
+                placeholder="USD"
+                disabled={busy !== null || !editingRemoteKeyBudget.trim()}
+                onChange={(event) => setEditingRemoteKeyCurrency(event.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="remote-key-models">模型白名单（逗号分隔，留空 = 不限）</label>
+              <input
+                id="remote-key-models"
+                value={editingRemoteKeyModels}
+                placeholder="gpt-4o, claude-*, *-turbo"
+                disabled={busy !== null}
+                onChange={(event) => setEditingRemoteKeyModels(event.target.value)}
+              />
+            </div>
+            <div className="sub">
+              币种只对本月这个币种的累计生效：USD 与 CNY 的消费不相加。
+              白名单支持 <span className="mono">*</span> 通配；不带通配时精确匹配
+              （<span className="mono">gpt-4</span> 不会放行 <span className="mono">gpt-4o</span>）。
+            </div>
             <div className="row end" style={{ marginTop: 18 }}>
               <button disabled={busy !== null} onClick={() => setEditingRemoteKey(null)}>取消</button>
               <button
@@ -1306,6 +1382,20 @@ ${keyInfo.ollama_endpoint}`}
                   label: editingRemoteKeyLabel,
                   enabled: editingRemoteKey.enabled,
                   rpm_limit: editingRemoteKeyRpmLimit,
+                  // 空串 = 不限，提交 0；否则按元转 micros
+                  monthly_budget_micros: editingRemoteKeyBudget.trim()
+                    ? Math.round(Number(editingRemoteKeyBudget) * 1_000_000)
+                    : 0,
+                  budget_currency: editingRemoteKeyBudget.trim()
+                    ? editingRemoteKeyCurrency.trim()
+                    : "",
+                  // 逗号或换行分隔，去空去重
+                  allowed_models: Array.from(new Set(
+                    editingRemoteKeyModels
+                      .split(/[,\n]/)
+                      .map((m) => m.trim())
+                      .filter(Boolean),
+                  )),
                 })}
               >
                 保存更改

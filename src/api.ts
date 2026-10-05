@@ -473,6 +473,12 @@ export interface RemoteAccessKeyView {
   label: string;
   enabled: boolean;
   rpm_limit: number;
+  /** 月度预算，单位 micros（1e-6 货币单位）。0 = 不限。 */
+  monthly_budget_micros: number;
+  /** 预算币种。空串 = 没设预算。 */
+  budget_currency: string;
+  /** 模型白名单。空数组 = 不限。支持 * 通配，不带通配时精确匹配。 */
+  allowed_models: string[];
   created_at: string;
   updated_at: string;
 }
@@ -483,6 +489,14 @@ export interface CreateRemoteAccessKeyInput {
 }
 
 export interface UpdateRemoteAccessKeyInput extends CreateRemoteAccessKeyInput {
+  /**
+   * 预算三件套是可选的：**不传表示「不改」**。
+   * 用必填的话，只想改 label 就必须把预算一起回传，
+   * 漏传一次就把用户设的预算清空了 —— 而界面上看不出任何异常。
+   */
+  monthly_budget_micros?: number;
+  budget_currency?: string;
+  allowed_models?: string[];
   id: string;
   enabled: boolean;
 }
