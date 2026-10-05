@@ -119,7 +119,34 @@ export default function ProvidersPage() {
         setMessage({ kind: "err", text: `删除失败：${errorText(error)}` });
       } finally { setBusy(null); }
     };
-  const test = (p: ProviderView) => run(p.id, async () => {
+    // 卡片上一键启停。此前该能力只藏在 •••• 折叠菜单里，界面上看得到
+    // 「已停用」标签却没有地方切回去 —— 一个半个死开关。
+    // 走既有 upsertProvider 整体回写，不新增后端命令。
+    const toggleEnabled = async (p: ProviderView) => {
+      await run(p.id, () => api.upsertProvider(providerInput(p, { enabled: !p.enabled })),
+        p.enabled ? `已停用 ${p.name}，不再参与路由` : `已启用 ${p.name}，将参与后续路由`);
+    };
+
+    // 复制：直接落库，名字加「副本」后缀，**API Key 留空**。
+    // 留空是刻意的 —— 明文 Key 永不返回前端（只有掩码），任何「连带复制」
+    // 的做法都只能由后端转存，那等于开后门。新副本必须自己填 Key。
+    // 先落库（而不是只展开表单）是用户定的：改完直接生效，不用记住
+    // 那张没提交的表单。
+    const duplicate = async (p: ProviderView) => {
+      await run(p.id, async () => {
+        const created = await api.upsertProvider({
+          ...providerInput(p),
+          id: undefined,
+          name: `${p.name} 副本`,
+          enabled: false,
+          api_key: "",
+          note: p.note ?? "",
+        });
+        return created;
+      }, `已复制为「${p.name} 副本」。请点它的「配置」补上 API Key 后再启用。`);
+    };
+
+      const test = (p: ProviderView) => run(p.id, async () => {
     const result = await api.testProvider(p.id);
     if (!result.ok) throw new Error(`连接失败：${result.error ?? "上游未返回详情"}`);
     setTestResult({ id: p.id, latency: result.latency_ms });
@@ -188,11 +215,11 @@ export default function ProvidersPage() {
           <div className="provider-address mono" title={p.base_url}>{p.base_url}</div><div className="provider-secret"><span>API Key</span><span className="mono">{p.api_key_masked || "未设置"}</span></div>
           <div className="provider-model-preview"><div><span>可用映射</span><strong>{p.models.length}</strong></div><div className="provider-model-tags">{p.models.slice(0, 4).map(m => <span className="tag" key={m.alias} title={`${m.upstream} · ${formatContext(m.context_window)} tokens`}>{m.alias}</span>)}{p.models.length > 4 && <span className="tag">+{p.models.length - 4}</span>}{!p.models.length && <span className="muted">未配置模型映射</span>}</div></div>
           <div className="provider-meta"><span>{p.rpm_limit ? `${p.rpm_limit} RPM` : "RPM 不限"}</span><span>优先级 {p.priority}</span>{testResult?.id === p.id && <span className="test-latency">实测 {testResult.latency} ms</span>}</div>
-          <footer><div className="row"><button className="ghost" disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), note: p.note ?? "" })}>配置</button><button className="ghost" disabled={busy !== null} onClick={() => void test(p)}>{busy === p.id ? "处理中…" : "测试连接"}</button><button className="ghost" disabled={busy !== null || !p.enabled || p.is_active} onClick={() => void run(p.id, () => api.setActive(p.id), `${p.name} 已设为主用`)}>{p.is_active ? "已主用" : "设为主用"}</button></div>
+          <footer><div className="row"><button className="ghost" disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), note: p.note ?? "" })}>配置</button><button className="ghost" disabled={busy !== null} onClick={() => void test(p)}>{busy === p.id ? "处理中…" : "测试连接"}</button><button className="ghost" disabled={busy !== null || !p.enabled || p.is_active} onClick={() => void run(p.id, () => api.setActive(p.id), `${p.name} 已设为主用`)}>{p.is_active ? "已主用" : "设为主用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void toggleEnabled(p)}>{p.enabled ? "停用" : "启用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void duplicate(p)} title="复制配置并落库，API Key 留空需自行填写">复制</button></div>
           <details className="provider-more"><summary aria-label={`${p.name} 更多操作`}>•••</summary><div className="provider-more-menu">
             <button disabled={busy !== null} onClick={() => setQuotaProvider(p)}>查询额度 / 有效期</button>
             <button disabled={busy !== null} onClick={() => void run(p.id, () => api.upsertProvider(providerInput(p, { enabled: !p.enabled })), p.enabled ? `已停用 ${p.name}` : `已启用 ${p.name}`)}>{p.enabled ? "停用供应商" : "启用供应商"}</button>
-            <button disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), id: undefined, name: `${p.name} 副本`, enabled: false, note: p.note ?? "" })}>复制配置（重新填写 Key）</button>
+            <button disabled={busy !== null} onClick={() => void duplicate(p)}>复制配置并新建</button>
             <button disabled={busy !== null || index === 0} onClick={() => move(p, -1)}>上移优先级</button><button disabled={busy !== null || index === ordered.length - 1} onClick={() => move(p, 1)}>下移优先级</button>
             <button className="danger" disabled={busy !== null} onClick={() => { if (window.confirm(`确定删除供应商“${p.name}”及其模型映射吗？`)) void run(p.id, () => api.deleteProvider(p.id), `已删除 ${p.name}`); }}>删除供应商</button>
           </div></details></footer>

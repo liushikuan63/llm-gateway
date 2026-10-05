@@ -54,6 +54,9 @@ export interface ModelOverrides {
 export interface ModelRef {
   alias: string;
   upstream: string;
+  // 是否参与自动路由。停用的模型仍留在配置里（前端要能看到并勾回来），
+  // 但不进路由候选链。省略时按 true 处理，保证旧载荷行为不变。
+  enabled: boolean;
   // 用途决定请求端点：chat=/v1/chat/completions 与 Responses，
   // embedding=/v1/embeddings，image=/v1/images/generations，speech=/v1/audio/speech。
   model_type: ModelType;

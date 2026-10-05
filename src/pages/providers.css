@@ -211,3 +211,8 @@
 .stale-list > li { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 7px; background: var(--panel-2); }
 .stale-list > li > label { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
 .stale-list > li > small { flex: 0 0 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 模型级启用开关 */
+.enable-toggle { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; font-size: 12px; color: var(--muted); cursor: pointer; }
+.enable-toggle input { cursor: pointer; }
+.enable-toggle.off { color: var(--danger, #c0392b); }

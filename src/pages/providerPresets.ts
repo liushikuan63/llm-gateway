@@ -3,7 +3,7 @@ import type { Dialect, ModelRef, ProviderInput } from "../api";
 export const DEFAULT_CONTEXT_WINDOW = 32768;
 export type ProviderForm = Omit<ProviderInput, "note"> & { note: string };
 export const emptyModel = (context = DEFAULT_CONTEXT_WINDOW): ModelRef => ({
-  alias: "", upstream: "", model_type: "chat", upstream_path: null, context_window: context,
+  alias: "", upstream: "", enabled: true, model_type: "chat", upstream_path: null, context_window: context,
   supports_tools: false, supports_vision: false, supports_audio: false, supports_video: false,
   // false 的含义是「不确定是否支持」，网关按不支持处理。
   supports_thinking: false, supports_stream: true,

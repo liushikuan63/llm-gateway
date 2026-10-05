@@ -13,7 +13,7 @@ assert(manualSections.length >= 10, `手册章节只有 ${manualSections.length}
 
 async function fixture({ empty = false, configFailure = false, providerFailure = false, bootWarning = null } = {}) {
   window.isTauri = true;
-  const model = (id, context = 32768, price = null, extra = {}) => ({ alias: id, upstream: id, model_type: "chat", upstream_path: null, context_window: context, supports_tools: true, supports_vision: false, supports_audio: false, supports_video: false, supports_stream: true, price, overrides: null, ...extra });
+  const model = (id, context = 32768, price = null, extra = {}) => ({ alias: id, upstream: id, enabled: true, model_type: "chat", upstream_path: null, context_window: context, supports_tools: true, supports_vision: false, supports_audio: false, supports_video: false, supports_stream: true, price, overrides: null, ...extra });
   // 带峰谷价的模型：谷时（UTC 16:30–00:30）打五折，用于验证时段规则的往返保存。
   const peakValleyPrice = { prompt: 2, completion: 8, currency: "cny", tiers: [], source: "manual", rules: [
     { label: "谷时", start_minute: 990, end_minute: 30, prompt_multiplier: 0.5, completion_multiplier: 0.25 },
@@ -26,6 +26,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     provider("multimodal", "多模态服务", "openai", "https://example.test/v1", [model("vision-model", 65536, peakValleyPrice, { supports_vision: true, supports_audio: true, supports_video: true })]),
     { ...provider("disabled", "备用服务", "openai", "https://example.test/v1", [model("backup-chat")]), enabled: false },
   ];
+  window.__fixtureConfig = { bind: "127.0.0.1", port: 15721, allow_lan: false, unified_key: "fixture-only", routing_strategy: "balanced", custom_rules: [], max_fallback_attempts: 3, upstream_timeout_secs: 90, sticky_ttl_secs: 1800, compact_threshold_tokens: 60000, compact_keep_recent: 12, analytics_retention_days: 30, http_proxy: null, failover_enabled: true, catalog_auto_update: false, catalog_feed_url: null, remote_mode: { enabled: false, public_url: null }, takeover: { claude_code: false, codex: false, gemini_cli: false, opencode: false, crush: false },
     smart_routing: {
       enabled: true, classifier: "jev",
       jev: { base_url: "http://127.0.0.1:8009/v1/systemone", model: "rl-agent", timeout_ms: 1200, max_state_chars: 4000,
@@ -493,7 +494,24 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         throw new Error(`接口协议下拉缺少 ${expected}，实际只有：${dialectValues.join(", ")}`);
       }
     }
+    // 新建供应商一个模型都没有，先加一个 —— 否则下面的模型级开关无从断言。
+    await page.locator(".selected-heading button").click();
+    await page.locator("#upstream-path-0").waitFor({ state: "visible", timeout: 5000 });
     await page.screenshot({ path: path.join(output, "provider-dialect-options.png"), fullPage: true });
+    // 模型级禁用开关：默认勾上（参与路由），取消勾选后文案要跟着变。
+    // 反向判据是「文案变了」而不是「复选框变了」—— 前者证明状态真的落进了
+    // 组件状态，而不只是 DOM 属性被改了。
+    const enableToggles = page.locator(".enable-toggle");
+    assert((await enableToggles.count()) >= 1, "配置页的模型行应有启用开关");
+    const firstToggle = page.locator(".enable-toggle input").first();
+    assert.equal(await firstToggle.isChecked(), true, "新模型默认参与路由");
+    // uncheck() 会等 actionability，这里元素可能被 sticky 头部遮住，直接派发 click。
+    await firstToggle.click({ force: true });
+    await page.waitForTimeout(200);
+    assert((await page.locator(".enable-toggle.off").count()) >= 1, "取消勾选后应显示为已停用");
+    await page.screenshot({ path: path.join(output, "model-disabled.png"), fullPage: true });
+    await firstToggle.check();
+    await page.waitForTimeout(150);
     await page.keyboard.press("Escape");
     await page.getByRole("button", { name: "刷新列表" }).click().catch(() => {});
     // 失效模型扫描：面板必须能分清「可删」与「不可删」。
@@ -637,7 +655,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.getByLabel("API 地址", { exact: true }).fill("https://broken.test/v1");
     await page.getByRole("button", { name: "获取支持模型", exact: true }).click();
     await page.getByRole("alert").filter({ hasText: "401" }).waitFor();
-    await page.getByRole("button", { name: "＋ 手动添加" }).click();
+    await page.locator(".selected-heading button").click();
     assert.equal(await page.locator(".configured-model").count(), 1);
     await page.getByRole("button", { name: "取消", exact: true }).click();
     for (const viewport of [{ width: 900, height: 650 }, { width: 390, height: 844 }]) {
