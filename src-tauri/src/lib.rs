@@ -15,6 +15,7 @@ pub mod error;
 pub mod intellect;
 pub mod local_models;
 pub mod log_rotate;
+pub mod mcp;
 pub mod media;
 pub mod model_catalog;
 pub mod pet_window;
