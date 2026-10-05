@@ -164,6 +164,92 @@
 
 ---
 
+## H. 现有评分体系的实情（D 批的扩展点）
+
+> 这一节是 2026-10-05 为「增加各模型多维评分系统」这个需求补做的定向盘点。
+> 结论先行：**现有实现能承载扩展，但层级错了**——能力分挂在 provider 上，
+> 而能力是模型的属性。这决定了 D 批必须先做 D1 的数据结构下沉。
+
+### H.1 现有的四个打分维度
+
+| 维度 | 取值来源 | 代码位置 | 局限 |
+| --- | --- | --- | --- |
+| `health` | `ProviderHealth`（成功率 / 健康状态） | `src-tauri/src/router/score.rs:211-221` | 与模型能力无关 |
+| `headroom` | 限流余量 | `score.rs:192` | 与模型能力无关 |
+| `capability` | **provider 级 `intelligence`（0-100）** + 上下文窗口 + tools | `score.rs:224-238` | **粒度错**，见 H.2 |
+| `latency` | 该 provider 近期平均延迟 | `score.rs:241-247` | 只看延迟，不看吞吐与首包 |
+| `intent`（第 5 维） | `TaskClass` × 候选的匹配度 | `score.rs:57-82` | 只有 simple/vision/reasoning 三类，无细分领域 |
+
+打分为**乘法衰减**（`score.rs:190-209`）：`h^wh * hd^whd * cap^wcap * lat^wlat * fit`。
+新增维度必须沿用乘法——加权求和会让「某项接近 0」的候选被其他项抬回来，
+那是现有设计刻意避免的（见 `score.rs:9-10` 的注释）。
+
+### H.2 三个结构性缺口（决定 D 批的卡序）
+
+| # | 缺口 | 判据（可复现） | 后果 |
+| --- | --- | --- | --- |
+| H2-1 | **`intelligence` 挂在 Provider 上，不是 Model 上** | 字段定义在 `src-tauri/src/domain/provider.rs:62`（`pub intelligence: i32`，注释「该 provider 下的模型白名单…」同结构）；数据库列在 `src-tauri/src/db/migrations.rs:18`（`intelligence INTEGER NOT NULL DEFAULT 50`，属 `providers` 表）。`models` 表**没有**这一列 | 同一个 Provider 下挂 3 个模型（本地 Ollama 常见），只能给它们**同一个能力分**。用 27B 和 8B 去做同一个「smartest」档，选出来的必然是随机的 |
+| H2-2 | **能力分只有一个标量，且只有 5 处手工赋值** | 全仓 `intelligence` 共 23 处命中，真正赋值只有三处：`migrations.rs:18`（默认 50）、`pricing.rs:311`、`commands.rs:3066`、`stale_models.rs:189`（均为构造测试/演示数据）。**没有任何一处从基准测试或公开榜单导入** | 「能力分」实际是**用户手填的一个数字**，没有可复现的依据。手填 90 分不代表任何可验证的能力 |
+| H2-3 | **成本与吞吐完全不在路由里** | `router/score.rs` 全文无 `cost` / `price` / `tokens_per_sec` / `ttft`；`capability_score` 只用 intelligence + context_window + tools | 价格已经算得很准（`requests.cost`、`usage_daily`、峰谷价、EWMA 校准，见 B6），**却完全没参与选模型**。用户为省钱的唯一手段是手工降 `priority` |
+
+### H.3 已经存在、可直接复用的资产（不要重造）
+
+| 资产 | 位置 | 在 D 批里的用法 |
+| --- | --- | --- |
+| 模型目录抓取 | `src-tauri/src/model_catalog.rs`（981 行）、价格目录 | D2 的能力数据可从同一批目录源带出，**不新增抓取通道** |
+| 定价刷新 | `src-tauri/src/pricing_refresh.rs` | D2 的价格维度直接复用 `requests.cost` 的口径，不另立一套 |
+| 审计表 `requests` | `db/migrations.rs:94-115`（含 `cost`/`latency_ms`/`prompt_tokens`/`completion_tokens`） | D3 的**实测吞吐**（tokens/s、首包时间）可以从这里算，**不需要新建采集通道** |
+| 任务定性 `TaskClass` | `score.rs:19-51`（simple/vision/reasoning） | D4 在其上扩展细分维度，**不替换**它——它是 X-Route-Intent 头的取值来源，替换会破坏对外契约 |
+| 路由金标准（若 A3 已做） | `tests/fixtures/route_golden.json` | D 批任何改动排序的卡，**必须先有 A3 的护栏**，这是依赖关系写死的理由 |
+
+---
+
+## I. 外部方案调研（2026-10-05 联网，D 批的设计依据）
+
+### I.1 三类路由策略与实测节省幅度
+
+| 策略 | 路由信号 | 延迟开销 | 适用 | 实测成本节省 |
+| --- | --- | --- | --- | --- |
+| **分类器路由** | 预测复杂度分数 | 低（训练后） | 高流量、结构化任务 | **45–85%** |
+| **级联路由** | 响应置信度 | 中（多一次模型调用） | 不预分类的混合负载 | **50–98%** |
+| **语义路由** | 查询主题 embedding | 极低 | 多领域、多模型部署 | 未给数字 |
+
+来源：[NeuralTrust · LLM Model Routing](https://neuraltrust.ai/blog/llm-model-routing)（2026-07-22）
+
+两个可引的实测数字：
+- **RouteLLM**（UC Berkeley, ICLR 2025）：矩阵分解路由在 MT Bench 上**成本降 85%、保持 GPT-4 的 95% 表现，仅 14% 的查询发给强模型**；
+  BERT 分类器在 MMLU 上成本降 45%。信号来自 LMSYS Chatbot Arena 的**人类偏好对**。
+- **FrugalGPT**（Stanford）：级联路由最高**降 98%**，平均 50–98%。
+
+> **本项目的位置**：现有 `smart` 档（B8）是**分类器路由**的三级递降，
+> 但它的分类器是本地 Jev + 启发式，**训练信号来自零**（没有偏好对）。
+> D4 的价值就在这里：把本地真实反馈变成训练信号。
+
+### I.2 外部能力评分的四种做法与可借鉴点
+
+| 做法 | 代表 | 怎么算 | 可借鉴 / 不可借鉴 |
+| --- | --- | --- | --- |
+| **Elo / Bradley-Terry** | LMArena | 大量**一对一对决**（人类判哪边更好），用成对比较推出相对能力分，可给分**置信区间** | ✅ 可借鉴：本地也能攒「同一请求两个模型、用户选了哪个」的对战数据。❌ 不可借鉴：LLM 拿不到真实人类偏好 |
+| **多基准聚合指数** | [Artificial Analysis Intelligence Index](https://artificialanalysis.ai/) | 对 MMLU-Pro / GPQA / LiveCodeBench / SciCode / HLE 等分组后加权聚合（编码类取 SciCode 与 LiveCodeBench 均值，知识类取 MMLU-Pro 与 HLE 均值） | ✅ 可借鉴：**分组**而不是单一标量，正是 H2-1/H2-2 的解法。⚠️ 指数口径随版本变（本轮检索到 2026 年有一次「overhauls … replacing popular」的改版），**不要把外部指数当长期稳定口径** |
+| **开放基准工具链** | EleutherAI `lm-evaluation-harness` | 统一接口跑大量标准基准 | ⚠️ 需要 Python 生态与 GPU，**与「不许加依赖 + 桌面应用」冲突**。只能借它的**基准清单**，不能引入它的运行时 |
+| **Pareto 前沿** | 多模型编排实践 | 不排单一总分，而是给出「质量 × 延迟 × 价格」的非支配解集，让用户按场景选 | ✅ 可借鉴：与现有乘法打分天然契合——**权重为 0 的维度不参与乘积**，正好能表达「我只在乎价格」 |
+
+### I.3 外部对本项目的直接结论
+
+1. **不要引入外部指数当事实源**：Artificial Analysis 这类指数会改版（I.2），
+   而本项目是本地优先的桌面应用，**应当以「本地实测 + 用户可编辑」双轨**：
+   实测给底数，用户可覆盖。
+2. **成本是当前最大的一块钱没花在刀刃上**：H2-3 表明价格已算准却不参与路由，
+   而 I.1 显示路由的收益正是 45–98%。这是 D 批 ROI 最高的一张卡。
+3. **吞吐必须独立于延迟**：现有 `latency_score` 只看平均延迟。
+   一个 200ms 首包、40 tok/s 的模型和一个 2s 首包、120 tok/s 的模型，
+   在长回答场景里后者体验好得多。`requests` 表已有 token 数，可直接算。
+4. **能力分要分层**：能力属于模型，但健康度/额度属于 provider。
+   D1 必须先把能力分下沉到 model 级，且**下沉后 provider 级的 `intelligence`
+   仍作为「未填写模型能力的兜底」**，否则老配置会全部失效。
+
+---
+
 ## G. 已裁决事项（2026-10-05 本人拍板）
 
 | # | 裁决 | 对本方案的影响 |
@@ -173,8 +259,47 @@
 | G3 | **A0 的 CI 落盘即推送** | A0 完成后直接 `git push origin main`，推送前唯一前置是确认工作区无他人未提交改动 |
 
 > 三项裁决的执行细节与候选对比见 [任务卡 §5](VibeCoding任务卡-后续完善方案.md)。
+
+### G2 补充裁决（2026-10-05 第二轮，本人提出新需求时一并确认）
+
+| # | 裁决 | 对本方案的影响 |
+| --- | --- | --- |
+| G4 | **新增 D 批（0.7.0）多维模型评分体系**，作为第四批排进路线图 | 新增 D1–D5 五张卡（见任务卡 §4.3）。D 批排在 A3 之后，因为它改的正是 `score()` |
+| G5 | **能力分必须下沉到 model 级**（D1），provider 级 `intelligence` 保留为兜底 | 依据 H2-1：能力是模型属性，挂在 provider 上会让同 Provider 的多个模型共享一个分数 |
+| G6 | **以「本地实测 + 用户可编辑」双轨为数据口径**，不把外部榜单指数当事实源 | 依据 I.3-1：外部指数会改版（本轮检索到 2026 年一次改版）。界面必须显示来源徽标 |
+| G7 | **成本与实测效率进入路由**（D3），但只在「简单任务 / 大上下文」场景计代价 | 依据 H2-3：价格已算准却不参与路由，是最大的一块钱没花在刀刃上。reasoning 类不计代价，否则会把「用强模型做难题」变成常态 |
 > **待回写的实测事实**：B4 第 1 步要确认 `tracing-subscriber` 是否已启用 `opentelemetry` feature。
 > 若已启用，则 G1 的真实成本远低于「破例」的表面代价，该结论必须回写本文。
+
+---
+
+## J. B4 实测补充（2026-10-06，B4 卡第 1 步「先量事实」）
+
+> 本节是**追加**的实测记录，不改动上面的 A–I 节。
+> 上面几节已因 B 批（B1 缓存 / B2 预算 / B3 审计）与 A 批落地而过期 ——
+> 触发条件见 §F 第 2、3 条。**按本文动手前先重盘**。
+
+| # | 事实 | 证据 |
+| --- | --- | --- |
+| J1 | `tracing-subscriber = { version = "0.3", features = ["env-filter"] }` —— **`opentelemetry` feature 未启用** | `src-tauri/Cargo.toml` 实测 |
+| J2 | `tokio = { version = "1", features = ["full"] }` ✓（OTel 异步运行时依赖它） | 同上 |
+| J3 | `uuid = { version = "1", features = ["v4", "serde"] }` ✓（traceId 生成用它，**不需要新依赖**） | 同上 |
+| J4 | `cargo add --dry-run` 实测：`opentelemetry 0.33` / `opentelemetry-otlp 0.33` / `tracing-opentelemetry 0.34` 三者可与现有 `tracing 0.1` / `tracing-subscriber 0.3` 共存，registry 可达 | `cargo add opentelemetry opentelemetry-otlp tracing-opentelemetry --dry-run` → 退出码 0 |
+
+**J1 是本节的关键结论**：卡片预期「如果 feature 已经开着，那 B4 只差一个
+exporter 层，破例加依赖的实际代价比预想小」。**实测是没开着** ——
+所以代价比预期大，除了 `opentelemetry` 还要一起加
+`opentelemetry-otlp` 与 `tracing-opentelemetry`，并给 `tracing-subscriber`
+补 feature。这条决定这条例外的真实成本，故回写在此。
+
+**已落地的部分（不依赖 J4 那三个 crate）**：traceId 生成 / 清洗 / 透传、
+`requests.trace_id` 列与索引、响应头 `X-Trace-Id`、每跳明细带
+`trace_id` + `attempt` 序号、按 traceId 过滤。
+见提交 `c293994 feat(trace): B4 第一笔`。
+
+**未落地的部分**：OTLP exporter 初始化 + 3 条 OTLP 相关用例
+（`otlp_关闭时_不初始化_exporter_也不发网络包` 目前以「判定函数恒为
+不导出」的形式覆盖，尚未验证真实 exporter 路径）。
 
 ---
 
@@ -183,6 +308,7 @@
 出现下列任一情况，本文即失效，必须重新盘点而不是直接沿用：
 
 1. `git log` 里出现改动 `router/score.rs`、`proxy/server.rs`、`db/migrations.rs` 的提交；
-2. B 批任一项落地（缓存 / 预算 / 导出 / trace 任一完成）；
+2. B 批或 D 批任一项落地（缓存 / 预算 / 导出 / trace / 能力下沉 任一完成）；
 3. `docs/0.3.0验证记录.md` 之后新增验证记录文件；
-4. **A2 的两条在途改动（开机自启 / Ollama options 透传）任一提交** —— 提交后 IPC 面从 65 个变成 67 个（B18 过期），`mod autostart` 的结构也会变。**先跑 `git status --short` 确认工作区干净再按本文动手。**
+4. **A2 的在途改动（开机自启 / Ollama options 透传 / Responses 协议）任一提交** —— 提交后 IPC 面的命令数会变（B18 过期），`mod autostart` 的结构也会变。**先跑 `git status --short` 确认工作区干净再按本文动手。**
+5. `models` 表新增 `capabilities_json` 列（D1 落地）—— §H.3 的资产清单与 §H.2 的缺口判定都要重算。
