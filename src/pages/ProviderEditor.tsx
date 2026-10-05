@@ -164,7 +164,18 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
       setMessage(result.models.length ? { kind: "ok", text: `获取到 ${result.models.length} 个模型，请勾选后添加到配置。` } : { kind: "err", text: "当前接口没有返回可选择的模型，可手动添加。" });
     } catch (error) {
       if (version === requestVersion.current) { setCatalog(null); setMessage({ kind: "err", text: `获取模型失败：${errorText(error)}。你仍可以手动配置。` }); }
-    } finally { if (version === requestVersion.current) setDiscovering(false); }
+    } finally {
+      // **无条件**复位，不能只在 version 对得上时复位。
+      //
+      // 实测（2026-10-05）：连点两次「获取支持模型」时，第二次的 version 递增，
+      // 第一次的 finally 因 `version !== requestVersion.current` 而跳过复位，
+      // 而第二次自己又可能因为 160 行的竞态守卫提前 return —— 于是
+      // `discovering` 永久停在 true，保存按钮一直灰着。用户看到的现象是
+      // 「点保存没反应，关掉重开再保存就正常」，与「模型加不进去」很容易混。
+      //
+      // 版本号只该用来丢弃**过期结果**，不该用来决定状态复位。
+      setDiscovering(false);
+    }
   };
   const configured = useMemo(() => new Set(models.map(m => m.upstream.trim())), [models]);
   const visible = useMemo(() => (catalog ?? []).filter(m => `${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase()) && (filter === "all" || filter === "free" && m.is_free === true || filter === "tools" && m.supports_tools === true || filter === "vision" && m.supports_vision === true || filter === "audio" && m.supports_audio === true || filter === "video" && m.supports_video === true || filter === "chat" && (m.model_type ?? "chat") === "chat" || filter === "embedding" && m.model_type === "embedding" || filter === "image" && m.model_type === "image" || filter === "speech" && m.model_type === "speech")), [catalog, query, filter]);
