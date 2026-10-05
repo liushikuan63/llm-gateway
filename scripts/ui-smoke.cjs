@@ -486,6 +486,31 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.getByRole("button", { name: "刷新列表" }).click().catch(() => {});
 
     await page.screenshot({ path: path.join(output, "providers-desktop.png"), fullPage: true });
+
+    // 工具栏按钮组必须单行排开，且完整落在视口内。
+    // 2026-10-05 用户报：标题文字长时三个按钮折成两行，「添加供应商」被挤到
+    // 第二行右侧留下空档。`.row` 是 flex-wrap: wrap，只靠它自己必然折行。
+    const toolbarButtons = page.locator(".providers-toolbar .row > button");
+    const btnCount = await toolbarButtons.count();
+    assert.equal(btnCount, 3, `工具栏应有 3 个按钮，实际 ${btnCount}`);
+    const tops = [];
+    for (let i = 0; i < btnCount; i++) {
+      tops.push((await toolbarButtons.nth(i).boundingBox()).y);
+    }
+    const firstTop = tops[0];
+    for (const [i, y] of tops.entries()) {
+      // 同一行意味着 y 相同；差 1px 容差避免亚像素抖动误报
+      assert.ok(
+        Math.abs(y - firstTop) < 1.5,
+        `工具栏第 ${i + 1} 个按钮换行了：y=${y.toFixed(1)}，第 1 个 y=${firstTop.toFixed(1)}`,
+      );
+    }
+    const lastBox = await toolbarButtons.nth(btnCount - 1).boundingBox();
+    const vp = page.viewportSize();
+    assert.ok(
+      lastBox.x + lastBox.width <= vp.width,
+      `「添加供应商」超出视口右边界：右缘 ${(lastBox.x + lastBox.width).toFixed(0)}px > ${vp.width}px`,
+    );
     await page.getByRole("textbox", { name: "搜索供应商" }).fill("qwen-local");
     assert.equal(await page.locator(".provider-card").count(), 1);
     await page.getByRole("textbox", { name: "搜索供应商" }).fill("");
@@ -594,6 +619,55 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     for (const viewport of [{ width: 900, height: 650 }, { width: 390, height: 844 }]) {
       await page.setViewportSize(viewport);
       assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `page overflow at ${viewport.width}`);
+      // 工具栏按钮**不得折行**：2026-10-05 用户报障时三个按钮折成两行，
+      // 「添加供应商」被挤到第二行左侧留下大片空档。
+      //
+      // 判据要量「按钮组容器宽度」而不是只量折不折 —— 折不折取决于容器有没有
+      // 被左侧标题挤窄，而 flex 子项默认 min-width: auto 不会被压缩。
+      // 扫描净宽区间（左侧导航 420px，工具栏净宽 = 视口 − 420）。
+      const sidebarW = 420;
+for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420, 400]) {
+        await page.setViewportSize({ width: net + sidebarW, height: 800 });
+        await page.waitForTimeout(120);
+        const m = await page.evaluate(() => {
+          const bar = document.querySelector(".providers-toolbar");
+          const row = bar && bar.querySelector(".row");
+          const btns = [...document.querySelectorAll(".providers-toolbar .row > button")];
+          return {
+            rowW: row ? Math.round(row.getBoundingClientRect().width) : -1,
+            rows: new Set(btns.map(n => Math.round(n.getBoundingClientRect().y))).size,
+          };
+        });
+        assert.equal(m.rows, 1, `工具栏按钮在净宽 ${net}px（视口 ${net + sidebarW}）下折成 ${m.rows} 行`);
+        assert.ok(m.rowW >= 290, `净宽 ${net}px 下按钮组被压到 ${m.rowW}px（应 >= 290）`);
+      }
+      await page.setViewportSize(viewport);
+      await page.waitForTimeout(150);
+      const probe1 = await page.locator(".providers-toolbar .row > button").evaluateAll(ns => ns.map(n => { const r = n.getBoundingClientRect(); return { y: Math.round(r.y), right: Math.round(r.right) }; }));
+      console.log(`  [toolbar] 视口${viewport.width}px -> ${probe1.length} 个按钮, ${new Set(probe1.map(p => p.y)).size} 行, 最右 ${Math.max(...probe1.map(p => p.right))}`);
+      await page.setViewportSize(viewport);
+      await page.waitForTimeout(150);
+      const probe2 = await page.locator(".providers-toolbar .row > button").evaluateAll(ns => ns.map(n => { const r = n.getBoundingClientRect(); return { y: Math.round(r.y), right: Math.round(r.right) }; }));
+      console.log(`  [toolbar] ${viewport.width}px -> ${probe2.length} 个按钮, ${new Set(probe2.map(p => p.y)).size} 行, 最右 ${Math.max(...probe2.map(p => p.right))}`);
+      // 工具栏按钮在 **900px**（用户报障时的宽度）不得折行。
+      // 390px 是纵向布局，媒体查询已放开 wrap，三个按钮本就该分两行，
+      // 所以只断言「都在视口内」。
+      const barButtons = page.locator(".providers-toolbar .row > button");
+      const barCount = await barButtons.count();
+      assert.equal(barCount, 3, `工具栏应有 3 个按钮，实际 ${barCount} @${viewport.width}`);
+      const ys = [];
+      const boxes = [];
+      for (let i = 0; i < barCount; i++) {
+        const b = await barButtons.nth(i).boundingBox();
+        ys.push(b.y); boxes.push(b);
+      }
+      if (viewport.width > 700) {
+        for (const [i, y] of ys.entries()) {
+          assert.ok(Math.abs(y - ys[0]) < 1.5, `按钮 ${i + 1} 在 ${viewport.width}px 下换行了：y=${y.toFixed(1)} vs ${ys[0].toFixed(1)}`);
+        }
+      }
+      const lastBox = boxes[barCount - 1];
+      assert.ok(lastBox.x + lastBox.width <= viewport.width + 1, `「添加供应商」超出视口 @${viewport.width}：右缘 ${(lastBox.x + lastBox.width).toFixed(0)}`);
       await page.screenshot({ path: path.join(output, `providers-${viewport.width}.png`), fullPage: true });
       await page.getByRole("button", { name: "＋ 添加供应商", exact: true }).click();
       assert(await page.evaluate(() => document.querySelector('.provider-editor').scrollWidth <= document.querySelector('.provider-editor').clientWidth), `dialog overflow at ${viewport.width}`);

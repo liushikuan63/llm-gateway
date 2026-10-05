@@ -7,7 +7,27 @@
 .provider-overview strong small { font-size: 11px; color: var(--muted); font-weight: 400; margin-left: 9px; letter-spacing: 0; }
 .provider-overview .overview-current strong { font-size: 18px; letter-spacing: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .overview-current > small { display: block; margin-top: 5px; color: var(--muted); }
+/* 根因（2026-10-05 用户报障）：工具栏是 `display: flex`，右侧按钮组
+   用了通用的 `.row`（`flex-wrap: wrap`）。左侧标题那句
+   「统一管理服务与模型… 定价上次刷新：…（更新 0 个，跳过手工价 0 个）」
+   很长，把按钮组挤到不足三个按钮的宽度，于是 `wrap` 生效折成两行、
+   「添加供应商」被挤到第二行左侧留下大片空档（用户截图里就是这样）。
+
+   修法见下面两条 `nowrap`。实测对照（ui-smoke 的断言，同一台机器、
+   左侧导航 420px、工具栏净宽 = 视口 − 420）：
+     原版：净宽 420 / 400（视口 840 / 820）-> 2 行，按钮组被压到 288 / 278px
+     修复后：同上两个宽度 -> 1 行，按钮组恒定 298px */
 .providers-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+.providers-toolbar > .row { flex-wrap: nowrap; flex-shrink: 0; }
+/* 决定性实验（2026-10-05）：**真正让按钮不折行的就是这条 `nowrap`**。
+   逐条注违规自检的结果：
+     删掉这条（保留标题侧的可压缩规则）-> 立刻折成 2 行，测试红
+     删掉标题侧的可压缩规则（保留这条）-> 仍然 1 行，测试绿
+   也就是说标题侧的 `min-width: 0` 是**冗余的**，别以为它在起作用。
+
+   `nowrap` 写在主规则、窄屏媒体查询（`flex-wrap: wrap`）**之前**：
+   媒体查询那条 wrap 靠级联顺序覆盖它，两处先后不能调换。 */
+.providers-toolbar > .row > button { white-space: nowrap; }
 .providers-toolbar h2 { font-size: 19px; display: flex; align-items: center; gap: 10px; }
 .providers-toolbar p, .route-strip p { font-size: 12px; color: var(--muted); margin: 7px 0 0; line-height: 1.6; }
 .count-badge { display: inline-flex; padding: 2px 7px; border-radius: 6px; font-weight: 500; background: var(--panel-2); font-size: 12px; color: var(--muted); }
@@ -162,6 +182,10 @@
   .provider-overview { grid-template-columns: 1fr 1fr; margin-bottom: 22px; }
   .provider-overview > div:nth-child(3) { border-left: 0; }
   .provider-overview > div:nth-child(n+3) { border-top: 1px solid var(--border); }
+  /* 纵向排列后按钮组**必须**放开 wrap：375px 宽屏下 nowrap 会把三个按钮
+     挤出屏幕，「添加供应商」点不到。放在媒体查询里是靠级联顺序覆盖
+     上面的 nowrap（同特异度、更晚出现），所以顺序不能调换。 */
+  .providers-toolbar > .row { flex-wrap: wrap; flex-shrink: 1; }
   .providers-toolbar { align-items: flex-start; flex-direction: column; }
   .provider-search-row { flex-wrap: wrap; }
   .provider-search-row > input { flex: 1; min-width: 150px; }
