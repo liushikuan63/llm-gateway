@@ -280,6 +280,15 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .await?;
     ensure_column(pool, "sessions", "token_ratio", "REAL").await?;
+    // B4 traceId 贯穿。**本地永远要有** —— 即使 OTLP 导出关着，
+    // traceId 也必须落库并在审计页可见，否则「导不出」会退化成「查不到」。
+    ensure_column(pool, "requests", "trace_id", "TEXT").await?;
+    // 索引：审计页要「按 traceId 串联一次请求的全部尝试」，
+    // 没有索引时那是全表扫。`CREATE INDEX IF NOT EXISTS` 是幂等的，
+    // 对已有库重复执行安全。
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_req_trace ON requests(trace_id)")
+        .execute(pool)
+        .await?;
     migrate_usage_daily_currency(pool).await?;
     Ok(())
 }

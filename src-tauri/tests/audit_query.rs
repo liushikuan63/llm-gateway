@@ -50,6 +50,8 @@ async fn seed(
             route: Default::default(),
             access_key_id: None,
             refined_prompt,
+            // B4 加的列。这些用例不关心它的值，只要不违反 NOT NULL 语义。
+            trace_id: "ffffffffffffffffffffffffffffffff",
         },
     )
     .await

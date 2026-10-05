@@ -971,6 +971,9 @@ async fn passthrough_dispatch(
                         // 改写后的提示词默认不落库；只有开了 audit.store_refined_prompt
                         // 才会由 refined_prompt_to_store 返回脱敏后的文本。失败路径一律 None。
                         refined_prompt: None,
+                        // 这条路径不在 dispatch 里（没有入口处的 traceId 可用），
+                        // 就地生成一个：本地永远要有，不能因为路径不同就留空。
+                        trace_id: &crate::trace::new_trace_id(),
                         requested_model: &audit_requested_model,
                         routed_provider: Some(&audit_provider),
                         routed_model: Some(&audit_model),
@@ -1039,6 +1042,9 @@ async fn passthrough_dispatch(
                         // 改写后的提示词默认不落库；只有开了 audit.store_refined_prompt
                         // 才会由 refined_prompt_to_store 返回脱敏后的文本。失败路径一律 None。
                         refined_prompt: None,
+                        // 这条路径不在 dispatch 里（没有入口处的 traceId 可用），
+                        // 就地生成一个：本地永远要有，不能因为路径不同就留空。
+                        trace_id: &crate::trace::new_trace_id(),
                         requested_model: &audit_requested_model,
                         routed_provider: None,
                         routed_model: None,
@@ -1215,6 +1221,9 @@ async fn dispatch_remote_compaction(
                         // 改写后的提示词默认不落库；只有开了 audit.store_refined_prompt
                         // 才会由 refined_prompt_to_store 返回脱敏后的文本。失败路径一律 None。
                         refined_prompt: None,
+                        // 这条路径不在 dispatch 里（没有入口处的 traceId 可用），
+                        // 就地生成一个：本地永远要有，不能因为路径不同就留空。
+                        trace_id: &crate::trace::new_trace_id(),
                         requested_model: &requested_model,
                         routed_provider: Some(&routed_provider),
                         routed_model: Some(&routed_model),
@@ -1327,6 +1336,9 @@ async fn dispatch_remote_compaction(
                         // 改写后的提示词默认不落库；只有开了 audit.store_refined_prompt
                         // 才会由 refined_prompt_to_store 返回脱敏后的文本。失败路径一律 None。
                         refined_prompt: None,
+                        // 这条路径不在 dispatch 里（没有入口处的 traceId 可用），
+                        // 就地生成一个：本地永远要有，不能因为路径不同就留空。
+                        trace_id: &crate::trace::new_trace_id(),
                         requested_model: &requested_model,
                         routed_provider: None,
                         routed_model: None,
@@ -1755,6 +1767,8 @@ struct DispatchInput {
     /// 实测证据：修之前两次完全相同的请求拿到
     /// `a-4ec77332-…` 与 `a-e4826059-…` 两个 session，键必然不同。
     cache_session: String,
+    /// B4 贯穿本次请求的 traceId。入口处定一次，之后所有落库与响应头都用它。
+    trace_id: String,
 }
 
 /// 智能模式 + 联网搜索在路由前的预处理结果。
@@ -2537,6 +2551,15 @@ async fn dispatch(
 ) -> Response {
     let cfg = state.cfg_snapshot();
 
+    // B4 traceId 在**入口处定一次**。之后所有落库、响应头、span 都用它。
+    //
+    // 客户端给了就透传（便于跨服务串联），但**必须清洗**：
+    // 这个值会被写进响应头，原样回显等于开了一个 HTTP 头注入面
+    // （客户端发 `X-Trace-Id: abc\r\nX-Injected: 1` 就能注入一个新头）。
+    // 清洗是白名单（只留 hex 与短横线），不是黑名单。
+    let trace_id =
+        crate::trace::resolve_trace_id(headers.get("x-trace-id").and_then(|v| v.to_str().ok()));
+
     // B2 模型白名单闸门。放在**路由打分之前**，卡片点名的位置。
     //
     // 为什么预算在中间件判、白名单在这里判：白名单要比的是**请求的模型名**，
@@ -2775,6 +2798,10 @@ async fn dispatch(
         search: preflight.search,
         refine: preflight.refine,
         cache_session: header_sid.clone().unwrap_or_default(),
+        // traceId 在**入口处定一次**：客户端给了合法值就透传（便于跨服务串联），
+        // 否则生成新的。清洗在 `resolve_trace_id` 里做 —— 这个值会被写进
+        // 响应头，不清洗就是 HTTP 头注入面。
+        trace_id: trace_id.clone(),
     };
     if dispatch_input.req.stream {
         stream_dispatch(state.clone(), dispatch_input).await
@@ -2964,6 +2991,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let audit_route = route.clone();
     let DispatchInput {
         cache_session,
+        trace_id,
         req,
         new_messages,
         response_session_id,
@@ -2974,7 +3002,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         exit,
         intent: _intent,
         search: _search,
-        refine: _refine,
+        // B3：改写后的提示词要不要落库，由这个值决定。
+        // 原来是 `_refine`（明确丢弃），现在真的要读它。
+        refine,
     } = input;
     let started = Instant::now();
     let flag = AtomicFlag::new();
@@ -3037,6 +3067,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         ))),
                     );
                     h.insert("x-session-id", parse_header(&response_session_id));
+                    // B4：traceId **永远**回给客户端，即使 OTLP 导出关着。
+                    // 否则「导不出」会退化成「查不到」——排查时手里一个可追的标识都没有。
+                    h.insert("x-trace-id", parse_header(&trace_id));
                     return resp;
                 }
                 crate::cache::Lookup::Miss(key) => Some(key),
@@ -3213,8 +3246,27 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 cache_read as i64,
                 cache_creation as i64,
             );
-            let audit_attempts = attempts_json(&attempt_records);
             let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
+            // traceId 要被三个地方用：响应头（借用）、审计落库（移进 spawn）、
+            // 以及每一条降级明细。先克隆一份，后面都用它。
+            let audit_trace_id = trace_id.clone();
+            let audit_attempts = attempts_json_traced(&attempt_records, Some(&audit_trace_id));
+            // 必须在 `tokio::spawn` **之前**算好：spawn 的闭包按值捕获，
+            // 而 `cfg` 与 `refine` 在里面拿不到。走 `refined_prompt_to_store`
+            // 而不是手写 `if`，是为了让「开关」与「脱敏」永远同进同退。
+            //
+            // 【B3 补正】这段接线在 B3 那一笔里**从未生效** ——
+            // 当时的 `String.Replace` 锚点没匹配上、静默返回原文，
+            // 而 B3 的测试全过，因为它们只测 `refined_prompt_to_store` 这个
+            // 纯函数，没有一条走 dispatch。现在补上，并加了端到端用例
+            // （tests/trace.rs 的 `开启提示词留存后_改写结果真的落库`）。
+            let audit_refined_prompt = crate::audit::refined_prompt_to_store(
+                &cfg.audit,
+                refine.as_ref().map(|r| r.prompt.as_str()),
+            );
+            // traceId 要被两个地方用：响应头（借用）与审计落库（移进 spawn）。
+            // 先克隆一份给 spawn，原值留给响应头。
+            let audit_trace_id = trace_id.clone();
             tokio::spawn(async move {
                 let _ = repo::log_request(
                     audit_state.db.pool(),
@@ -3224,9 +3276,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
                         // 与 client 同源派生，不另写一套前缀解析。
                         access_key_id: crate::budget::access_key_id_of(audit_client.as_deref()),
-                        // 改写后的提示词默认不落库；只有开了 audit.store_refined_prompt
-                        // 才会由 refined_prompt_to_store 返回脱敏后的文本。失败路径一律 None。
-                        refined_prompt: None,
+                        // 已脱敏（开关关着时是 None）。
+                        refined_prompt: audit_refined_prompt.as_deref(),
+                        trace_id: &audit_trace_id,
                         requested_model: &audit_requested_model,
                         routed_provider: Some(&audit_pid),
                         routed_model: Some(&audit_mid),
@@ -3257,6 +3309,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             );
             h.insert("x-fallback-attempts", parse_header(&o.attempts.to_string()));
             h.insert("x-session-id", parse_header(&response_session_id));
+            // B4：traceId **永远**回给客户端，即使 OTLP 导出关着。
+            // 否则「导不出」会退化成「查不到」——排查时手里一个可追的标识都没有。
+            h.insert("x-trace-id", parse_header(&trace_id));
 
             // 回填。三条前置：拿到过键、路由与首选一致、响应不含 tool_calls。
             //
@@ -3309,7 +3364,10 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             let audit_client = client.clone();
             // 同 963 行：尝试次数取真实记录数，不从错误里反推。
             let audit_fallback_attempts = fallback_count(attempt_records.len());
-            let audit_attempts = attempts_json(&attempt_records);
+            // 失败路径也要带上 traceId：本地永远要有，不能因为路径不同就留空。
+            // 克隆一份给 spawn，原值留给响应头。
+            let audit_trace_id = trace_id.clone();
+            let audit_attempts = attempts_json_traced(&attempt_records, Some(&audit_trace_id));
             tokio::spawn(async move {
                 let _ = repo::log_request(
                     st.db.pool(),
@@ -3322,6 +3380,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         // 改写后的提示词默认不落库；只有开了 audit.store_refined_prompt
                         // 才会由 refined_prompt_to_store 返回脱敏后的文本。失败路径一律 None。
                         refined_prompt: None,
+                        trace_id: &audit_trace_id,
                         requested_model: &requested_model,
                         routed_provider: None,
                         routed_model: None,
@@ -3356,6 +3415,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let DispatchInput {
         // 流式一律 BYPASS，用不到缓存键里的会话 id。
         cache_session: _cache_session,
+        trace_id,
         req,
         new_messages,
         response_session_id,
@@ -3368,6 +3428,11 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         search: _search,
         refine: _refine,
     } = input;
+
+    // `async_stream::stream!` 生成的是协程，它**会拿走**在里面用到的变量。
+    // `trace_id` 既要在协程里落库、又要在协程外的响应头上用，
+    // 所以先克隆一份给协程，原值留给响应头。
+    let stream_trace_id = trace_id.clone();
 
     let req_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let started = Instant::now();
@@ -3787,8 +3852,11 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             final_usage.cache_read_tokens as i64,
             final_usage.cache_creation_tokens as i64,
         );
-        let audit_attempts = attempts_json(&attempt_records);
         let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
+        // 用协程外面备好的那份（见 `stream_trace_id` 的说明）。
+        let audit_trace_id = stream_trace_id;
+        let audit_attempts =
+            attempts_json_traced(&attempt_records, Some(&audit_trace_id));
         tokio::spawn(async move {
             let _ = repo::log_request(
                 audit_state.db.pool(),
@@ -3801,6 +3869,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     // 改写后的提示词默认不落库；只有开了 audit.store_refined_prompt
                     // 才会由 refined_prompt_to_store 返回脱敏后的文本。失败路径一律 None。
                     refined_prompt: None,
+                    trace_id: &audit_trace_id,
                     requested_model: &audit_requested_model,
                     routed_provider: Some(&audit_provider_id),
                     routed_model: Some(&audit_model),
@@ -3833,6 +3902,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     apply_route_headers(&route, resp.headers_mut());
     let h = resp.headers_mut();
     h.insert("x-session-id", parse_header(&response_session_id));
+    // B4：traceId **永远**回给客户端，即使 OTLP 导出关着。
+    // 否则「导不出」会退化成「查不到」——排查时手里一个可追的标识都没有。
+    h.insert("x-trace-id", parse_header(&trace_id));
     h.insert("x-routed-via", parse_header(&routed_via));
     h.insert("x-fallback-attempts", parse_header(&attempts.to_string()));
     h.insert("x-accel-buffering", parse_header("no"));
@@ -4030,11 +4102,43 @@ fn price_charge(
     }
 }
 
+/// 把降级链的每一跳序列化成审计用的 JSON 数组。
+///
+/// **B4：每一跳都补上 `trace_id` 与 `attempt` 序号。**
+/// 同一个请求的所有尝试共用一个 traceId，但 attempt 从 0 递增 ——
+/// 这样「降级 3 次分别打到了哪」才能从**一条记录**里看出来，
+/// 而不必去翻三条日志再自己按时间对齐。
+///
+/// `attempt` 由**数组下标**决定，不是从记录里读的：记录本身没有这个字段，
+/// 而按遍历顺序编号正是调用方看到的顺序，不会与排序后的下标不一致。
 fn attempts_json(records: &[crate::router::failover::AttemptRecord]) -> Option<String> {
+    attempts_json_traced(records, None)
+}
+
+fn attempts_json_traced(
+    records: &[crate::router::failover::AttemptRecord],
+    trace_id: Option<&str>,
+) -> Option<String> {
     if records.is_empty() {
         return None;
     }
-    serde_json::to_string(records).ok()
+    let Some(trace_id) = trace_id else {
+        // 没有 traceId 时保持旧形状（那几条不在 dispatch 里的路径）。
+        return serde_json::to_string(records).ok();
+    };
+    let enriched: Vec<serde_json::Value> = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let mut value = serde_json::to_value(record).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("trace_id".into(), serde_json::json!(trace_id));
+                obj.insert("attempt".into(), serde_json::json!(index));
+            }
+            value
+        })
+        .collect();
+    serde_json::to_string(&enriched).ok()
 }
 
 /// 首个流式事件之前整体失败的请求（所有候选都试过或不可重试）的审计上下文。
@@ -4076,6 +4180,9 @@ fn spawn_failed_stream_audit(state: Arc<GatewayState>, audit: FailedStreamAudit<
                 // 改写后的提示词默认不落库；只有开了 audit.store_refined_prompt
                 // 才会由 refined_prompt_to_store 返回脱敏后的文本。失败路径一律 None。
                 refined_prompt: None,
+                // 这条路径不在 dispatch 里（没有入口处的 traceId 可用），
+                // 就地生成一个：本地永远要有，不能因为路径不同就留空。
+                trace_id: &crate::trace::new_trace_id(),
                 requested_model: &requested_model,
                 routed_provider: None,
                 routed_model: None,

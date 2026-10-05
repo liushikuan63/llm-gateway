@@ -260,6 +260,7 @@ async fn seed_spend(db: &db::Db, key_id: &str, cost: f64, currency: &str) {
             route: Default::default(),
             access_key_id: Some(key_id),
             refined_prompt: None,
+            trace_id: "ffffffffffffffffffffffffffffffff",
         },
     )
     .await

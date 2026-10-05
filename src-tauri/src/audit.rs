@@ -93,6 +93,9 @@ pub struct RequestFilter {
     /// 按 `currency` 精确匹配。
     #[serde(default)]
     pub currency: Option<String>,
+    /// B4：按 traceId 精确匹配，用于把一次请求的全部尝试串起来。
+    #[serde(default)]
+    pub trace_id: Option<String>,
     /// 成本下限（含）。
     #[serde(default)]
     pub min_cost: Option<f64>,
@@ -214,6 +217,15 @@ pub fn build_where(f: &RequestFilter) -> (String, Vec<Bind>) {
         clauses.push("currency = ?");
         binds.push(Bind::Text(c.to_string()));
     }
+    if let Some(t) = f
+        .trace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        clauses.push("trace_id = ?");
+        binds.push(Bind::Text(t.to_string()));
+    }
     if let Some(s) = f.status.as_deref().and_then(StatusMatcher::parse) {
         match s {
             StatusMatcher::Exact(code) => {
@@ -286,6 +298,8 @@ pub struct AuditRow {
     /// 改写后的最终提示词。**默认不写**（`audit.store_refined_prompt` 关着时恒为 `None`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refined_prompt: Option<String>,
+    /// B4 贯穿全链路的 traceId。同一请求的所有尝试共享同一个值。
+    pub trace_id: Option<String>,
 }
 
 impl AuditRow {
@@ -319,6 +333,7 @@ impl AuditRow {
             "route_refine_note": self.route_refine_note,
             "access_key_id": self.access_key_id,
             "refined_prompt": self.refined_prompt,
+            "trace_id": self.trace_id,
         })
     }
 }
@@ -746,6 +761,7 @@ mod tests {
             route_refine_note: None,
             access_key_id: None,
             refined_prompt: None,
+            trace_id: Some("aabbccddeeff00112233445566778899".into()),
         }
     }
 

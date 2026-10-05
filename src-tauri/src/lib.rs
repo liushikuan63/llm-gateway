@@ -27,6 +27,7 @@ pub mod proxy;
 pub mod router;
 pub mod search;
 pub mod stale_models;
+pub mod trace;
 
 use crate::config::AppConfig;
 use crate::proxy::server::GatewayState;

@@ -410,6 +410,9 @@ pub struct AppConfig {
     /// B3 审计存储。`store_refined_prompt` **默认关闭** ——
     /// 存提示词等于存用户内容，隐私边界要显式打开。
     pub audit: crate::audit::AuditConfig,
+    /// B4 遥测导出。`otlp.endpoint` **默认为空** = 不导出任何东西。
+    /// 绝不默认指向公网 collector —— 那等于把用户请求的元数据发给第三方。
+    pub telemetry: crate::trace::TelemetryConfig,
 }
 
 /// 上游鉴权失败的处理档位。
@@ -575,6 +578,7 @@ impl Default for AppConfig {
             cache: crate::cache::CacheConfig::default(),
             budget: crate::budget::BudgetConfig::default(),
             audit: crate::audit::AuditConfig::default(),
+            telemetry: crate::trace::TelemetryConfig::default(),
         }
     }
 }

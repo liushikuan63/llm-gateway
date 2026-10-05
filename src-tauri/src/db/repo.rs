@@ -346,6 +346,7 @@ fn audit_row_from(r: &sqlx::sqlite::SqliteRow) -> crate::audit::AuditRow {
         route_refine_note: r.get::<Option<String>, _>("route_refine_note"),
         access_key_id: r.get::<Option<String>, _>("access_key_id"),
         refined_prompt: r.get::<Option<String>, _>("refined_prompt"),
+        trace_id: r.get::<Option<String>, _>("trace_id"),
     }
 }
 
@@ -355,7 +356,7 @@ const AUDIT_COLUMNS: &str = "id, ts, session_id, client, requested_model, routed
      routed_model, status, latency_ms, prompt_tokens, completion_tokens, fallback_attempts, \
      error, cost, currency, rate_label, estimated_prompt_tokens, attempts_json, \
      route_intent, route_classifier, route_search, route_search_hits, route_refined, \
-     route_refine_note, access_key_id, refined_prompt";
+     route_refine_note, access_key_id, refined_prompt, trace_id";
 
 /// 把一串绑定值贴到查询上。
 ///
@@ -1165,6 +1166,9 @@ pub struct RequestLog<'a> {
     /// 那个函数把「开关判断」与「脱敏」绑在一起，绕过它就会把未脱敏的
     /// 用户内容写进库。
     pub refined_prompt: Option<&'a str>,
+    /// B4 贯穿全链路的 traceId。**永远有值**（不是 Option）：
+    /// 即使 OTLP 导出关着，traceId 也必须落库并在审计页可见。
+    pub trace_id: &'a str,
 }
 
 /// 智能模式 + 联网搜索在审计里的落点。
@@ -1205,8 +1209,8 @@ pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> 
               latency_ms, prompt_tokens, completion_tokens, fallback_attempts, error,
               cost, currency, rate_label, estimated_prompt_tokens, attempts_json,
               route_intent, route_classifier, route_search, route_search_hits,
-              route_refined, route_refine_note, access_key_id, refined_prompt)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+              route_refined, route_refine_note, access_key_id, refined_prompt, trace_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
     )
     .bind(ts)
     .bind(log.session_id)
@@ -1236,8 +1240,10 @@ pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> 
     // 错位 —— 症状是「失败请求也应记录尝试链」这类断言红，而错误里
     // 看不出是顺序问题。
     .bind(log.access_key_id)
-    // 最后一位：绑定顺序必须与列顺序一致，`refined_prompt` 是第 25 列。
+    // 最后两位：绑定顺序必须与列顺序一致。
+    // `refined_prompt` 是第 25 列、`trace_id` 是第 26 列。
     .bind(log.refined_prompt)
+    .bind(log.trace_id)
     .execute(pool)
     .await?;
 
