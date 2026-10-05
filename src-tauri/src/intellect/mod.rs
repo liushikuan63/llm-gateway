@@ -23,6 +23,7 @@
 //! 改写本身靠一次独立的小模型调用——edgeJev 走 scoring pass，产不出文本。
 
 pub mod autostart;
+pub mod bench;
 pub mod calibrate;
 pub mod classify;
 pub mod jev;
@@ -30,6 +31,11 @@ pub mod refine;
 
 pub use crate::router::score::TaskClass;
 pub use autostart::SpawnOutcome;
+pub use bench::{
+    diff, load_jsonl, render, score, AlwaysSimpleClassifier, BenchClassifier, BenchReport,
+    BenchSample, BenchSource, DiffReport, HeuristicClassifier, PrecomputedClassifier,
+    StrategyReport, ALL_CLASSES,
+};
 pub use calibrate::{build_report, CalibrationReport, LabeledSample, SampleOutcome};
 pub use classify::{
     classify, classify_by_heuristic, classify_by_rules, ClassifierSource, ClassifyInput,
