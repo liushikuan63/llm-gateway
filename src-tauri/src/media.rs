@@ -81,7 +81,8 @@ pub fn carry(dialect: Dialect, media: &Media) -> Result<(), String> {
     }
     match dialect {
         // OpenAI 兼容链路三种媒体都按原样透传，由上游自行取用远程地址。
-        Dialect::OpenAI => Ok(()),
+        // Responses 是 OpenAI 系，媒体处理与 Chat Completions 同规则。
+        Dialect::OpenAI | Dialect::Responses => Ok(()),
         // Ollama 原生只接受 base64 图片；音频与视频不在其 /api/chat 协议里。
         Dialect::Ollama => {
             if media.audio {

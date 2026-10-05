@@ -56,6 +56,7 @@ fn dialect_str(d: Dialect) -> &'static str {
         Dialect::Anthropic => "anthropic",
         Dialect::Gemini => "gemini",
         Dialect::Ollama => "ollama",
+        Dialect::Responses => "responses",
     }
 }
 

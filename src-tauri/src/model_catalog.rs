@@ -176,6 +176,18 @@ fn normalized_path_len(dialect: Dialect, segments: &[&str]) -> usize {
                 len
             }
         }
+        // Responses 的路径段只有一段（`/responses`、`/models`），
+        // 不套用 OpenAI 的两段规则 —— `/responses` 不是 `chat/completions`。
+        Dialect::Responses => {
+            if segments
+                .last()
+                .is_some_and(|segment| matches!(*segment, "responses" | "models"))
+            {
+                len.saturating_sub(1)
+            } else {
+                len
+            }
+        }
         Dialect::Anthropic => {
             if segments
                 .last()
@@ -276,6 +288,8 @@ async fn discover_inner(
         Dialect::Anthropic => discover_anthropic(client, base_url, api_key).await?,
         Dialect::Gemini => discover_gemini(client, base_url, api_key).await?,
         Dialect::Ollama => discover_ollama(client, base_url, api_key).await?,
+        // Responses 用 OpenAI 的 `/models` 列举模型 —— 它是 OpenAI 系。
+        Dialect::Responses => discover_openai(client, base_url, api_key).await?,
     };
 
     Ok(DiscoveryResponse {
@@ -918,14 +932,14 @@ fn auth_headers(dialect: Dialect, api_key: &str) -> Result<HeaderMap, String> {
     }
 
     let header_value = match dialect {
-        Dialect::OpenAI | Dialect::Ollama => HeaderValue::from_str(&format!("Bearer {api_key}"))
+        Dialect::OpenAI | Dialect::Ollama | Dialect::Responses => HeaderValue::from_str(&format!("Bearer {api_key}"))
             .map_err(|_| "API Key 格式无效".to_string())?,
         Dialect::Anthropic | Dialect::Gemini => {
             HeaderValue::from_str(api_key).map_err(|_| "API Key 格式无效".to_string())?
         }
     };
     match dialect {
-        Dialect::OpenAI | Dialect::Ollama => {
+        Dialect::OpenAI | Dialect::Ollama | Dialect::Responses => {
             headers.insert(AUTHORIZATION, header_value);
         }
         Dialect::Anthropic => {
@@ -1002,4 +1016,28 @@ async fn response_json(mut response: reqwest::Response) -> Result<Value, String>
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| "上游模型目录不是有效 JSON".to_string())
+}
+
+#[cfg(test)]
+mod dialect_path_tests {
+    use super::*;
+
+    #[test]
+    fn responses_路径归一化只脱一段() {
+        // Responses 的路径是单段（/responses），不是 OpenAI 的两段
+        // （/chat/completions）。套错规则会让去重把不同模型判成同一个。
+        assert_eq!(normalized_path_len(Dialect::Responses, &["v1", "responses"]), 1);
+        assert_eq!(normalized_path_len(Dialect::Responses, &["v1", "models"]), 1);
+        // 未知尾段不动 —— 静默截断比不匹配更糟
+        assert_eq!(normalized_path_len(Dialect::Responses, &["v1", "weird"]), 2);
+    }
+
+    #[test]
+    fn openai_两段路径规则不得因新增方言而改变() {
+        // 模式隔离：给 Dialect 加变体时，最容易误伤的���旧方言分支。
+        assert_eq!(normalized_path_len(Dialect::OpenAI, &["v1", "chat", "completions"]), 1);
+        assert_eq!(normalized_path_len(Dialect::OpenAI, &["v1", "models"]), 1);
+        assert_eq!(normalized_path_len(Dialect::Anthropic, &["v1", "messages"]), 1);
+        assert_eq!(normalized_path_len(Dialect::Ollama, &["api", "chat"]), 0);
+    }
 }

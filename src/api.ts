@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type Dialect = "openai" | "anthropic" | "gemini" | "ollama";
+export type Dialect = "openai" | "anthropic" | "gemini" | "ollama" | "responses";
 export type Currency = "usd" | "cny";
 export type ModelType = "chat" | "embedding" | "image" | "speech";
 // manual：用户手填，刷新定价时永不被覆盖；catalog：由目录/定价源带出，可被刷新。
@@ -867,6 +867,10 @@ export const api = {
   runGatewaySelfCheck: () =>
     invoke<SelfCheckResult>("run_gateway_self_check"),
 
+  getAutostartState: () => invoke<{ command: string | null }>("get_autostart_state"),
+  setAutostart: (enabled: boolean) =>
+    invoke<{ command: string | null }>("set_autostart", { enabled }),
+
   getPetStatus: () => invoke<PetStatus>("get_pet_status"),
   getPetAsset: (slug: string) => invoke<PetAsset>("get_pet_asset", { slug }),
   openPetWindow: () => invoke<void>("open_pet_window"),
@@ -940,6 +944,7 @@ export const DIALECT_LABEL: Record<Dialect, string> = {
   anthropic: "Anthropic",
   gemini: "Gemini",
   ollama: "Ollama",
+  responses: "OpenAI Responses（Codex CLI 用）",
 };
 
 export const CURRENCY_LABEL: Record<string, string> = {

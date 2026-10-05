@@ -70,7 +70,7 @@ impl UpstreamClient {
             return Ok(h);
         }
         match p.dialect {
-            Dialect::OpenAI | Dialect::Ollama => {
+            Dialect::OpenAI | Dialect::Ollama | Dialect::Responses => {
                 h.insert(
                     AUTHORIZATION,
                     format!("Bearer {api_key}")
@@ -156,6 +156,7 @@ impl UpstreamClient {
                 }
             }
             Dialect::Ollama => append_url_path(&mut url, &["api", "chat"])?,
+            Dialect::Responses => append_url_path(&mut url, &["responses"])?,
         }
         Ok(url)
     }
@@ -169,6 +170,7 @@ impl UpstreamClient {
             }
             Dialect::Gemini => crate::protocol::gemini::to_gemini_body(req),
             Dialect::Ollama => crate::protocol::ollama::to_ollama_body(req, model),
+            Dialect::Responses => crate::protocol::responses::to_responses_body(req, model),
         }
     }
 
@@ -234,6 +236,7 @@ impl UpstreamClient {
             Dialect::Anthropic => crate::protocol::anthropic::anthropic_to_internal(&v),
             Dialect::Gemini => crate::protocol::gemini::from_gemini_response(&v),
             Dialect::Ollama => crate::protocol::ollama::from_ollama_response(&v),
+            Dialect::Responses => crate::protocol::responses::from_responses_response(&v, model),
         })
     }
 
@@ -250,7 +253,10 @@ impl UpstreamClient {
         timeout: Duration,
         expect_json: bool,
     ) -> Result<PassthroughResponse> {
-        if p.dialect != Dialect::OpenAI {
+        // Responses 也放行：它是 OpenAI 系，只是请求体结构不同
+        // （见 protocol::responses）。拦掉它会让自定义上游路径对
+        // Responses 方言失效。
+        if p.dialect != Dialect::OpenAI && p.dialect != Dialect::Responses {
             return Err(GatewayError::CapabilityUnavailable {
                 kind: format!("{} 当前仅支持 OpenAI 兼容上游", path_segments.join("/")),
             });
@@ -521,7 +527,7 @@ fn parse_event_value(
 ) -> Vec<Result<UpstreamEvent>> {
     let mut out = Vec::new();
     match dialect {
-        Dialect::OpenAI => parse_openai_chunk(v, &mut out),
+        Dialect::OpenAI | Dialect::Responses => parse_openai_chunk(v, &mut out),
         Dialect::Anthropic => parse_anthropic_chunk(event_name, v, &mut out),
         Dialect::Gemini => parse_gemini_chunk(v, &mut out),
         Dialect::Ollama => parse_ollama_chunk(v, &mut out),
@@ -1064,6 +1070,10 @@ fn ensure_successful_response(
         Dialect::Ollama => value
             .get("message")
             .is_some_and(|message| message.is_object()),
+        // Responses 成功时必有 `output` 数组（空数组也算成功 ——
+        // 内容被上限截断时就是这样）。这里判「字段在不在」而不是「非空」，
+        // 否则空输出会被误判成上游错误。
+        Dialect::Responses => value.get("output").is_some_and(|o| o.is_array()),
     };
 
     if application_error || !expected_payload {

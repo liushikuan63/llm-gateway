@@ -468,6 +468,23 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     page.on("dialog", dialog => dialog.accept());
     await page.goto(baseUrl);
     await page.getByRole("heading", { name: "OpenRouter", exact: true }).waitFor();
+
+    // 「接口协议」下拉必须列出全部五种方言。少一种的症状是**静默的**：
+    // 新建的供应商压根没法选那个协议，而测试全绿、界面也不报错。
+    // 2026-10-05 新增 Responses 后在这里钉住。
+    await page.getByRole("button", { name: "＋ 添加供应商" }).click();
+    const dialectSelect = page.locator("#provider-dialect");
+    await dialectSelect.waitFor({ state: "visible", timeout: 5000 });
+    const dialectValues = await dialectSelect.locator("option").evaluateAll(nodes => nodes.map(n => n.value));
+    for (const expected of ["openai", "anthropic", "gemini", "ollama", "responses"]) {
+      if (!dialectValues.includes(expected)) {
+        throw new Error(`接口协议下拉缺少 ${expected}，实际只有：${dialectValues.join(", ")}`);
+      }
+    }
+    await page.screenshot({ path: path.join(output, "provider-dialect-options.png"), fullPage: true });
+    await page.keyboard.press("Escape");
+    await page.getByRole("button", { name: "刷新列表" }).click().catch(() => {});
+
     await page.screenshot({ path: path.join(output, "providers-desktop.png"), fullPage: true });
     await page.getByRole("textbox", { name: "搜索供应商" }).fill("qwen-local");
     assert.equal(await page.locator(".provider-card").count(), 1);

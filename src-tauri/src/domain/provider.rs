@@ -14,6 +14,16 @@ pub enum Dialect {
     Gemini,
     /// Ollama 原生（/api/chat），用于兼容 Zed / JetBrains AI
     Ollama,
+    /// OpenAI Responses API（/v1/responses）。
+    ///
+    /// 为什么需要单独一种：它与 Chat Completions **结构不同**而非字段改名 ——
+    /// `messages` 变 `input`（content 变对象数组）、工具从嵌套 `function`
+    /// 变成扁平 `name`/`parameters`、输出上限叫 `max_output_tokens`。
+    /// 拿 Chat Completions 的构造发过去，上游会 400 或静默返回空。
+    ///
+    /// 没有它的话，Codex CLI（只认 `/v1/responses`）无法使用
+    /// OpenAI / Anthropic / Gemini 上游，只能在客户端侧绕。
+    Responses,
 }
 
 impl Dialect {
@@ -24,6 +34,7 @@ impl Dialect {
             Dialect::Anthropic => "/v1/messages",
             Dialect::Gemini => "/v1beta/models",
             Dialect::Ollama => "/api/chat",
+            Dialect::Responses => "/v1/responses",
         }
     }
 }
