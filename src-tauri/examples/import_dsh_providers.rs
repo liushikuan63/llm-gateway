@@ -39,9 +39,18 @@ struct ManifestProvider {
     base_url: String,
     #[serde(default = "default_intelligence")]
     intelligence: i32,
+    /// 是否参与路由。凭据已被上游拒绝的供应商必须为 false：上游对 401/403
+    /// 返回不可重试，网关会当场终止整条候选链，一家坏供应商就能让「自动分流」
+    /// 整体失败，而报错显示的是「API 密钥无效」，指向客户端而不是真正原因。
+    #[serde(default = "default_enabled")]
+    enabled: bool,
     #[serde(default)]
     note: Option<String>,
     models: Vec<ManifestModel>,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_intelligence() -> i32 {
@@ -251,7 +260,7 @@ async fn main() -> Result<()> {
             dialect,
             base_url,
             api_key_enc: api_key_enc.clone(),
-            enabled: true,
+            enabled: entry.enabled,
             // 全部落在默认优先级：首选项由用户后续在界面上调，不在导入时替用户决定。
             priority: 100,
             models: models.clone(),
@@ -298,11 +307,12 @@ async fn main() -> Result<()> {
         providers_written += 1;
         models_written += models.len();
         println!(
-            "[written]  {:<14} {:<8} models={:<4} key={:<3} {}",
+            "[written]  {:<14} {:<8} models={:<4} key={:<3} {} {}",
             provider.id,
             dialect_code(provider.dialect),
             stored.len(),
             if api_key_enc.is_empty() { "no" } else { "yes" },
+            if provider.enabled { "enabled" } else { "DISABLED" },
             provider.base_url
         );
     }

@@ -120,6 +120,9 @@ for (const [id, p] of Object.entries(providers)) {
   const candidates = [...(p.models || []), ...(EXTRA_MODELS[id] || [])];
 
   const groups = { openai: [], anthropic: [] };
+  // 探测原文要单独留一份：判定账号级阻断必须看**响应正文**（订阅到期码 1309、
+  // 余额不足 INSUFFICIENT_BALANCE 都不是 auth_failed），而正文不在模型对象里。
+  const groupProbes = { openai: [], anthropic: [] };
   const verdictTally = {};
 
   for (const m of candidates) {
@@ -140,7 +143,7 @@ for (const [id, p] of Object.entries(providers)) {
     // anthropic* 系列结论都表示「上游点名要 /messages 形状」；差别只在能不能用，
     // 那属于套餐/额度问题，不影响该放哪个方言。
     const target = verdict && verdict.startsWith('anthropic') ? 'anthropic' : 'openai';
-
+    groupProbes[target].push({ verdict: verdict || '', note: (hit && hit.note) || '' });
     groups[target].push({
       alias: m.id,
       upstream: m.id,
@@ -161,11 +164,29 @@ for (const [id, p] of Object.entries(providers)) {
     });
   }
 
+  // 账号级阻断：这家供应商**每一个模型**都被上游按凭据/额度拒绝。
+  // 这类供应商必须停用，而不是留在候选链里 —— 上游对 401/403 返回
+  // retryable=false，网关会当场终止整条链，于是「自动分流」会被这一家拖死，
+  // 症状却显示成「API 密钥无效」，指向客户端而不是真正的原因。
+  // 判据只用响应文本，不按模型名猜。
+  const blockedReason = (() => {
+    if (!probe) return null;
+    const all = [...groupProbes.openai, ...groupProbes.anthropic];
+    if (!all.length) return null;
+    const allRefused = all.every(
+      (mm) => mm.verdict === 'auth_failed' ||
+        (mm.verdict && /1309|INSUFFICIENT_BALANCE|subscription|Subscription|unauthorized client/i.test(mm.note)),
+    );
+    return allRefused ? '全部模型都被上游按凭据/额度拒绝（auth_failed 或订阅/余额失效）' : null;
+  })();
+  const enabled = !blockedReason;
+
   const note = (providerId, groupName, modelIds) => {
     const parts = [`从 DSH provider「${providerId}」导入`];
     if (probe) {
       parts.push(`探测：${modelIds.map((mm) => `${mm.alias}=${mm.verdict || '未探测'}`).join('，')}`);
     }
+    if (blockedReason) parts.push(`已停用：${blockedReason}`);
     parts.push(groupName === 'anthropic' ? '协议：Anthropic Messages（/messages）' : '');
     return parts.filter(Boolean).join('；');
   };
@@ -207,6 +228,7 @@ for (const [id, p] of Object.entries(providers)) {
       has_key: Boolean(keyEnv && refs[keyEnv]),
       intelligence: 50,
       note: note(id, 'openai', groups.openai),
+      enabled,
       models: groups.openai,
     });
   }
@@ -220,6 +242,7 @@ for (const [id, p] of Object.entries(providers)) {
       has_key: Boolean(keyEnv && refs[keyEnv]),
       intelligence: 50,
       note: note(id, 'anthropic', groups.anthropic),
+      enabled,
       models: groups.anthropic,
     });
     keys[`${id}-anthropic`] = keys[id];
@@ -238,8 +261,12 @@ for (const p of out) {
   total += p.models.length;
   const tally = {};
   for (const m of p.models) if (m.verdict) tally[m.verdict] = (tally[m.verdict] || 0) + 1;
-  console.log(`${p.id.padEnd(24)} ${p.dialect.padEnd(10)} key=${p.has_key ? 'yes' : 'NO '} models=${String(p.models.length).padStart(3)}  ${Object.entries(tally).map(([k, v]) => `${k}:${v}`).join(' ')}`);
+  console.log(`${p.id.padEnd(24)} ${p.dialect.padEnd(10)} ${p.enabled ? '启用' : '停用'} key=${p.has_key ? 'yes' : 'NO '} models=${String(p.models.length).padStart(3)}  ${Object.entries(tally).map(([k, v]) => `${k}:${v}`).join(' ')}`);
 }
 console.log(`\n合计 providers=${out.length} models=${total} keys=${Object.keys(keys).length}${probe ? '（已按探测结果修正）' : '（未探测，未修正）'}`);
+const disabled = out.filter((p) => !p.enabled);
+if (disabled.length) {
+  console.log(`\n停用 ${disabled.length} 个供应商（凭据/额度被上游拒绝，留着会拖死自动分流）：\n  ${disabled.map((p) => p.id).join('\n  ')}`);
+}
 if (dropped.length) console.log(`\n剔除 ${dropped.length} 个上游已下线的模型：\n  ${dropped.join('\n  ')}`);
 if (skipped.length) console.log(`\n跳过：\n  ${skipped.join('\n  ')}`);
