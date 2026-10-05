@@ -824,6 +824,7 @@ async fn replace_snapshot_providers(
             Dialect::Anthropic => "anthropic",
             Dialect::Gemini => "gemini",
             Dialect::Ollama => "ollama",
+            Dialect::Responses => "responses",
         })
         .bind(&provider.base_url)
         .bind(&provider.api_key_enc)
@@ -3522,4 +3523,28 @@ pub async fn import_bundle(
         },
         backup_dir: backup.display().to_string(),
     })
+}
+
+/// 开机自启状态：是否已开启 + 已注册的命令行（用于界面回显）。
+#[derive(serde::Serialize)]
+pub struct AutostartView {
+    /// 已注册的命令行；`None` 表示未开启
+    pub command: Option<String>,
+}
+
+#[tauri::command]
+pub fn get_autostart_state() -> AutostartView {
+    // 读失败时返回未开启而不是报错：界面上的开关不该因为一个只读操作
+    // 而变成红色错误条，用户会以为出事了。
+    AutostartView { command: crate::autostart::status().unwrap_or(None) }
+}
+
+#[tauri::command]
+pub fn set_autostart(enabled: bool) -> Result<AutostartView, String> {
+    if enabled {
+        crate::autostart::enable(None)?;
+    } else {
+        crate::autostart::disable()?;
+    }
+    Ok(AutostartView { command: crate::autostart::status().unwrap_or(None) })
 }

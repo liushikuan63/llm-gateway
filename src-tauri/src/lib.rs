@@ -1,4 +1,5 @@
 pub mod boot;
+pub mod autostart;
 pub mod bundle;
 pub mod cli_tools;
 mod commands;
@@ -179,6 +180,14 @@ pub fn run() {
             // 5. 系统托盘：CC Switch 式的极速切换就靠它
             build_tray(&handle)?;
 
+            // 6. 自启静默：只藏主窗口，托盘/桌宠照常。
+            // 放在 build_tray 之后 —— 先确保图标存在，用户才「看得见它在跑」。
+            if should_start_hidden() {
+                if let Some(window) = handle.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -248,6 +257,9 @@ pub fn run() {
             commands::jev_probe,
             commands::calibrate_classifier,
             commands::calibrate_default_samples,
+            commands::get_autostart_state,
+            commands::set_autostart,
+            commands::calibrate_default_samples,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -272,6 +284,18 @@ pub fn run() {
 
 fn should_hide_to_tray(window_label: &str) -> bool {
     window_label == "main"
+}
+
+/// 自启启动（`--minimized`）时要不要隐藏主窗口。
+///
+/// 自启的用户是「希望它在后台跑着」，不是「想看界面」—— 每次开机弹窗
+/// 逼着用户手动关一次，托盘常驻的意义也就没了。所以只隐藏窗口，
+/// 托盘图标照常出现，点它就能打开面板。
+///
+/// 判据要**只看参数不看窗口**：托盘/桌宠窗口也是通过同一个 setup
+/// 创建的，把它们一起藏掉会出现「自启后连图标都没有，完全不知道它在跑」。
+fn should_start_hidden() -> bool {
+    std::env::args().any(|a| a == autostart::MINIMIZED_FLAG)
 }
 
 fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
@@ -320,11 +344,41 @@ fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_hide_to_tray;
+    use super::{should_hide_to_tray, should_start_hidden};
 
     #[test]
     fn only_main_window_close_is_intercepted_for_tray_residency() {
         assert!(should_hide_to_tray("main"));
         assert!(!should_hide_to_tray("settings"));
+    }
+
+    /// 判定逻辑抽成可测的纯函数：直接读 `std::env::args()` 没法在测试里
+    /// 换掉参数，而「有/无 --minimized」这两个分支都必须被覆盖。
+    fn starts_hidden_with(args: &[&str]) -> bool {
+        args.iter().any(|a| *a == crate::autostart::MINIMIZED_FLAG)
+    }
+
+    #[test]
+    fn 静默启动只认_minimized_参数() {
+        assert!(
+            !starts_hidden_with(&["llm-gateway.exe"]),
+            "正常双击启动必须显示面板，否则用户以为程序没起来"
+        );
+        assert!(
+            starts_hidden_with(&["llm-gateway.exe", "--minimized"]),
+            "自启必须静默：开机弹窗逼着用户手动关一次"
+        );
+        // 大小写与位置都不能影响判定
+        assert!(!starts_hidden_with(&["llm-gateway.exe", "--MINIMIZED"]));
+        assert!(starts_hidden_with(&["--minimized", "llm-gateway.exe"]));
+        // 相近参数不得误判
+        assert!(!starts_hidden_with(&["llm-gateway.exe", "--minimized=false"]));
+        assert!(!starts_hidden_with(&["llm-gateway.exe", "-m"]));
+    }
+
+    #[test]
+    fn 当前进程不带_minimized_时不该隐藏() {
+        // 测试进程自己没有这个参数 —— 防止有人把判定写反。
+        assert!(!should_start_hidden());
     }
 }

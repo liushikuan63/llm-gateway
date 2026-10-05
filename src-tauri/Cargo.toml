@@ -69,6 +69,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    # 开机自启要写 HKCU\Software\Microsoft\Windows\CurrentVersion\Run。
+    # 特性名带下划线是 windows-sys 的惯例（对应模块 System::Registry）。
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
