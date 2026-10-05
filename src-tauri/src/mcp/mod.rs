@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub mod runtime;
 pub mod stdio;
 
 /// 一次 MCP server 连接的传输方式。

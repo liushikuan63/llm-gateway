@@ -117,6 +117,29 @@ impl StdioSession {
         &self.skipped_samples
     }
 
+    /// 发一条 **JSON-RPC 通知**：只写、不等响应。
+    ///
+    /// JSON-RPC 的通知**没有 `id`，协议规定不回响应**。
+    /// 用 [`Self::request`] 发通知会一直等到超时，然后 `kill_tree()`
+    /// 把进程杀掉 —— 后续调用拿到的是断管错误，
+    /// 而报错完全指不到「这里不该等响应」。
+    ///
+    /// 这个坑是端到端用例抓到的：`initialize` 与 `tools/list` 都成功，
+    /// 只有紧随其后的 `tools/call` 报 `flush stdin 失败：管道正在被关闭`
+    /// （因为通知那一步等超时后把进程杀了）。
+    pub async fn notify(&mut self, payload: &Value) -> Result<(), String> {
+        let mut body = serde_json::to_string(payload).map_err(|e| e.to_string())?;
+        body.push('\n');
+        self.stdin
+            .write_all(body.as_bytes())
+            .await
+            .map_err(|e| format!("写 stdin 失败：{e}"))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| format!("flush stdin 失败：{e}"))
+    }
+
     /// 发一条 JSON-RPC 请求并等一条**能解析成 JSON** 的响应。
     ///
     /// 中间那些不能解析成 JSON 的行会被跳过并计数 ——
