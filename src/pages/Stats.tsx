@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useState } from "react";
-import { api, AttemptRecord, formatMoney, RequestLog, SpendBucket, SpendByDimension, SpendDaily, StatsOverview, TokenCalibration } from "../api";
+import { api, AttemptRecord, AuditFilter, formatMoney, RequestLog, SpendBucket, SpendByDimension, SpendDaily, StatsOverview, TokenCalibration } from "../api";
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error);
@@ -75,16 +75,33 @@ export default function StatsPage() {
   const [msg, setMsg] = useState<{ kind: "err" | "ok"; text: string } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
+  // ---------- B3 审计筛选 ----------
+  //
+  // 筛选条件与「本页条数 / 命中总数 / 还有更多」都放在这里。
+  // 用 `queryRequests` 而不是 `recentRequests`：后者是固定窗口，
+  // 加不了条件也拿不到总数。
+  const [filter, setFilter] = useState<AuditFilter>({});
+  const [total, setTotal] = useState(0);
+  const [truncated, setTruncated] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  const patchFilter = (next: Partial<AuditFilter>) =>
+    // 换条件时**必须回到第一页**：留在第 3 页而结果只剩 5 条，
+    // 用户会看到一张空表，以为「没有记录」。
+    setFilter((prev) => ({ ...prev, ...next, offset: 0 }));
+
   const load = async () => {
     setRefreshing(true);
     try {
-      const [overview, requests, calibrationRows] = await Promise.all([
+      const [overview, page, calibrationRows] = await Promise.all([
         api.statsOverview(),
-        api.recentRequests(120),
+        api.queryRequests({ ...filter, limit: 120 }),
         api.listTokenCalibrations(),
       ]);
       setStats(overview);
-      setRows(requests);
+      setRows(page.rows);
+      setTotal(page.total);
+      setTruncated(page.truncated);
       setCalibrations(calibrationRows);
       setMsg(null);
     } catch (error) {
@@ -98,7 +115,44 @@ export default function StatsPage() {
     void load();
     const timer = window.setInterval(() => void load(), 5000);
     return () => window.clearInterval(timer);
-  }, []);
+    // 依赖 filter：条件变了必须立刻重查。留在旧结果上会让人以为
+    // 「筛选没生效」—— 而表里显示的其实是上一次查询的数据。
+    // 依赖整个对象是安全的：`setFilter` 每次都产生新对象，
+    // 且只有用户操作与 `patchFilter` 会调它。
+  }, [filter]);
+
+  /**
+   * 导出当前筛选条件下的**全部**命中记录。
+   *
+   * 路径由用户选（系统保存对话框）。不自己拼一个「下载目录」路径 ——
+   * 桌面应用里用户对「文件去哪了」的预期只有他自己知道。
+   */
+  const exportAudit = async (format: "jsonl" | "csv") => {
+    setExporting(true);
+    setMsg(null);
+    try {
+      const dest = await api.pickSavePath({
+        defaultPath: `llm-gateway-audit.${format}`,
+        filters:
+          format === "csv"
+            ? [{ name: "CSV", extensions: ["csv"] }]
+            : [{ name: "JSON Lines", extensions: ["jsonl"] }],
+      });
+      // 用户取消 → 什么都不做，也不报错（取消不是失败）
+      if (!dest) return;
+      const result = await api.exportRequests(filter, format, dest);
+      setMsg({
+        kind: "ok",
+        text: `已导出 ${formatNumber(result.written)} 条到 ${result.path}${
+          result.columns_doc ? `（列说明：${result.columns_doc}）` : ""
+        }`,
+      });
+    } catch (error) {
+      setMsg({ kind: "err", text: `导出失败：${errorText(error)}` });
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const spend = stats?.spend;
   const daily: SpendDaily[] = spend?.daily ?? [];
@@ -345,6 +399,124 @@ export default function StatsPage() {
 
       <div className="card table-card">
         <strong>最近请求</strong>
+        {/* B3 审计筛选。放在表格上方而不是折叠面板里：
+            筛选条件看不见时，用户会以为「记录变少了」而不是「被筛掉了」。 */}
+        <div className="audit-filters" style={{ marginTop: 10 }}>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            <label className="audit-field">
+              <span>供应商</span>
+              <input
+                id="audit-provider"
+                placeholder="全部"
+                value={filter.provider ?? ""}
+                onChange={(event) => patchFilter({ provider: event.target.value || null })}
+              />
+            </label>
+            <label className="audit-field">
+              <span>模型</span>
+              <input
+                id="audit-model"
+                placeholder="全部"
+                value={filter.model ?? ""}
+                onChange={(event) => patchFilter({ model: event.target.value || null })}
+              />
+            </label>
+            <label className="audit-field">
+              <span>状态</span>
+              <input
+                id="audit-status"
+                placeholder="2xx / 4xx / 429"
+                value={filter.status ?? ""}
+                onChange={(event) => patchFilter({ status: event.target.value || null })}
+              />
+            </label>
+            <label className="audit-field">
+              <span>币种</span>
+              <input
+                id="audit-currency"
+                placeholder="全部"
+                value={filter.currency ?? ""}
+                onChange={(event) => patchFilter({ currency: event.target.value || null })}
+              />
+            </label>
+            <label className="audit-field">
+              <span>成本下限</span>
+              <input
+                id="audit-min-cost"
+                type="number"
+                step="0.01"
+                placeholder="不限"
+                value={filter.min_cost ?? ""}
+                onChange={(event) =>
+                  patchFilter({
+                    min_cost: event.target.value === "" ? null : Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <label className="audit-field">
+              <span>成本上限</span>
+              <input
+                id="audit-max-cost"
+                type="number"
+                step="0.01"
+                placeholder="不限"
+                value={filter.max_cost ?? ""}
+                onChange={(event) =>
+                  patchFilter({
+                    max_cost: event.target.value === "" ? null : Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <label className="audit-check">
+              <input
+                id="audit-only-errors"
+                type="checkbox"
+                checked={filter.only_errors ?? false}
+                onChange={(event) => patchFilter({ only_errors: event.target.checked })}
+              />
+              <span>只看有错误</span>
+            </label>
+            <label className="audit-check">
+              <input
+                id="audit-only-fallbacks"
+                type="checkbox"
+                checked={filter.only_fallbacks ?? false}
+                onChange={(event) => patchFilter({ only_fallbacks: event.target.checked })}
+              />
+              <span>只看降级过</span>
+            </label>
+            <button
+              id="audit-reset"
+              className="ghost"
+              disabled={refreshing}
+              onClick={() => setFilter({})}
+            >
+              重置筛选
+            </button>
+            <button
+              id="audit-export-jsonl"
+              disabled={exporting || rows.length === 0}
+              onClick={() => void exportAudit("jsonl")}
+            >
+              导出 JSONL
+            </button>
+            <button
+              id="audit-export-csv"
+              disabled={exporting || rows.length === 0}
+              onClick={() => void exportAudit("csv")}
+            >
+              导出 CSV
+            </button>
+          </div>
+          <div className="sub" style={{ marginTop: 6, marginBottom: 0 }}>
+            {/* 命中总数必须露出来：只看当前 120 条会让人以为「一共就这么点」。 */}
+            命中 <strong>{formatNumber(total)}</strong> 条
+            {truncated && <>（当前显示前 {formatNumber(rows.length)} 条，请加筛选条件缩小范围）</>}
+            。导出会按当前筛选条件写出**全部**命中记录（上限 100000 条）。
+          </div>
+        </div>
         <div style={{ marginTop: 10 }}>
           {rows.length === 0 ? (
             <div className="empty">暂无记录</div>

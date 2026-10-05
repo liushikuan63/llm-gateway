@@ -678,6 +678,63 @@ export interface RequestLog {
   attempts: AttemptRecord[] | null;
 }
 
+// ---------- B3 审计检索与导出 ----------
+
+/**
+ * 审计检索的过滤条件。**所有字段都是可选的**，缺省即不加该条件。
+ *
+ * 时间用 Unix 秒（与 `RequestLog.ts` 同口径）。
+ */
+export interface AuditFilter {
+  from_ts?: number | null;
+  to_ts?: number | null;
+  provider?: string | null;
+  model?: string | null;
+  /** 具体状态码（`"429"`）或状态类（`"2xx"` / `"4xx"` / `"5xx"`）。 */
+  status?: string | null;
+  currency?: string | null;
+  min_cost?: number | null;
+  max_cost?: number | null;
+  only_errors?: boolean;
+  only_fallbacks?: boolean;
+  limit?: number | null;
+  offset?: number | null;
+}
+
+/** 一条审计记录。在 `RequestLog` 的基础上多了 B2/B3 的列。 */
+export interface AuditRow extends RequestLog {
+  id: number;
+  session_id: string | null;
+  route_intent: string | null;
+  route_classifier: string | null;
+  route_search: string | null;
+  route_search_hits: number | null;
+  route_refined: boolean | null;
+  route_refine_note: string | null;
+  /** 归属的远程访问 Key。null 表示本机统一 Key 发出。 */
+  access_key_id: string | null;
+  /**
+   * 改写后的最终提示词。**默认不返回**（`audit.store_refined_prompt` 关着时为 null）。
+   * 开启后返回的也是**已脱敏**的文本。
+   */
+  refined_prompt?: string | null;
+}
+
+/** 一页审计记录。`total` 是**命中总数**，不是本页条数。 */
+export interface AuditPage {
+  rows: AuditRow[];
+  total: number;
+  /** 还有更多页。 */
+  truncated: boolean;
+}
+
+export interface AuditExportResult {
+  written: number;
+  path: string;
+  /** 伴随的列说明文件（只有 CSV 会生成）。 */
+  columns_doc: string | null;
+}
+
 // 定价刷新结果：逐项报告，避免只说成功。
 export interface PricingRefreshOutcome {
   feed_models: number;
@@ -864,6 +921,38 @@ export const api = {
 
   statsOverview: () => invoke<StatsOverview>("stats_overview"),
   recentRequests: (limit = 100) => invoke<RequestLog[]>("recent_requests", { limit }),
+  // ---------- B3 审计检索与导出 ----------
+
+  /**
+   * 按条件检索审计记录。
+   *
+   * 与 `recentRequests` 的区别：那个是「最近 N 条」的固定窗口，
+   * 这个是可过滤、可分页、带命中总数的检索。列表页在没有任何筛选时
+   * 仍然只取一页（`limit`），不会把整表拉进内存。
+   */
+  queryRequests: (filter: AuditFilter) =>
+    invoke<AuditPage>("query_requests", { filter }),
+
+  exportRequests: (filter: AuditFilter, format: "jsonl" | "csv", destPath: string) =>
+    invoke<AuditExportResult>("export_requests", { filter, format, destPath }),
+
+  /**
+   * 让用户选一个保存路径。取消时返回 `null`。
+   *
+   * 动态 import 与 Settings 里的 `open` 同款：dialog 插件只在 Tauri 里存在，
+   * 静态导入会让纯浏览器下（`verify:ui` 的 Vite 预览）直接崩。
+   */
+  pickSavePath: async (options: {
+    defaultPath: string;
+    filters: Array<{ name: string; extensions: string[] }>;
+  }): Promise<string | null> => {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const picked = await save({
+      defaultPath: options.defaultPath,
+      filters: options.filters,
+    });
+    return typeof picked === "string" ? picked : null;
+  },
 
   applyTakeover: () => invoke<TakeoverResult[]>("apply_takeover"),
   exportBundle: (dest: string) => invoke<void>("export_bundle", { dest }),

@@ -325,6 +325,67 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         return null;
       }
       case "recent_requests": return structuredClone(window.__fixtureRequests);
+      // B3 审计检索与导出。
+      //
+      // `query_requests` 必须**真的按条件过滤**，不能一律返回全部 ——
+      // 那样「筛选生效」的断言会因为「什么都没筛也一样」而恒真，
+      // 两边都算过。这里实现与后端同口径的几个条件。
+      case "query_requests": {
+        const f = args.filter || {};
+        let rows = structuredClone(window.__fixtureRequests);
+        if (f.provider) rows = rows.filter(r => r.routed_provider === f.provider);
+        if (f.model) rows = rows.filter(r => r.routed_model === f.model);
+        if (f.only_errors) rows = rows.filter(r => r.error !== null);
+        if (f.only_fallbacks) rows = rows.filter(r => r.fallback_attempts > 0);
+        if (f.currency) rows = rows.filter(r => r.currency === f.currency);
+        if (typeof f.min_cost === "number") rows = rows.filter(r => r.cost !== null && r.cost >= f.min_cost);
+        if (typeof f.max_cost === "number") rows = rows.filter(r => r.cost !== null && r.cost <= f.max_cost);
+        if (f.status) {
+          const s = String(f.status).toLowerCase();
+          const m = /^([1-5])xx$/.exec(s);
+          rows = m
+            ? rows.filter(r => r.status !== null && Math.floor(r.status / 100) === Number(m[1]))
+            : rows.filter(r => String(r.status) === s);
+        }
+        const total = rows.length;
+        const limit = f.limit ?? 100;
+        const offset = f.offset ?? 0;
+        const page = rows.slice(offset, offset + limit);
+        // 给每行补上 AuditRow 比 RequestLog 多出来的列。
+        // 漏了会让前端读 undefined 而不报错（默认值恰好是 falsy），
+        // 正是卡片警告的那类静默失败。
+        const withAuditCols = page.map((r, i) => ({
+          id: offset + i + 1,
+          session_id: "sess-fixture",
+          route_intent: "simple",
+          route_classifier: "heuristic",
+          route_search: null,
+          route_search_hits: null,
+          route_refined: false,
+          route_refine_note: null,
+          access_key_id: null,
+          refined_prompt: null,
+          ...r,
+        }));
+        return { rows: withAuditCols, total, truncated: offset + page.length < total };
+      }
+      case "export_requests": {
+        const f = args.filter || {};
+        let n = window.__fixtureRequests.length;
+        if (f.only_errors) n = window.__fixtureRequests.filter(r => r.error !== null).length;
+        if (f.only_fallbacks) n = window.__fixtureRequests.filter(r => r.fallback_attempts > 0).length;
+        window.__lastExport = { format: args.format, dest: args.destPath, filter: f, written: n };
+        return {
+          written: n,
+          path: args.destPath,
+          // 只有 CSV 有伴随列说明，与后端同口径（后端用 file_stem 拼，
+          // 所以无论用户选的路径带不带 .csv 都会得到 `<stem>_columns.md`）。
+          columns_doc: args.format === "csv"
+            ? args.destPath.replace(/\.csv$/, "") + "_columns.md"
+            : null,
+        };
+      }
+      case "plugin:dialog|save": return "C:/fixture/audit-export";
       case "stats_overview": return structuredClone(window.__fixtureStats);
       case "import_bundle": {
         if (args.src.includes("broken")) throw new Error("该目录里没有 config.toml 或 gateway.db，不是导出包");
@@ -1106,6 +1167,73 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     assert(chain.includes("OpenRouter"));
     assert(chain.includes("上游返回 HTTP 429"));
     await page.locator(".attempt-toggle").first().click();
+
+    // ---------- B3 审计筛选与导出 ----------
+    // 筛选器必须真的改变结果集。反向断言是重点：夹具里的 query_requests
+    // 若不按条件过滤（一律返回全部），「筛掉了一些行」这件事就永远成立不了。
+    const rowCount = () => page.locator(".requests-table tbody tr.request-row").count();
+    const allRows = await rowCount();
+    assert(allRows >= 3, `素材至少 3 条，实际 ${allRows}`);
+    // 命中总数要露出来 —— 只看当前页会让人以为「一共就这么点」
+    const filterBar = page.locator(".audit-filters");
+    assert((await filterBar.innerText()).includes("命中"), "筛选栏必须显示命中总数");
+
+    await page.locator("#audit-only-errors").check();
+    await page.waitForTimeout(400);
+    const errRows = await rowCount();
+    assert(errRows > 0 && errRows < allRows,
+      `「只看有错误」必须筛掉一部分：全部 ${allRows} → 现在 ${errRows}`);
+    await page.screenshot({ path: path.join(output, "audit-filter-errors.png"), fullPage: true });
+
+    // 再叠一个「只看降级过」，结果只能更少（条件是 AND）
+    await page.locator("#audit-only-fallbacks").check();
+    await page.waitForTimeout(400);
+    const bothRows = await rowCount();
+    assert(bothRows <= errRows, `叠加条件后不该变多：${errRows} → ${bothRows}`);
+
+    // 重置必须回到全量
+    await page.locator("#audit-reset").click();
+    await page.waitForTimeout(400);
+    assert.equal(await rowCount(), allRows, "重置筛选后必须回到全部行");
+
+    // 按状态类筛选：夹具里有一条 401
+    await page.locator("#audit-status").fill("4xx");
+    await page.waitForTimeout(400);
+    const fourXX = await rowCount();
+    assert(fourXX > 0 && fourXX < allRows, `4xx 应筛出部分行，实际 ${fourXX}/${allRows}`);
+    await page.locator("#audit-status").fill("5xx");
+    await page.waitForTimeout(400);
+    assert.equal(await rowCount(), 0, "夹具里没有 5xx，应筛成空表");
+    assert((await page.locator(".empty").innerText()).includes("暂无"),
+      "筛成空表时要显示空态，而不是一张没有表头的怪表");
+    await page.locator("#audit-reset").click();
+    await page.waitForTimeout(400);
+
+    // 导出：CSV 要带伴随列说明，JSONL 不带 —— 与后端同口径
+    await page.locator("#audit-export-csv").click();
+    await page.waitForTimeout(400);
+    const csvExport = await page.evaluate(() => window.__lastExport);
+    assert(csvExport && csvExport.format === "csv", `应记录一次 CSV 导出：${JSON.stringify(csvExport)}`);
+    assert((await page.locator(".msg.ok").innerText()).includes("_columns.md"),
+      "CSV 导出的提示里要带列说明文件路径");
+
+    await page.locator("#audit-export-jsonl").click();
+    await page.waitForTimeout(400);
+    const jsonlExport = await page.evaluate(() => window.__lastExport);
+    assert(jsonlExport && jsonlExport.format === "jsonl", "应记录一次 JSONL 导出");
+    const okText = await page.locator(".msg.ok").innerText();
+    assert(!okText.includes("_columns.md"), `JSONL 不该有列说明文件：${okText}`);
+
+    // 导出要带上当前筛选条件：先筛再导，写出去的条件必须与界面一致
+    await page.locator("#audit-only-errors").check();
+    await page.waitForTimeout(400);
+    await page.locator("#audit-export-jsonl").click();
+    await page.waitForTimeout(400);
+    const filteredExport = await page.evaluate(() => window.__lastExport);
+    assert(filteredExport.filter && filteredExport.filter.only_errors === true,
+      `导出必须带上当前筛选条件：${JSON.stringify(filteredExport.filter)}`);
+    await page.locator("#audit-reset").click();
+    await page.waitForTimeout(400);
     // 401 那一行：失败且不可重试时必须明确显示「已停止降级」。
     await page.locator(".attempt-toggle").nth(1).click();
     const blocked = await page.locator(".attempt-row").last().innerText();

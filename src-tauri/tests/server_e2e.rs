@@ -1388,6 +1388,7 @@ async fn spend_tables_separate_currencies_and_report_unpriced_requests() {
                 session_id: None,
                 client: Some("local-unified-key"),
                 access_key_id: llm_gateway_lib::budget::access_key_id_of(Some("local-unified-key")),
+                refined_prompt: None,
                 requested_model: "auto",
                 routed_provider: Some(provider),
                 routed_model: Some(model),

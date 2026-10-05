@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod autostart;
 pub mod boot;
 pub mod budget;
@@ -237,6 +238,8 @@ pub fn run() {
             commands::create_snapshot,
             commands::stats_overview,
             commands::recent_requests,
+            commands::query_requests,
+            commands::export_requests,
             commands::apply_takeover,
             commands::export_bundle,
             commands::import_bundle,

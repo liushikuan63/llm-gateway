@@ -1297,6 +1297,106 @@ pub async fn recent_requests(
         .map_err(|e| e.to_string())
 }
 
+/* --------------------------- B3 审计检索与导出 --------------------------- */
+
+/// 一页审计记录。`total` 是**命中总数**（不是本页条数），
+/// `truncated` 表示「还有更多页」。
+#[derive(Debug, Serialize)]
+pub struct AuditPage {
+    pub rows: Vec<crate::audit::AuditRow>,
+    pub total: u64,
+    pub truncated: bool,
+}
+
+#[tauri::command]
+pub async fn query_requests(
+    state: State<'_, AppState>,
+    filter: crate::audit::RequestFilter,
+) -> Result<AuditPage, String> {
+    let (rows, total) = repo::query_requests(state.db.pool(), &filter)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 本页最后一条在全集里的位置 < total ⇒ 还有下一页
+    // 括号不能省：`rows.len() as u64 < total` 会被解析成泛型实参
+    let truncated = u64::from(filter.page_offset()) + (rows.len() as u64) < total;
+    Ok(AuditPage {
+        rows,
+        total,
+        truncated,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditExportResult {
+    pub written: u64,
+    pub path: String,
+    /// 伴随的列说明文件路径（只有 CSV 会生成）。
+    pub columns_doc: Option<String>,
+}
+
+/// 导出审计记录。
+///
+/// `format` 只认 `jsonl` / `csv`；其余一律报错而不是「默认按 jsonl」——
+/// 用户写错格式却拿到一个能打开的文件，会以为导出的就是他要的格式。
+#[tauri::command]
+pub async fn export_requests(
+    state: State<'_, AppState>,
+    filter: crate::audit::RequestFilter,
+    format: String,
+    dest_path: String,
+) -> Result<AuditExportResult, String> {
+    let fmt = format.trim().to_ascii_lowercase();
+    if fmt != "jsonl" && fmt != "csv" {
+        return Err(format!("不支持的导出格式 {format:?}，只支持 jsonl 与 csv"));
+    }
+    let path = std::path::PathBuf::from(dest_path.trim());
+    if path.as_os_str().is_empty() {
+        return Err("导出路径不能为空".into());
+    }
+
+    let rows = repo::query_requests_for_export(state.db.pool(), &filter)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (content, columns_doc_path) = if fmt == "jsonl" {
+        (crate::audit::to_jsonl(&rows), None)
+    } else {
+        let max_attempts = rows.iter().map(|r| r.attempts.len()).max().unwrap_or(0);
+        // CSV 没有注释标准，列名来源写成伴随文件而不是塞进注释行
+        // （注释行会被解析器当成数据）。
+        let mut doc_path = path.clone();
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "export".into());
+        doc_path.set_file_name(format!("{stem}_columns.md"));
+        if let Some(parent) = doc_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+        }
+        std::fs::write(&doc_path, crate::audit::columns_doc(max_attempts))
+            .map_err(|e| format!("写列说明失败：{e}"))?;
+        (
+            crate::audit::to_csv(&rows),
+            Some(doc_path.to_string_lossy().into_owned()),
+        )
+    };
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::write(&path, content).map_err(|e| format!("写导出文件失败：{e}"))?;
+
+    Ok(AuditExportResult {
+        written: rows.len() as u64,
+        path: path.to_string_lossy().into_owned(),
+        columns_doc: columns_doc_path,
+    })
+}
+
 /* --------------------------- CLI 工具接管（可选） --------------------------- */
 
 #[cfg(windows)]

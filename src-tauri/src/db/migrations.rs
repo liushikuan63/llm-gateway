@@ -251,6 +251,10 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     // （`remote-key:<id>` 只是网关自己写的格式），不是 Key 身份；
     // 猜错了会把别人的钱算到这个 Key 头上，而且算错了没有任何报错。
     ensure_column(pool, "requests", "access_key_id", "TEXT").await?;
+    // B3 审计存储：改写后的最终提示词。**默认不写** ——
+    // 由 `audit.store_refined_prompt` 显式打开，且写入前必须脱敏。
+    // 开这个列而不是建新表：它与一次请求一一对应，且审计查询要按行返回。
+    ensure_column(pool, "requests", "refined_prompt", "TEXT").await?;
     ensure_column(
         pool,
         "remote_access_keys",

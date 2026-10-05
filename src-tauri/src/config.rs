@@ -407,6 +407,9 @@ pub struct AppConfig {
     /// 否则就是「开着没反应的开关」。默认路径零成本靠的是
     /// 「Key 的 monthly_budget_micros == 0 直接跳过」，不是把总开关关掉。
     pub budget: crate::budget::BudgetConfig,
+    /// B3 审计存储。`store_refined_prompt` **默认关闭** ——
+    /// 存提示词等于存用户内容，隐私边界要显式打开。
+    pub audit: crate::audit::AuditConfig,
 }
 
 /// 上游鉴权失败的处理档位。
@@ -571,6 +574,7 @@ impl Default for AppConfig {
             auth_failure: AuthFailureConfig::default(),
             cache: crate::cache::CacheConfig::default(),
             budget: crate::budget::BudgetConfig::default(),
+            audit: crate::audit::AuditConfig::default(),
         }
     }
 }

@@ -311,6 +311,153 @@ pub async fn update_remote_access_key(
     Ok(changed)
 }
 
+/// 组装一行审计记录。抽出来是因为 `query_requests` 与导出共用同一套映射，
+/// 分两份写迟早会漂移（加一列只改一处，另一处静默少一个字段）。
+fn audit_row_from(r: &sqlx::sqlite::SqliteRow) -> crate::audit::AuditRow {
+    crate::audit::AuditRow {
+        id: r.get::<i64, _>("id"),
+        ts: r.get::<i64, _>("ts"),
+        session_id: r.get::<Option<String>, _>("session_id"),
+        client: r.get::<Option<String>, _>("client"),
+        requested_model: r.get::<String, _>("requested_model"),
+        routed_provider: r.get::<Option<String>, _>("routed_provider"),
+        routed_model: r.get::<Option<String>, _>("routed_model"),
+        status: r.get::<Option<i64>, _>("status"),
+        latency_ms: r.get::<Option<i64>, _>("latency_ms"),
+        prompt_tokens: r.get::<i64, _>("prompt_tokens"),
+        completion_tokens: r.get::<i64, _>("completion_tokens"),
+        fallback_attempts: r.get::<i64, _>("fallback_attempts"),
+        error: r.get::<Option<String>, _>("error"),
+        cost: r.get::<Option<f64>, _>("cost"),
+        currency: r.get::<Option<String>, _>("currency"),
+        rate_label: r.get::<Option<String>, _>("rate_label"),
+        estimated_prompt_tokens: r.get::<Option<i64>, _>("estimated_prompt_tokens"),
+        // 解析成数组而不是留字符串 —— 导出的目的是给人看和给脚本读。
+        // 坏 JSON 退化成空数组而不是整行失败：一行坏数据不该让整个查询失败。
+        attempts: r
+            .get::<Option<String>, _>("attempts_json")
+            .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+            .unwrap_or_default(),
+        route_intent: r.get::<Option<String>, _>("route_intent"),
+        route_classifier: r.get::<Option<String>, _>("route_classifier"),
+        route_search: r.get::<Option<String>, _>("route_search"),
+        route_search_hits: r.get::<Option<i64>, _>("route_search_hits"),
+        route_refined: r.get::<Option<i64>, _>("route_refined").map(|v| v != 0),
+        route_refine_note: r.get::<Option<String>, _>("route_refine_note"),
+        access_key_id: r.get::<Option<String>, _>("access_key_id"),
+        refined_prompt: r.get::<Option<String>, _>("refined_prompt"),
+    }
+}
+
+/// 审计查询用到的全部列。与 `audit_row_from` 必须同步 ——
+/// 少一列会在 `r.get("列名")` 处 panic，不是静默。
+const AUDIT_COLUMNS: &str = "id, ts, session_id, client, requested_model, routed_provider, \
+     routed_model, status, latency_ms, prompt_tokens, completion_tokens, fallback_attempts, \
+     error, cost, currency, rate_label, estimated_prompt_tokens, attempts_json, \
+     route_intent, route_classifier, route_search, route_search_hits, route_refined, \
+     route_refine_note, access_key_id, refined_prompt";
+
+/// 把一串绑定值贴到查询上。
+///
+/// 用宏而不是函数：sqlx 的 `Query` 类型带生命周期参数，写成泛型函数
+/// 要把三个类型参数都摊开，读起来比这里麻烦得多。
+macro_rules! bind_all {
+    ($q:expr, $binds:expr) => {{
+        let mut q = $q;
+        for b in $binds {
+            q = match b {
+                crate::audit::Bind::I64(v) => q.bind(*v),
+                crate::audit::Bind::F64(v) => q.bind(*v),
+                crate::audit::Bind::Text(v) => q.bind(v.clone()),
+            };
+        }
+        q
+    }};
+}
+
+/// 按条件检索审计记录。返回 `(本页行, 命中总数)`。
+///
+/// **总数单独查一次**，不是「把全部行读出来数一遍」：这是桌面应用，
+/// 用户可能已经跑了几个月，读全表会随数据量线性变慢。
+/// 两条语句共用同一份 WHERE，所以计数与行必然同源。
+///
+/// 排序是 `ts DESC, id DESC`。**`id` 那一级不能省**：同一秒内可能有多条
+/// （并发请求），只按 `ts` 排序时它们的相对顺序由 SQLite 决定，
+/// 翻页会重复或漏掉 —— 正是「分页不重复不遗漏」那条用例要挡的。
+pub async fn query_requests(
+    pool: &SqlitePool,
+    f: &crate::audit::RequestFilter,
+) -> Result<(Vec<crate::audit::AuditRow>, u64)> {
+    let (where_sql, binds) = crate::audit::build_where(f);
+
+    // `format!` 的结果必须先落到变量：直接写 `&format!(..)` 会在语句结束
+    // 时把临时 String 释放掉，而查询还借着它。
+    let count_sql = format!("SELECT COUNT(*) FROM requests{where_sql}");
+    let total = bind_all!(sqlx::query_scalar::<_, i64>(&count_sql), &binds)
+        .fetch_one(pool)
+        .await? as u64;
+
+    let sql = format!(
+        "SELECT {AUDIT_COLUMNS} FROM requests{where_sql} \
+         ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
+    );
+    let rows = bind_all!(sqlx::query(&sql), &binds)
+        .bind(i64::from(f.page_size()))
+        .bind(i64::from(f.page_offset()))
+        .fetch_all(pool)
+        .await?;
+
+    Ok((rows.iter().map(audit_row_from).collect(), total))
+}
+
+/// 一页审计记录。与 `commands::AuditPage` 字段同形，但要留在数据层 ——
+/// 「还有没有下一页」是分页逻辑的一部分，不该让命令层自己算。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditPage {
+    pub rows: Vec<crate::audit::AuditRow>,
+    pub total: u64,
+    pub truncated: bool,
+}
+
+/// 查一页，并算出「还有没有更多」。
+pub async fn query_page(pool: &SqlitePool, f: &crate::audit::RequestFilter) -> Result<AuditPage> {
+    let (rows, total) = query_requests(pool, f).await?;
+    // 括号不能省：`rows.len() as u64 < total` 会被解析成泛型实参
+    let truncated = u64::from(f.page_offset()) + (rows.len() as u64) < total;
+    Ok(AuditPage {
+        rows,
+        total,
+        truncated,
+    })
+}
+
+/// 按条件取出**全部**命中的行，供导出使用。
+///
+/// 导出确实需要全量，所以这里没有 LIMIT。但加了硬上限
+/// [`crate::audit::EXPORT_MAX_ROWS`]：一次导出几十万行会让进程内存和
+/// 用户等待时间都失控，而超限时**如实报错**比静默截断好 ——
+/// 截断的导出看起来是成功的，用户拿去对账才发现少了。
+pub async fn query_requests_for_export(
+    pool: &SqlitePool,
+    f: &crate::audit::RequestFilter,
+) -> Result<Vec<crate::audit::AuditRow>> {
+    let (where_sql, binds) = crate::audit::build_where(f);
+    // `format!` 的结果必须先落到变量：直接写 `&format!(..)` 会在语句结束
+    // 时把临时 String 释放掉，而查询还借着它。
+    let count_sql = format!("SELECT COUNT(*) FROM requests{where_sql}");
+    let total = bind_all!(sqlx::query_scalar::<_, i64>(&count_sql), &binds)
+        .fetch_one(pool)
+        .await? as u64;
+    // 判定逻辑在 `audit::check_export_size` 里（纯函数、可单测）；
+    // 这里只把它转成 GatewayError。用 `Protocol` 而不是 `Other(anyhow!)`：
+    // 这是一条**给用户看的**、可操作的提示，不是内部错误。
+    crate::audit::check_export_size(total).map_err(crate::error::GatewayError::Protocol)?;
+
+    let sql = format!("SELECT {AUDIT_COLUMNS} FROM requests{where_sql} ORDER BY ts DESC, id DESC");
+    let rows = bind_all!(sqlx::query(&sql), &binds).fetch_all(pool).await?;
+    Ok(rows.iter().map(audit_row_from).collect())
+}
+
 /// 某个远程 Key 从 `since_ts` 起的消费，**按币种分组**。
 ///
 /// 返回 `(currency, cost)` 的列表而不是一个总数：多币种的数字加在一起
@@ -1012,6 +1159,12 @@ pub struct RequestLog<'a> {
     /// 回填口径：历史行一律 NULL。**不按 `client` 猜** ——
     /// client 是客户端自报的字符串，不是 Key 身份。
     pub access_key_id: Option<&'a str>,
+    /// 改写后的最终提示词。**默认不写**。
+    ///
+    /// 只应由 `crate::audit::refined_prompt_to_store` 的返回值填进来 ——
+    /// 那个函数把「开关判断」与「脱敏」绑在一起，绕过它就会把未脱敏的
+    /// 用户内容写进库。
+    pub refined_prompt: Option<&'a str>,
 }
 
 /// 智能模式 + 联网搜索在审计里的落点。
@@ -1036,15 +1189,24 @@ pub struct RouteTrace {
 }
 
 pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
-    let ts = Utc::now().timestamp();
+    log_request_at(pool, Utc::now().timestamp(), log).await
+}
+
+/// 与 [`log_request`] 相同，但**时间戳由调用方给**。
+///
+/// 存在的理由：审计的时间区间过滤、月份切换、分页顺序都要靠不同的 `ts`
+/// 才能测到。用 `Utc::now()` 的话测试只能 `sleep` 等着跨秒 ——
+/// 那既慢又不稳（CLAUDE.md 第 11 条的同款教训：时间夹具不能靠等）。
+/// 生产路径仍然走 [`log_request`]。
+pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO requests
              (ts, session_id, client, requested_model, routed_provider, routed_model, status,
               latency_ms, prompt_tokens, completion_tokens, fallback_attempts, error,
               cost, currency, rate_label, estimated_prompt_tokens, attempts_json,
               route_intent, route_classifier, route_search, route_search_hits,
-              route_refined, route_refine_note, access_key_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+              route_refined, route_refine_note, access_key_id, refined_prompt)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
     )
     .bind(ts)
     .bind(log.session_id)
@@ -1074,11 +1236,18 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
     // 错位 —— 症状是「失败请求也应记录尝试链」这类断言红，而错误里
     // 看不出是顺序问题。
     .bind(log.access_key_id)
+    // 最后一位：绑定顺序必须与列顺序一致，`refined_prompt` 是第 25 列。
+    .bind(log.refined_prompt)
     .execute(pool)
     .await?;
 
-    // 日粒度聚合，供用量看板直接查，不用每次扫全表
-    let day = Utc::now().format("%Y-%m-%d").to_string();
+    // 日粒度聚合，供用量看板直接查，不用每次扫全表。
+    // `day` 从**同一个 ts** 推，不另取一次 now()：补写历史数据时
+    // 否则会出现「行落在旧日期、聚合落在今天」两个口径对不上。
+    let day = chrono::DateTime::from_timestamp(ts, 0)
+        .unwrap_or_else(Utc::now)
+        .format("%Y-%m-%d")
+        .to_string();
     let pid = log.routed_provider.unwrap_or("unknown");
     let mid = log.routed_model.unwrap_or("unknown");
     let currency = log.currency.unwrap_or("");
