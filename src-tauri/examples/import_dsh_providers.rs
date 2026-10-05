@@ -21,7 +21,7 @@ use anyhow::{bail, Context, Result};
 use llm_gateway_lib::config;
 use llm_gateway_lib::db::{repo, Db};
 use llm_gateway_lib::domain::{
-    Currency, Dialect, ModelPrice, ModelRef, ModelType, PriceSource, Provider,
+    Currency, Dialect, ModelOverrides, ModelPrice, ModelRef, ModelType, PriceSource, Provider,
 };
 use llm_gateway_lib::{crypto, model_catalog};
 use serde::Deserialize;
@@ -69,6 +69,10 @@ struct ManifestModel {
     model_type: String,
     #[serde(default)]
     price: Option<ManifestPrice>,
+    /// 模型级参数覆盖。探测发现「上游点名要 temperature=1」这类硬性要求时靠它落地；
+    /// 不落库的话每次调用都会 400，而报错指向参数、看不出是配置问题。
+    #[serde(default)]
+    overrides: Option<ModelOverrides>,
 }
 
 fn default_true() -> bool {
@@ -137,6 +141,15 @@ fn model_ref_of(m: &ManifestModel) -> Result<ModelRef> {
         }
     }
 
+    // 非法覆盖同样要在落库前拒绝：保存期拦不住的坏值，会变成每次请求都 400。
+    if let Some(overrides) = &m.overrides {
+        if !overrides.is_empty() {
+            overrides
+                .validate()
+                .map_err(|e| anyhow::anyhow!("模型 {} 的参数覆盖无效：{e}", m.alias))?;
+        }
+    }
+
     Ok(ModelRef {
         alias: m.alias.clone(),
         upstream: m.upstream.clone(),
@@ -150,7 +163,7 @@ fn model_ref_of(m: &ManifestModel) -> Result<ModelRef> {
         model_type,
         upstream_path: None,
         price,
-        overrides: None,
+        overrides: m.overrides.clone(),
         local: None,
     })
 }
