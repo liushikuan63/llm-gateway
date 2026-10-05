@@ -86,6 +86,18 @@ function Invoke-RustSteps {
     }
 }
 
+
+# scripts/*.cjs are NOT compiled by "npm run build" (only src/ is) and
+# verify:manual only checks docs. Measured 2026-10-05: a broken object
+# literal in ui-smoke.cjs was committed with CI fully green, because
+# nothing ever parsed it. `node --check` costs ~0.1s and closes that gap.
+function Invoke-ScriptSyntaxStep {
+    $scripts = Get-ChildItem (Join-Path $RepoRoot 'scripts') -Filter *.cjs -File
+    Invoke-Step 'scripts' {
+        foreach ($s in $scripts) { & node --check $s.FullName }
+    }
+}
+
 function Invoke-FrontendSteps {
     foreach ($n in @('build', 'manual', 'release', 'plan')) {
         switch ($n) {
@@ -101,7 +113,7 @@ Set-Location -LiteralPath $RepoRoot
 try {
     $rustSteps = @('fmt', 'clippy', 'check', 'test')
     switch ($Step) {
-        'all'     { Import-RustEnv; Invoke-RustSteps; Invoke-FrontendSteps }
+        'all'     { Import-RustEnv; Invoke-ScriptSyntaxStep; Invoke-RustSteps; Invoke-FrontendSteps }
         default   {
             if ($rustSteps -contains $Step) {
                 Import-RustEnv

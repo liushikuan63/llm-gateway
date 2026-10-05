@@ -80,6 +80,13 @@ jobs:
         run: npm run build
 
       - name: npm run verify:manual
+
+      # scripts/*.cjs is not compiled by `npm run build` (only src/ is),
+      # and verify:manual only inspects docs. Measured 2026-10-05: a broken
+      # object literal in ui-smoke.cjs landed with CI fully green because
+      # nothing ever parsed that file. Keep this step.
+      - name: scripts syntax
+        run: for f in scripts/*.cjs; do node --check "$f"; done
         run: npm run verify:manual
 
       - name: npm run verify:release
