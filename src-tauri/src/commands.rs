@@ -1962,8 +1962,29 @@ pub async fn apply_takeover(state: State<'_, AppState>) -> Result<Vec<TakeoverRe
 
 fn ensure_supported_takeover_selection(gemini_cli: bool) -> Result<(), String> {
     if gemini_cli {
+        // 【2026-10-06 更新理由】原先写的是「网关尚未提供 Gemini 入站协议」，
+        // 那个阻塞点已经解开（C2 落了 `/v1beta/models/{m}:generateContent`、
+        // `streamGenerateContent` 与 `Exit::Gemini`）。现在挡着的是**另一件事**：
+        //
+        // 查官方文档（google-gemini.github.io/gemini-cli/docs/get-started/configuration.html）
+        // 逐条核对过 `~/.gemini/settings.json` 的 schema —— 分类是
+        // general / output / ui / ide / privacy / model / tools / mcp /
+        // security / advanced / mcpServers / telemetry，**没有 baseUrl 这一项**。
+        // 网上流传的 `{"baseUrl": ..., "apiKey": ...}` 骨架不在官方 schema 里；
+        // 照它写进用户主目录，Gemini CLI 会**读不到也不报错** ——
+        // 正是 CLAUDE.md 第 9 条禁止的「开着没反应的开关」。
+        //
+        // 官方唯一的端点覆盖是环境变量 `CODE_ASSIST_ENDPOINT`，而那是
+        // **Cloud Code Assist 后端**的地址；本网关实现的是公开 Gemini API 的
+        // `generateContent` 形状，不是 Code Assist 协议。指过去也不会通。
+        //
+        // 所以这里保持拒绝，且**一个字节都不读不写**用户主目录 ——
+        // 写一个猜测出来的配置比不写更糟：它会静默失效，还让用户以为接管生效了。
         return Err(
-            "Gemini CLI 接管暂不支持：网关尚未提供 Gemini 入站协议，未读取、备份或写入任何 Gemini 配置"
+            "Gemini CLI 接管暂不支持：官方 settings.json 没有端点配置项，\
+             其端点覆盖走环境变量 CODE_ASSIST_ENDPOINT（指向 Code Assist 后端），\
+             与本网关提供的公开 Gemini generateContent 面不是同一条协议。\
+             未读取、备份或写入任何 Gemini 配置"
                 .to_string(),
         );
     }
