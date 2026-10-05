@@ -11,6 +11,7 @@ pub mod domain;
 pub mod error;
 pub mod intellect;
 pub mod local_models;
+pub mod log_rotate;
 pub mod media;
 pub mod model_catalog;
 pub mod pet_window;
@@ -104,14 +105,30 @@ pub fn run() {
                 .unwrap_or_else(|_| "llm_gateway=info,tower_http=warn".into()),
         )
         .with_writer(
-            std::fs::File::options()
-                .create(true)
-                .append(true)
-                .open(log_dir.join("gateway.log"))
-                .unwrap_or_else(|_| {
-                    std::fs::File::create(std::env::temp_dir().join("llm-gateway.log"))
-                        .expect("open log")
-                }),
+            // RotatingWriter instead of a plain appending File: this is a
+            // long-running desktop app and the log had neither rotation nor a
+            // size cap. Falls back to a temp-dir writer when the log
+            // directory is not writable, so logging never becomes a hard
+            // startup dependency (the old code used .expect here, which would
+            // panic the whole app if temp dir was also unavailable).
+            // `with_writer` takes a `MakeWriter`, not a value, and the subscriber
+            // is `Send + Sync`. `SharedWriterHandle` is the adapter: it hands
+            // out a cheap clone per event and serialises the actual write so
+            // rotation never interleaves with another thread's append.
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(log_rotate::SharedWriterHandle(
+                std::sync::Arc::new(log_rotate::SharedWriter::new(
+                    log_rotate::RotatingWriter::new(&log_dir, "gateway.log")
+                        .map(|writer| Box::new(writer) as Box<dyn std::io::Write + Send + Sync>)
+                        .unwrap_or_else(|_| {
+                            std::fs::File::create(std::env::temp_dir().join("llm-gateway.log"))
+                                .map(|file| Box::new(file) as Box<dyn std::io::Write + Send + Sync>)
+                                .unwrap_or_else(|_| {
+                                    Box::new(std::io::sink())
+                                        as Box<dyn std::io::Write + Send + Sync>
+                                })
+                        }),
+                )),
+            )),
         )
         .init();
 
