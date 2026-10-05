@@ -320,6 +320,20 @@ pub async fn serve(state: Arc<GatewayState>) -> Result<()> {
         // Anthropic 原生面（Claude Code / Claude Desktop 走这里）
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        // C2 Gemini 原生面（Gemini CLI / Gemini SDK 走这里）
+        //
+        // 路径里 `:generateContent` 之前那段是 `models/<模型名>`，
+        // 而 `:` 不是路径分隔符，所以整段会作为一个路径参数进来，
+        // 由 `gemini_inbound::parse_model_action` 拆开。
+        // 这样写而不是用 `:model:action`：axum 只允许一个 `:` 参数前缀，
+        // 写成两个会把 `:action` 当成字面量。
+        .route("/v1beta/models", get(gemini_models))
+        // 用**通配**而不是 `:model_action`：卡片刻意提醒「路径里的 {model}
+        // 形如 models/gemini-2.5-pro」，也就是说前缀可能出现两次
+        // （`/v1beta/models/models/gemini-2.5-pro:generateContent`）。
+        // `:param` 只吃一段，第二种形态会 404；通配把余下整段都收进来，
+        // 再由 `parse_model_action` 剥前缀。
+        .route("/v1beta/models/*model_action", post(gemini_generate))
         // Ollama 仿真面（Zed / JetBrains AI 走这里）
         .route("/api/chat", post(ollama_chat))
         .route("/api/tags", get(ollama_tags))
@@ -655,6 +669,72 @@ async fn anthropic_messages(
         },
         Err(e) => error_response(&GatewayError::Protocol(format!("请求体解析失败: {e}"))),
     }
+}
+
+/// C2 `GET /v1beta/models`：Gemini 原生面的模型列表。
+///
+/// 返回的 `name` **带 `models/` 前缀** —— 客户端会把它原样拼回
+/// `:generateContent` 的路径里，不带前缀会 404。
+async fn gemini_models(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
+    let models: Vec<(String, String)> = GatewayRouter::public_models(&state.providers.read())
+        .into_iter()
+        .map(|m| (m.id.clone(), m.id))
+        .collect();
+    Json(crate::protocol::gemini_inbound::models_list(&models))
+}
+
+/// C2 `POST /v1beta/models/{model}:{action}`：Gemini 原生入站。
+///
+/// 走的是**同一条**已有 dispatch 路径（能力过滤、降级链、会话派生都在里面），
+/// 没有为 Gemini 写旁路 —— 旁路意味着两套行为，测试成本翻倍且必然漂移。
+async fn gemini_generate(
+    State(state): State<Arc<GatewayState>>,
+    Extension(auth): Extension<AuthContext>,
+    headers: HeaderMap,
+    axum::extract::Path(model_action): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some((model, action)) = crate::protocol::gemini_inbound::parse_model_action(&model_action)
+    else {
+        // 路径不合法 ⇒ 明确的 404，而不是让 axum 回空响应
+        return error_response(&GatewayError::ModelNotFound(format!(
+            "路径 {model_action:?} 不是 <模型名>:<动作> 的形态"
+        )));
+    };
+    let stream = match action.as_str() {
+        "generateContent" => false,
+        "streamGenerateContent" => true,
+        other => {
+            // 用 `ModelNotFound`（→404）而不是 `Protocol`（→500）：
+            // 「你请求的动作不存在」是调用方的问题，不是网关坏了。
+            return error_response(&GatewayError::ModelNotFound(format!(
+                "动作 {other} 不存在（{model_action}）：Gemini 原生入站只提供 \
+                 generateContent 与 streamGenerateContent"
+            )));
+        }
+    };
+    // `?alt=sse` 是 Gemini 的流式开关。**不认它也不报错**：有些客户端
+    // 两个都发（路径动作 + alt=sse），而 `streamGenerateContent` 本身就隐含流式。
+    // 但如果客户端**只**给了 `alt=sse` 而动作是 generateContent，那按非流式走 ——
+    // 动作是权威，query 只是提示。
+    let _ = query;
+
+    let inbound: crate::protocol::gemini_inbound::GeminiInboundRequest =
+        match serde_json::from_value(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error_response(&GatewayError::Protocol(format!(
+                    "Gemini 请求体解析失败: {e}"
+                )))
+            }
+        };
+
+    let req = match crate::protocol::gemini_inbound::to_internal(&model, &inbound, stream) {
+        Ok(req) => req,
+        Err(error) => return error_response(&error),
+    };
+    dispatch(state, req, &headers, auth.client, Exit::Gemini).await
 }
 
 /// Codex CLI 需要的 /v1/responses。
@@ -1738,6 +1818,8 @@ enum Exit {
     Anthropic,
     Responses,
     Ollama,
+    /// C2 Gemini 原生入站面。客户端是 Gemini CLI / Gemini SDK。
+    Gemini,
 }
 
 /// 已完成会话定位、上下文重建和路由排序的一次内部派发。
@@ -3599,6 +3681,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 yield Ok::<String, std::convert::Infallible>(created);
             }
             Exit::OpenAI | Exit::Ollama => {}
+            // C2：Gemini 的 `alt=sse` **没有**独立的 start 事件 ——
+            // 第一帧就是第一个增量。造一个 start 会让客户端多收到一个空 parts。
+            Exit::Gemini => {}
         }
         let mut next_event = Some(first_event);
 
@@ -3630,7 +3715,10 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                                 yield Ok::<String, std::convert::Infallible>(encoded);
                             }
                         }
-                        Exit::OpenAI | Exit::Ollama => {
+                        // C2：Gemini 也走 `encode_delta` —— 编码只放一处。
+                        // 两套编码逻辑必然漂移，而漂移的表现是「某个协议的流式
+                        // 少了几帧」，不会有任何报错。
+                        Exit::OpenAI | Exit::Ollama | Exit::Gemini => {
                             let include_openai_role = exit == Exit::OpenAI && !openai_role_sent;
                             if include_openai_role {
                                 openai_role_sent = true;
@@ -3660,7 +3748,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                                 yield Ok::<String, std::convert::Infallible>(encoded);
                             }
                         }
-                        Exit::OpenAI | Exit::Ollama => {
+                        Exit::OpenAI | Exit::Ollama | Exit::Gemini => {
                             let include_openai_role = exit == Exit::OpenAI && !openai_role_sent;
                             if include_openai_role {
                                 openai_role_sent = true;
@@ -4239,6 +4327,9 @@ fn encode_response(
     match exit {
         Exit::OpenAI => crate::protocol::openai::chat_completion_response(&resp.id, model, resp),
         Exit::Anthropic => crate::protocol::anthropic::messages_response(resp, model),
+        // C2：Gemini 原生的形状是 `candidates[].content.parts[]`，不是 OpenAI 的
+        // `choices` —— 客户端按同名形状读，返回错形状会得到「响应为空」而不是报错。
+        Exit::Gemini => crate::protocol::gemini_inbound::from_internal_response(resp),
         Exit::Responses => {
             let mut output = Vec::new();
             let has_tool_calls = resp
@@ -4325,6 +4416,11 @@ fn encode_delta(
             "message": { "role": "assistant", "content": text },
             "done": false,
         })),
+        // C2：Gemini 的增量帧是 `candidates[].content.parts[].text`，
+        // 且**没有** `[DONE]` 哨兵（结束靠 finishReason + 连接关闭）。
+        Exit::Gemini => crate::protocol::gemini_inbound::sse_frame(
+            &crate::protocol::gemini_inbound::sse_delta_chunk(text, model),
+        ),
     }
 }
 
@@ -4431,6 +4527,40 @@ fn encode_tool_delta(
             },
             "done": false,
         })),
+        // C2：Gemini 用 `functionCall` part 表示工具调用，
+        // 与 OpenAI 的 `tool_calls[].function` 不是一种形状。
+        Exit::Gemini => {
+            let mut encoded = String::new();
+            for (position, call) in tool_call_values(tc).into_iter().enumerate() {
+                let _ = position;
+                let Some(name) = call
+                    .get("function")
+                    .and_then(|value| value.get("name"))
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let args = call
+                    .get("function")
+                    .and_then(|value| value.get("arguments"))
+                    .and_then(|value| value.as_str())
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                encoded.push_str(&crate::protocol::gemini_inbound::sse_frame(
+                    &serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{"functionCall": {"name": name, "args": args}}],
+                            },
+                            "index": 0,
+                        }],
+                        "modelVersion": model,
+                    }),
+                ));
+            }
+            encoded
+        }
     }
 }
 
@@ -4460,6 +4590,22 @@ fn encode_done(
             })
             .to_string(),
         ),
+        // C2：Gemini 的收尾帧是一个**普通的 data 帧**，带 finishReason 与用量，
+        // 而不是一个具名事件。
+        Exit::Gemini => crate::protocol::gemini_inbound::sse_frame(&serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason":
+                    crate::protocol::gemini_inbound::gemini_finish_reason(finish),
+                "index": 0,
+            }],
+            "modelVersion": model,
+            "usageMetadata": {
+                "promptTokenCount": usage.prompt_tokens,
+                "candidatesTokenCount": usage.completion_tokens,
+                "totalTokenCount": usage.total_tokens,
+            },
+        })),
         Exit::Responses => sse_event(
             Some("response.completed"),
             serde_json::json!({
@@ -4517,6 +4663,10 @@ fn encode_stream_end(_req_id: &str, exit: Exit) -> Option<String> {
             serde_json::json!({ "type": "message_stop" }).to_string(),
         )),
         Exit::Responses | Exit::Ollama => None,
+        // C2：Gemini 的 `alt=sse` **没有** `[DONE]` 哨兵 ——
+        // 结束靠最后一帧的 `finishReason` 与连接关闭。
+        // 加一个会让严格按协议解析的客户端（Gemini SDK）报错。
+        Exit::Gemini => None,
     }
 }
 
