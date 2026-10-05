@@ -30,6 +30,7 @@ use axum::Router;
 
 fn model(name: &str, thinking: bool) -> ModelRef {
     ModelRef {
+        enabled: true,
         alias: name.into(),
         upstream: name.into(),
         context_window: 128_000,

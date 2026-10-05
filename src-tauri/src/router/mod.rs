@@ -122,6 +122,7 @@ impl Router {
                 price: None,
                 overrides: None,
                 local: None,
+                enabled: true,
             };
             let models = if p.models.is_empty() {
                 std::slice::from_ref(&default_model)

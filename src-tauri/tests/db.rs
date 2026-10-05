@@ -25,6 +25,7 @@ fn provider() -> Provider {
         enabled: true,
         priority: 10,
         models: vec![ModelRef {
+            enabled: true,
             alias: "model-a".to_owned(),
             upstream: "upstream-a".to_owned(),
             context_window: 32_768,

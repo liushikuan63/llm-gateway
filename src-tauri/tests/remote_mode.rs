@@ -34,6 +34,7 @@ fn mock_provider(base_url: String) -> Provider {
         enabled: true,
         priority: 1,
         models: vec![ModelRef {
+            enabled: true,
             alias: "remote-model".into(),
             upstream: "remote-model".into(),
             context_window: 16_384,

@@ -74,11 +74,7 @@ fn auth_confirm_handler(
 /// 把供应商标记为停用，并把原因**追加**到 `note`。
 ///
 /// 追加而不是覆盖：备注里可能有用户自己写的内容，抹掉就再也找不回来。
-async fn auto_disable_provider(
-    state: &Arc<GatewayState>,
-    provider_id: &str,
-    provider_name: &str,
-) {
+async fn auto_disable_provider(state: &Arc<GatewayState>, provider_id: &str, provider_name: &str) {
     let Ok(list) = repo::list_providers(state.db.pool()).await else {
         return;
     };

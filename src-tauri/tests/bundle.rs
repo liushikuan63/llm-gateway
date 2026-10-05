@@ -37,6 +37,7 @@ fn provider(id: &str, name: &str, api_key_enc: String) -> Provider {
         priority: 10,
         models: vec![
             ModelRef {
+                enabled: true,
                 alias: "chat".to_owned(),
                 upstream: "chat".to_owned(),
                 context_window: 32_768,
@@ -67,6 +68,7 @@ fn provider(id: &str, name: &str, api_key_enc: String) -> Provider {
                 local: None,
             },
             ModelRef {
+                enabled: true,
                 alias: "plain".to_owned(),
                 upstream: "plain".to_owned(),
                 context_window: 8_192,

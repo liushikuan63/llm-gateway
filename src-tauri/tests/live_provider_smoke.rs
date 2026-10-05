@@ -29,6 +29,7 @@ fn live_provider(
         enabled: true,
         priority: 1,
         models: vec![ModelRef {
+            enabled: true,
             alias: model.into(),
             upstream: model.into(),
             context_window: 32_768,

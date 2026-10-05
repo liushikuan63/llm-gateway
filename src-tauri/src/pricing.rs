@@ -304,6 +304,7 @@ mod tests {
                     price,
                     overrides: None,
                     local: None,
+                    enabled: true,
                 })
                 .collect(),
             rpm_limit: 0,

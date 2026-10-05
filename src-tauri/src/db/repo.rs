@@ -64,8 +64,8 @@ pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<
     let rows = sqlx::query(
         r#"SELECT alias, upstream, context_window, supports_tools, supports_vision,
                   supports_audio, supports_video, supports_thinking, supports_stream, model_type,
-                  upstream_path, price_json, overrides_json, local_json
-           FROM models WHERE provider_id = ? AND enabled = 1"#,
+                  upstream_path, price_json, overrides_json, local_json, enabled
+           FROM models WHERE provider_id = ?"#,
     )
     .bind(provider_id)
     .fetch_all(pool)
@@ -87,6 +87,7 @@ pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<
             price: read_model_price(&r),
             overrides: read_model_overrides(&r),
             local: read_local_meta(&r),
+            enabled: r.get::<i64, _>("enabled") == 1,
         })
         .collect())
 }
@@ -167,8 +168,8 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
             r#"INSERT OR REPLACE INTO models
                  (id, provider_id, alias, upstream, context_window, supports_tools, supports_vision,
                   supports_audio, supports_video, supports_thinking, supports_stream, model_type,
-                  upstream_path, price_json, overrides_json, local_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                   upstream_path, price_json, overrides_json, local_json, enabled)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
         )
         .bind(format!("{}:{}", p.id, m.alias))
         .bind(&p.id)
@@ -186,6 +187,7 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
         .bind(price)
         .bind(overrides)
         .bind(local)
+        .bind(m.enabled as i64)
         .execute(pool)
         .await?;
     }
@@ -1427,4 +1429,33 @@ pub async fn delete_secret(pool: &SqlitePool, name: &str) -> Result<bool> {
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// 取**只有已启用模型**的供应商列表，供路由打分使用。
+///
+/// 为什么不能直接在 SQL 里 `WHERE enabled = 1`：`list_providers` 同时喂给
+/// 前端（要看到已禁用的模型才能重新勾上）和路由（只该看已启用的）。两边
+/// 需求相反，所以拆成两个入口—— SQL 层过滤会把「已禁用」这个状态对前端
+/// 藏起来，用户就没法在界面上把它改回来了。
+pub async fn list_routable_providers(pool: &SqlitePool) -> Result<Vec<Provider>> {
+    Ok(list_providers(pool)
+        .await?
+        .into_iter()
+        .map(|mut p| {
+            p.models.retain(|m| m.enabled);
+            p
+        })
+        .collect())
+}
+
+/// 某供应商下**只有已启用模型**的列表，供精确点名模型时查。
+pub async fn list_routable_models_of(
+    pool: &SqlitePool,
+    provider_id: &str,
+) -> Result<Vec<ModelRef>> {
+    Ok(list_models_of(pool, provider_id)
+        .await?
+        .into_iter()
+        .filter(|m| m.enabled)
+        .collect())
 }

@@ -38,6 +38,7 @@ fn mock_provider(base_url: String) -> Provider {
         enabled: true,
         priority: 1,
         models: vec![ModelRef {
+            enabled: true,
             alias: "integration-model".into(),
             upstream: "integration-model".into(),
             context_window: 16_384,

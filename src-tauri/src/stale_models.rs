@@ -171,6 +171,7 @@ mod tests {
             price: None,
             overrides: None,
             local: None,
+            enabled: true,
         }
     }
 

@@ -44,6 +44,7 @@ async fn 把本机_ollama_登记成网关供应商() {
     let refs: Vec<ModelRef> = infos
         .iter()
         .map(|info| ModelRef {
+            enabled: true,
             alias: info.alias.clone(),
             upstream: info.upstream.clone(),
             context_window: info.context_window,

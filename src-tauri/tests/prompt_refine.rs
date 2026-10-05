@@ -142,6 +142,7 @@ fn candidate(id: &str, thinking: bool, priority: i32) -> Candidate {
             updated_at: now,
         },
         model: ModelRef {
+            enabled: true,
             alias: format!("{id}-model"),
             upstream: format!("{id}-model"),
             context_window: 32_768,

@@ -10,6 +10,7 @@ use llm_gateway_lib::router::{RouteRule, Router, RuleAction};
 
 fn model(alias: &str, upstream: &str) -> ModelRef {
     ModelRef {
+        enabled: true,
         alias: alias.into(),
         upstream: upstream.into(),
         context_window: 128_000,
@@ -211,6 +212,7 @@ fn model_type_prevents_cross_endpoint_routing() {
     provider.models = vec![
         model("text-model", "text-model"),
         ModelRef {
+            enabled: true,
             alias: "embed-model".into(),
             upstream: "embed-model".into(),
             model_type: ModelType::Embedding,

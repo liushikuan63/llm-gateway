@@ -526,6 +526,7 @@ async fn model_overrides_apply_after_gateway_normalization_and_skip_protected_fi
 
     let mut provider = local_provider(Dialect::OpenAI, format!("{base_url}/v1"));
     provider.models = vec![llm_gateway_lib::domain::ModelRef {
+        enabled: true,
         alias: "local-model".into(),
         upstream: "local-model".into(),
         context_window: 8192,

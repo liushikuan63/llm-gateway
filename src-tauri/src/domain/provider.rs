@@ -414,6 +414,22 @@ pub struct ModelRef {
     /// 本地模型来源元数据；云端模型为 `None`。
     #[serde(default)]
     pub local: Option<LocalMeta>,
+    /// 是否参与自动路由。
+    ///
+    /// 默认 `true`（`#[serde(default = "default_true")]`），保证旧配置与旧前端
+    /// 载荷反序列化后行为逐位不变。
+    ///
+    /// 这一列 2026-10-05 之前就存在于 `models` 表，`list_models_of` 也一直在用
+    /// `WHERE enabled = 1` 过滤，但 `ModelRef` 里没有对应字段 —— 于是「禁用某个
+    /// 模型」**只能靠手改数据库达成，且撑不过一次保存**：`upsert_provider` 是
+    /// DELETE 后重插，INSERT 又不写这一列、走列默认值 1，下次在编辑器里点保存，
+    /// 刚禁用的模型就复活了。现在字段接上了，禁用状态能持久。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ModelRef {

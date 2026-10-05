@@ -64,6 +64,7 @@ async fn mock_openai_chat(state: MockState) -> Router {
 
 fn model(alias: &str, vision: bool, thinking: bool) -> ModelRef {
     ModelRef {
+        enabled: true,
         alias: alias.into(),
         upstream: alias.into(),
         context_window: 32_768,
