@@ -27,7 +27,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
-use crate::config::{AppConfig, RoutingStrategy};
+use crate::config::{AppConfig, AuthFailureMode, RoutingStrategy};
+
 use crate::context::{
     estimate_message_tokens, scoped_session_id, trim_to_budget, ContextStore, ExchangeWrite,
 };
@@ -40,6 +41,71 @@ use crate::error::{GatewayError, Result};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::upstream::{PassthroughResponse, UpstreamClient, UpstreamEvent};
 use crate::router::failover::{classify, AtomicFlag, FailoverChain};
+
+/// 鉴权失败复测确认之后的处理：按策略把这家供应商自动停用。
+///
+/// **只在这一刻动手**，而不是第一次 401 的时候——中转站的 401 未必等于凭据永久失效。
+/// 写入是后台任务：降级链路不能被一次数据库写阻塞。
+///
+/// 豁免规则（用户「可以强制走用户选定的」）：主用供应商与配置里的豁免名单不自动停用，
+/// 自动停用等于替用户改主意。
+fn auth_confirm_handler(
+    state: Arc<GatewayState>,
+    cfg: AppConfig,
+) -> impl FnMut(&crate::domain::Provider, &GatewayError) {
+    move |provider, _error| {
+        if cfg.auth_failure.mode != AuthFailureMode::SkipAndDisable || !provider.enabled {
+            return;
+        }
+        let active = state.active.read().clone();
+        if cfg.auth_failure.is_exempt(&provider.id, active.as_deref()) {
+            tracing::info!(provider = %provider.id, "鉴权失败但命中豁免，保留供应商");
+            return;
+        }
+        let state = state.clone();
+        let provider_id = provider.id.clone();
+        let provider_name = provider.name.clone();
+        tokio::spawn(async move {
+            auto_disable_provider(&state, &provider_id, &provider_name).await;
+        });
+    }
+}
+
+/// 把供应商标记为停用，并把原因**追加**到 `note`。
+///
+/// 追加而不是覆盖：备注里可能有用户自己写的内容，抹掉就再也找不回来。
+async fn auto_disable_provider(
+    state: &Arc<GatewayState>,
+    provider_id: &str,
+    provider_name: &str,
+) {
+    let Ok(list) = repo::list_providers(state.db.pool()).await else {
+        return;
+    };
+    let Some(mut provider) = list.into_iter().find(|p| p.id == provider_id) else {
+        return;
+    };
+    if !provider.enabled {
+        return;
+    }
+    provider.enabled = false;
+    let stamp = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
+    let reason = format!("上游连续返回 401/403 且复测确认凭据不可用（{provider_name}）");
+    provider.note = Some(match provider.note.as_deref().map(str::trim) {
+        Some(existing) if !existing.is_empty() => format!("{existing}｜{reason}（{stamp}）"),
+        _ => format!("{reason}（{stamp}）"),
+    });
+    if repo::upsert_provider(state.db.pool(), &provider)
+        .await
+        .is_ok()
+    {
+        let _ = state.reload_providers().await;
+        tracing::warn!(
+            provider = %provider_id,
+            "鉴权失败已确认，自动停用该供应商；恢复可在供应商页重新启用"
+        );
+    }
+}
 use crate::router::ratelimit::{Quota, RateLimiter};
 use crate::router::Router as GatewayRouter;
 
@@ -97,7 +163,14 @@ impl GatewayState {
     }
 
     pub async fn reload_providers(&self) -> Result<()> {
-        let list = repo::list_providers(self.db.pool()).await?;
+        // 走 routable 变体：路由表里只放**已启用**的模型。
+        //
+        // 用的是 `list_routable_providers` 而不是 `list_providers` ——后者同时
+        // 喂前端（需要看到已禁用的模型才能在界面上勾回来），需求与路由相反。
+        // `models.enabled` 2026-10-05 才接进领域模型，此前SQL 里的
+        // `AND enabled = 1` 只在读取时生效、INSERT 又不写这一列，禁用状态
+        // 撑不过一次保存。
+        let list = repo::list_routable_providers(self.db.pool()).await?;
         let remote_keys = repo::list_remote_access_keys(self.db.pool()).await?;
         *self.providers.write() = list;
         *self.remote_access_keys.write() = remote_keys;
@@ -757,13 +830,14 @@ async fn passthrough_dispatch(
     };
     let flag = AtomicFlag::new();
     let chain = FailoverChain::new(&ranked, max_attempts, &flag);
+    let chain = chain.with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
     let upstream = state.upstream.clone();
     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
     let body = Arc::new(body);
     let started = Instant::now();
     let mut attempt_records = Vec::new();
     let outcome = chain
-        .run(
+        .run_with_auth_policy(
             &mut attempt_records,
             |provider, model| {
                 let upstream = upstream.clone();
@@ -793,6 +867,7 @@ async fn passthrough_dispatch(
                 }
                 state.health.record_failure(&provider.id, model, error);
             },
+            auth_confirm_handler(state.clone(), cfg.clone()),
         )
         .await;
 
@@ -963,6 +1038,7 @@ async fn dispatch_remote_compaction(
     };
     let flag = AtomicFlag::new();
     let chain = FailoverChain::new(&ranked, max_attempts, &flag);
+    let chain = chain.with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
     let upstream = state.upstream.clone();
     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
     let upstream_req = Arc::new(ChatRequest {
@@ -972,7 +1048,7 @@ async fn dispatch_remote_compaction(
     let started = Instant::now();
     let mut attempt_records = Vec::new();
     let outcome = chain
-        .run(
+        .run_with_auth_policy(
             &mut attempt_records,
             |provider, model| {
                 let upstream = upstream.clone();
@@ -996,6 +1072,7 @@ async fn dispatch_remote_compaction(
                 }
                 state.health.record_failure(&provider.id, model, error);
             },
+            auth_confirm_handler(state.clone(), cfg.clone()),
         )
         .await;
 
@@ -2765,6 +2842,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         1
     };
     let chain = FailoverChain::new(&ranked, max_attempts, &flag);
+    let chain = chain.with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
 
     let upstream = state.upstream.clone();
     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
@@ -2775,7 +2853,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
     let mut attempt_records = Vec::new();
     let outcome = chain
-        .run(
+        .run_with_auth_policy(
             &mut attempt_records,
             |provider, model| {
                 let up = upstream.clone();
@@ -2792,6 +2870,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 }
                 health.record_failure(&provider.id, model, err);
             },
+            auth_confirm_handler(state.clone(), cfg.clone()),
         )
         .await;
 

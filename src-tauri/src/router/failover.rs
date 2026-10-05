@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use crate::config::AuthFailureMode;
 use crate::domain::{Provider, ProviderHealth};
 use crate::error::{GatewayError, Result};
 use crate::router::score::Candidate;
@@ -80,6 +81,30 @@ impl AttemptRecord {
             retryable: false,
         }
     }
+
+    /// 复测**成功**的记录。必须有标记：否则审计里只剩「一次失败 + 一次成功」，
+    /// 看不出这次成功是复测得来的——而这正是「不凭一次失败就判死」的全部证据。
+    pub fn confirm_success(provider: &Provider, model: &str, latency_ms: u64) -> Self {
+        let mut record = Self::success(provider, model, latency_ms);
+        record.reason = Some("确认复测：本次成功，此前那次鉴权失败判定为暂态".into());
+        record
+    }
+
+    /// 复测记录。`reason` 带 `确认复测：` 前缀——排查时必须一眼看出
+    /// 「这次失败是判定前的复测」，否则会误以为是两次独立的业务失败。
+    pub fn confirm_failure(
+        provider: &Provider,
+        model: &str,
+        error: &GatewayError,
+        latency_ms: u64,
+    ) -> Self {
+        let mut record = Self::failure(provider, model, error, latency_ms);
+        record.reason = Some(format!(
+            "确认复测：{}",
+            record.reason.unwrap_or_else(|| "unknown".into())
+        ));
+        record
+    }
 }
 
 /// 记录原因时保留归类前缀，便于 UI 同时展示「哪一类」与「具体是什么」。
@@ -101,6 +126,10 @@ pub struct FailoverChain<'a> {
     max_attempts: usize,
     /// 是否已经吐出过字节（流式）。一旦为 true，后续失败不再换家。
     stream_started: &'a AtomicFlag,
+    /// 上游鉴权失败的处理策略。默认 `Strict`，即本文件引入该字段之前的行为。
+    auth_mode: AuthFailureMode,
+    /// 判定「真实不可用」之前的独立复测次数。
+    auth_confirm_retries: u32,
 }
 
 /// 轻量标志位：流式写出前向代理层汇报
@@ -134,7 +163,16 @@ impl<'a> FailoverChain<'a> {
             candidates,
             max_attempts,
             stream_started,
+            auth_mode: AuthFailureMode::Strict,
+            auth_confirm_retries: 0,
         }
+    }
+
+    /// 套用鉴权失败策略。**不改这里的调用方保持旧行为**，因为默认档位是 `Strict`。
+    pub fn with_auth_policy(mut self, mode: AuthFailureMode, confirm_retries: u32) -> Self {
+        self.auth_mode = mode;
+        self.auth_confirm_retries = confirm_retries.min(3);
+        self
     }
 
     /// 逐个候选尝试。`f` 拿到 (provider, model)，返回业务结果。
@@ -144,13 +182,33 @@ impl<'a> FailoverChain<'a> {
     pub async fn run<T, F, Fut, E>(
         &self,
         records: &mut Vec<AttemptRecord>,
-        mut f: F,
-        mut on_failure: E,
+        f: F,
+        on_failure: E,
     ) -> Result<AttemptOutcome<T>>
     where
         F: FnMut(Provider, String) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
         E: FnMut(&Provider, &str, &GatewayError),
+    {
+        // 默认策略是 `Strict`，因此这里等价于改动前的行为；既有调用方无需改动。
+        self.run_with_auth_policy(records, f, on_failure, |_provider, _error| {})
+            .await
+    }
+
+    /// 同 [`Self::run`]，但额外拿到「鉴权失败已复测确认」这个时机，
+    /// 让上层按策略把该供应商自动停用。
+    pub async fn run_with_auth_policy<T, F, Fut, E, C>(
+        &self,
+        records: &mut Vec<AttemptRecord>,
+        mut f: F,
+        mut on_failure: E,
+        mut on_auth_confirmed: C,
+    ) -> Result<AttemptOutcome<T>>
+    where
+        F: FnMut(Provider, String) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+        E: FnMut(&Provider, &str, &GatewayError),
+        C: FnMut(&Provider, &GatewayError),
     {
         if self.candidates.is_empty() {
             return Err(GatewayError::ModelNotFound(
@@ -161,8 +219,20 @@ impl<'a> FailoverChain<'a> {
         let limit = self.max_attempts.min(self.candidates.len());
         let mut attempts = 0usize;
         let mut last_err: Option<GatewayError> = None;
+        // 一旦发生过鉴权失败，后续候选**不得落到免 Key 后端**（本地 Ollama、
+        // 无鉴权的自建服务）。硬约束「401 不回落」：不能因为上游拒了 Key 就
+        // 悄悄换一家不需要凭据的服务——那既可能泄露上下文，也让错误更难追。
+        let mut no_keyless_fallback = false;
 
         for c in self.candidates.iter().take(limit) {
+            if no_keyless_fallback && c.provider.api_key_enc.trim().is_empty() {
+                tracing::warn!(
+                    "鉴权失败后跳过免 Key 后端 [{} / {}]",
+                    c.provider.name,
+                    c.model.upstream
+                );
+                continue;
+            }
             attempts += 1;
             let started = Instant::now();
 
@@ -204,7 +274,40 @@ impl<'a> FailoverChain<'a> {
                         return Err(e);
                     }
                     if !e.retryable() {
-                        return Err(e);
+                        // 上游鉴权失败：先确认「真实不可用」，再决定要不要放弃这家。
+                        // 旧行为（Strict）是一次 401/403 立刻终止整条链，
+                        // 于是一家中转站被拒就能让「自动分流」整体失败。
+                        if !is_fatal_auth(&e) || self.auth_mode == AuthFailureMode::Strict {
+                            return Err(e);
+                        }
+                        match self
+                            .confirm_auth_failure(c, &mut f, records, &mut attempts)
+                            .await
+                        {
+                            ConfirmOutcome::Recovered(v) => {
+                                let latency_ms = started.elapsed().as_millis() as u64;
+                                return Ok(AttemptOutcome {
+                                    value: v,
+                                    provider_id: c.provider.id.clone(),
+                                    model: c.model.upstream.clone(),
+                                    attempts,
+                                    latency_ms,
+                                });
+                            }
+                            ConfirmOutcome::StillRefused => {
+                                // 已确认不可用：调用方的 on_failure 按策略自动停用
+                                // 这家供应商，这里换下一家继续。
+                                // 已确认不可用：上层按策略把这家供应商自动停用，这里换下一家继续。
+                                no_keyless_fallback = true;
+                                on_auth_confirmed(&c.provider, &e);
+                                last_err = Some(e);
+                                continue;
+                            }
+                            ConfirmOutcome::Undecidable(seen) => {
+                                last_err = Some(seen.unwrap_or(e));
+                                continue;
+                            }
+                        }
                     }
                     last_err = Some(e);
                 }
@@ -213,6 +316,66 @@ impl<'a> FailoverChain<'a> {
 
         Err(last_err.unwrap_or(GatewayError::AllProvidersFailed { attempts }))
     }
+
+    /// 鉴权失败的确认复测。
+    ///
+    /// 为什么要有这一步：中转站的 401 未必等于「Key 永久失效」——可能是某个
+    /// 路径被风控、或瞬时拒流。不复测就判死，会把**仍然可用**的供应商踢出路由；
+    /// 而复测通过时直接把它当成功结果用，等于承认「这次能用」。
+    ///
+    /// 复测复用同一个闭包 `f`，因此发的是**同一个请求**，不是另造探针：
+    /// 探针成功只能证明「探针能过」，证明不了「这个请求能过」。
+    async fn confirm_auth_failure<T, F, Fut>(
+        &self,
+        c: &Candidate,
+        f: &mut F,
+        records: &mut Vec<AttemptRecord>,
+        attempts: &mut usize,
+    ) -> ConfirmOutcome<T>
+    where
+        F: FnMut(Provider, String) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        for _ in 0..self.auth_confirm_retries {
+            if *attempts >= self.max_attempts {
+                return ConfirmOutcome::Undecidable(None);
+            }
+            *attempts += 1;
+            let started = Instant::now();
+            match f(c.provider.clone(), c.model.upstream.clone()).await {
+                Ok(v) => {
+                    records.push(AttemptRecord::confirm_success(
+                        &c.provider,
+                        &c.model.upstream,
+                        started.elapsed().as_millis() as u64,
+                    ));
+                    return ConfirmOutcome::Recovered(v);
+                }
+                Err(e) => {
+                    let fatal = is_fatal_auth(&e);
+                    records.push(AttemptRecord::confirm_failure(
+                        &c.provider,
+                        &c.model.upstream,
+                        &e,
+                        started.elapsed().as_millis() as u64,
+                    ));
+                    if !fatal {
+                        return ConfirmOutcome::Undecidable(Some(e));
+                    }
+                }
+            }
+        }
+        ConfirmOutcome::StillRefused
+    }
+}
+
+enum ConfirmOutcome<T> {
+    /// 复测通过：这家的模型其实能用，直接用它。
+    Recovered(T),
+    /// 复测仍然被拒：已确认真实不可用（原始错误由调用方保留）。
+    StillRefused,
+    /// 复测给出的是另一种错误（限流等），不足以判定凭据失效。
+    Undecidable(Option<GatewayError>),
 }
 
 /// 把一次失败归类成人类可读的原因，写进请求日志的 error 字段

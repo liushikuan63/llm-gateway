@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use llm_gateway_lib::config::AppConfig;
+use llm_gateway_lib::config::{AppConfig, AuthFailureMode};
 use llm_gateway_lib::db::{self, repo};
 use llm_gateway_lib::domain::{Dialect, ModelRef, Provider};
 use llm_gateway_lib::proxy::server::{serve, GatewayState};
@@ -47,6 +47,7 @@ fn provider(id: &str, base_url: String, dialect: Dialect, priority: i32) -> Prov
         enabled: true,
         priority,
         models: vec![ModelRef {
+            enabled: true,
             alias: "integration-model".into(),
             upstream: "integration-model".into(),
             context_window: 16_384,
@@ -311,16 +312,40 @@ async fn wait_for_gateway(base_url: &str) {
     panic!("gateway did not start in time");
 }
 
+/// 给测试供应商补一把 Key。
+///
+/// **为什么必须补**：鉴权失败策略里有一条硬约束——上游拒了凭据之后不得回落到
+/// **免 Key** 后端（本地 Ollama 那类）。夹具若不带 Key，备选会被这条约束正确地
+/// 跳过，于是测试测到的不是「换下一家」而是「没有下一家」。真实云供应商必然带 Key，
+/// 夹具必须对齐真实形状。
+fn keyed(mut provider: Provider) -> Provider {
+    // 必须是**真的**密文：转发前会 `crypto::decrypt`，塞明文串会得到 500，
+    // 症状看着像服务端炸了，实际是夹具形状不对（`tests/live_provider_smoke.rs` 同款做法）。
+    provider.api_key_enc =
+        llm_gateway_lib::crypto::encrypt("test-key").expect("测试应能用真加密格式的 Key");
+    provider
+}
+
 async fn spawn_gateway(providers: Vec<Provider>) -> (db::Db, AppConfig, JoinHandle<()>, String) {
+    spawn_gateway_with(providers, |_| {}).await
+}
+
+/// 带配置改写的网关实例。鉴权失败策略这类「同一套代码、不同档位」的行为
+/// 必须各自钉住，否则改了一档就会悄悄带走另一档。
+async fn spawn_gateway_with(
+    providers: Vec<Provider>,
+    tune: impl FnOnce(&mut AppConfig),
+) -> (db::Db, AppConfig, JoinHandle<()>, String) {
     let db = db::Db::connect_in_memory().await.unwrap();
     for provider in providers {
         repo::upsert_provider(db.pool(), &provider).await.unwrap();
     }
-    let config = AppConfig {
+    let mut config = AppConfig {
         port: unused_loopback_port().await,
         unified_key: "e2e-gateway-key".into(),
         ..Default::default()
     };
+    tune(&mut config);
     let gateway = Arc::new(GatewayState::new(db.clone(), config.clone()));
     gateway.reload_providers().await.unwrap();
     let task = tokio::spawn({
@@ -541,15 +566,19 @@ async fn malformed_successful_upstreams_are_retryable_and_fall_back_at_gateway_b
     }
 }
 
+/// 鉴权失败的新契约（用户 2026-10-05 定）：先复测确认，确认不可用才换下一家。
+///
+/// 旧契约是「一次 401 就原样返回、不碰备选」——它对应的是 `strict` 档，
+/// 由下一条测试继续钉住。两条都在，档位之间的差异才是真的被守住。
 #[tokio::test]
-async fn upstream_auth_failure_is_returned_without_trying_the_backup() {
+async fn upstream_auth_failure_is_confirmed_then_falls_back_to_the_backup() {
     let (bad_url, bad_state, bad_task) =
         spawn_openai_upstream(OpenAiBehavior::Status(StatusCode::UNAUTHORIZED)).await;
     let (good_url, good_state, good_task) =
-        spawn_openai_upstream(OpenAiBehavior::Complete("must not be used")).await;
+        spawn_openai_upstream(OpenAiBehavior::Complete("backup reply")).await;
     let (_db, config, gateway_task, base_url) = spawn_gateway(vec![
-        provider("invalid-key", bad_url, Dialect::OpenAI, 1),
-        provider("backup", good_url, Dialect::OpenAI, 2),
+        keyed(provider("invalid-key", bad_url, Dialect::OpenAI, 1)),
+        keyed(provider("backup", good_url, Dialect::OpenAI, 2)),
     ])
     .await;
 
@@ -560,8 +589,53 @@ async fn upstream_auth_failure_is_returned_without_trying_the_backup() {
         .send()
         .await
         .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-routed-via"],
+        "backup/integration-model"
+    );
+    assert_eq!(
+        bad_state.hits.load(Ordering::SeqCst),
+        2,
+        "首次 + 一次确认复测"
+    );
+    assert_eq!(good_state.hits.load(Ordering::SeqCst), 1);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "backup reply");
+
+    gateway_task.abort();
+    bad_task.abort();
+    good_task.abort();
+}
+
+/// 对照组：`strict` 档保持旧行为——一次 401 立刻原样返回，备选一次都不碰。
+///
+/// 没有这条，「新契约通过」可能只是因为 `strict` 早已没人走。
+#[tokio::test]
+async fn strict_mode_keeps_returning_the_auth_error_without_touching_the_backup() {
+    let (bad_url, bad_state, bad_task) =
+        spawn_openai_upstream(OpenAiBehavior::Status(StatusCode::UNAUTHORIZED)).await;
+    let (good_url, good_state, good_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("must not be used")).await;
+    let (_db, config, gateway_task, base_url) = spawn_gateway_with(
+        vec![
+            keyed(provider("invalid-key", bad_url, Dialect::OpenAI, 1)),
+            keyed(provider("backup", good_url, Dialect::OpenAI, 2)),
+        ],
+        |cfg| cfg.auth_failure.mode = AuthFailureMode::Strict,
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&config.unified_key)
+        .json(&openai_body("integration-model"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(bad_state.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(bad_state.hits.load(Ordering::SeqCst), 1, "strict 不复测");
     assert_eq!(good_state.hits.load(Ordering::SeqCst), 0);
 
     gateway_task.abort();

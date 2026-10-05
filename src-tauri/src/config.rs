@@ -399,6 +399,98 @@ pub struct AppConfig {
     pub search: SearchConfig,
     /// 注入给 Ollama 上游的专属旋钮。客户端协议表达不了，必须网关侧给。
     pub ollama_options: OllamaOptionsConfig,
+    /// 上游鉴权失败（401/403）时的处理策略
+    pub auth_failure: AuthFailureConfig,
+}
+
+/// 上游鉴权失败的处理档位。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthFailureMode {
+    /// 维持旧行为：一次 401/403 立刻终止整条候选链，错误原样返回客户端。
+    Strict,
+    /// 跳过该候选继续试下一家，不改任何配置。
+    Skip,
+    /// 确认不可用后跳过该候选，并把这家供应商自动停用。
+    ///
+    /// 默认档位。理由（2026-10-05 实测）：中转站对「Key 被拒」「余额不足」
+    /// 返回的是 401/403，网关把它当不可重试 → 整条链当场终止，
+    /// 于是**一家坏供应商就能让「自动分流」整体失败**，而客户端看到的报错是
+    /// 「API 密钥无效」，指向自己而不是真正原因。
+    SkipAndDisable,
+}
+
+impl Default for AuthFailureMode {
+    fn default() -> Self {
+        AuthFailureMode::SkipAndDisable
+    }
+}
+
+impl AuthFailureMode {
+    pub fn code(self) -> &'static str {
+        match self {
+            AuthFailureMode::Strict => "strict",
+            AuthFailureMode::Skip => "skip",
+            AuthFailureMode::SkipAndDisable => "skip_and_disable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "strict" => Some(AuthFailureMode::Strict),
+            "skip" => Some(AuthFailureMode::Skip),
+            "skip_and_disable" => Some(AuthFailureMode::SkipAndDisable),
+            _ => None,
+        }
+    }
+}
+
+/// 上游鉴权失败策略的可调项。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AuthFailureConfig {
+    pub mode: AuthFailureMode,
+    /// 判定「真实不可用」之前的独立复测次数。
+    ///
+    /// 默认 1：**不凭一次失败就判死**。实测里确有「显示上游有问题、实际能调」的
+    /// 情况（401 可能来自某个特定路径或瞬时风控），复测一次通过就继续用它。
+    /// 设 0 表示不复测，等价于「第一次失败即确认」。
+    pub confirm_retries: u32,
+    /// 豁免名单：这些供应商 id 永不被自动停用（用户已明确选定的那些）。
+    pub exempt_providers: Vec<String>,
+}
+
+impl Default for AuthFailureConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthFailureMode::default(),
+            confirm_retries: 1,
+            exempt_providers: Vec::new(),
+        }
+    }
+}
+
+impl AuthFailureConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.confirm_retries > 3 {
+            anyhow::bail!(
+                "鉴权失败复测次数最多 3 次，当前 {} 次会把延迟放大到不可接受",
+                self.confirm_retries
+            );
+        }
+        Ok(())
+    }
+
+    /// 该供应商是否被用户显式选定、因而免于自动停用。
+    ///
+    /// 「主用供应商」是用户在界面上按下的那个开关，自动停用它等于替用户改主意；
+    /// 豁免名单则是把这条规则显式写进配置，两者都必须真的生效。
+    pub fn is_exempt(&self, provider_id: &str, active_provider: Option<&str>) -> bool {
+        self.exempt_providers
+            .iter()
+            .any(|id| id.trim() == provider_id)
+            || active_provider == Some(provider_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -475,6 +567,7 @@ impl Default for AppConfig {
             smart_routing: SmartRoutingConfig::default(),
             search: SearchConfig::default(),
             ollama_options: OllamaOptionsConfig::default(),
+            auth_failure: AuthFailureConfig::default(),
         }
     }
 }
@@ -673,6 +766,7 @@ impl AppConfig {
         {
             anyhow::bail!("选择 SearXNG 后端时必须填写实例地址");
         }
+        self.auth_failure.validate()?;
         Ok(())
     }
 
