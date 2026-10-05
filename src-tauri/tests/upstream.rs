@@ -634,6 +634,59 @@ async fn quota_exhausted_falls_back_but_unauthorized_does_not() {
     server.abort();
 }
 
+// ─── 上游 404「我这儿没这个模型」必须回退，普通 400 不得回退 ────────────────
+//
+// 2026-10-05 实测：`openrouter/stealth/space-bunny-alpha` 回
+// 404 `No endpoints found for stealth/space-bunny-alpha`，被判 retryable=false，
+// `fallback_attempts=0` —— 候选链上 `commandcode` 的**同名模型一次都没被试**。
+//
+// 候选链是按**别名**跨供应商组装的，所以「这家没有」恰恰是换一家最典型的理由。
+// 对照组用普通 400：证明放宽的是 404 这一种语义，而不是把所有 4xx 一起放开。
+
+async fn model_gone_response() -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"error":{"message":"No endpoints found for stealth/space-bunny-alpha.","code":404}}"#,
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stale_model_404_falls_back_but_plain_400_does_not() {
+    let app = Router::new()
+        .route("/gone/chat/completions", post(model_gone_response))
+        .route(
+            "/plain400/chat/completions",
+            post(plain_bad_request_response),
+        );
+    let (base_url, server) = spawn_axum(app).await;
+    let client = UpstreamClient::new();
+
+    // ① 上游 404 —— 另一家可能还有同名模型，必须可重试。
+    let gone = local_provider(Dialect::OpenAI, format!("{base_url}/gone"));
+    let error = stream_error(&client, &gone, "404 必须报错").await;
+    assert!(
+        error.retryable(),
+        "上游 404 必须回退到链上另一家的同名模型：{error:?}"
+    );
+    match &error {
+        GatewayError::Upstream { status, .. } => assert_eq!(*status, 404),
+        other => panic!("期望保留 Upstream{{404}}，实际 {other:?}"),
+    }
+
+    // ② 对照组：普通 400 仍是客户端错，不得回退（防止「所有 4xx 都放开」）。
+    let plain = local_provider(Dialect::OpenAI, format!("{base_url}/plain400"));
+    let error = stream_error(&client, &plain, "400 必须报错").await;
+    assert!(
+        !error.retryable(),
+        "普通 400 被放宽会让坏请求被静默重试到整条链：{error:?}"
+    );
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn upstream_redirects_are_not_followed() {
     let hits = Arc::new(AtomicUsize::new(0));

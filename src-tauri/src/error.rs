@@ -48,13 +48,25 @@ impl GatewayError {
     pub fn retryable(&self) -> bool {
         match self {
             GatewayError::Upstream { status, .. } => {
+                // 这个列表筛的是「换一家**还有没有戏**」，不是「错误严不严重」。
+                //
+                // 404 是**上游说它这儿没有这个模型**（OpenRouter: "No endpoints
+                // found for X"；sensenova: "model is not found"），不是「请求写错
+                // 了」。候选链是**按别名**跨供应商组装的，同名模型常常另一家还有，
+                // 判不可重试会让整条链在第一家就死掉 —— 而且失败原因看起来像
+                // 模型不存在，指向完全错误的方向。
+                // 2026-10-05 实测：openrouter/stealth/space-bunny-alpha 回 404 →
+                // retryable=false → fallback_attempts=0，链上 commandcode 的
+                // **同名模型一次都没被试**。
+                // 注意与 `GatewayError::ModelNotFound` 区分：那个是「本地登记里
+                // 就没有这个模型」，失败在组装候选链之前，与这里无关。
+                //
                 // 402 是**额度/计费**耗尽，不是凭据错。Key 本身还有效（401/403
-                // 才是），只是这个池子没钱了 —— 换一家 provider 完全还有戏，
-                // 判不可重试会让整条候选链在第一家就死掉。
-                // 2026-10-05 实测：agentrouter 返回 402 "Budget pool quota has
-                // been exhausted" 后 `retryable=false`，请求没有回退到链上的
-                // sensenova / openrouter。
+                // 才是），只是这个池子没钱了 —— 换一家 provider 完全还有戏。
+                // 实测：agentrouter 返回 402 "Budget pool quota has been
+                // exhausted" 后曾判不可重试，请求没有回退到 sensenova / openrouter。
                 *status == 402
+                    || *status == 404
                     || *status == 408
                     || *status == 409
                     || *status == 429
