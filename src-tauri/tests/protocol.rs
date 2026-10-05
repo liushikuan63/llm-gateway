@@ -516,3 +516,87 @@ fn anthropic_outbound_merges_consecutive_tool_results_into_one_user_message() {
     assert_eq!(messages[2]["content"][0]["tool_use_id"], json!("call_a"));
     assert_eq!(messages[2]["content"][1]["tool_use_id"], json!("call_b"));
 }
+
+#[test]
+fn ollama_options_里的_num_ctx_必须透传() {
+    // 真 bug（2026-10-05）：客户端给 options.num_ctx 会被丢弃，
+    // Ollama 退回默认 4096 —— prompt 与输出共用这 4096，推理模型的 thinking
+    // 把预算吃光后正文长度为 0、`done_reason: length`，界面上表现为
+    // 「已达到输出 token 上限」。而此时 max_tokens 传得再大也没用，
+    // 因为瓶颈是 num_ctx 不是 num_predict。
+    let body = serde_json::json!({
+        "model": "qwen3.8:27b-q4_K_M",
+        "messages": [{"role": "user", "content": "hi"}],
+        "options": {"num_ctx": 32768, "num_thread": 8},
+    });
+    let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body)
+        .expect("应能解析");
+    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "qwen3.8:27b-q4_K_M");
+    let opts = out.get("options").expect("options 必须存在");
+    assert_eq!(
+        opts.get("num_ctx").and_then(|v| v.as_u64()),
+        Some(32768),
+        "num_ctx 必须原样透传，实际 options={}",
+        opts
+    );
+    assert_eq!(opts.get("num_thread").and_then(|v| v.as_u64()), Some(8));
+}
+
+#[test]
+fn ollama_options_不得覆盖显式的_max_tokens() {
+    // 显式 max_tokens 是 IR 正式字段，优先级必须高于 options.num_predict，
+    // 否则两处打架时行为不可预测。
+    let mut body = serde_json::json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 2048,
+    });
+    body["options"] = serde_json::json!({"num_predict": 999, "num_ctx": 16384});
+    let req = llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body).expect("解析");
+    let out = llm_gateway_lib::protocol::ollama::to_ollama_body(&req, "m");
+    let opts = out.get("options").expect("options");
+    assert_eq!(opts.get("num_predict").and_then(|v| v.as_u64()), Some(2048), "max_tokens 应覆盖 num_predict");
+    assert_eq!(opts.get("num_ctx").and_then(|v| v.as_u64()), Some(16384), "其余键仍要透传");
+}
+
+#[test]
+fn ollama_缓存命中数必须透出() {
+    // Ollama 的 prompt_eval_cached_count 之前被 `..Default::default()` 吞掉，
+    // 导致 usage 里缓存命中恒为 0。本地模型的多轮对话全靠 prompt 缓存提速，
+    // 命中率掉到 0 意味着每轮重算全部历史 —— 而 usage 里看不出原因。
+    let resp = serde_json::json!({
+        "model": "m",
+        "message": {"role": "assistant", "content": "ok"},
+        "done": true,
+        "prompt_eval_count": 1200,
+        "prompt_eval_cached_count": 900,
+        "eval_count": 50,
+    });
+    let out = llm_gateway_lib::protocol::ollama::from_ollama_response(&resp);
+    let u = out.usage.expect("必须有 usage");
+    assert_eq!(u.prompt_tokens, 1200);
+    assert_eq!(u.cache_read_tokens, 900, "缓存命中数必须透出");
+    assert_eq!(u.completion_tokens, 50);
+    // 口径：cache_read 是**已包含在** prompt_tokens 里的部分，
+    // 所以 total 不能把它再加一次。
+    assert_eq!(u.total_tokens, 1250);
+    assert!(
+        u.cache_read_tokens <= u.prompt_tokens,
+        "cache_read 不得大于 prompt_tokens，否则 total 会被重复计算"
+    );
+}
+
+#[test]
+fn ollama_没有缓存字段时不得凭空造数() {
+    let resp = serde_json::json!({
+        "model": "m",
+        "message": {"role": "assistant", "content": "ok"},
+        "prompt_eval_count": 100,
+        "eval_count": 10,
+    });
+    let u = llm_gateway_lib::protocol::ollama::from_ollama_response(&resp)
+        .usage
+        .expect("usage");
+    assert_eq!(u.cache_read_tokens, 0, "字段缺失时必须是 0 而不是别的数");
+    assert_eq!(u.total_tokens, 110);
+}

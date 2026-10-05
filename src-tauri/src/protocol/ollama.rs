@@ -30,10 +30,16 @@ pub fn ollama_request_to_internal(body: &serde_json::Value) -> Result<ChatReques
         body.get("top_p")
             .or_else(|| options.and_then(|options| options.get("top_p"))),
     );
+    // `max_tokens`（IR 正式字段）优先于 `options.num_predict`（Ollama 侧旋钮）。
+    //
+    // 顺序反了的后果很隐蔽：客户端同时给两者时，取到 num_predict 的值，
+    // 出站时又按 IR 优先写回 num_predict，于是「显式 max_tokens 被静默忽略」。
+    // 交叉测试见 `ollama_options_不得覆盖显式的_max_tokens`。
     copy_option(
         &mut openai,
         "max_tokens",
-        body.get("num_predict")
+        body.get("max_tokens")
+            .or_else(|| body.get("num_predict"))
             .or_else(|| options.and_then(|options| options.get("num_predict"))),
     );
     copy_option(
@@ -44,6 +50,12 @@ pub fn ollama_request_to_internal(body: &serde_json::Value) -> Result<ChatReques
     );
     copy_option(&mut openai, "tools", body.get("tools"));
     copy_option(&mut openai, "tool_choice", body.get("tool_choice"));
+
+    // 保留客户端给的 `options`：里面是 num_ctx / num_thread / seed 这些
+    // 没有对应 IR 字段的 Ollama 专属旋钮。丢掉它们的表现是「截断但无报错」。
+    if let Some(options) = body.get("options").and_then(|v| v.as_object()) {
+        openai["options"] = serde_json::Value::Object(options.clone());
+    }
 
     let request: crate::protocol::openai::OaChatRequest = serde_json::from_value(openai)
         .map_err(|error| GatewayError::Protocol(format!("Ollama 请求体解析失败: {error}")))?;
@@ -100,6 +112,26 @@ pub fn to_ollama_body(req: &ChatRequest, model: &str) -> serde_json::Value {
             options.insert("stop".into(), json!(stop));
         }
     }
+    // 透传客户端显式给的 `options`（num_ctx / num_thread / seed …）。
+    //
+    // **漏掉 num_ctx 会表现为「回答到一半被截断」，而且完全看不出原因**：
+    // Ollama 的 `num_ctx` 默认只有 4096，prompt 与输出**共用**这 4096。
+    // 推理模型（thinking）会把预算吃掉大半 —— 实测 qwen3.8:27b 思考用了
+    // 4064 token，正文只剩 0 字符，`done_reason: length`。
+    // 而客户端传 `max_tokens: 65536` 完全无效，因为瓶颈是 num_ctx 不是
+    // num_predict：直连 Ollama 带 `num_ctx: 8192` 时能正常输出 12309 字符。
+    //
+    // 放在显式字段**之后** merge：`max_tokens` 是 IR 的正式字段，
+    // 应当覆盖 options 里的同名项，否则会出现两处打架。
+    if let Some(extra) = req.extra.get("options").and_then(|v| v.as_object()) {
+        for (key, value) in extra {
+            if key == "num_predict" && req.max_tokens.is_some() {
+                continue;
+            }
+            options.insert(key.clone(), value.clone());
+        }
+    }
+
     if !options.is_empty() {
         body["options"] = serde_json::Value::Object(options);
     }
@@ -246,6 +278,16 @@ fn usage_from_ollama(value: &serde_json::Value) -> Usage {
         prompt_tokens,
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
-        ..Default::default()
+        // Ollama 的 `prompt_eval_cached_count` 是**已包含在** `prompt_eval_count`
+        // 里的命中部分（与 Anthropic / OpenAI 的 cached_tokens 口径一致）。
+        //
+        // 不填的表现不是「少个数字」，而是**缓存命中率恒为 0**：
+        // 本地模型的多轮对话全靠 prompt 缓存提速，命中率掉到 0 意味着
+        // 每轮都要重算全部历史，耗时成倍上升，而 usage 里看不出原因。
+        cache_read_tokens: value
+            .get("prompt_eval_cached_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        cache_creation_tokens: 0,
     }
 }

@@ -210,6 +210,51 @@ impl Default for PromptRefineConfig {
     }
 }
 
+/// Ollama 专属旋钮。**客户端协议表达不了这些**，所以由网关按配置注入。
+///
+/// 为什么必须在网关侧：`num_ctx` 是 Ollama 的 KV cache 窗口，不是任何
+/// 客户端协议里的字段。`/v1/messages`（Claude Code）与 `/v1/responses`
+/// （Codex CLI）根本没有地方放它 —— 实测两个入口的正文输出分别是
+/// 3787 与 **0 字符**，而同一个模型走 `/v1/chat/completions` 正常输出
+/// 7614 字符。客户端侧再怎么改都发不出这个参数。
+///
+/// 注意这与 `Dialect` 无关：`Dialect` 决定「请求转成什么格式发给上游」，
+/// 而这里是「发给上游后额外带哪些 Ollama 旋钮」。两者正交。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OllamaOptionsConfig {
+    /// 注入 `options.num_ctx`。0 表示不注入（沿用 Ollama 默认 4096）。
+    ///
+    /// **漏掉它的症状是「回答到一半被截断，且看不出原因」**：Ollama 的
+    /// prompt 与输出**共用** `num_ctx`（默认 4096），推理模型的 thinking
+    /// 会把预算吃掉大半 —— 实测 qwen3.8:27b 思考用了 4064 token，
+    /// 正文剩 0 字符，`done_reason: length`。
+    ///
+    /// 代价：Ollama 按这个值预留 KV cache 内存，且值越大 prefill 越慢。
+    pub default_num_ctx: u32,
+    /// 注入 `options.num_predict`。0 表示不注入，由客户端的
+    /// `max_tokens` / `max_output_tokens` 决定。
+    pub default_num_predict: u32,
+    /// 推理模型的 thinking 预算，写进 `options.num_think`（Ollama 0.35+）。
+    /// 0 表示交给 Ollama 自己决定。
+    ///
+    /// 显式设它的意义是**给正文留出确定的空间**：thinking 吃光预算、
+    /// 正文输出 0 的现象，根因就是两者共用同一个池子。
+    pub num_think: u32,
+}
+
+impl Default for OllamaOptionsConfig {
+    fn default() -> Self {
+        Self {
+            // 32768：本地 12B/27B 在 25 GB 内存机上既能跑长任务，
+            // 又不至于让 prefill 慢到不可用。
+            default_num_ctx: 32768,
+            default_num_predict: 0,
+            num_think: 8192,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SmartRoutingConfig {
@@ -357,6 +402,8 @@ pub struct AppConfig {
     pub smart_routing: SmartRoutingConfig,
     /// 网关内置联网搜索（不含密钥）
     pub search: SearchConfig,
+    /// 注入给 Ollama 上游的专属旋钮。客户端协议表达不了，必须网关侧给。
+    pub ollama_options: OllamaOptionsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -433,6 +480,7 @@ impl Default for AppConfig {
             local_models: LocalModelConfig::default(),
             smart_routing: SmartRoutingConfig::default(),
             search: SearchConfig::default(),
+        ollama_options: OllamaOptionsConfig::default(),
         }
     }
 }
