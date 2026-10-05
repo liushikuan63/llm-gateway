@@ -1,0 +1,1145 @@
+{
+  "cases": [
+    {
+      "candidates": [],
+      "custom_rules": [],
+      "expected_order": [],
+      "intent": null,
+      "name": "空候选集",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 500,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "only",
+          "intelligence": 80,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "only"
+      ],
+      "intent": null,
+      "name": "只有一个候选",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 500,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "twin-a",
+          "intelligence": 80,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 500,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "twin-b",
+          "intelligence": 80,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 500,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "twin-c",
+          "intelligence": 80,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "twin-a",
+        "twin-b",
+        "twin-c"
+      ],
+      "intent": null,
+      "name": "两个完全相同的候选_钉住并列时的顺序",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 100,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "低优先级-快",
+          "intelligence": 90,
+          "priority": 90,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 5000,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "高优先级-慢",
+          "intelligence": 20,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "高优先级-慢",
+        "低优先级-快"
+      ],
+      "intent": null,
+      "name": "priority档_纯手工排序",
+      "requested_model": "auto",
+      "strategy": "priority"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 800,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "均衡",
+          "intelligence": 60,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 0.949999988079071,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 2500,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "偏能力",
+          "intelligence": 95,
+          "priority": 40,
+          "rpm_limit": 0,
+          "success_rate": 0.8999999761581421,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 200,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "偏速度",
+          "intelligence": 30,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.9900000095367432,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "偏能力",
+        "均衡",
+        "偏速度"
+      ],
+      "intent": null,
+      "name": "balanced档_综合",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 150,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "快但弱",
+          "intelligence": 20,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 4000,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "慢但强",
+          "intelligence": 98,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.800000011920929,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 900,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "中等",
+          "intelligence": 55,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 0.949999988079071,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "慢但强",
+        "中等",
+        "快但弱"
+      ],
+      "intent": null,
+      "name": "smartest档_能力主导",
+      "requested_model": "auto",
+      "strategy": "smartest"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 6000,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "慢",
+          "intelligence": 95,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 1500,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "中",
+          "intelligence": 55,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 100,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "快",
+          "intelligence": 20,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "中",
+        "快",
+        "慢"
+      ],
+      "intent": null,
+      "name": "fastest档_延迟主导",
+      "requested_model": "auto",
+      "strategy": "fastest"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 5000,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "稳定但慢",
+          "intelligence": 30,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 200,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Error",
+          "id": "不稳但快",
+          "intelligence": 90,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.20000000298023224,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 900,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "次稳",
+          "intelligence": 60,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 0.6000000238418579,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "稳定但慢",
+        "次稳"
+      ],
+      "intent": null,
+      "name": "reliable档_健康主导",
+      "requested_model": "auto",
+      "strategy": "reliable"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 500,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "普通",
+          "intelligence": 50,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 3000,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "指定-model",
+          "intelligence": 10,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [
+        {
+          "action": "BoostProvider { provider_id: \"指定-model\", bonus: 1000 }",
+          "pattern": "指定-"
+        }
+      ],
+      "expected_order": [
+        "指定-model",
+        "普通"
+      ],
+      "intent": null,
+      "name": "custom档_boost规则把指定供应商提到队首",
+      "requested_model": "指定-xxx",
+      "strategy": "custom"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 150,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "快但弱",
+          "intelligence": 20,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 3000,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "慢但强",
+          "intelligence": 95,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.800000011920929,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "慢但强",
+        "快但弱"
+      ],
+      "intent": null,
+      "name": "custom档_无规则时退化为balanced",
+      "requested_model": "auto",
+      "strategy": "custom"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 900,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "会思考",
+          "intelligence": 60,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 900,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "不会思考",
+          "intelligence": 60,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "会思考",
+        "不会思考"
+      ],
+      "intent": "reasoning",
+      "name": "smart档_总开关关着时退化为balanced",
+      "requested_model": "auto",
+      "strategy": "smart"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "健康",
+          "intelligence": 40,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 100,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "RateLimited",
+          "id": "半开",
+          "intelligence": 95,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.6000000238418579,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 50,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Error",
+          "id": "故障",
+          "intelligence": 99,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 0.10000000149011612,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "健康"
+      ],
+      "intent": null,
+      "name": "健康度差异主导",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "成功率100",
+          "intelligence": 50,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "成功率83",
+          "intelligence": 50,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.8299999833106995,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "成功率66",
+          "intelligence": 50,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 0.6600000262260437,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "成功率100",
+        "成功率83",
+        "成功率66"
+      ],
+      "intent": null,
+      "name": "健康度差异主导_三档成功率都可用",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "额度充足",
+          "intelligence": 40,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 50,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "额度将尽",
+          "intelligence": 99,
+          "priority": 20,
+          "rpm_limit": 4,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 500,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "额度中等",
+          "intelligence": 70,
+          "priority": 30,
+          "rpm_limit": 20,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "额度充足",
+        "额度将尽",
+        "额度中等"
+      ],
+      "intent": null,
+      "name": "额度余量主导",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 200,
+          "context_window": 8000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "小上下文无工具",
+          "intelligence": 30,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 1500,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "长上下文有工具",
+          "intelligence": 90,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "长上下文有工具",
+        "小上下文无工具"
+      ],
+      "intent": null,
+      "name": "能力差异主导_长上下文与工具",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 900,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "会思考",
+          "intelligence": 60,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": true,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 900,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "不会思考",
+          "intelligence": 60,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "会思考",
+        "不会思考"
+      ],
+      "intent": "reasoning",
+      "name": "smart档_总开关打开_任务定性生效",
+      "requested_model": "auto",
+      "strategy": "smart"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 100,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "会思考但快",
+          "intelligence": 90,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": true,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 2000,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "不会思考但慢",
+          "intelligence": 50,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "不会思考但慢",
+        "会思考但快"
+      ],
+      "intent": "simple",
+      "name": "smart档_简单任务应避开会思考的模型",
+      "requested_model": "auto",
+      "strategy": "smart"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 5000,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "成功率高-最慢",
+          "intelligence": 30,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 900,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "成功率中-中等",
+          "intelligence": 55,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.8299999833106995,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 200,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "成功率低-最快",
+          "intelligence": 95,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 0.6600000262260437,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "成功率高-最慢",
+        "成功率中-中等",
+        "成功率低-最快"
+      ],
+      "intent": null,
+      "name": "reliable档_三档健康都可用_健康主导",
+      "requested_model": "auto",
+      "strategy": "reliable"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 1500,
+          "context_window": 8000,
+          "exact_match": true,
+          "health": "Healthy",
+          "id": "点名的模型",
+          "intelligence": 10,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 0.8999999761581421,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 300,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "没点名但更强更快",
+          "intelligence": 95,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.949999988079071,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 100,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "没点名且最弱",
+          "intelligence": 20,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 0.949999988079071,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "没点名但更强更快",
+        "点名的模型",
+        "没点名且最弱"
+      ],
+      "intent": null,
+      "name": "exact命中模型名_不被更快的候选抢走",
+      "requested_model": "点名的模型",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "健康高-能力低",
+          "intelligence": 20,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "健康中-能力中",
+          "intelligence": 55,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.8299999833106995,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "健康低-能力高",
+          "intelligence": 95,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 0.6600000262260437,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "健康中-能力中",
+        "健康低-能力高",
+        "健康高-能力低"
+      ],
+      "intent": null,
+      "name": "健康与能力相互抵消_权重敏感",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 100,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "快而弱",
+          "intelligence": 20,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 6000,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "慢而强",
+          "intelligence": 98,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "快而弱",
+        "慢而强"
+      ],
+      "intent": null,
+      "name": "策略差异_快而弱vs慢而强",
+      "requested_model": "auto",
+      "strategy": "fastest"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 100,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "快而弱",
+          "intelligence": 20,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 6000,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "慢而强",
+          "intelligence": 98,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "慢而强",
+        "快而弱"
+      ],
+      "intent": null,
+      "name": "策略差异_同一批候选在smartest档",
+      "requested_model": "auto",
+      "strategy": "smartest"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 100,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "快而弱",
+          "intelligence": 20,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 6000,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "慢而强",
+          "intelligence": 98,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "快而弱",
+        "慢而强"
+      ],
+      "intent": null,
+      "name": "策略差异_同一批候选在priority档",
+      "requested_model": "auto",
+      "strategy": "priority"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 5000,
+          "context_window": 32000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "健康但慢",
+          "intelligence": 30,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 100,
+          "context_window": 200000,
+          "exact_match": false,
+          "health": "Error",
+          "id": "故障但快",
+          "intelligence": 99,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 0.20000000298023224,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "健康但慢"
+      ],
+      "intent": null,
+      "name": "策略差异_同一批候选在reliable档",
+      "requested_model": "auto",
+      "strategy": "reliable"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "并列-a",
+          "intelligence": 50,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 1000,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "并列-b",
+          "intelligence": 50,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "并列-a",
+        "并列-b"
+      ],
+      "intent": null,
+      "name": "并列_健康与延迟完全一致",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    },
+    {
+      "candidates": [
+        {
+          "avg_latency_ms": 700,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "同分-优先级30",
+          "intelligence": 70,
+          "priority": 30,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 700,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "同分-优先级10",
+          "intelligence": 70,
+          "priority": 10,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        },
+        {
+          "avg_latency_ms": 700,
+          "context_window": 128000,
+          "exact_match": false,
+          "health": "Healthy",
+          "id": "同分-优先级20",
+          "intelligence": 70,
+          "priority": 20,
+          "rpm_limit": 0,
+          "success_rate": 1.0,
+          "supports_thinking": false,
+          "supports_tools": true
+        }
+      ],
+      "custom_rules": [],
+      "expected_order": [
+        "同分-优先级30",
+        "同分-优先级10",
+        "同分-优先级20"
+      ],
+      "intent": null,
+      "name": "并列_三项相同仅priority不同",
+      "requested_model": "auto",
+      "strategy": "balanced"
+    }
+  ],
+  "generated_from": "6094e38",
+  "note": "记录当前代码的输出，不是设计意图。改基线必须用 route_golden_gen 重新生成。"
+}
