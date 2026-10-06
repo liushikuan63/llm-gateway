@@ -263,6 +263,93 @@ pub async fn write_model_capabilities(
     Ok(result.rows_affected() > 0)
 }
 
+/// 读某个模型的多来源账本。没有或坏 JSON 时返回 `None`（同 `read_capabilities`）。
+pub async fn read_capability_ledger(
+    pool: &SqlitePool,
+    provider_id: &str,
+    alias: &str,
+) -> Result<Option<crate::capability::CapabilitySet>> {
+    let row = sqlx::query(
+        "SELECT capability_sources_json FROM models WHERE provider_id = ? AND alias = ?",
+    )
+    .bind(provider_id)
+    .bind(alias)
+    .fetch_optional(pool)
+    .await?;
+    // 坏 JSON 降级成 None，绝不 panic —— 与 read_capabilities 同一取向
+    Ok(row
+        .as_ref()
+        .and_then(|r| r.get::<Option<String>, _>("capability_sources_json"))
+        .and_then(|raw| serde_json::from_str::<crate::capability::CapabilitySet>(&raw).ok()))
+}
+
+/// 写多来源账本，并**同步**把解析后的定值写进 `capabilities_json`。
+///
+/// 两列必须一起更新：只写账本的话，路由读到的还是旧定值 ——
+/// 表现为「界面显示改了、路由没变」，而用户看不出哪个是真的。
+/// 一起写在这里而不是让调用方记得调两次，是同一个理由
+/// （`audit::refined_prompt_to_store` 把「开关」与「脱敏」绑在一起也是这个考虑）。
+///
+/// 返回是否命中了记录。
+pub async fn write_capability_ledger(
+    pool: &SqlitePool,
+    provider_id: &str,
+    alias: &str,
+    ledger: &crate::capability::CapabilitySet,
+) -> Result<bool> {
+    let encoded =
+        serde_json::to_string(ledger).map_err(|e| crate::error::GatewayError::Other(e.into()))?;
+    // 从账本推出定值：每维取信任度最高的那个来源。
+    // **没有账本条目时该维是 None**，不是 0.0（D1 的核心约束）。
+    let resolved = resolved_from_ledger(ledger);
+    let resolved_json = serde_json::to_string(&resolved)
+        .map_err(|e| crate::error::GatewayError::Other(e.into()))?;
+
+    let result = sqlx::query(
+        "UPDATE models SET capability_sources_json = ?, capabilities_json = ? \
+         WHERE provider_id = ? AND alias = ?",
+    )
+    .bind(encoded)
+    .bind(resolved_json)
+    .bind(provider_id)
+    .bind(alias)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// 账本 → 扁平定值。**唯一的口径落点。**
+///
+/// 抽成函数而不是在两处各推一遍：D3 的实测写入、导出、界面预览都会用到它，
+/// 各写一遍必然漂移，而漂移的表现是「界面显示 0.9、路由用 0.5」。
+pub fn resolved_from_ledger(
+    ledger: &crate::capability::CapabilitySet,
+) -> crate::domain::ModelCapabilities {
+    use crate::capability::Dimension;
+    let get = |d: Dimension| ledger.resolve(d);
+    crate::domain::ModelCapabilities {
+        coding: get(Dimension::Coding).map(|v| v.value),
+        reasoning: get(Dimension::Reasoning).map(|v| v.value),
+        knowledge: get(Dimension::Knowledge).map(|v| v.value),
+        math: get(Dimension::Math).map(|v| v.value),
+        // 来源取**信任度最高的那个维度**的来源 —— 它代表这份数据整体
+        // 最可信到什么程度。没有任何维度时留最不可信的那档（D1 默认）。
+        source: [
+            Dimension::Coding,
+            Dimension::Reasoning,
+            Dimension::Knowledge,
+            Dimension::Math,
+        ]
+        .into_iter()
+        .filter_map(|d| ledger.resolve(d))
+        .max_by_key(|v| v.source.trust())
+        .map(|v| v.source)
+        .unwrap_or_default(),
+        // 其余维度（上下文窗口 / 吞吐 / 单价…）由各自的通道维护，不由账本推
+        ..Default::default()
+    }
+}
+
 /// 仅更新一个模型的价格 JSON，供「自动获取最新定价」使用。返回是否命中了记录。
 pub async fn update_model_price(
     pool: &SqlitePool,

@@ -286,6 +286,13 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     // 而维度还会继续加（D2 就要接数据来源）。
     // 与 `models.local_json` 同构，读写方式照抄。
     ensure_column(pool, "models", "capabilities_json", "TEXT").await?;
+    // D2：多来源账本。与 `capabilities_json` **两列并存，不是重复存储** ——
+    // 它们回答不同的问题：
+    //   `capabilities_json`       = 解析后的**定值**（路由实际用的那个数）
+    //   `capability_sources_json` = 每一维**各来源各说过什么**（界面展示冲突用）
+    // 只留前者则冲突信息丢失（「用户填的没生效」永远查不出来）；
+    // 只留后者则每次路由都要现算，且 D1 之前写的旧行没有账本。
+    ensure_column(pool, "models", "capability_sources_json", "TEXT").await?;
     // B4 traceId 贯穿。**本地永远要有** —— 即使 OTLP 导出关着，
     // traceId 也必须落库并在审计页可见，否则「导不出」会退化成「查不到」。
     ensure_column(pool, "requests", "trace_id", "TEXT").await?;

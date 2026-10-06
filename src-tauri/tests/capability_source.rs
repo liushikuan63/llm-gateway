@@ -11,6 +11,188 @@
 use llm_gateway_lib::capability::{CapabilitySet, Dimension, WriteOutcome};
 use llm_gateway_lib::domain::{CapabilitySource, ModelCapabilities};
 
+// ------------------------------ D2 第三笔：落库 ------------------------------
+
+/// 造一个只挂一个模型的 provider，供落库用例复用。
+///
+/// 三个用例各写一遍 20 行结构体字面量太难读，也容易改漏字段。
+async fn seed_model(database: &llm_gateway_lib::db::Db) {
+    use llm_gateway_lib::db::repo;
+    use llm_gateway_lib::domain::{Dialect, ModelRef, ModelType, Provider};
+    let now = chrono::Utc::now();
+    let p = Provider {
+        id: "p1".into(),
+        name: "p1".into(),
+        dialect: Dialect::OpenAI,
+        base_url: "https://example.invalid/v1".into(),
+        api_key_enc: String::new(),
+        enabled: true,
+        priority: 0,
+        models: vec![ModelRef {
+            enabled: true,
+            alias: "m1".into(),
+            upstream: "m1".into(),
+            context_window: 32_768,
+            supports_tools: true,
+            supports_vision: false,
+            supports_audio: false,
+            supports_video: false,
+            supports_thinking: false,
+            supports_stream: true,
+            model_type: ModelType::Chat,
+            upstream_path: None,
+            price: None,
+            overrides: None,
+            local: None,
+            capabilities: None,
+        }],
+        rpm_limit: 0,
+        intelligence: 80,
+        note: None,
+        created_at: now,
+        updated_at: now,
+    };
+    repo::upsert_provider(database.pool(), &p).await.unwrap();
+}
+
+#[tokio::test]
+async fn 账本落库后能读回来_且定值同步更新() {
+    use llm_gateway_lib::db::{self, repo};
+
+    let database = db::Db::connect_in_memory().await.unwrap();
+    seed_model(&database).await;
+
+    // 账本：目录说 0.5、用户手填 0.9
+    let mut ledger = CapabilitySet::new();
+    ledger.apply_catalog(Dimension::Coding, 0.5);
+    ledger.insert(Dimension::Coding, CapabilitySource::Manual, 0.9);
+    ledger.insert(Dimension::Reasoning, CapabilitySource::Measured, 0.7);
+
+    assert!(
+        repo::write_capability_ledger(database.pool(), "p1", "m1", &ledger)
+            .await
+            .unwrap(),
+        "写入应当命中记录"
+    );
+
+    // 1) 账本读得回来，冲突仍在
+    let back = repo::read_capability_ledger(database.pool(), "p1", "m1")
+        .await
+        .unwrap()
+        .expect("账本应当读得回来");
+    assert_eq!(back, ledger, "账本往返不丢信息");
+    assert_eq!(
+        back.conflict(Dimension::Coding).map(|v| v.len()),
+        Some(2),
+        "冲突必须在落库之后仍然看得见"
+    );
+
+    // 2) 定值**同步**更新了 —— 只写账本不写定值的话，
+    //    路由读到的还是旧值，表现为「界面显示改了、路由没变」
+    let resolved = repo::read_model_capabilities(database.pool(), "p1", "m1")
+        .await
+        .unwrap()
+        .expect("定值应当也写了");
+    assert_eq!(resolved.coding, Some(0.9), "定值取信任度最高的那个");
+    assert_eq!(resolved.reasoning, Some(0.7));
+    // 整体来源取**跨维度最可信**的那档：这里是 Reasoning←Measured(3)，
+    // 高于 Coding←Manual(2)。第一版我写的是 Manual，只看了 Coding 那一维。
+    assert_eq!(
+        resolved.source,
+        CapabilitySource::Measured,
+        "整体来源取跨维度信任度最高的那档"
+    );
+
+    // 3) 路由真正拿到的那份（list_models_of）也要有
+    let models = repo::list_models_of(database.pool(), "p1").await.unwrap();
+    assert_eq!(
+        models[0].capabilities.as_ref().and_then(|c| c.coding),
+        Some(0.9)
+    );
+}
+
+#[tokio::test]
+async fn 没被写过的维度在定值里是_none_而不是零() {
+    use llm_gateway_lib::db::{self, repo};
+
+    let database = db::Db::connect_in_memory().await.unwrap();
+    seed_model(&database).await;
+
+    let mut ledger = CapabilitySet::new();
+    ledger.insert(Dimension::Math, CapabilitySource::Manual, 0.6);
+    repo::write_capability_ledger(database.pool(), "p1", "m1", &ledger)
+        .await
+        .unwrap();
+
+    let resolved = repo::read_model_capabilities(database.pool(), "p1", "m1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.math, Some(0.6));
+    // 关键：其余三档必须是 None。写成 0.0 会让这个模型在几何平均里被判死。
+    assert_eq!(resolved.coding, None);
+    assert_eq!(resolved.reasoning, None);
+    assert_eq!(resolved.knowledge, None);
+    assert!(resolved.has_any_quality());
+}
+
+#[tokio::test]
+async fn 账本里的坏_json_降级成_none_而不是_panic() {
+    use llm_gateway_lib::db::{self, repo};
+
+    let database = db::Db::connect_in_memory().await.unwrap();
+    seed_model(&database).await;
+    sqlx::query(
+        "UPDATE models SET capability_sources_json = ? WHERE provider_id = ? AND alias = ?",
+    )
+    .bind("{ 不是 JSON")
+    .bind("p1")
+    .bind("m1")
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        repo::read_capability_ledger(database.pool(), "p1", "m1")
+            .await
+            .unwrap(),
+        None,
+        "坏 JSON 必须降级成 None"
+    );
+    assert_eq!(
+        repo::list_models_of(database.pool(), "p1")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "坏账本不该让模型列表读不出来"
+    );
+}
+
+#[test]
+fn 从账本推定的值_与逐维取信任度最高者一致() {
+    use llm_gateway_lib::db::repo::resolved_from_ledger;
+
+    let mut ledger = CapabilitySet::new();
+    ledger.apply_catalog(Dimension::Coding, 0.5);
+    ledger.insert(Dimension::Coding, CapabilitySource::Manual, 0.9);
+    ledger.insert(Dimension::Reasoning, CapabilitySource::Community, 0.4);
+
+    let resolved = resolved_from_ledger(&ledger);
+    assert_eq!(resolved.coding, Some(0.9), "Manual 信任度高于 Catalog");
+    assert_eq!(resolved.reasoning, Some(0.4));
+    assert_eq!(resolved.knowledge, None);
+    assert_eq!(resolved.math, None);
+    // 整体来源取**信任度最高的那个维度**的来源：Manual(2) > Community(1)
+    assert_eq!(resolved.source, CapabilitySource::Manual);
+
+    // 空账本 ⇒ 全 None 且来源取最不可信的那档（D1 的默认）
+    let empty = resolved_from_ledger(&CapabilitySet::new());
+    assert_eq!(empty.coding, None);
+    assert_eq!(empty.source, CapabilitySource::Catalog);
+    assert!(!empty.has_any_quality());
+}
+
 // ------------------------------ 卡片点名 ------------------------------
 
 #[test]
