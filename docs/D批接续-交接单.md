@@ -190,3 +190,41 @@ D4/D5 原文见任务卡一。任务卡二的 11 张（A5→A8 / B5→B8 / C6 / 
 再遇到「clippy/check/test 三步 0 秒即红」，先怀疑 cargo 写到 stderr 的
 **warning**：`ci-local.ps1` 用 `$ErrorActionPreference='Stop'`，
 warning 会被当成命令失败。
+
+---
+
+## 五、打包验证记录（2026-10-06 23:09）
+
+本批改动**已重打包并真启动验证**（项目纪律第 7 / 12 条）。
+之所以要重打：原产物停在当天 `00:36`，而最后一次代码改动是 `23:05` ——
+**产物比代码旧 22 小时**，「改了代码」不等于「交付了」。
+
+```powershell
+& scripts/cargo-env.ps1
+npm run tauri:build          # exit 0
+Start-Process src-tauri\target\release\llm-gateway.exe
+```
+
+| 判据 | 实测 |
+| --- | --- |
+| 编译 | `npm run tauri:build` **退出码 0**（release 2m39s） |
+| 产物时间 > 代码时间 | exe `23:09:26` > 代码 `23:05:57` ✓ |
+| 进程存活 | `Responding=True`，标题 `LLM Gateway` ✓ |
+| 监听端口 | `127.0.0.1:15721` |
+| `GET /healthz` | **200**，内容 `ok` |
+| `GET /v1/models` 无 Key | **401**（需鉴权）✓ |
+| 不存在路径 | **401**（不是 404） |
+
+**关于最后一行**：我原以为对照组会给 404，实际是 **401** ——
+鉴权中间件在路由之前跑，所以未鉴权请求无论路径存不存在都先被拦。
+这**比 404 更好**（不泄漏「哪些路由存在」），但也意味着
+「拿 404 当路由对照」这个常见做法在本项目不成立。
+要验路由存在性必须**带上 Key** 再打。
+
+安装包（两个都产出了）：
+
+- `bundle/nsis/LLM Gateway_0.2.0_x64-setup.exe` —— 3.9 MB
+- `bundle/msi/LLM Gateway_0.2.0_x64_en-US.msi` —— 6.1 MB
+
+**未做**：没有跑安装包本身的安装/卸载流程（那会改本机注册表与安装目录，
+属红线动作）。上面验的是 `target/release/llm-gateway.exe` 这个产物本体。
