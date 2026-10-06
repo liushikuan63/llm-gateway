@@ -715,6 +715,7 @@ fn build_provider(spec: &CandSpec) -> Provider {
             price: None,
             overrides: None,
             local: None,
+            capabilities: None,
         }],
         rpm_limit: spec.rpm_limit as i32,
         intelligence: spec.intelligence,

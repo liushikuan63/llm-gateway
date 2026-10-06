@@ -59,6 +59,7 @@ async fn 把本机_ollama_登记成网关供应商() {
             price: None,
             overrides: None,
             local: None,
+            capabilities: None,
         })
         .collect();
 

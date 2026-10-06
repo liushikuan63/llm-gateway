@@ -426,6 +426,18 @@ pub struct ModelRef {
     /// 刚禁用的模型就复活了。现在字段接上了，禁用状态能持久。
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// D1 模型级能力分。`None` = 没有任何模型级能力数据，
+    /// 由 `router::score::capability_score` 回落到 provider 级 `intelligence`。
+    ///
+    /// **放在最后并带 `#[serde(default)]`**：旧配置与旧前端载荷反序列化后
+    /// 得到 `None`，与 D1 之前的行为逐位一致。
+    ///
+    /// 为什么是 `Option<ModelCapabilities>` 而不是直接内嵌：
+    /// 「这个模型有没有能力数据」本身就是路由要用的判断
+    /// （没有 ⇒ 走兜底），内嵌成默认值会把「未知」抹成「全 None 的已知」，
+    /// 两者在界面上要区分显示。
+    #[serde(default)]
+    pub capabilities: Option<crate::domain::ModelCapabilities>,
 }
 
 fn default_true() -> bool {

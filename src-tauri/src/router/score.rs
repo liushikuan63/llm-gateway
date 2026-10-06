@@ -220,9 +220,74 @@ fn health_score(h: Option<&ProviderHealth>) -> f32 {
     }
 }
 
-/// 能力分：provider 的 intelligence（0-100）为主，模型特性为辅
+/// 模型级能力分的底数。**没有模型级能力时返回 `None`**，由调用方回落到
+/// provider 级 `intelligence`。
+///
+/// ## 为什么用几何平均而不是算术平均
+///
+/// `score()` 是**乘法衰减**（`h^wh * hd^whd * cap^wcap * lat^wlat * fit`），
+/// 事实源 H.1 明确写着：「新增维度必须沿用乘法 —— 加权求和会让
+/// 『某项接近 0』的候选被其他项抬回来，那是现有设计刻意避免的」。
+///
+/// 算术平均会把 `coding=0, reasoning=1` 抬成 0.5，正好是那条设计要避免的；
+/// 几何平均则 `(0 * 1)^(1/2) = 0`，**任一维度接近 0 整体就归零**，
+/// 与既有语义一致。
+///
+/// ## 缺失的维度不参与
+///
+/// 只对 `Some` 的维度求几何平均：`n` 取实际存在的个数，
+/// 而不是固定的 4。这是 `Option` 设计的直接推论 ——
+/// 若把 `None` 当 0 参与乘积，一个只标了 `coding` 的模型会因为
+/// 另外三个「不知道」而被判成 0 分，那正是 D1 要消灭的错。
+fn capability_base(m: &ModelRef) -> Option<f32> {
+    capability_base_of(m.capabilities.as_ref()?)
+}
+
+/// 几何平均本体。抽出来是为了让 `capability_base` 与它对测试的入口
+/// **共用同一份实现** —— 复制一份到测试里就等于没有验证。
+fn capability_base_of(caps: &crate::domain::ModelCapabilities) -> Option<f32> {
+    let present: Vec<f32> = caps.quality_dimensions().into_iter().flatten().collect();
+    if present.is_empty() {
+        // 有能力数据但一个质量维度都没有（只标了价格/吞吐）——
+        // 对「能力分」这件事仍然没有信息量，回落到 provider 级。
+        return None;
+    }
+    let product: f32 = present.iter().product();
+    Some(product.powf(1.0 / present.len() as f32))
+}
+
+/// 供集成测试使用。`#[doc(hidden)]`：不是 API，只是让
+/// `tests/capability_model.rs` 能钉住几何平均与「缺失维度不参与」这两条语义。
+///
+/// 之所以要开放而不是在测试里重写一遍：**重写一遍就测不到实现**
+/// （测试与实现各写各的，改了实现测试照样绿）。
+#[doc(hidden)]
+pub fn capability_base_for_test(caps: &crate::domain::ModelCapabilities) -> Option<f32> {
+    capability_base_of(caps)
+}
+
+/// 供集成测试使用，理由同上。
+#[doc(hidden)]
+pub fn capability_score_for_test(p: &Provider, m: &ModelRef) -> f32 {
+    capability_score(p, m)
+}
+
+/// 能力分：**优先读模型级能力**，没有则回落 provider 的 intelligence（0-100）。
+///
+/// 【D1 的兼容性判据】兜底那一支的算式与改动前**逐字相同** ——
+/// 同样的输入、同样的运算顺序，所以老配置（只有 provider intelligence、
+/// 没有任何模型能力）的得分逐位不变，排序也逐位不变。
+/// 这一点由 `tests/capability_model.rs` 与 A3 的路由金标准共同守着。
+///
+/// 长上下文与 tools 两个加分项对两条路径**一视同仁**：
+/// 它们是结构性事实（窗口多大、能不能调工具），不是「质量评分」，
+/// 不该因为有了模型级能力就消失。
 fn capability_score(p: &Provider, m: &ModelRef) -> f32 {
-    let mut s = (p.intelligence.clamp(0, 100) as f32) / 100.0;
+    let mut s = match capability_base(m) {
+        Some(model_level) => model_level,
+        // 兜底：与 D1 之前完全相同的算式
+        None => (p.intelligence.clamp(0, 100) as f32) / 100.0,
+    };
     // 长上下文是硬能力，按窗口大小再抬一档
     s += match m.context_window {
         0 => 0.0,

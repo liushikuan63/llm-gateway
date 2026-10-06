@@ -32,6 +32,7 @@ fn model(alias: &str) -> ModelRef {
         price: None,
         overrides: None,
         local: None,
+        capabilities: None,
     }
 }
 
@@ -346,6 +347,231 @@ async fn 有了模型级能力后_同一_provider_的两个模型可以不同() 
     assert!(read_big.coding.unwrap() > read_small.coding.unwrap());
     // 而 provider 级的 intelligence 只有一个值，对有能力的模型不再有约束力
     assert_eq!(read_big.coding, Some(0.95));
+}
+
+// ------------------------------ D1 第二笔：接进打分 ------------------------------
+
+#[tokio::test]
+async fn 能力数据经列表读出后进入_model_ref() {
+    // 上一条验的是 `read_model_capabilities` 这个专用读口；
+    // 这条验的是**路由真正拿到的那份数据**（`list_models_of`）里有没有它。
+    // 只验专用读口的话，「列表路径忘了带上这一列」不会被发现 ——
+    // 而那正是路由用的那条路径。
+    let db = new_db().await;
+    seed(&db, provider("p1", 80, vec![model("m1")])).await;
+    let caps = ModelCapabilities {
+        coding: Some(0.9),
+        source: CapabilitySource::Measured,
+        ..Default::default()
+    };
+    repo::write_model_capabilities(db.pool(), "p1", "m1", &caps)
+        .await
+        .unwrap();
+
+    let models = repo::list_models_of(db.pool(), "p1").await.unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(
+        models[0].capabilities.as_ref().and_then(|c| c.coding),
+        Some(0.9),
+        "列表读出来的 ModelRef 必须带上能力数据"
+    );
+}
+
+#[tokio::test]
+async fn 保存_provider_不会抹掉已标定的能力() {
+    // `upsert_provider` 是 DELETE 后重插。INSERT 不写 capabilities_json 的话
+    // 会落 NULL —— 于是「在编辑器里点一次保存，刚标定的能力就全没了」。
+    // `enabled` 字段的注释记着同款事故（禁用状态撑不过一次保存）。
+    let db = new_db().await;
+    let mut p = provider("p1", 80, vec![model("m1")]);
+    seed(&db, p.clone()).await;
+    let caps = ModelCapabilities {
+        coding: Some(0.85),
+        source: CapabilitySource::Manual,
+        ..Default::default()
+    };
+    repo::write_model_capabilities(db.pool(), "p1", "m1", &caps)
+        .await
+        .unwrap();
+
+    // 把带能力的 ModelRef 从库里读出来（模拟前端保存时回传的载荷），再整体保存
+    p.models = repo::list_models_of(db.pool(), "p1").await.unwrap();
+    assert!(p.models[0].capabilities.is_some(), "前置：读出来应当有");
+    repo::upsert_provider(db.pool(), &p).await.unwrap();
+
+    let after = repo::list_models_of(db.pool(), "p1").await.unwrap();
+    assert_eq!(
+        after[0].capabilities.as_ref().and_then(|c| c.coding),
+        Some(0.85),
+        "保存 provider 后能力数据必须还在"
+    );
+    assert_eq!(
+        after[0].capabilities.as_ref().map(|c| c.source),
+        Some(CapabilitySource::Manual)
+    );
+}
+
+#[test]
+fn 几何平均_任一维度接近零则整体归零() {
+    // 事实源 H.1：打分为**乘法衰减**，新增维度必须沿用乘法 ——
+    // 「加权求和会让『某项接近 0』的候选被其他项抬回来，那是现有设计刻意避免的」。
+    //
+    // 所以模型级能力分的底数用**几何平均**而不是算术平均：
+    // 前者保持「任一维为 0 ⇒ 整体为 0」的语义，后者会把它抬成 0.75。
+    use llm_gateway_lib::router::score::capability_base_for_test as base;
+
+    let zero_coding = ModelCapabilities {
+        coding: Some(0.0),
+        reasoning: Some(1.0),
+        knowledge: Some(1.0),
+        math: Some(1.0),
+        ..Default::default()
+    };
+    let got = base(&zero_coding).expect("有质量维度就该给 Some");
+    assert!(
+        got < 1e-6,
+        "coding=0 时整体应归零（几何平均），算术平均会给 0.75；实际 {got}"
+    );
+
+    let all_one = ModelCapabilities {
+        coding: Some(1.0),
+        reasoning: Some(1.0),
+        knowledge: Some(1.0),
+        math: Some(1.0),
+        ..Default::default()
+    };
+    assert!((base(&all_one).unwrap() - 1.0).abs() < 1e-6);
+
+    let all_quarter = ModelCapabilities {
+        coding: Some(0.25),
+        reasoning: Some(0.25),
+        knowledge: Some(0.25),
+        math: Some(0.25),
+        ..Default::default()
+    };
+    assert!((base(&all_quarter).unwrap() - 0.25).abs() < 1e-6);
+}
+
+#[test]
+fn 缺失的维度不参与几何平均() {
+    // 若把 None 当 0 参与乘积，一个只标了 coding 的模型会因为另外三个
+    // 「不知道」而被判成 0 分 —— 那正是 D1 要消灭的错。
+    use llm_gateway_lib::router::score::capability_base_for_test as base;
+
+    let only_coding = ModelCapabilities {
+        coding: Some(0.64),
+        ..Default::default()
+    };
+    let got = base(&only_coding).unwrap();
+    assert!(
+        (got - 0.64).abs() < 1e-6,
+        "只有一个维度时几何平均就是它本身（n 取实际存在的个数）；实际 {got}"
+    );
+
+    let two = ModelCapabilities {
+        coding: Some(0.25),
+        reasoning: Some(1.0),
+        ..Default::default()
+    };
+    let got = base(&two).unwrap();
+    assert!((got - 0.5).abs() < 1e-6, "sqrt(0.25*1.0)=0.5；实际 {got}");
+}
+
+#[test]
+fn 没有质量维度时返回_none_而不是零() {
+    use llm_gateway_lib::router::score::capability_base_for_test as base;
+
+    assert_eq!(base(&ModelCapabilities::default()), None);
+    // 有数据但只有价格 / 吞吐 —— 对「能力分」仍然没有信息量
+    let cost_only = ModelCapabilities {
+        input_cost_per_mtok: Some(3.0),
+        throughput_tps: Some(80.0),
+        context_window: Some(200_000),
+        ..Default::default()
+    };
+    assert_eq!(
+        base(&cost_only),
+        None,
+        "只有价格与吞吐时不该给出能力分 —— 应当回落到 provider 级"
+    );
+}
+
+#[tokio::test]
+async fn 老配置的候选排分逐位不变() {
+    // D1 的兼容性铁律：老配置（只有 provider intelligence、没有任何模型能力）
+    // 在 D1 之后排序结果必须**逐位不变**。
+    //
+    // 判据用**逐位相同的 f32**，不是「顺序大致一样」——
+    // 浮点的微小差在权重取幂之后可能翻转相邻两名，
+    // 而那表现为「升级后偶尔换了模型」，极难归因。
+    use llm_gateway_lib::router::score::capability_score_for_test as cap;
+
+    for intelligence in [0, 1, 30, 50, 80, 99, 100, 150] {
+        for window in [0, 8_000, 32_000, 128_000, 200_000, 1_000_000] {
+            for tools in [false, true] {
+                let p = provider("p", intelligence, vec![]);
+                let mut m = model("m");
+                m.context_window = window;
+                m.supports_tools = tools;
+                m.capabilities = None;
+
+                // 与 D1 之前**逐字相同**的算式（直接抄自改动前的实现）
+                let mut expected = (p.intelligence.clamp(0, 100) as f32) / 100.0;
+                expected += match m.context_window {
+                    0 => 0.0,
+                    n if n >= 200_000 => 0.15,
+                    n if n >= 100_000 => 0.1,
+                    n if n >= 32_000 => 0.05,
+                    _ => 0.0,
+                };
+                if m.supports_tools {
+                    expected += 0.05;
+                }
+                let expected = expected.clamp(0.0, 1.0);
+
+                let got = cap(&p, &m);
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "intelligence={intelligence} window={window} tools={tools} 时\
+                     capability_score 与 D1 之前不逐位相同：{got} vs {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn 有模型级能力时不再看_provider_intelligence() {
+    // 反向：证明上一条的「逐位相同」是**因为没有能力数据**，
+    // 而不是因为新代码路径根本没被走到。
+    use llm_gateway_lib::router::score::capability_score_for_test as cap;
+
+    let mut p = provider("p", 10, vec![]);
+    let mut m = model("m");
+    m.capabilities = Some(ModelCapabilities {
+        coding: Some(0.9),
+        reasoning: Some(0.9),
+        knowledge: Some(0.9),
+        math: Some(0.9),
+        ..Default::default()
+    });
+
+    let got = cap(&p, &m);
+    // 0.9（几何平均）+ 0.05（32k 窗口）= 0.95
+    assert!(
+        got > 0.9,
+        "provider 只有 10 分但模型标了 0.9，能力分应当由模型决定；实际 {got}"
+    );
+
+    // 把 provider 的 intelligence 改到 100，结果不该变 ——
+    // 证明这条路径真的没在读 provider
+    p.intelligence = 100;
+    assert_eq!(
+        got.to_bits(),
+        cap(&p, &m).to_bits(),
+        "有模型级能力时 provider.intelligence 不该再影响结果"
+    );
 }
 
 // ------------------------------ 未知与零分的区分（跨层） ------------------------------

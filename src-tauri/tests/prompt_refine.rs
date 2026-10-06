@@ -157,6 +157,7 @@ fn candidate(id: &str, thinking: bool, priority: i32) -> Candidate {
             price: None,
             overrides: None,
             local: None,
+            capabilities: None,
         },
         exact_match: false,
         virtual_strategy: None,

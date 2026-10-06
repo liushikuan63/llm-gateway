@@ -161,6 +161,7 @@ fn model_ref_of(m: &ManifestModel) -> Result<ModelRef> {
 
     Ok(ModelRef {
         alias: m.alias.clone(),
+        enabled: true,
         upstream: m.upstream.clone(),
         context_window: m.context_window,
         supports_tools: m.supports_tools,
@@ -174,6 +175,9 @@ fn model_ref_of(m: &ManifestModel) -> Result<ModelRef> {
         price,
         overrides: m.overrides.clone(),
         local: None,
+        // D1：导入的模型不带模型级能力数据，由 capability_score
+        // 回落到 provider 级 intelligence。
+        capabilities: None,
     })
 }
 
@@ -312,7 +316,11 @@ async fn main() -> Result<()> {
             dialect_code(provider.dialect),
             stored.len(),
             if api_key_enc.is_empty() { "no" } else { "yes" },
-            if provider.enabled { "enabled" } else { "DISABLED" },
+            if provider.enabled {
+                "enabled"
+            } else {
+                "DISABLED"
+            },
             provider.base_url
         );
     }

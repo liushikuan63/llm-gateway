@@ -27,6 +27,7 @@ fn model(alias: &str, enabled: bool) -> ModelRef {
         price: None,
         overrides: None,
         local: None,
+        capabilities: None,
     }
 }
 
@@ -54,7 +55,11 @@ async fn pool() -> sqlx::SqlitePool {
         .connect("sqlite::memory:")
         .await
         .expect("内存库");
-    sqlx::query("CREATE TABLE models (id TEXT PRIMARY KEY, provider_id TEXT, alias TEXT, upstream TEXT, context_window INTEGER, supports_tools INTEGER, supports_vision INTEGER, supports_audio INTEGER, supports_video INTEGER, supports_thinking INTEGER, supports_stream INTEGER, model_type TEXT, upstream_path TEXT, enabled INTEGER NOT NULL DEFAULT 1, price_json TEXT, overrides_json TEXT, local_json TEXT)")
+    // 手写建表：**加列时要跟着改这里**。
+    // D1 加了 `capabilities_json`，漏加会让 upsert 报
+    // "table models has no column named capabilities_json" ——
+    // 而这个文件里的两条用例与能力分无关，报错完全指不到原因。
+    sqlx::query("CREATE TABLE models (id TEXT PRIMARY KEY, provider_id TEXT, alias TEXT, upstream TEXT, context_window INTEGER, supports_tools INTEGER, supports_vision INTEGER, supports_audio INTEGER, supports_video INTEGER, supports_thinking INTEGER, supports_stream INTEGER, model_type TEXT, upstream_path TEXT, enabled INTEGER NOT NULL DEFAULT 1, price_json TEXT, overrides_json TEXT, local_json TEXT, capabilities_json TEXT)")
         .execute(&pool)
         .await
         .expect("建表");

@@ -45,6 +45,7 @@ fn model(name: &str, thinking: bool) -> ModelRef {
         price: None,
         overrides: None,
         local: None,
+        capabilities: None,
     }
 }
 

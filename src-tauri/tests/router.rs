@@ -25,6 +25,7 @@ fn model(alias: &str, upstream: &str) -> ModelRef {
         price: None,
         overrides: None,
         local: None,
+        capabilities: None,
     }
 }
 

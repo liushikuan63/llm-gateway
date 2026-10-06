@@ -53,6 +53,7 @@ fn mock_provider(base_url: String) -> Provider {
             price: None,
             overrides: None,
             local: None,
+            capabilities: None,
         }],
         rpm_limit: 0,
         intelligence: 50,

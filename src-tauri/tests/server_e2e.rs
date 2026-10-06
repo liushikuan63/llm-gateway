@@ -62,6 +62,7 @@ fn provider(id: &str, base_url: String, dialect: Dialect, priority: i32) -> Prov
             price: None,
             overrides: None,
             local: None,
+            capabilities: None,
         }],
         rpm_limit: 0,
         intelligence: 50,

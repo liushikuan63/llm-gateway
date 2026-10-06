@@ -40,6 +40,7 @@ fn provider() -> Provider {
             price: None,
             overrides: None,
             local: None,
+            capabilities: None,
         }],
         rpm_limit: 60,
         intelligence: 80,

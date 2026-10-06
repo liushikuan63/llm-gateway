@@ -160,6 +160,7 @@ fn ollama_model(alias: &str, thinking: bool) -> ModelRef {
         price: None,
         overrides: None,
         local: None,
+        capabilities: None,
     }
 }
 

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use llm_gateway_lib::config::AuthFailureMode;
 use llm_gateway_lib::domain::{Dialect, ModelRef, ModelType, Provider};
 use llm_gateway_lib::error::GatewayError;
-use llm_gateway_lib::router::failover::{AttemptRecord, AtomicFlag, FailoverChain};
+use llm_gateway_lib::router::failover::{AtomicFlag, AttemptRecord, FailoverChain};
 use llm_gateway_lib::router::score::Candidate;
 
 type Reply = Result<String, GatewayError>;
@@ -35,6 +35,7 @@ fn model(alias: &str) -> ModelRef {
         price: None,
         overrides: None,
         local: None,
+        capabilities: None,
         enabled: true,
     }
 }
@@ -46,7 +47,11 @@ fn provider(id: &str, alias: &str, with_key: bool) -> Provider {
         name: id.into(),
         dialect: Dialect::OpenAI,
         base_url: "https://example.invalid/v1".into(),
-        api_key_enc: if with_key { "enc".into() } else { String::new() },
+        api_key_enc: if with_key {
+            "enc".into()
+        } else {
+            String::new()
+        },
         enabled: true,
         priority: 100,
         models: vec![model(alias)],
@@ -193,8 +198,7 @@ async fn 对照组_strict模式下必须立刻终止不换家也不复测() {
     ];
     let counter = Arc::new(AtomicUsize::new(0));
     let flag = AtomicFlag::new();
-    let chain =
-        FailoverChain::new(&cands, 4, &flag).with_auth_policy(AuthFailureMode::Strict, 1);
+    let chain = FailoverChain::new(&cands, 4, &flag).with_auth_policy(AuthFailureMode::Strict, 1);
     let mut records: Vec<AttemptRecord> = Vec::new();
     let result = chain
         .run_with_auth_policy(

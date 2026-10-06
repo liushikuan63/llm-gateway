@@ -64,7 +64,8 @@ pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<
     let rows = sqlx::query(
         r#"SELECT alias, upstream, context_window, supports_tools, supports_vision,
                   supports_audio, supports_video, supports_thinking, supports_stream, model_type,
-                  upstream_path, price_json, overrides_json, local_json, enabled
+                  upstream_path, price_json, overrides_json, local_json, enabled,
+                  capabilities_json
            FROM models WHERE provider_id = ?"#,
     )
     .bind(provider_id)
@@ -87,6 +88,8 @@ pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<
             price: read_model_price(&r),
             overrides: read_model_overrides(&r),
             local: read_local_meta(&r),
+            // D1：模型级能力分。读不出来是 `None`，由 capability_score 走兜底。
+            capabilities: read_capabilities(&r),
             enabled: r.get::<i64, _>("enabled") == 1,
         })
         .collect())
@@ -164,12 +167,20 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
             .as_ref()
             .filter(|local| !local.runtime.trim().is_empty())
             .and_then(|local| serde_json::to_string(local).ok());
+        // D1：**必须一起写**。`upsert_provider` 是 DELETE 后重插，
+        // INSERT 不写这一列的话会落 NULL —— 于是「在编辑器里点一次保存，
+        // 刚标定的模型能力就全没了」。`enabled` 字段的注释记着同款事故。
+        let capabilities = m
+            .capabilities
+            .as_ref()
+            .and_then(|c| serde_json::to_string(c).ok());
         sqlx::query(
             r#"INSERT OR REPLACE INTO models
                  (id, provider_id, alias, upstream, context_window, supports_tools, supports_vision,
                   supports_audio, supports_video, supports_thinking, supports_stream, model_type,
-                   upstream_path, price_json, overrides_json, local_json, enabled)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                   upstream_path, price_json, overrides_json, local_json, enabled,
+                   capabilities_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
         )
         .bind(format!("{}:{}", p.id, m.alias))
         .bind(&p.id)
@@ -188,6 +199,7 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
         .bind(overrides)
         .bind(local)
         .bind(m.enabled as i64)
+        .bind(capabilities)
         .execute(pool)
         .await?;
     }

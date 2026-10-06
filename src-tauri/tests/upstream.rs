@@ -777,6 +777,7 @@ async fn model_overrides_apply_after_gateway_normalization_and_skip_protected_fi
             }]),
         }),
         local: None,
+        capabilities: None,
     }];
 
     let mut req = chat_request();

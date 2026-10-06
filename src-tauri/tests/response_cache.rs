@@ -71,6 +71,7 @@ fn model(alias: &str, tools: bool, vision: bool) -> ModelRef {
         price: None,
         overrides: None,
         local: None,
+        capabilities: None,
     }
 }
 

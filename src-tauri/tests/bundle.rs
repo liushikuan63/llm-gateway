@@ -66,6 +66,7 @@ fn provider(id: &str, name: &str, api_key_enc: String) -> Provider {
                     extra_headers: None,
                 }),
                 local: None,
+                capabilities: None,
             },
             ModelRef {
                 enabled: true,
@@ -83,6 +84,7 @@ fn provider(id: &str, name: &str, api_key_enc: String) -> Provider {
                 price: None,
                 overrides: None,
                 local: None,
+                capabilities: None,
             },
         ],
         rpm_limit: 60,

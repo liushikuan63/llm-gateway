@@ -43,6 +43,7 @@ fn model(alias: &str) -> ModelRef {
         price: None,
         overrides: None,
         local: None,
+        capabilities: None,
     }
 }
 
