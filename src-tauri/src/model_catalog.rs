@@ -61,6 +61,19 @@ pub struct DiscoveredModel {
     pub is_free: Option<bool>,
     /// 仅当目录提供可辨识的定价结构时填写；缺失表示未知。
     pub price: Option<ModelPrice>,
+    /// D2：目录带出来的**质量维度**能力值（coding / reasoning / knowledge / math）。
+    ///
+    /// 走 [`crate::capability::CapabilitySet`]，每维记成 `Catalog` 来源 ——
+    /// 信任度最低的那一档（事实源 I.3-1：外部榜单会改版，且本项目无法校验其口径）。
+    ///
+    /// **目录里没有就留 `None`**，不要造一个全 0 的账本 ——
+    /// 「未知」与「确定很差」是两件事（D1 的核心约束）。
+    ///
+    /// 【实情】当前接的三家目录（OpenRouter / Anthropic / Ollama）都**没有**
+    /// 发布质量维度分数。这个字段是为了 D3（本项目实测）与将来接有分数的目录
+    /// 而留的，现在实际拿到的基本都是 `None`。
+    #[serde(default)]
+    pub capabilities: Option<crate::capability::CapabilitySet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -85,7 +98,14 @@ impl DiscoveredModel {
             model_type: None,
             is_free: None,
             price: None,
+            capabilities: None,
         }
+    }
+
+    /// 带上从目录里解析出来的质量维度能力值。
+    fn with_capabilities(mut self, entry: &serde_json::Value) -> Self {
+        self.capabilities = parse_catalog_capabilities(entry);
+        self
     }
 
     fn with_context(mut self, context_window: Option<i32>) -> Self {
@@ -343,10 +363,12 @@ async fn discover_anthropic(
         models.extend(data.iter().filter_map(|entry| {
             let id = non_empty_string(entry.get("id"))?;
             let name = non_empty_string(entry.get("display_name")).unwrap_or_else(|| id.clone());
-            let mut model = DiscoveredModel::default_for(id, name).with_context(first_context(
-                entry,
-                &["context_window", "context_length", "max_input_tokens"],
-            ));
+            let mut model = DiscoveredModel::default_for(id, name)
+                .with_capabilities(entry)
+                .with_context(first_context(
+                    entry,
+                    &["context_window", "context_length", "max_input_tokens"],
+                ));
             // Anthropic 的目录会在 `capabilities.image_input.supported` 明确
             // 报告视觉输入能力；没有该字段时不能根据模型名补猜。
             model.supports_vision = nested_supported(entry, "capabilities", "image_input");
@@ -487,6 +509,9 @@ async fn discover_ollama(
     let mut ordered = Vec::with_capacity(results.len());
     let mut failed_details = 0usize;
     for (index, id, name, response) in results {
+        // Ollama 这条走 `/api/show` 逐模型取详情，构造时**还没有响应**，
+        // 所以这里不接 `with_capabilities` —— 而 Ollama 的详情里也没有
+        // 质量维度分数（只有模态与参数规模），接了也是 None。
         let mut model = DiscoveredModel::default_for(id, name);
         match response {
             Ok(response) => apply_ollama_details(&mut model, &response),
@@ -511,10 +536,12 @@ async fn discover_ollama(
 fn openai_model(entry: &Value) -> Option<DiscoveredModel> {
     let id = non_empty_string(entry.get("id"))?;
     let name = non_empty_string(entry.get("name")).unwrap_or_else(|| id.clone());
-    let mut model = DiscoveredModel::default_for(id, name).with_context(first_context(
-        entry,
-        &["context_length", "context_window", "max_input_tokens"],
-    ));
+    let mut model = DiscoveredModel::default_for(id, name)
+        .with_capabilities(entry)
+        .with_context(first_context(
+            entry,
+            &["context_length", "context_window", "max_input_tokens"],
+        ));
     model.model_type = detect_openai_model_type(entry);
 
     if let Some(parameters) = entry.get("supported_parameters").and_then(string_list) {
@@ -549,6 +576,7 @@ fn gemini_model(entry: &Value) -> Option<DiscoveredModel> {
         .or_else(|| non_empty_string(entry.get("baseModelId")))?;
     let name = non_empty_string(entry.get("displayName")).unwrap_or_else(|| id.clone());
     let mut model = DiscoveredModel::default_for(id, name)
+        .with_capabilities(entry)
         .with_context(context_value(entry.get("inputTokenLimit")));
     model.model_type = detect_gemini_model_type(entry);
 
@@ -1018,6 +1046,148 @@ async fn response_json(mut response: reqwest::Response) -> Result<Value, String>
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| "上游模型目录不是有效 JSON".to_string())
+}
+
+/// D2：从目录条目里解析**质量维度**能力值。
+///
+/// 认三种已知形态（按优先级）：
+/// 1. `benchmarks: {"coding":0.9, ...}` —— 有目录用这个名字放跑分
+/// 2. `capabilities.scores: {...}` —— 嵌套形态
+/// 3. 顶层直接给 `coding` / `reasoning` / `knowledge` / `math` 数字
+///
+/// 全部认不出来 ⇒ 返回 `None`。**绝不返回一个全 0 的账本** ——
+/// 「未知」与「确定很差」是两件事（D1 的核心约束）。
+///
+/// 【实情，不要误读】当前接的三家目录（OpenRouter / Anthropic / Ollama）
+/// 都**没有**发布质量维度分数，所以生产上这个函数现在基本都返回 `None`。
+/// 它的价值在于：接第四家带分数的目录时不用改结构，
+/// 而卡片「目录里有的就带出来，没有的就留 None」这条要求有个明确落点。
+fn parse_catalog_capabilities(
+    entry: &serde_json::Value,
+) -> Option<crate::capability::CapabilitySet> {
+    let candidates = [
+        entry.get("benchmarks"),
+        entry.get("capabilities").and_then(|v| v.get("scores")),
+        Some(entry),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        let Some(obj) = candidate.as_object() else {
+            continue;
+        };
+        let mut set = crate::capability::CapabilitySet::new();
+        let mut found = false;
+        for (key, raw) in obj {
+            let Some(dimension) = crate::capability::Dimension::parse(key) else {
+                continue;
+            };
+            // 分数可能是数字，也可能是 `{"score": 0.9}` 这种包装
+            let value = match raw {
+                serde_json::Value::Number(n) => n.as_f64(),
+                serde_json::Value::Object(o) => o
+                    .get("score")
+                    .or_else(|| o.get("value"))
+                    .and_then(|v| v.as_f64()),
+                _ => None,
+            };
+            if let Some(value) = value {
+                set.apply_catalog(dimension, value as f32);
+                found = true;
+            }
+        }
+        if found {
+            return Some(set);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod catalog_capability_tests {
+    use super::*;
+    use crate::capability::Dimension;
+
+    #[test]
+    fn 目录没有分数时返回_none_而不是空账本() {
+        // 本函数的核心判据。「未知」与「确定很差」是两件事。
+        let entry = serde_json::json!({
+            "id": "m", "name": "M",
+            "capabilities": {"image_input": {"supported": true}}
+        });
+        assert_eq!(
+            parse_catalog_capabilities(&entry),
+            None,
+            "只有模态布尔、没有质量分数时必须返回 None"
+        );
+        assert_eq!(parse_catalog_capabilities(&serde_json::json!({})), None);
+        assert_eq!(parse_catalog_capabilities(&serde_json::json!("x")), None);
+    }
+
+    #[test]
+    fn 认得三种已知形态() {
+        let set = parse_catalog_capabilities(&serde_json::json!({
+            "benchmarks": {"coding": 0.9, "reasoning": 0.8}
+        }))
+        .expect("benchmarks 形态应当认得");
+        assert_eq!(set.resolve(Dimension::Coding).unwrap().value, 0.9);
+        assert_eq!(set.resolve(Dimension::Reasoning).unwrap().value, 0.8);
+        assert_eq!(
+            set.resolve(Dimension::Knowledge),
+            None,
+            "没给的维度仍是 None"
+        );
+
+        let set = parse_catalog_capabilities(&serde_json::json!({
+            "capabilities": {"scores": {"knowledge": 0.7}}
+        }))
+        .expect("嵌套形态应当认得");
+        assert_eq!(set.resolve(Dimension::Knowledge).unwrap().value, 0.7);
+
+        let set = parse_catalog_capabilities(&serde_json::json!({"math": 0.6}))
+            .expect("顶层形态应当认得");
+        assert_eq!(set.resolve(Dimension::Math).unwrap().value, 0.6);
+
+        let set = parse_catalog_capabilities(&serde_json::json!({
+            "benchmarks": {"coding": {"score": 0.85}}
+        }))
+        .expect("包装形态应当认得");
+        assert_eq!(set.resolve(Dimension::Coding).unwrap().value, 0.85);
+    }
+
+    #[test]
+    fn 带出来的值来源是_catalog_且越界被夹住() {
+        let set = parse_catalog_capabilities(&serde_json::json!({
+            "benchmarks": {"coding": 1.7, "reasoning": -0.5}
+        }))
+        .unwrap();
+        let coding = set.resolve(Dimension::Coding).unwrap();
+        assert_eq!(
+            coding.source,
+            crate::domain::CapabilitySource::Catalog,
+            "目录来源必须是信任度最低的那一档"
+        );
+        assert_eq!(coding.value, 1.0, "越界被夹");
+        assert_eq!(set.resolve(Dimension::Reasoning).unwrap().value, 0.0);
+    }
+
+    #[test]
+    fn 认不出来的维度被忽略而不是让整个解析失败() {
+        let set = parse_catalog_capabilities(&serde_json::json!({
+            "benchmarks": {"coding": 0.9, "未来新维度": 0.5}
+        }))
+        .expect("有一个认得的就该返回 Some");
+        assert_eq!(set.covered_dimensions(), 1);
+        assert_eq!(set.resolve(Dimension::Coding).unwrap().value, 0.9);
+    }
+
+    #[test]
+    fn 分数是字符串等非法类型时忽略该维度() {
+        let set = parse_catalog_capabilities(&serde_json::json!({
+            "benchmarks": {"coding": "很高", "reasoning": 0.8}
+        }))
+        .expect("至少 reasoning 是合法的");
+        assert_eq!(set.resolve(Dimension::Coding), None, "非法类型不该被当成 0");
+        assert_eq!(set.resolve(Dimension::Reasoning).unwrap().value, 0.8);
+    }
 }
 
 #[cfg(test)]
