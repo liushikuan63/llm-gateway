@@ -335,6 +335,37 @@ pub fn efficiency_score(mine: f32, slowest: f32, fastest: f32) -> f32 {
     0.2 + 0.8 * position
 }
 
+/// D3：从一列候选值里算出**相对区间**，供 `cost_score` / `efficiency_score` 用。
+///
+/// ## 为什么单独抽出来
+///
+/// 两个打分函数都要「整批候选的最小值与最大值」。若让调用方各算一遍，
+/// 很容易出现「成本用了含免费模型的区间、效率用了不含的」这类不一致 ——
+/// 而那种不一致不报错，只表现为排序偶尔不对。
+///
+/// ## 过滤规则
+///
+/// **非有限值（NaN / inf）与非正值一律剔除**：
+/// - NaN 参与 `min`/`max` 会污染整个区间
+/// - 负价格、负吞吐是坏数据；吞吐的 `0` 在我们这套约定里表示**无样本**
+///   （与 `latency_score` 的 `0 => 1.0` 同源），不该当成「最慢」去拉低下界
+///
+/// 一个可用的都没有 ⇒ `None`，调用方据此不施加偏置。
+/// 只有一个可用值 ⇒ `Some((v, v))`，两个打分函数对「区间退化」已有处理
+/// （返回 1.0），这里不重复判断。
+pub fn value_range(values: impl IntoIterator<Item = f32>) -> Option<(f32, f32)> {
+    let mut min: Option<f32> = None;
+    let mut max: Option<f32> = None;
+    for v in values {
+        if !v.is_finite() || v <= 0.0 {
+            continue;
+        }
+        min = Some(min.map_or(v, |m: f32| m.min(v)));
+        max = Some(max.map_or(v, |m: f32| m.max(v)));
+    }
+    Some((min?, max?))
+}
+
 /// D3 阈值型代价：**只在两种场景**下让成本参与打分。
 ///
 /// 1. `simple` 类请求 —— 简单任务用贵模型是纯浪费

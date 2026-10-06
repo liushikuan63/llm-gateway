@@ -9,6 +9,61 @@
 use llm_gateway_lib::config::RoutingStrategy;
 use llm_gateway_lib::router::score::{cost_bias_applies, cost_score, efficiency_score, Weights};
 
+// ------------------------------ 候选集区间 ------------------------------
+
+#[test]
+fn 区间忽略无样本与坏数据() {
+    use llm_gateway_lib::router::score::value_range;
+
+    // 0 = 无样本（与 latency_score 的 `0 => 1.0` 同源），
+    // 不该被当成「最慢」去把下界拉到 0 —— 那样最慢的真实候选会显得不慢。
+    assert_eq!(value_range([0.0, 10.0, 50.0]), Some((10.0, 50.0)));
+    // NaN 参与 min/max 会污染整个区间
+    assert_eq!(value_range([f32::NAN, 10.0, 50.0]), Some((10.0, 50.0)));
+    // inf 会让上界变成无穷，进而让所有位置都算成 0
+    assert_eq!(value_range([f32::INFINITY, 10.0, 50.0]), Some((10.0, 50.0)));
+    assert_eq!(
+        value_range([f32::NEG_INFINITY, 10.0, 50.0]),
+        Some((10.0, 50.0))
+    );
+    // 负值是坏数据
+    assert_eq!(value_range([-5.0, 10.0, 50.0]), Some((10.0, 50.0)));
+    // 全是坏数据 ⇒ None（调用方据此不施加偏置）
+    assert_eq!(value_range([0.0, f32::NAN, -1.0]), None);
+    assert_eq!(value_range([] as [f32; 0]), None);
+}
+
+#[test]
+fn 只有一个可用值时区间退化但仍返回_some() {
+    use llm_gateway_lib::router::score::value_range;
+    assert_eq!(value_range([42.0]), Some((42.0, 42.0)));
+    assert_eq!(value_range([0.0, 42.0, f32::NAN]), Some((42.0, 42.0)));
+    // 退化区间下两个打分函数都给满分（既有行为，此处不重复判断）
+    assert_eq!(cost_score(42.0, 42.0, 42.0), 1.0);
+    assert_eq!(efficiency_score(42.0, 42.0, 42.0), 1.0);
+}
+
+#[test]
+fn 区间与打分函数串起来能给出一致的排序() {
+    use llm_gateway_lib::router::score::value_range;
+
+    // 端到端对照：三个候选的价格，算区间后用 cost_score 排序，
+    // 结果必须与「按价格从低到高」一致。
+    let prices = [30.0f32, 1.0, 15.0];
+    let (lo, hi) = value_range(prices).expect("三个正数应当有区间");
+    assert_eq!((lo, hi), (1.0, 30.0));
+
+    let mut scored: Vec<(f32, f32)> = prices
+        .iter()
+        .map(|p| (*p, cost_score(*p, lo, hi)))
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let order: Vec<f32> = scored.iter().map(|(p, _)| *p).collect();
+    assert_eq!(order, vec![1.0, 15.0, 30.0], "便宜的必须排在前面");
+    assert_eq!(scored[0].1, 1.0, "最便宜满分");
+    assert!((scored[2].1 - 0.2).abs() < 1e-6, "最贵下界");
+}
+
 // ------------------------------ 铁律：默认不改变行为 ------------------------------
 
 #[test]
