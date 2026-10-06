@@ -64,6 +64,96 @@ fn 区间与打分函数串起来能给出一致的排序() {
     assert!((scored[2].1 - 0.2).abs() < 1e-6, "最贵下界");
 }
 
+// ------------------------------ 配置项被消费 ------------------------------
+
+#[test]
+fn 关着时权重与策略给出的逐位相同() {
+    use llm_gateway_lib::config::CostRoutingConfig;
+    use llm_gateway_lib::router::score::Weights;
+
+    let off = CostRoutingConfig::default();
+    let strategies = [
+        RoutingStrategy::Priority,
+        RoutingStrategy::Balanced,
+        RoutingStrategy::Smartest,
+        RoutingStrategy::Fastest,
+        RoutingStrategy::Reliable,
+        RoutingStrategy::Custom,
+        RoutingStrategy::Smart,
+    ];
+    for s in strategies {
+        let base = Weights::for_strategy(s);
+        let got = Weights::with_cost_routing(base, &off);
+        // 逐字段相等，且两个新权重**保持 base 原值**（不是被清零）
+        assert_eq!(got, base, "{s:?} 关着时不该动任何权重");
+        assert_eq!(got.cost, base.cost);
+        assert_eq!(got.efficiency, base.efficiency);
+    }
+}
+
+#[test]
+fn 开着时只动这两个权重() {
+    use llm_gateway_lib::config::CostRoutingConfig;
+    use llm_gateway_lib::router::score::Weights;
+
+    let base = Weights::for_strategy(RoutingStrategy::Balanced);
+    let on = CostRoutingConfig {
+        enabled: true,
+        cost_weight: 0.3,
+        efficiency_weight: 0.15,
+        ..Default::default()
+    };
+    let got = Weights::with_cost_routing(base, &on);
+
+    assert_eq!(got.cost, 0.3);
+    assert_eq!(got.efficiency, 0.15);
+    // 关键：用户开的是「考虑成本」，不是「重新平衡所有维度」。
+    // 悄悄动别的权重会让排序整体变化，而用户只期待一个维度的加入。
+    assert_eq!(got.health, base.health);
+    assert_eq!(got.headroom, base.headroom);
+    assert_eq!(got.capability, base.capability);
+    assert_eq!(got.latency, base.latency);
+    assert_eq!(got.intent, base.intent);
+}
+
+#[test]
+fn 开着但权重为零时与关着等价() {
+    use llm_gateway_lib::config::CostRoutingConfig;
+    use llm_gateway_lib::router::score::Weights;
+
+    // `enabled: true` 但两个权重都是 0.0 —— 数学上与关着完全一样
+    // （`powf(0.0)` 恒等）。这一条把「开关」与「权重」两件事分开：
+    // 开关只决定**要不要读**权重，真正决定行为的是权重值。
+    let on_but_zero = CostRoutingConfig {
+        enabled: true,
+        cost_weight: 0.0,
+        efficiency_weight: 0.0,
+        ..Default::default()
+    };
+    let base = Weights::for_strategy(RoutingStrategy::Smartest);
+    let got = Weights::with_cost_routing(base, &on_but_zero);
+    assert_eq!(got, base, "零权重时开启开关不该改变任何东西");
+}
+
+#[test]
+fn 消费时再夹一次越界权重() {
+    use llm_gateway_lib::config::CostRoutingConfig;
+    use llm_gateway_lib::router::score::Weights;
+
+    // `CostRoutingConfig` 可能来自反序列化（前端载荷、手工编辑的
+    // config.toml），而 `sanitized()` 只在保存路径上调用。
+    // 所以消费点必须自己再夹一次。
+    let wild = CostRoutingConfig {
+        enabled: true,
+        cost_weight: 9.0,
+        efficiency_weight: -2.0,
+        ..Default::default()
+    };
+    let got = Weights::with_cost_routing(Weights::default(), &wild);
+    assert_eq!(got.cost, 1.0);
+    assert_eq!(got.efficiency, 0.0);
+}
+
 // ------------------------------ 配置项 ------------------------------
 
 #[test]

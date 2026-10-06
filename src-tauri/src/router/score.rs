@@ -81,7 +81,7 @@ pub fn intent_fit(class: TaskClass, c: &Candidate) -> f32 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Weights {
     pub health: f32,
     pub headroom: f32,
@@ -181,6 +181,36 @@ impl Weights {
                 efficiency: 0.0,
             },
         }
+    }
+
+    /// D3：把 `CostRoutingConfig` 施加到一套策略权重上。
+    ///
+    /// **这是配置项唯一的消费者。** 没有它，`cost_routing.enabled` 是个
+    /// 「开着没反应的开关」—— `CLAUDE.md` 铁律 9 明确禁止那种东西。
+    ///
+    /// ## 关着时返回的权重与传入的**逐位相同**
+    ///
+    /// `enabled == false` 时直接返回 `base` 的拷贝，两个新权重保持 `base`
+    /// 原值（八档策略给出的都是 0.0）。不做「把权重清零」那种动作 ——
+    /// 那会覆盖掉将来可能由别的路径设进来的值，而这里不该有那个权力。
+    ///
+    /// ## 开着时只动这两个权重
+    ///
+    /// 不改 `health` / `headroom` / `capability` / `latency` / `intent`：
+    /// 用户开的是「考虑成本」，不是「重新平衡所有维度」。
+    /// 悄悄动别的权重会让排序整体变化，而用户只期待一个维度的加入。
+    pub fn with_cost_routing(mut base: Self, config: &crate::config::CostRoutingConfig) -> Self {
+        if !config.enabled {
+            return base;
+        }
+        // 夹取在这里再做一次：`CostRoutingConfig` 可能来自反序列化
+        // （前端载荷、手工编辑的 config.toml），而 `sanitized()` 只在
+        // 保存路径上调用。权重超过 1.0 会让 `powf` 把差距放大到失真，
+        // 表现为「某个模型永远第一」且没有报错。
+        let sanitized = config.clone().sanitized();
+        base.cost = sanitized.cost_weight;
+        base.efficiency = sanitized.efficiency_weight;
+        base
     }
 }
 
