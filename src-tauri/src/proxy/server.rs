@@ -3257,6 +3257,11 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     )
                 })
                 .unwrap_or((0, 0, 0, 0));
+            // D3：流式路径的实测吞吐。**与上一个记账点（非流式）同一口径** ——
+            // 流式的 usage 往往在最后一个 chunk 才出现，所以必须等到
+            // `o.value.usage` 拿到之后再记，不能挪到 `record_success` 旁边。
+            // `record_tps` 自己会拒绝 0 token（多数流式中间帧没有 usage）。
+            health.record_tps(&o.provider_id, &o.model, ct, latency as u32);
             let pid = o.provider_id.clone();
             let mid = o.model.clone();
             let assistant = Message {
