@@ -22,17 +22,21 @@ D 批 5 张卡里 **D1 完成、D2 差界面、D3 差调用侧、D4/D5 未开工
 | --- | --- | --- |
 | D1 能力分下沉到模型级 | `74e94be` `1c87eb6` | 完整 |
 | D2 三条来源 | `be7ad05` `091bcb6` `73827c9` `0e218e3` `f83e0a8` | **差界面** |
-| D3 成本与效率进路由 | `29ce5a8` `1def853` `00661f8` | **差调用侧** |
+| D3 成本与效率进路由 | `29ce5a8` `1def853` `00661f8` `c618625` `11b6ece` | **差吞吐与长 prompt** |
 
 ### 明确未做（不得当作已完成）
 
-1. **D3 的调用侧没接。** `router/mod.rs` 的 `score_of` 传的仍是
-   `cost_bias: false` 与全 `None`，八档 `Weights` 全 0.0。
-   ⇒ **现在把 `cost_routing.enabled` 打开不会有任何效果。**
-   缺四件：① `Weights` 从配置派生（`with_cost_routing` 已就绪但没人调）；
-   ② 从候选集调 `value_range` 填 `cost_range` / `tps_range`；
-   ③ 从 `requests` 表算实测 tok/s（用 `min_efficiency_samples` 判充足性）；
-   ④ 每个候选的价格（峰谷价 / 缓存价 / 币种换算**必须与定价模块同源**）。
+1. **D3 已接通，但三个口子没接。** `11b6ece` 之后
+   `cost_routing.enabled = true` **确实会改变排序**（成本维度生效）。
+   仍缺三件：
+   - **吞吐维度恒为 `None`**：`ProviderHealth` 只有 `avg_latency_ms`，没有 tok/s。
+     要从 `requests` 表按 `completion_tokens / latency_ms` 现算，
+     并用 `min_efficiency_samples` 判样本充足性。
+     **不要拿延迟倒推一个假吞吐** —— 假的效率分会奖励「首包快但吐字慢」的模型。
+   - **长 prompt 那一支没接**：`rank_with_intent` 签名里没有 prompt token 数，
+     要加参数得改 `server.rs` 的 4 个调用点。现在只有 `Simple` 类拿到成本偏置。
+   - **分档价 / 峰谷时段价 / 缓存价没生效**：只取了 `price.prompt` 基础价。
+     卡片要求与定价模块同源，别另立一套。
 2. **D2 的冲突界面没做。** 后端已把「每一维各来源说过什么」准备好
    （`CapabilitySet` 类型在 `src/api.ts`、两个 IPC 已注册），
    但 `src/pages/` 下没有 UI，`scripts/ui-smoke.cjs` 也没有夹具与断言。
@@ -47,20 +51,19 @@ D 批 5 张卡里 **D1 完成、D2 差界面、D3 差调用侧、D4/D5 未开工
 
 ## 二、下一步该做什么（按推荐顺序）
 
-### 第一步：补上 D3 的消费者（约 1 小时）
+### 第一步：补上 D3 剩下的三个口子（约 1.5 小时）
 
-这是**当前最该做的一格** —— 因为 `00661f8` 自己就是一笔欠账
-（`CLAUDE.md` 铁律 9「不留只写不读的字段」）。
+调用侧已经接通（`11b6ece`），剩下的是**数据源**与**参数**，不是接线。
+`Weights::with_cost_routing` 与 `score::comparable_range` 都已就绪且有测试，
+照着用即可。
 
-```rust
-// src/router/mod.rs 的 score_of 附近
-let weights = Weights::with_cost_routing(Weights::for_strategy(strategy), &cfg.cost_routing);
-// 候选集维度：整批算一次，不要每个候选各算一遍
-let cost_range = score::value_range(candidates.iter().map(|c| price_of(c)));
-let tps_range  = score::value_range(candidates.iter().map(|c| tps_of(c)));
-let cost_bias  = score::cost_bias_applies(intent, estimated_prompt_tokens,
-                                          cfg.cost_routing.long_prompt_threshold_tokens);
-```
+**先做吞吐**（三件里唯一能让 efficiency 维度从 0 变有的）：
+`ProviderHealth` 要加 tok/s 字段，或从 `requests` 表现算
+（`completion_tokens / latency_ms`）。样本数 `< min_efficiency_samples`
+（配置默认 5）时视为没有实测数据，**不参与打分**。
+
+现状（`src/router/mod.rs` 的 `CostContext`）：`range` 已接、`tps_range` 恒 None、
+`cost_bias` 传的 prompt token 是 0。要改的就是后两项。
 
 **四个坑，动手前先看：**
 
