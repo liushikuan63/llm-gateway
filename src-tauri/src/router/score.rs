@@ -396,6 +396,41 @@ pub fn value_range(values: impl IntoIterator<Item = f32>) -> Option<(f32, f32)> 
     Some((min?, max?))
 }
 
+/// D3：从一组「价格 + 币种」算出**可比**的区间。
+///
+/// ## 币种不同不能比（本函数的全部意义）
+///
+/// USD 与 CNY 的数字直接比大小没有意义 —— 混着比的结果是
+/// 「CNY 的 1.0 比 USD 的 3.0 便宜」，而 1 CNY 约合 0.14 USD。
+///
+/// 出现第二种币种时**整体返回 `None`**（该维度不参与），而不是：
+/// - 偷偷混着比 —— 那会给出错误的「相对便宜」；
+/// - 只取第一种币种的子集 —— 那会让「币种不同」这个事实消失，
+///   用户看到「有的模型没算成本」却不知道原因。
+///
+/// 与 B2 的多币种处理同口径。非正值由 [`value_range`] 一并剔除。
+pub fn comparable_range(
+    prices: impl IntoIterator<Item = Option<(f32, crate::domain::Currency)>>,
+) -> Option<(f32, f32)> {
+    let mut currency: Option<crate::domain::Currency> = None;
+    let mut values: Vec<f32> = Vec::new();
+    for item in prices {
+        // `None` = 这个候选**没有价格**，因此也**不主张任何币种**。
+        // 用 `Currency::default()` 之类去补一个的话，一个还没填价的模型
+        // 会把整批拖成「币种不可比」，而它根本没有参与比较的资格。
+        let Some((price, c)) = item else {
+            continue;
+        };
+        match currency {
+            None => currency = Some(c),
+            Some(existing) if existing != c => return None,
+            _ => {}
+        }
+        values.push(price);
+    }
+    value_range(values)
+}
+
 /// D3 阈值型代价：**只在两种场景**下让成本参与打分。
 ///
 /// 1. `simple` 类请求 —— 简单任务用贵模型是纯浪费

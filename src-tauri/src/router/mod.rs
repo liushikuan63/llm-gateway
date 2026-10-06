@@ -31,6 +31,62 @@ pub struct Router {
     custom_rules: parking_lot::RwLock<Vec<RouteRule>>,
 }
 
+/// D3：整批候选一次算出来的成本上下文。
+///
+/// 单独一个结构而不是三个散参数：它们必须**同时**由整批候选算出，
+/// 分开传会让人以为可以只改其中一个。
+#[derive(Debug, Clone, Copy, Default)]
+struct CostContext {
+    /// 可比的成本区间；`None` = 没有价格数据或币种不可比。
+    range: Option<(f32, f32)>,
+    /// 【未接】吞吐区间恒为 `None`，理由见调用点注释。
+    tps_range: Option<(f32, f32)>,
+    /// 本次请求是否适用成本偏置。
+    cost_bias: bool,
+}
+
+/// D3：从整批候选算出**可比**的成本区间。
+///
+/// ## 币种不同不能比（本函数的全部意义）
+///
+/// USD 与 CNY 的数字直接比大小是没有意义的 —— 混着比的结果是
+/// 「CNY 的 1.0 比 USD 的 3.0 便宜」，而 1 CNY 约合 0.14 USD。
+/// 只要候选里出现第二种币种，**整体返回 `None`**（该维度不参与），
+/// 而不是偷偷混着比、也不是只取第一种币种的子集
+/// —— 后者会让「币种不同」这个事实消失，用户看到的是「有的模型没算成本」
+/// 却不知道原因。与 B2 的多币种处理同口径。
+///
+/// ## 用基础输入单价作参考
+///
+/// 【未接】分档价（`tiers`）与时段价（`rules`）**还没生效** ——
+/// 它们要经过定价模块按时段与输入长度解析，本函数只取 `prompt` 基础价。
+/// 这一点写在 `docs/D批接续-交接单.md` 的「下一步」里，
+/// 不在代码里假装已经按峰谷价算了。
+fn comparable_cost_range(candidates: &[Candidate]) -> Option<(f32, f32)> {
+    // 币种可比的规则在 `score::comparable_range` 里（可单测），
+    // 这里只负责把候选映射成「价格 + 币种」。
+    // **没有价格的候选整条跳过** —— 它既不参与区间，也不主张任何币种。
+    // 给它补一个默认币种的话，一个还没填价的模型会把整批拖成
+    // 「币种不可比」，而它根本没有参与比较的资格。
+    score::comparable_range(
+        candidates
+            .iter()
+            .map(|c| -> Option<(f32, crate::domain::Currency)> {
+                // 非正价格当作「没有价格」：区间与 `candidate_cost` 必须同源，
+                // 否则最便宜的那个也拿不到满分。
+                let p = c.model.price.as_ref()?;
+                (p.prompt > 0.0).then_some((p.prompt as f32, p.currency))
+            }),
+    )
+}
+
+/// 单个候选的参考成本。与 [`comparable_cost_range`] 取的**必须是同一个字段**，
+/// 否则区间与取值不同源 —— 那会让最便宜的那个也拿不到满分。
+fn candidate_cost(c: &Candidate) -> Option<f32> {
+    let price = c.model.price.as_ref()?;
+    (price.prompt > 0.0).then_some(price.prompt as f32)
+}
+
 impl Router {
     pub fn new(limiter: Arc<RateLimiter>, health: Arc<HealthRegistry>) -> Self {
         Self::with_custom_rules(limiter, health, Vec::new())
@@ -237,10 +293,37 @@ impl Router {
 
         // 4) 先按现有健康、额度、能力、延迟权重打分。显式 Boost 作为额外
         // 排序层级：同一层级仍完全沿用原有分数，避免规则吞掉正常的权重排序。
-        let w = Weights::for_strategy(strategy);
+        //
+        // D3：权重从配置派生。**关着时 `with_cost_routing` 返回的与原值逐位相同**
+        // （两个新权重保持 0.0），所以这一步本身不改变任何既有行为。
+        let w = Weights::with_cost_routing(Weights::for_strategy(strategy), &cfg.cost_routing);
+
+        // D3：成本/效率的**相对区间必须整批算一次**。
+        // 每个候选各算一遍会得出「成本用了含免费模型的区间、效率用了不含的」
+        // 这类不一致，而那种不一致不报错，只表现为排序偶尔不对。
+        let cost = CostContext {
+            range: comparable_cost_range(&candidates),
+            // 【未接】吞吐数据源不存在：`ProviderHealth` 只有 `avg_latency_ms`，
+            // 没有 tok/s。卡片要求从 `requests` 表按
+            // `completion_tokens / latency_ms` 现算，那需要把统计接进来。
+            // 这里**明确留 None** 而不是拿延迟倒推一个假吞吐 ——
+            // 假的效率分会让「首包快但吐字慢」的模型拿到高分，
+            // 正好是这一维要修的反面。见 docs/D批接续-交接单.md。
+            tps_range: None,
+            // 长 prompt 那一支**也没接**：`rank_with_intent` 的签名里
+            // 没有 prompt token 数，要加参数得改 server.rs 的 4 个调用点。
+            // 这里传 0 ⇒ 只有 `Simple` 类请求会拿到成本偏置，
+            // 而这正是卡片点名的第一场景。长 prompt 场景记为未接。
+            cost_bias: score::cost_bias_applies(
+                intent,
+                0,
+                cfg.cost_routing.long_prompt_threshold_tokens,
+            ),
+        };
+
         candidates.sort_by(|a, b| {
-            let sa = self.score_of(a, &w, intent);
-            let sb = self.score_of(b, &w, intent);
+            let sa = self.score_of(a, &w, intent, &cost);
+            let sb = self.score_of(b, &w, intent, &cost);
             let score_order = sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal);
             if custom_rules_active {
                 custom_rule_boost(b, &custom_rules)
@@ -270,22 +353,24 @@ impl Router {
         candidates
     }
 
-    fn score_of(&self, c: &Candidate, w: &Weights, intent: Option<TaskClass>) -> f32 {
+    fn score_of(
+        &self,
+        c: &Candidate,
+        w: &Weights,
+        intent: Option<TaskClass>,
+        cost: &CostContext,
+    ) -> f32 {
         let key = rate_key(&c.provider, &c.model);
         let q = quota_of(&c.provider);
         let input = ScoreInput {
             health: Some(self.health.get(&c.provider.id, &c.model.upstream)),
             headroom: self.limiter.headroom(&key, &q),
             intent,
-            // D3：**默认不施加成本/效率偏置**。这里刻意留 None/false，
-            // 而不是顺手从候选集算出区间 —— 算出来但权重仍是 0.0 时
-            // 「看起来接了、其实没生效」，那种状态最难查。
-            // 真正接上要等 D3 的调用侧改造（配置项 + 区间计算）。
-            cost_range: None,
-            candidate_cost: None,
-            tps_range: None,
+            cost_range: cost.range,
+            candidate_cost: candidate_cost(c),
+            tps_range: cost.tps_range,
             candidate_tps: None,
-            cost_bias: false,
+            cost_bias: cost.cost_bias,
         };
         score::score(c, &input, w)
     }

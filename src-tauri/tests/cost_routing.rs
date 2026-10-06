@@ -64,6 +64,76 @@ fn 区间与打分函数串起来能给出一致的排序() {
     assert!((scored[2].1 - 0.2).abs() < 1e-6, "最贵下界");
 }
 
+// ------------------------------ 币种可比性 ------------------------------
+
+#[test]
+fn 币种不同时整体不可比而不是混着比() {
+    use llm_gateway_lib::domain::Currency;
+    use llm_gateway_lib::router::score::comparable_range;
+
+    // 全部 USD ⇒ 有区间
+    let usd = comparable_range([
+        Some((1.0, Currency::Usd)),
+        Some((3.0, Currency::Usd)),
+        Some((2.0, Currency::Usd)),
+    ]);
+    assert_eq!(usd, Some((1.0, 3.0)));
+
+    // 混入 CNY ⇒ **整体 None**。
+    // 混着比会给出「CNY 的 1.0 比 USD 的 3.0 便宜」，
+    // 而 1 CNY 约合 0.14 USD —— 那个结论是错的。
+    let mixed = comparable_range([
+        Some((1.0, Currency::Usd)),
+        Some((3.0, Currency::Usd)),
+        Some((1.0, Currency::Cny)),
+    ]);
+    assert_eq!(
+        mixed, None,
+        "出现第二种币种时必须整体不可比，不能偷偷混着比"
+    );
+    // 反向：也不能「只取第一种币种的子集」——
+    // 那样会给出 Some((1.0, 3.0))，把 CNY 那个悄悄丢掉。
+    assert_ne!(mixed, Some((1.0, 3.0)));
+}
+
+#[test]
+fn 没有价格的候选既不参与区间也不主张币种() {
+    use llm_gateway_lib::domain::Currency;
+    use llm_gateway_lib::router::score::comparable_range;
+
+    // `None` = 这个候选没有价格。它不该让整批变成「币种不可比」——
+    // 给它补一个默认币种的话，一个还没填价的模型会让整批成本维度失效，
+    // 而它根本没有参与比较的资格。
+    let r = comparable_range([
+        Some((5.0, Currency::Usd)),
+        None,
+        Some((20.0, Currency::Usd)),
+    ]);
+    assert_eq!(r, Some((5.0, 20.0)), "无价的候选应当被跳过而不是拖垮整批");
+
+    // 有价但币种不同 ⇒ 仍然不可比
+    let r = comparable_range([Some((5.0, Currency::Usd)), Some((8.0, Currency::Cny))]);
+    assert_eq!(r, None);
+
+    // 一个可比的都没有 ⇒ None
+    assert_eq!(comparable_range([None, None]), None);
+    assert_eq!(comparable_range([] as [Option<(f32, Currency)>; 0]), None);
+}
+
+#[test]
+fn 币种一致时非正价格被剔除() {
+    use llm_gateway_lib::domain::Currency;
+    use llm_gateway_lib::router::score::comparable_range;
+
+    // 0 与负价格是坏数据，不该把下界拉到 0
+    let r = comparable_range([
+        Some((0.0, Currency::Usd)),
+        Some((-1.0, Currency::Usd)),
+        Some((5.0, Currency::Usd)),
+        Some((20.0, Currency::Usd)),
+    ]);
+    assert_eq!(r, Some((5.0, 20.0)));
+}
 // ------------------------------ 配置项被消费 ------------------------------
 
 #[test]
