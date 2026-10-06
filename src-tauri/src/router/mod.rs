@@ -10,7 +10,9 @@
 // 这里只回答「这一次之后该不该升级」—— 三条硬约束都是「不许升级」，
 // 埋在异步流程里几乎无法断言。
 pub mod cascade;
+// D5：质量 × 速度 × 价格的三维 Pareto 前沿（纯逻辑，无 IO）。
 pub mod failover;
+pub mod pareto;
 pub mod ratelimit;
 pub mod score;
 
