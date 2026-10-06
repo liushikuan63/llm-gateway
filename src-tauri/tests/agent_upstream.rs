@@ -172,3 +172,182 @@ fn 未知_runtime_id_的错误文本面向用户() {
     assert!(!err.contains("500"));
     assert!(!err.contains("panic"));
 }
+
+// ------------------------------ 持久层 ------------------------------
+
+#[tokio::test]
+async fn 运行时能写入读回并更新() {
+    use llm_gateway_lib::db::repo;
+    use llm_gateway_lib::domain::AgentRuntime;
+
+    let db = new_db().await;
+    let mut runtime = AgentRuntime::new("codex-work", "codex", "Codex（工作）");
+    runtime.options = Some(serde_json::json!({"exe": "codex.exe"}));
+    repo::upsert_agent_runtime(db.pool(), &runtime)
+        .await
+        .unwrap();
+
+    let back = repo::get_agent_runtime(db.pool(), "codex-work")
+        .await
+        .unwrap()
+        .expect("应当读得回来");
+    assert_eq!(back.id, runtime.id);
+    assert_eq!(back.kind, "codex");
+    assert_eq!(back.label, "Codex（工作）");
+    assert_eq!(back.options, runtime.options);
+    assert!(back.enabled);
+
+    // 更新：改 label 与 enabled
+    let created_before = back.created_at;
+    let mut updated = back.clone();
+    updated.label = "改了".into();
+    updated.enabled = false;
+    repo::upsert_agent_runtime(db.pool(), &updated)
+        .await
+        .unwrap();
+
+    let after = repo::get_agent_runtime(db.pool(), "codex-work")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.label, "改了");
+    assert!(!after.enabled, "enabled 必须真的落库");
+    // **created_at 必须保持原值** —— 覆盖它会让界面上的「创建于」
+    // 每次保存都变成今天
+    assert_eq!(after.created_at, created_before, "更新不该覆盖 created_at");
+    assert!(after.updated_at >= updated.updated_at - chrono::Duration::seconds(5));
+}
+
+#[tokio::test]
+async fn 列表按_id_字典序() {
+    use llm_gateway_lib::db::repo;
+    use llm_gateway_lib::domain::AgentRuntime;
+
+    let db = new_db().await;
+    for id in ["zzz", "aaa", "mmm"] {
+        repo::upsert_agent_runtime(db.pool(), &AgentRuntime::new(id, "fake", id))
+            .await
+            .unwrap();
+    }
+    let ids: Vec<String> = repo::list_agent_runtimes(db.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["aaa", "mmm", "zzz"],
+        "顺序必须稳定，否则设置页每次刷新都在跳"
+    );
+}
+
+#[tokio::test]
+async fn 坏_options_json_降级成_none_而不拖垮整张列表() {
+    use llm_gateway_lib::db::repo;
+    use llm_gateway_lib::domain::AgentRuntime;
+
+    let db = new_db().await;
+    repo::upsert_agent_runtime(db.pool(), &AgentRuntime::new("good", "fake", "好的"))
+        .await
+        .unwrap();
+    // 直接塞坏 JSON（模拟手改库、或被截断的写入）
+    sqlx::query(
+        "INSERT INTO agent_runtimes (id, kind, label, options_json, enabled, created_at, updated_at) \
+         VALUES ('bad','fake','坏的','{ 不是 JSON',1,'2026-01-01','2026-01-01')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let all = repo::list_agent_runtimes(db.pool()).await.unwrap();
+    assert_eq!(all.len(), 2, "坏 options 不该让整张列表读不出来");
+    let bad = all.iter().find(|r| r.id == "bad").unwrap();
+    assert_eq!(bad.options, None, "坏 JSON 降级成 None");
+    // 而**关键列仍然可用** —— 这条是「降级但不残废」
+    assert_eq!(bad.kind, "fake");
+    assert_eq!(bad.label, "坏的");
+}
+
+#[tokio::test]
+async fn 坏时间戳回落成_now_而不是报错() {
+    use llm_gateway_lib::db::repo;
+
+    let db = new_db().await;
+    sqlx::query(
+        "INSERT INTO agent_runtimes (id, kind, label, options_json, enabled, created_at, updated_at) \
+         VALUES ('t','fake','l',NULL,1,'根本不是时间','2026-01-01')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let r = repo::get_agent_runtime(db.pool(), "t")
+        .await
+        .unwrap()
+        .expect("时间戳坏了也该读得出来");
+    assert_eq!(r.id, "t");
+}
+
+#[tokio::test]
+async fn 写入前会校验_空_id_被拦住() {
+    use llm_gateway_lib::db::repo;
+    use llm_gateway_lib::domain::AgentRuntime;
+
+    let db = new_db().await;
+    let bad = AgentRuntime::new("", "codex", "l");
+    assert!(
+        repo::upsert_agent_runtime(db.pool(), &bad).await.is_err(),
+        "空 id 必须在写库前被拦住"
+    );
+    // 反向：合法的一定写得进去（不然上面的断言可能只是因为别的原因失败）
+    let ok = AgentRuntime::new("ok", "codex", "l");
+    assert!(repo::upsert_agent_runtime(db.pool(), &ok).await.is_ok());
+}
+
+#[tokio::test]
+async fn 删除命中与否如实返回() {
+    use llm_gateway_lib::db::repo;
+    use llm_gateway_lib::domain::AgentRuntime;
+
+    let db = new_db().await;
+    repo::upsert_agent_runtime(db.pool(), &AgentRuntime::new("gone", "fake", "l"))
+        .await
+        .unwrap();
+    assert!(repo::delete_agent_runtime(db.pool(), "gone").await.unwrap());
+    assert!(
+        !repo::delete_agent_runtime(db.pool(), "gone").await.unwrap(),
+        "第二次删同一个必须返回 false 而不是报错"
+    );
+}
+
+#[tokio::test]
+async fn 能查出哪些_provider_引用了这个运行时() {
+    use llm_gateway_lib::db::repo;
+    use llm_gateway_lib::domain::AgentRuntime;
+
+    let db = new_db().await;
+    repo::upsert_agent_runtime(db.pool(), &AgentRuntime::new("rt", "codex", "l"))
+        .await
+        .unwrap();
+    // 手工插两行 Provider，一行引用、一行不引用
+    for (id, runtime) in [("p-user", Some("rt")), ("p-free", None)] {
+        sqlx::query(
+            "INSERT INTO providers (id, name, dialect, base_url, api_key_enc, enabled, priority, \
+             rpm_limit, intelligence, runtime_id, created_at, updated_at) \
+             VALUES (?,'n','openai','http://127.0.0.1:1/v1','',1,0,0,50,?,'2026-01-01','2026-01-01')",
+        )
+        .bind(id)
+        .bind(runtime)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    let users = repo::providers_using_runtime(db.pool(), "rt")
+        .await
+        .unwrap();
+    assert_eq!(users, vec!["p-user".to_string()], "只该报出真正引用的那个");
+    assert!(repo::providers_using_runtime(db.pool(), "没人用")
+        .await
+        .unwrap()
+        .is_empty());
+}

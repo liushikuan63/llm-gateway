@@ -1871,3 +1871,123 @@ pub async fn list_routable_models_of(
         .filter(|m| m.enabled)
         .collect())
 }
+
+/* ------------------- 任务卡二 A5：账号型上游运行时 ------------------- */
+
+/// 读全部运行时，按 id 字典序。
+///
+/// 坏 JSON 的 `options_json` 降级成 `None` 而**不报错** ——
+/// 与 `read_local_meta` / `read_capabilities` 同一取向：
+/// 一个运行时的附加配置坏了不该让整张列表读不出来，
+/// 那样用户看到的是「所有账号型上游都没了」，而根因在一个字段上。
+pub async fn list_agent_runtimes(pool: &SqlitePool) -> Result<Vec<AgentRuntime>> {
+    let rows = sqlx::query(
+        "SELECT id, kind, label, options_json, enabled, created_at, updated_at \
+         FROM agent_runtimes ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(read_agent_runtime(&row)?);
+    }
+    Ok(out)
+}
+
+/// 读一个运行时。不存在返回 `None`。
+pub async fn get_agent_runtime(pool: &SqlitePool, id: &str) -> Result<Option<AgentRuntime>> {
+    let row = sqlx::query(
+        "SELECT id, kind, label, options_json, enabled, created_at, updated_at \
+         FROM agent_runtimes WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(row) => Ok(Some(read_agent_runtime(&row)?)),
+        None => Ok(None),
+    }
+}
+
+/// 从一行解出运行时。
+///
+/// 时间戳解析失败**回落到 `Utc::now()` 而不是报错**：与坏 options 同理 ——
+/// 「这行是什么时候建的」不是关键信息，为一个时间戳让整张列表读不出来不值。
+/// 但 `id` / `kind` / `label` 是**关键列**，它们坏了必须报错，
+/// 否则会得到一个 id 为空串的运行时，而它会被 `provider.runtime_id`
+/// 以各种意想不到的方式匹配上。
+fn read_agent_runtime(row: &sqlx::sqlite::SqliteRow) -> Result<AgentRuntime> {
+    let options = row
+        .get::<Option<String>, _>("options_json")
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let parse_time = |value: String| {
+        chrono::DateTime::parse_from_rfc3339(&value)
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now())
+    };
+    Ok(AgentRuntime {
+        id: row.get("id"),
+        kind: row.get("kind"),
+        label: row.get("label"),
+        options,
+        enabled: row.get::<i64, _>("enabled") == 1,
+        created_at: parse_time(row.get("created_at")),
+        updated_at: parse_time(row.get("updated_at")),
+    })
+}
+
+/// 写入（存在则更新）。**先 `validate`** —— 把能拦的错拦在写库之前。
+///
+/// `created_at` 在更新时**保持原值**：它是「这行什么时候建的」，
+/// 覆盖它会让界面上的「创建于」每次保存都变成今天。
+pub async fn upsert_agent_runtime(pool: &SqlitePool, runtime: &AgentRuntime) -> Result<()> {
+    runtime
+        .validate()
+        .map_err(|e| crate::error::GatewayError::Other(anyhow::anyhow!(e)))?;
+    let options = runtime
+        .options
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok());
+    let now = Utc::now();
+    let created = get_agent_runtime(pool, &runtime.id)
+        .await?
+        .map(|existing| existing.created_at)
+        .unwrap_or(runtime.created_at);
+    sqlx::query(
+        r#"INSERT OR REPLACE INTO agent_runtimes
+             (id, kind, label, options_json, enabled, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?)"#,
+    )
+    .bind(&runtime.id)
+    .bind(&runtime.kind)
+    .bind(&runtime.label)
+    .bind(options)
+    .bind(runtime.enabled as i64)
+    .bind(created.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 删除。返回是否命中了记录。
+///
+/// **调用方要先检查有没有 Provider 引用它** —— 本函数不做级联：
+/// 删掉一个还被引用的运行时会留下一个指向空气的 `provider.runtime_id`，
+/// 而那会在请求时才报「未知账号运行时」，离操作已经很远了。
+pub async fn delete_agent_runtime(pool: &SqlitePool, id: &str) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM agent_runtimes WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// 有哪些 Provider 引用这个运行时。供删除前的检查用。
+pub async fn providers_using_runtime(pool: &SqlitePool, runtime_id: &str) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT id FROM providers WHERE runtime_id = ? ORDER BY id")
+        .bind(runtime_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+}
