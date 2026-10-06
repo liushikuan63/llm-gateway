@@ -49,6 +49,10 @@ struct CostContext {
     health: Arc<HealthRegistry>,
     /// 本次请求是否适用成本偏置。
     cost_bias: bool,
+    /// D3：请求的 prompt token 估算值，供分档价选档。
+    prompt_tokens: i64,
+    /// D3：当天第几分钟，供峰谷时段倍率选规则。
+    minute_of_day: u16,
 }
 
 impl CostContext {
@@ -60,6 +64,12 @@ impl CostContext {
     fn candidate_tps(&self, c: &Candidate) -> Option<f32> {
         let h = self.health.get(&c.provider.id, &c.model.upstream);
         usable_tps(&h, self.min_tps_samples)
+    }
+
+    /// 单个候选的参考成本。**与 `range` 用同一个函数** ——
+    /// 两边口径不同的话，最便宜的那个也拿不到满分。
+    fn candidate_cost(&self, c: &Candidate) -> Option<f32> {
+        candidate_cost(c, self.prompt_tokens, self.minute_of_day)
     }
 }
 
@@ -76,11 +86,13 @@ impl CostContext {
 ///
 /// ## 用基础输入单价作参考
 ///
-/// 【未接】分档价（`tiers`）与时段价（`rules`）**还没生效** ——
-/// 它们要经过定价模块按时段与输入长度解析，本函数只取 `prompt` 基础价。
-/// 这一点写在 `docs/D批接续-交接单.md` 的「下一步」里，
-/// 不在代码里假装已经按峰谷价算了。
-fn comparable_cost_range(candidates: &[Candidate]) -> Option<(f32, f32)> {
+/// 【已接】分档价与时段价都经过 [`reference_unit_price`] 生效 ——
+/// 与 `ModelPrice::charge_with_cache` 用同一对因子。
+fn comparable_cost_range(
+    candidates: &[Candidate],
+    prompt_tokens: i64,
+    minute_of_day: u16,
+) -> Option<(f32, f32)> {
     // 币种可比的规则在 `score::comparable_range` 里（可单测），
     // 这里只负责把候选映射成「价格 + 币种」。
     // **没有价格的候选整条跳过** —— 它既不参与区间，也不主张任何币种。
@@ -93,18 +105,55 @@ fn comparable_cost_range(candidates: &[Candidate]) -> Option<(f32, f32)> {
                 // 非正价格当作「没有价格」：区间与 `candidate_cost` 必须同源，
                 // 否则最便宜的那个也拿不到满分。
                 let p = c.model.price.as_ref()?;
-                (p.prompt > 0.0).then_some((p.prompt as f32, p.currency))
+                reference_unit_price(p, prompt_tokens, minute_of_day).map(|v| (v, p.currency))
             }),
     )
+}
+
+/// D3：**与定价模块同源**的参考单价。
+///
+/// 直接调 `ModelPrice::charge_with_cache` 用的那两个因子：
+/// `effective_unit`（输入长度分档）× `active_rule`（峰谷时段倍率）。
+///
+/// ## 为什么不直接取 `price.prompt`
+///
+/// 卡片明确要求「必须与定价模块同源，不要另立一套」。
+/// 只取基础价的话，路由会按**基础价**比较，而实际计费可能是
+/// 「输入 ≥128K 档 × 高峰 1.5 倍」—— 两者差 3 倍时，
+/// 网关选的「便宜」模型在账单上更贵，而用户没有任何线索能看出这个偏差。
+///
+/// 缓存价**不在这一维里体现**：它是**请求内容**决定的
+/// （同一模型命中缓存与否单价不同），不是模型的属性。
+/// 拿它给模型排序会把「这个请求恰好命中缓存」误当成「这个模型便宜」。
+#[doc(hidden)]
+pub fn reference_unit_price_for_test(
+    price: &crate::domain::ModelPrice,
+    prompt_tokens: i64,
+    minute_of_day: u16,
+) -> Option<f32> {
+    reference_unit_price(price, prompt_tokens, minute_of_day)
+}
+
+fn reference_unit_price(
+    price: &crate::domain::ModelPrice,
+    prompt_tokens: i64,
+    minute_of_day: u16,
+) -> Option<f32> {
+    let (unit, _, _) = price.effective_unit(prompt_tokens);
+    let multiplier = price
+        .active_rule(minute_of_day)
+        .map(|rule| rule.prompt_multiplier)
+        .unwrap_or(1.0);
+    let value = unit * multiplier;
+    (value.is_finite() && value > 0.0).then_some(value as f32)
 }
 
 /// 单个候选的参考成本。与 [`comparable_cost_range`] 取的**必须是同一个字段**，
 /// 否则区间与取值不同源 —— 那会让最便宜的那个也拿不到满分。
 /// 单个候选的参考成本。与 [`comparable_cost_range`] 取的**必须是同一个字段**，
 /// 否则区间与取值不同源 —— 那会让最便宜的那个也拿不到满分。
-fn candidate_cost(c: &Candidate) -> Option<f32> {
-    let price = c.model.price.as_ref()?;
-    (price.prompt > 0.0).then_some(price.prompt as f32)
+fn candidate_cost(c: &Candidate, prompt_tokens: i64, minute_of_day: u16) -> Option<f32> {
+    reference_unit_price(c.model.price.as_ref()?, prompt_tokens, minute_of_day)
 }
 
 /// D3：某个候选的实测吞吐（tok/s），样本不足时返回 `None`。
@@ -352,8 +401,12 @@ impl Router {
         // D3：成本/效率的**相对区间必须整批算一次**。
         // 每个候选各算一遍会得出「成本用了含免费模型的区间、效率用了不含的」
         // 这类不一致，而那种不一致不报错，只表现为排序偶尔不对。
+        // D3：峰谷时段倍率要「当天第几分钟」。用时间戳现算而不是引 `Timelike`：
+        // 本文件其余地方都没有 time feature 的依赖，为一个整数引入 trait 不值。
+        let minute_of_day =
+            ((chrono::Utc::now().timestamp().div_euclid(60)).rem_euclid(1440)) as u16;
         let cost = CostContext {
-            range: comparable_cost_range(&candidates),
+            range: comparable_cost_range(&candidates, prompt_tokens as i64, minute_of_day),
             // D3：实测吞吐区间。**样本数不足的候选整条跳过**
             // （与「无价格 = 不主张币种」同款处理）：
             // 一两个样本的 tok/s 抖动极大，用它排序等于随机。
@@ -363,6 +416,8 @@ impl Router {
                 usable_tps(&h, cfg.cost_routing.min_efficiency_samples)
             })),
             min_tps_samples: cfg.cost_routing.min_efficiency_samples,
+            prompt_tokens: prompt_tokens as i64,
+            minute_of_day,
             health: self.health.clone(),
             // 长 prompt 那一支**还没接**：`rank_with_intent` 的签名里
             // 没有 prompt token 数，要加参数得改 server.rs 的 4 个调用点。
@@ -421,7 +476,7 @@ impl Router {
             headroom: self.limiter.headroom(&key, &q),
             intent,
             cost_range: cost.range,
-            candidate_cost: candidate_cost(c),
+            candidate_cost: cost.candidate_cost(c),
             tps_range: cost.tps_range,
             candidate_tps: cost.candidate_tps(c),
             cost_bias: cost.cost_bias,

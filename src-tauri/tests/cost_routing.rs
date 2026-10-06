@@ -522,3 +522,84 @@ fn 阈值设为零时所有分类都计入() {
     assert!(cost_bias_applies(Some(TaskClass::Reasoning), 0, 0));
     assert!(cost_bias_applies(Some(TaskClass::Vision), 1, 0));
 }
+
+// ------------------------------ D3 分档价与峰谷价的同源口径 ------------------------------
+
+/// 卡片要求「必须与定价模块同源，不要另立一套」。
+/// 判据：路由用的参考单价 == `charge_with_cache` 用的
+/// `effective_unit × active_rule` 倍率。
+#[test]
+fn 参考单价走分档价而不是基础价() {
+    use llm_gateway_lib::router::reference_unit_price_for_test as unit;
+
+    // 基础价 1.0；输入 ≥100K 时跳到 5.0 档
+    let price: llm_gateway_lib::domain::ModelPrice = serde_json::from_value(serde_json::json!({
+        "prompt": 1.0, "completion": 2.0, "currency": "usd",
+        "tiers": [{"min_prompt_tokens": 100000, "prompt": 5.0, "completion": 10.0}]
+    }))
+    .unwrap();
+
+    // 短输入走基础价
+    assert_eq!(unit(&price, 1_000, 0), Some(1.0));
+    // 长输入走分档价 —— **这一条是「同源」的核心**：
+    // 若实现里取的是 `price.prompt`，这里会得到 1.0 而不是 5.0。
+    assert_eq!(
+        unit(&price, 200_000, 0),
+        Some(5.0),
+        "输入超过档位阈值时必须用档位单价，否则路由按基础价比、账单按档位收"
+    );
+    // 恰好等于阈值也命中（`>=`）
+    assert_eq!(unit(&price, 100_000, 0), Some(5.0));
+    assert_eq!(unit(&price, 99_999, 0), Some(1.0));
+}
+
+#[test]
+fn 参考单价乘上峰谷时段倍率() {
+    use llm_gateway_lib::router::reference_unit_price_for_test as unit;
+
+    // 高峰（0:00-8:00，即 minute 0..480）1.5 倍
+    let price: llm_gateway_lib::domain::ModelPrice = serde_json::from_value(serde_json::json!({
+        "prompt": 2.0, "completion": 4.0, "currency": "usd",
+        "rules": [{"start_minute": 0, "end_minute": 480, "prompt_multiplier": 1.5,
+                   "completion_multiplier": 1.5, "label": "高峰"}]
+    }))
+    .unwrap();
+
+    // 高峰时段：2.0 × 1.5 = 3.0
+    assert_eq!(unit(&price, 1_000, 60), Some(3.0));
+    // 非高峰：只剩基础价 2.0
+    assert_eq!(unit(&price, 1_000, 600), Some(2.0));
+    // **反向**：若实现里没有乘倍率，上面两条会相等 —— 这正是要区分的
+    assert_ne!(unit(&price, 1_000, 60), unit(&price, 1_000, 600));
+}
+
+#[test]
+fn 参考单价把分档与倍率一起算上() {
+    use llm_gateway_lib::router::reference_unit_price_for_test as unit;
+
+    // 基础 1.0，档位 5.0，高峰 1.5 ⇒ 7.5
+    let price: llm_gateway_lib::domain::ModelPrice = serde_json::from_value(serde_json::json!({
+        "prompt": 1.0, "completion": 2.0, "currency": "usd",
+        "tiers": [{"min_prompt_tokens": 100000, "prompt": 5.0, "completion": 10.0}],
+        "rules": [{"start_minute": 0, "end_minute": 480, "prompt_multiplier": 1.5,
+                   "completion_multiplier": 1.5, "label": "高峰"}]
+    }))
+    .unwrap();
+
+    assert_eq!(unit(&price, 200_000, 60), Some(7.5), "5.0 × 1.5");
+    assert_eq!(unit(&price, 1_000, 60), Some(1.5), "1.0 × 1.5");
+    assert_eq!(unit(&price, 200_000, 600), Some(5.0), "5.0 × 1.0");
+}
+
+#[test]
+fn 参考单价对零价与坏数据返回_none() {
+    use llm_gateway_lib::router::reference_unit_price_for_test as unit;
+
+    let free: llm_gateway_lib::domain::ModelPrice = serde_json::from_value(serde_json::json!({
+        "prompt": 0.0, "completion": 0.0, "currency": "usd"
+    }))
+    .unwrap();
+    // 0 价 = 「没有可比的成本信息」，不是「最便宜」。
+    // 给 Some(0.0) 的话它会拿走成本维度的满分，而免费模型通常有别的代价。
+    assert_eq!(unit(&free, 1_000, 0), None);
+}
