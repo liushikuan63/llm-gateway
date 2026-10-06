@@ -255,6 +255,7 @@ fn build_provider(spec: &GoldenCandidate) -> Provider {
         rpm_limit: spec.rpm_limit as i32,
         intelligence: spec.intelligence,
         note: None,
+        runtime_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

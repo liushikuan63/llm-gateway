@@ -49,6 +49,7 @@ fn live_provider(
         rpm_limit: 0,
         intelligence: 50,
         note: None,
+        runtime_id: None,
         created_at: now,
         updated_at: now,
     }

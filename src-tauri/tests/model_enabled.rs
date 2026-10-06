@@ -44,6 +44,7 @@ fn provider_with(models: Vec<ModelRef>) -> Provider {
         rpm_limit: 0,
         intelligence: 70,
         note: None,
+        runtime_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

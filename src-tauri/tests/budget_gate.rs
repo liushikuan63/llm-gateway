@@ -61,6 +61,7 @@ fn provider(base_url: String) -> Provider {
         rpm_limit: 0,
         intelligence: 80,
         note: None,
+        runtime_id: None,
         created_at: now,
         updated_at: now,
     }

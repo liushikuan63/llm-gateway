@@ -293,6 +293,7 @@ async fn 端点地址变更后应清掉自动登记的旧供应商() {
         rpm_limit: 0,
         intelligence: 50,
         note: Some("由 Ollama 自动登记的本地模型".into()),
+        runtime_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -344,6 +345,7 @@ async fn 用户手工建的供应商绝不被清理_对照组() {
             rpm_limit: 0,
             intelligence: 50,
             note: None,
+            runtime_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         },

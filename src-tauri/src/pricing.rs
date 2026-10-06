@@ -304,12 +304,14 @@ mod tests {
                     price,
                     overrides: None,
                     local: None,
+                    capabilities: None,
                     enabled: true,
                 })
                 .collect(),
             rpm_limit: 0,
             intelligence: 50,
             note: None,
+            runtime_id: None,
             created_at: now,
             updated_at: now,
         }

@@ -90,6 +90,7 @@ fn provider(id: &str, name: &str, api_key_enc: String) -> Provider {
         rpm_limit: 60,
         intelligence: 70,
         note: Some("bundle test".to_owned()),
+        runtime_id: None,
         created_at: now,
         updated_at: now,
     }

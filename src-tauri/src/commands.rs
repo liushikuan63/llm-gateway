@@ -217,6 +217,7 @@ pub async fn upsert_provider(
         rpm_limit: input.rpm_limit,
         intelligence: input.intelligence,
         note: input.note,
+        runtime_id: None,
         created_at: now,
         updated_at: now,
     };
@@ -780,6 +781,17 @@ struct SnapshotProvider {
     rpm_limit: i32,
     intelligence: i32,
     note: Option<String>,
+    /// 任务卡二 A5：快照**必须带上运行时 id**。
+    ///
+    /// 漏掉它的后果是：回滚一次快照会把 Provider 的账号型配置
+    /// **悄悄清成 NULL** —— 于是它退回 HTTP 直连，带着空 Key
+    /// 去连真实上游。而「回滚」是用户为了**恢复**才做的动作，
+    /// 出一个「越回滚越坏」的结果最难归因。
+    ///
+    /// `#[serde(default)]` 让**旧的快照文件**（没有这个键）仍能读 ——
+    /// 那时它读出来是 `None`，与旧快照当时的语义一致。
+    #[serde(default)]
+    runtime_id: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -797,6 +809,7 @@ impl From<&Provider> for SnapshotProvider {
             rpm_limit: provider.rpm_limit,
             intelligence: provider.intelligence,
             note: provider.note.clone(),
+            runtime_id: provider.runtime_id.clone(),
             created_at: provider.created_at,
             updated_at: provider.updated_at,
         }
@@ -817,6 +830,7 @@ impl SnapshotProvider {
             rpm_limit: self.rpm_limit,
             intelligence: self.intelligence,
             note: self.note,
+            runtime_id: None,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -3448,6 +3462,7 @@ pub async fn register_local_model(
             rpm_limit: 0,
             intelligence: 50,
             note: Some(format!("由 {} 自动登记的本地模型", endpoint.label)),
+            runtime_id: None,
             created_at: now,
             updated_at: now,
         });

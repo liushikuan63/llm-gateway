@@ -49,6 +49,7 @@ async fn seed_model(database: &llm_gateway_lib::db::Db) {
         rpm_limit: 0,
         intelligence: 80,
         note: None,
+        runtime_id: None,
         created_at: now,
         updated_at: now,
     };

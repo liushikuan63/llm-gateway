@@ -58,6 +58,7 @@ fn provider(dialect: Dialect, base_url: String, api_key_enc: &str) -> Provider {
         rpm_limit: 0,
         intelligence: 50,
         note: None,
+        runtime_id: None,
         created_at: now,
         updated_at: now,
     }

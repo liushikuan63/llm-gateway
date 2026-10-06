@@ -67,6 +67,7 @@ fn provider(id: &str, base_url: String, dialect: Dialect, priority: i32) -> Prov
         rpm_limit: 0,
         intelligence: 50,
         note: None,
+        runtime_id: None,
         created_at: now,
         updated_at: now,
     }

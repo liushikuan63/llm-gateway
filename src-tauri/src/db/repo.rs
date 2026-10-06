@@ -34,6 +34,7 @@ pub async fn list_providers(pool: &SqlitePool) -> Result<Vec<Provider>> {
             rpm_limit: r.get("rpm_limit"),
             intelligence: r.get("intelligence"),
             note: r.get("note"),
+            runtime_id: None,
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         });

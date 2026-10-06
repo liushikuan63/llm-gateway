@@ -50,6 +50,7 @@ fn provider(id: &str, intelligence: i32, models: Vec<ModelRef>) -> Provider {
         rpm_limit: 0,
         intelligence,
         note: None,
+        runtime_id: None,
         created_at: now,
         updated_at: now,
     }

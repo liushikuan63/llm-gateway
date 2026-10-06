@@ -62,6 +62,16 @@ pub struct Provider {
     pub intelligence: i32,
     /// 备注
     pub note: Option<String>,
+    /// 任务卡二 A5：账号型上游的运行时 id。
+    ///
+    /// `None`（**默认，也是绝大多数 Provider 的现状**）表示走原有的
+    /// HTTP 直连路径 —— 铁律「模式隔离」在这一层的表述。
+    ///
+    /// 有值时必须能在 `AdapterRegistry` 里解析出适配器，
+    /// 否则请求得到可读错误「未知账号运行时：xxx」，
+    /// **绝不静默回落到 HTTP 直连** —— 那会带着空 Key 去连真实上游。
+    #[serde(default)]
+    pub runtime_id: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }

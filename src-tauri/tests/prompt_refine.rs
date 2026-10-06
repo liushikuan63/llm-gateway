@@ -138,6 +138,7 @@ fn candidate(id: &str, thinking: bool, priority: i32) -> Candidate {
             rpm_limit: 0,
             intelligence: 70,
             note: None,
+            runtime_id: None,
             created_at: now,
             updated_at: now,
         },

@@ -271,6 +271,7 @@ async fn main() -> Result<()> {
             rpm_limit: 0,
             intelligence: entry.intelligence,
             note: entry.note.clone(),
+            runtime_id: None,
             created_at: now,
             updated_at: now,
         };

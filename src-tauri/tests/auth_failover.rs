@@ -58,6 +58,7 @@ fn provider(id: &str, alias: &str, with_key: bool) -> Provider {
         rpm_limit: 0,
         intelligence: 50,
         note: None,
+        runtime_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

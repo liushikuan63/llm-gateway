@@ -45,6 +45,7 @@ fn provider() -> Provider {
         rpm_limit: 60,
         intelligence: 80,
         note: Some("integration test".to_owned()),
+        runtime_id: None,
         created_at: now,
         updated_at: now,
     }
