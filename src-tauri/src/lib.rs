@@ -48,6 +48,11 @@ pub struct AppState {
     pub db: db::Db,
     pub config: Arc<parking_lot::RwLock<AppConfig>>,
     pub gateway: Arc<GatewayState>,
+    /// 任务卡二 A5：账号型上游的适配器注册表。
+    ///
+    /// **进程级共享**（`Arc`）：适配器是无状态的、只读的，
+    /// 每个请求各造一份没有意义。A6/A7 加真适配器时也在这里注册一次。
+    pub adapters: Arc<crate::agent_upstream::AdapterRegistry>,
 }
 
 /// 在事件循环启动后异步完成后端初始化，避免阻塞首帧渲染。
@@ -88,6 +93,8 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
         db,
         config: Arc::new(parking_lot::RwLock::new(cfg)),
         gateway: gateway.clone(),
+        // A5：现在只有假适配器；A6/A7 会在这里加真适配器。
+        adapters: Arc::new(crate::agent_upstream::AdapterRegistry::with_builtins()),
     });
 
     let gw = gateway.clone();
@@ -269,6 +276,10 @@ pub fn run() {
             commands::query_requests,
             commands::export_requests,
             commands::export_capabilities,
+            commands::list_agent_runtimes,
+            commands::list_agent_adapters,
+            commands::save_agent_runtime,
+            commands::delete_agent_runtime,
             commands::import_capabilities,
             commands::apply_takeover,
             commands::export_bundle,

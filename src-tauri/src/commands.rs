@@ -1411,6 +1411,97 @@ pub async fn export_requests(
     })
 }
 
+/* ------------------- 任务卡二 A5：账号型上游运行时 ------------------- */
+
+/// 列出全部运行时。
+///
+/// 返回体里**不带任何凭据** —— 运行时表里现在也没有凭据列，
+/// 登录态由各家 CLI 自己管（`~/.codex/auth.json` 那类），
+/// 网关**不读也不存**。这是任务卡二的红线之一。
+#[tauri::command]
+pub async fn list_agent_runtimes(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::domain::AgentRuntime>, String> {
+    repo::list_agent_runtimes(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 已注册的适配器。供前端在「新建运行时」时列出可选 kind。
+///
+/// 返回 `(id, label)` 二元组：`id` 是写进库的值，`label` 是给人看的。
+/// 界面上只显示 `label` 会让用户配不出正确的 `kind`，
+/// 只显示 `id` 则屏幕上全是 `codex` / `qoder` 这种没有上下文的词。
+#[tauri::command]
+pub async fn list_agent_adapters(
+    state: State<'_, AppState>,
+) -> Result<Vec<(String, String)>, String> {
+    Ok(state
+        .adapters
+        .ids()
+        .into_iter()
+        .filter_map(|id| {
+            state
+                .adapters
+                .get(id)
+                .map(|a| (a.id().to_string(), a.label().to_string()))
+        })
+        .collect())
+}
+
+/// 新建或更新一个运行时。
+///
+/// 校验在 `repo::upsert_agent_runtime` 里（写库前跑），这里只做一层
+/// 前置：**`kind` 必须能在注册表里解析出适配器**。
+/// 不查的话用户能存下一个 `kind = "codexx"` 的运行时，
+/// 而那个错误要等到**请求时**才爆 —— 离操作已经很远。
+#[tauri::command]
+pub async fn save_agent_runtime(
+    state: State<'_, AppState>,
+    runtime: crate::domain::AgentRuntime,
+) -> Result<(), String> {
+    if state.adapters.get(runtime.kind.trim()).is_none() {
+        // 错误里带上「有哪些可用的」—— 只说「不认识」用户还得自己去翻
+        return Err(format!(
+            "未知账号运行时类型：{}（可用的有：{}）",
+            runtime.kind,
+            state.adapters.ids().join("、")
+        ));
+    }
+    repo::upsert_agent_runtime(state.db.pool(), &runtime)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 删除运行时。
+///
+/// **被引用时拒绝并报出是谁在用** —— 不做级联删除：
+/// 删掉一个还被引用的运行时会留下指向空气的 `provider.runtime_id`，
+/// 而那要等到请求时才报「未知账号运行时」，离操作已经很远。
+///
+/// 也不「顺手把引用它的 Provider 也删掉」：用户点的是「删运行时」，
+/// 不是「删那几个供应商」。多删的东西不会自己回来。
+#[tauri::command]
+pub async fn delete_agent_runtime(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let users = repo::providers_using_runtime(state.db.pool(), &id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !users.is_empty() {
+        return Err(format!(
+            "还有 {} 个供应商在用它：{}。请先把它们改成别的上游，或换掉它们的运行时。",
+            users.len(),
+            users.join("、")
+        ));
+    }
+    let hit = repo::delete_agent_runtime(state.db.pool(), &id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !hit {
+        return Err(format!("没有这个运行时：{id}"));
+    }
+    Ok(())
+}
+
 /* --------------------------- D2 能力集导出 / 导入 --------------------------- */
 
 /// 导出**全部**模型的多来源能力账本。
