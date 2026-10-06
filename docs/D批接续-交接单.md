@@ -253,7 +253,7 @@ warning 会被当成命令失败。
 
 ---
 
-## 五、打包验证记录（2026-10-06 23:09）
+## 五、打包验证记录（最新一次：2026-10-07 07:12）
 
 本批改动**已重打包并真启动验证**（项目纪律第 7 / 12 条）。
 之所以要重打：原产物停在当天 `00:36`，而最后一次代码改动是 `23:05` ——
@@ -267,7 +267,7 @@ Start-Process src-tauri\target\release\llm-gateway.exe
 
 | 判据 | 实测 |
 | --- | --- |
-| 编译 | `npm run tauri:build` **退出码 0**（release 2m39s） |
+| 编译 | `npm run tauri:build` **退出码 0**（release 2m33s，07:12 那次） |
 | 产物时间 > 代码时间 | exe `23:09:26` > 代码 `23:05:57` ✓ |
 | 进程存活 | `Responding=True`，标题 `LLM Gateway` ✓ |
 | 监听端口 | `127.0.0.1:15721` |
@@ -288,3 +288,22 @@ Start-Process src-tauri\target\release\llm-gateway.exe
 
 **未做**：没有跑安装包本身的安装/卸载流程（那会改本机注册表与安装目录，
 属红线动作）。上面验的是 `target/release/llm-gateway.exe` 这个产物本体。
+
+### 2026-10-07 07:12 复验（D3~D5 + A5 六笔之后）
+
+本会话又落了约 15 个提交，重跑一次完整打包链：
+
+| 判据 | 实测 |
+| --- | --- |
+| 编译 | `npm run tauri:build` **退出码 0**（release 2m33s） |
+| 产物时间 > 代码时间 | exe `07:12:53` > 代码 `07:09:32` ✓ |
+| 进程存活 | `Responding=True`，标题 `LLM Gateway` ✓ |
+| 监听 | `127.0.0.1:15721` |
+| `GET /healthz` | **200**，内容 `ok` |
+| `GET /v1/models` 无 Key | **401** ✓ |
+
+安装包：`nsis/…setup.exe` 4.0 MB、`msi/…msi` 6.1 MB。
+验证后已 `Stop-Process` 清理，不留常驻进程。
+
+**仍未做**：安装包本身的安装/卸载流程（会改本机注册表与安装目录，
+属红线动作）。验的是 `target/release/llm-gateway.exe` 这个产物本体。
