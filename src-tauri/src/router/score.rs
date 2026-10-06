@@ -217,6 +217,25 @@ impl Weights {
                 cost: 0.0,
                 efficiency: 0.0,
             },
+            RoutingStrategy::Cascade => Self {
+                // D4：级联档的权重**与 `Balanced` 完全相同**。
+                //
+                // 「先发最便宜的」不体现在权重里，而体现在**执行顺序**里
+                // （见 `router/cascade.rs`：第 0 次尝试取最便宜的合格候选，
+                // 置信度不够才升到下一档）。
+                //
+                // 为什么不在这里把 `cost` 调高：那样做会让级联档与
+                // 「开了成本维度的 Balanced」变成同一个东西，
+                // 而它们的区别恰恰是**要不要多花一次请求**——
+                // 那是执行层的决策，不是排序口径的差异。
+                health: 0.35,
+                headroom: 0.25,
+                capability: 0.2,
+                latency: 0.2,
+                intent: 0.0,
+                cost: 0.0,
+                efficiency: 0.0,
+            },
         }
     }
 

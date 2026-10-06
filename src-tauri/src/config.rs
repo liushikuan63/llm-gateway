@@ -604,6 +604,16 @@ pub enum RoutingStrategy {
     /// 分类优先用本地 Jev 决策模型，不可用时回落启发式规则。
     /// **这一档是增量**：`auto` 与其余六档的行为不因它的存在而改变。
     Smart,
+    /// 级联路由（FrugalGPT）：先发给最便宜的合格候选，置信度不够再升级，
+    /// 最多升 `cascade.max_escalations` 次。决策规则见 `router/cascade.rs`。
+    ///
+    /// **只在非流式请求上生效** —— 流式首个字节发出后不能换家，
+    /// 那是既有铁律的必然推论，不是取舍。
+    ///
+    /// **这一档也是增量**：`cascade.max_escalations` 默认 0，
+    /// 且没有任何一档策略的默认值是这个变体，所以其余七档的行为
+    /// 不因它的存在而改变。
+    Cascade,
 }
 
 impl Default for AppConfig {

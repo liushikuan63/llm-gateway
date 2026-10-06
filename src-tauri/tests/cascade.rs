@@ -209,3 +209,79 @@ fn 亲和度始终落在_0_到_1_之间() {
         assert!(a.is_finite());
     }
 }
+
+// ============================ ② 级联档本身 ============================
+
+/// 卡片要求「新增第 8 档 `RoutingStrategy::Cascade`」。
+#[test]
+fn 级联档的权重与_balanced_逐位相同() {
+    use llm_gateway_lib::config::RoutingStrategy;
+    use llm_gateway_lib::router::score::Weights;
+
+    let cascade = Weights::for_strategy(RoutingStrategy::Cascade);
+    let balanced = Weights::for_strategy(RoutingStrategy::Balanced);
+    assert_eq!(
+        cascade, balanced,
+        "级联档的权重必须与 Balanced 相同 —— 「先发最便宜的」体现在\
+         执行顺序里（cascade.rs 的第 0 次尝试），不体现在排序口径里"
+    );
+    // 反向：若哪个字段不同，上面的整体相等会红，但这条能指出是哪个
+    assert_eq!(cascade.health, balanced.health);
+    assert_eq!(cascade.headroom, balanced.headroom);
+    assert_eq!(cascade.capability, balanced.capability);
+    assert_eq!(cascade.latency, balanced.latency);
+    assert_eq!(cascade.intent, balanced.intent);
+    // D3 的两个维度也必须是 0.0（级联档不该顺手打开成本维度）
+    assert_eq!(cascade.cost, 0.0);
+    assert_eq!(cascade.efficiency, 0.0);
+}
+
+/// 八档策略全都要有非零权重——加新档时最容易漏的就是「臂写了但全是 0」。
+#[test]
+fn 八档策略都能给出权重且默认不启用成本维度() {
+    use llm_gateway_lib::config::RoutingStrategy;
+    use llm_gateway_lib::router::score::Weights;
+
+    let all = [
+        RoutingStrategy::Priority,
+        RoutingStrategy::Balanced,
+        RoutingStrategy::Smartest,
+        RoutingStrategy::Fastest,
+        RoutingStrategy::Reliable,
+        RoutingStrategy::Custom,
+        RoutingStrategy::Smart,
+        RoutingStrategy::Cascade,
+    ];
+    assert_eq!(all.len(), 8, "卡片要求第 8 档");
+    for s in all {
+        let w = Weights::for_strategy(s);
+        let sum = w.health + w.headroom + w.capability + w.latency;
+        assert!(sum > 0.0, "{s:?} 的四个基础权重全是 0 —— 臂写了但没填");
+        // 铁律 2：D3 的两个维度必须在**所有**档位默认关闭
+        assert_eq!(w.cost, 0.0, "{s:?} 的 cost 权重必须默认 0.0");
+        assert_eq!(w.efficiency, 0.0, "{s:?} 的 efficiency 权重必须默认 0.0");
+    }
+}
+
+/// 新档必须能被序列化往返 —— 它要进 `config.toml`。
+#[test]
+fn 级联档能序列化往返() {
+    use llm_gateway_lib::config::RoutingStrategy;
+
+    let json = serde_json::to_string(&RoutingStrategy::Cascade).expect("序列化");
+    assert_eq!(json, "\"cascade\"", "对外形态应当是 snake_case");
+    let back: RoutingStrategy = serde_json::from_str(&json).expect("反序列化");
+    assert_eq!(back, RoutingStrategy::Cascade);
+}
+
+/// 默认档位**不是**级联 —— 否则升级后所有请求都会变成一串真实账单。
+#[test]
+fn 默认档位不是级联() {
+    use llm_gateway_lib::config::{AppConfig, RoutingStrategy};
+
+    assert_eq!(
+        AppConfig::default().routing_strategy,
+        RoutingStrategy::Priority
+    );
+    assert_ne!(RoutingStrategy::default(), RoutingStrategy::Cascade);
+}
