@@ -13,7 +13,7 @@
 D 批 5 张卡里 **D1 完成、D2 差界面、D3 完成、D4 差级联执行层、D5 差界面**。**剩下的活基本全是前端。**
 任务卡二 **11 张全部未开工**。
 
-**测试基线**：420（本批前）→ **833 passed / 0 failed / 15 ignored**。
+**测试基线**：420（本批前）→ **865 passed / 0 failed / 15 ignored**。
 `cargo clippy --all-targets -- -D warnings` **退出码 0**（全仓零告警）。
 
 ### 已完成并推送
@@ -57,7 +57,23 @@ D 批 5 张卡里 **D1 完成、D2 差界面、D3 完成、D4 差级联执行层
    卡片还要 `src/pages/Capabilities.tsx`（每个候选摊开显示各维原始值
    与加权贡献），以及三条诚实性要求（来源徽标 / 无样本显示「数据不足」/
    冲突提示）。
-7. **任务卡二 11 张全部未开工。**
+7. **任务卡二已开工：A5 落了 6 笔，只差「唯一分派点」与前端徽标。**
+   `1c95b3d` `bf41e43` `0f95660` `7ebf80c` `d0a7dac` `7116fd3`。
+   已完成：`AgentAdapter` trait + `AdapterRegistry` + 假适配器、
+   `agent_runtimes` 表 + `providers.runtime_id` 列、领域类型、
+   持久层、四个 IPC、`AppState.adapters`。
+
+   **仍未做（A5 的全部剩余）**：
+   - **唯一分派点**：`proxy/server.rs` 里还没有「Provider 有 `runtime_id`
+     就走适配器」那个判断。所以**数据全通了（字段→库→repo→IPC），
+     但请求时仍一律走 HTTP 直连**。
+   - **前端只读徽标**。这四个 IPC 因此**没有消费者** ——
+     按铁律 9，它们现在是一笔欠账。
+   - **卡片判据 2 没有失败证据**：它要求「`runtime_id = NULL` 的老
+     Provider 注入新字段后 `/v1/chat/completions` 响应体**逐字节不变**」。
+     那要等分派点接上后用既有 fixture 做负向对照才算数。
+     现在 865 条全绿只说明「没改坏」。
+   - **A6~A8 / B5~B8 / C6 / C7 / C9 共 10 张未开工。**
 
 ### 剩下的活为什么都以「前端」为主
 
@@ -176,7 +192,13 @@ D5 原文见任务卡一。任务卡二的 11 张（A5→A8 / B5→B8 / C6 / C7 
 
 ### PowerShell 陷阱（都实测踩过）
 
-- `String.Replace` 在锚点不匹配时**静默 no-op**。批量替换后**必须回读确认**。
+- **`String.Replace` 的静默 no-op 有确切根因（2026-10-07 定位）**：
+  **PowerShell here-string 里是 `\n`，而仓库里的文件是 `\r\n`。**
+  所以**多行锚点必然不匹配，单行锚点不受影响** ——
+  这正好解释了「为什么有的替换成功、有的失败」。
+  本会话至少踩了 5 次，前 4 次都误以为是「锚点文字抄错了」。
+  **对策：多行锚点一律用 `edit` 工具**（它按文件真实内容匹配），
+  不要用 `String.Replace` 拼多行。单行替换仍可用脚本。
 - 中文注释在 `pwsh -Command` 里会被误解析 —— 改文件优先用编辑工具，
   或用 `[IO.File]::ReadAllText/WriteAllText` + `UTF8Encoding($false)`。
 - **禁止用 `Get-Content -Raw` 往返写中文文档**：本机按 GBK 解码，
