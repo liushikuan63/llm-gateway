@@ -1016,6 +1016,16 @@ async fn passthrough_dispatch(
                 .record_success(&outcome.provider_id, &outcome.model, latency as u32);
             let (prompt_tokens, completion_tokens, total_tokens) =
                 passthrough_usage(&outcome.value);
+            // D3：记一次实测吞吐样本。放在拿到 usage 之后 ——
+            // 没有 `completion_tokens` 就算不出 tok/s，
+            // 而在这里编一个 0 会把 EWMA 拉向 0，
+            // 与「0 = 无样本」的约定撞车（`record_tps` 自己也会拒绝 0）。
+            state.health.record_tps(
+                &outcome.provider_id,
+                &outcome.model,
+                completion_tokens,
+                latency as u32,
+            );
             if let Some(provider) = ranked
                 .iter()
                 .find(|candidate| candidate.provider.id == outcome.provider_id)

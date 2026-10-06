@@ -35,14 +35,32 @@ pub struct Router {
 ///
 /// 单独一个结构而不是三个散参数：它们必须**同时**由整批候选算出，
 /// 分开传会让人以为可以只改其中一个。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone)]
 struct CostContext {
     /// 可比的成本区间；`None` = 没有价格数据或币种不可比。
     range: Option<(f32, f32)>,
-    /// 【未接】吞吐区间恒为 `None`，理由见调用点注释。
+    /// 实测吞吐区间。样本不足的候选不参与，所以它可能比成本区间小。
     tps_range: Option<(f32, f32)>,
+    /// 最少样本数，来自 `cost_routing.min_efficiency_samples`。
+    /// `candidate_tps` 要用它与 `tps_range` **同一个门槛**，
+    /// 否则会出现「进了区间、自己却拿不到分」。
+    min_tps_samples: u32,
+    /// 健康注册表，供 `candidate_tps` 查单个候选的吞吐。
+    health: Arc<HealthRegistry>,
     /// 本次请求是否适用成本偏置。
     cost_bias: bool,
+}
+
+impl CostContext {
+    /// 单个候选的实测吞吐。
+    ///
+    /// **与 `tps_range` 用同一个门槛函数** `usable_tps` ——
+    /// 两边各判一次的话会出现「这个候选进了区间、自己却返回 None」，
+    /// 于是它拿到 `1.0` 而别人按相对位置算分，排序失去意义**且不报错**。
+    fn candidate_tps(&self, c: &Candidate) -> Option<f32> {
+        let h = self.health.get(&c.provider.id, &c.model.upstream);
+        usable_tps(&h, self.min_tps_samples)
+    }
 }
 
 /// D3：从整批候选算出**可比**的成本区间。
@@ -82,9 +100,32 @@ fn comparable_cost_range(candidates: &[Candidate]) -> Option<(f32, f32)> {
 
 /// 单个候选的参考成本。与 [`comparable_cost_range`] 取的**必须是同一个字段**，
 /// 否则区间与取值不同源 —— 那会让最便宜的那个也拿不到满分。
+/// 单个候选的参考成本。与 [`comparable_cost_range`] 取的**必须是同一个字段**，
+/// 否则区间与取值不同源 —— 那会让最便宜的那个也拿不到满分。
 fn candidate_cost(c: &Candidate) -> Option<f32> {
     let price = c.model.price.as_ref()?;
     (price.prompt > 0.0).then_some(price.prompt as f32)
+}
+
+/// D3：某个候选的实测吞吐（tok/s），样本不足时返回 `None`。
+///
+/// ## 为什么要一个单独的门槛函数
+///
+/// 「有多少样本才算有实测数据」是**业务判断**，不是数据问题。
+/// 散在调用点各写一遍 `if samples >= 5` 的话，区间那边与逐候选那边
+/// 迟早会写出不同的门槛 —— 而那种不一致的表现是
+/// 「有的模型进了区间、自己却拿不到分」，没有任何报错。
+///
+/// 与 `latency_score` 的 `0 => 1.0, // 无样本，不惩罚` 同源：
+/// 一两个样本的 tok/s 抖动极大，用它排序等于随机，不如不参与。
+///
+/// `min_samples` 由配置给（默认 5）；配置被夹到 `>=1`，
+/// 所以这里不需要再防 0。
+fn usable_tps(health: &crate::domain::ProviderHealth, min_samples: u32) -> Option<f32> {
+    if health.tps_samples < min_samples {
+        return None;
+    }
+    (health.avg_tps > 0.0).then_some(health.avg_tps)
 }
 
 impl Router {
@@ -303,17 +344,20 @@ impl Router {
         // 这类不一致，而那种不一致不报错，只表现为排序偶尔不对。
         let cost = CostContext {
             range: comparable_cost_range(&candidates),
-            // 【未接】吞吐数据源不存在：`ProviderHealth` 只有 `avg_latency_ms`，
-            // 没有 tok/s。卡片要求从 `requests` 表按
-            // `completion_tokens / latency_ms` 现算，那需要把统计接进来。
-            // 这里**明确留 None** 而不是拿延迟倒推一个假吞吐 ——
-            // 假的效率分会让「首包快但吐字慢」的模型拿到高分，
-            // 正好是这一维要修的反面。见 docs/D批接续-交接单.md。
-            tps_range: None,
-            // 长 prompt 那一支**也没接**：`rank_with_intent` 的签名里
+            // D3：实测吞吐区间。**样本数不足的候选整条跳过**
+            // （与「无价格 = 不主张币种」同款处理）：
+            // 一两个样本的 tok/s 抖动极大，用它排序等于随机。
+            // 阈值来自配置的 `min_efficiency_samples`（默认 5）。
+            tps_range: score::value_range(candidates.iter().filter_map(|c| {
+                let h = self.health.get(&c.provider.id, &c.model.upstream);
+                usable_tps(&h, cfg.cost_routing.min_efficiency_samples)
+            })),
+            min_tps_samples: cfg.cost_routing.min_efficiency_samples,
+            health: self.health.clone(),
+            // 长 prompt 那一支**还没接**：`rank_with_intent` 的签名里
             // 没有 prompt token 数，要加参数得改 server.rs 的 4 个调用点。
             // 这里传 0 ⇒ 只有 `Simple` 类请求会拿到成本偏置，
-            // 而这正是卡片点名的第一场景。长 prompt 场景记为未接。
+            // 而那正是卡片点名的第一场景。长 prompt 场景记为未接。
             cost_bias: score::cost_bias_applies(
                 intent,
                 0,
@@ -369,7 +413,7 @@ impl Router {
             cost_range: cost.range,
             candidate_cost: candidate_cost(c),
             tps_range: cost.tps_range,
-            candidate_tps: None,
+            candidate_tps: cost.candidate_tps(c),
             cost_bias: cost.cost_bias,
         };
         score::score(c, &input, w)

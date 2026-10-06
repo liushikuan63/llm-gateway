@@ -657,6 +657,10 @@ pub struct ProviderHealth {
     pub success_rate: f32,
     /// 近期平均延迟（ms，EWMA）
     pub avg_latency_ms: u32,
+    /// D3 实测吞吐（tok/s）的 EWMA。`0.0` = 无样本。
+    pub avg_tps: f32,
+    /// 已累计的吞吐样本数。
+    pub tps_samples: u32,
     pub last_error: Option<String>,
     pub last_checked_at: i64,
 }

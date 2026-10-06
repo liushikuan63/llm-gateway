@@ -192,11 +192,23 @@ fn score_uses_multiplicative_decay_when_quota_is_exhausted() {
     };
     let healthy = ScoreInput {
         intent: None,
+        // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
+        cost_range: None,
+        candidate_cost: None,
+        tps_range: None,
+        candidate_tps: None,
+        cost_bias: false,
         health: Some(HealthRegistry::new().get("smart", "mock-model")),
         headroom: 1.0,
     };
     let exhausted = ScoreInput {
         intent: None,
+        // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
+        cost_range: None,
+        candidate_cost: None,
+        tps_range: None,
+        candidate_tps: None,
+        cost_bias: false,
         health: healthy.health.clone(),
         headroom: 0.0,
     };
@@ -264,6 +276,12 @@ fn invalid_health_has_zero_score_and_does_not_auto_recover() {
             &candidate,
             &ScoreInput {
                 intent: None,
+                // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
+                cost_range: None,
+                candidate_cost: None,
+                tps_range: None,
+                candidate_tps: None,
+                cost_bias: false,
                 health: Some(status),
                 headroom: 1.0,
             },
@@ -660,4 +678,81 @@ fn wildcard_matching_handles_star_positions_without_regex_semantics() {
     for pattern in ["gpt*", "vendor/chat-4*", "*:paid", "vendor?chat*"] {
         assert!(!model_name_matches(&target, pattern), "不应命中：{pattern}");
     }
+}
+
+// ------------------------------ D3 实测吞吐样本 ------------------------------
+
+/// 吞吐样本的记账规则。**每种「不算样本」的情形都要有用例** ——
+/// 把 0 计进 EWMA 会与「0 = 无样本」的约定撞车，
+/// 之后 `min_efficiency_samples` 就判不准了，而那种错没有任何报错。
+#[test]
+fn 吞吐样本_rejects_zero_tokens_and_zero_latency() {
+    let health = HealthRegistry::new();
+    // 必须先有成功记录（`record_tps` 不创建条目）
+    health.record_success("p", "m", 1000);
+
+    // 0 token：非流式 usage 缺失、或纯 scoring pass —— 不算样本
+    health.record_tps("p", "m", 0, 1000);
+    assert_eq!(health.get("p", "m").tps_samples, 0);
+    assert_eq!(health.get("p", "m").avg_tps, 0.0);
+
+    // 0 延迟：时钟精度不足 —— 不算样本（会算出 inf）
+    health.record_tps("p", "m", 100, 0);
+    assert_eq!(health.get("p", "m").tps_samples, 0);
+
+    // 反向对照组：正常样本确实进去了
+    health.record_tps("p", "m", 100, 1000);
+    assert_eq!(health.get("p", "m").tps_samples, 1);
+    assert!((health.get("p", "m").avg_tps - 100.0).abs() < 1e-3);
+}
+
+#[test]
+fn 吞吐样本_ewma_收敛且样本数累加() {
+    let health = HealthRegistry::new();
+    health.record_success("p", "m", 1000);
+
+    // 第一个样本直接落值（不是从 0 做 EWMA）——
+    // 从 0 起算会让前若干个样本被严重低估
+    health.record_tps("p", "m", 100, 1000); // 100 tok/s
+    assert!((health.get("p", "m").avg_tps - 100.0).abs() < 1e-3);
+
+    // 第二个样本按 0.8/0.2 与 avg_latency_ms 同款权重
+    health.record_tps("p", "m", 200, 1000); // 200 tok/s
+    let expected = 100.0 * 0.8 + 200.0 * 0.2;
+    assert!((health.get("p", "m").avg_tps - expected).abs() < 1e-3);
+    assert_eq!(health.get("p", "m").tps_samples, 2);
+}
+
+#[test]
+fn 吞吐样本_荒谬值不采信() {
+    let health = HealthRegistry::new();
+    health.record_success("p", "m", 1000);
+
+    // 10 万 token / 1ms = 1e8 tok/s。上游把 usage 报错时会出现这种数。
+    health.record_tps("p", "m", 100_000, 1);
+    assert_eq!(
+        health.get("p", "m").tps_samples,
+        0,
+        "超过 2000 tok/s 不该采信"
+    );
+
+    // 边界内侧要采信
+    health.record_tps("p", "m", 2000, 1000); // 2000 tok/s
+    assert_eq!(health.get("p", "m").tps_samples, 1);
+}
+
+#[test]
+fn 吞吐样本_没有条目时不创建() {
+    let health = HealthRegistry::new();
+    // 没先 record_success 就记吞吐
+    health.record_tps("ghost", "ghost-model", 100, 1000);
+
+    // 关键：`get()` 对不存在的条目返回「健康、成功率 1.0、无样本」，
+    // 与「刚创建一条只有吞吐的条目」在数值上看起来一样 ——
+    // 所以判据要用 `snapshot()` 的长度，而不是看字段值。
+    assert!(
+        health.snapshot().is_empty(),
+        "只有吞吐、没有成功记录的条目不该被创建：\
+         它会让 get() 返回一个「健康且成功率 1.0」的假象"
+    );
 }
