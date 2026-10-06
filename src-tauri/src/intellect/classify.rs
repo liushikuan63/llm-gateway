@@ -3,7 +3,7 @@
 //! 每一级都比上一级弱，但每一级都更可靠地覆盖更多情况。**没有任何一级会返回
 //! `Err`**：分类失败最多意味着用启发式结果，绝不能让一次请求因为分类器挂掉而 500。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{SmartClassifier, SmartRoutingConfig};
 use crate::domain::Message;
@@ -544,4 +544,259 @@ async fn jev_ask(
         "questions": crate::intellect::jev::preview_questions(),
     });
     client.decide(body).await
+}
+
+// ============================ D4 ①：细分任务维度 ============================
+
+/// D4：任务**领域**。挂在 `TaskClass`（难度）之下，**不替换它**。
+///
+/// ## 为什么需要第二个维度
+///
+/// 事实源 I.1 的语义路由指出：「一个简单的医学问题和一个复杂的医学问题
+/// 都该走医学模型」—— 现有三级分类只能表达**难度**（simple / vision /
+/// reasoning），表达不了**领域**。
+///
+/// ## 边界（卡片写死的三条）
+///
+/// 1. **不替换 `TaskClass`**：它是 `X-Route-Intent` 响应的取值来源，
+///    替换会破坏对外契约（事实源 H.3）。
+/// 2. **判定失败回落 `General`，不许出现第四个兜底层**：
+///    `TaskClass` 的现有三级递降（硬规则 → Jev → 启发式）原样保留，
+///    本模块只是在它**旁边**多给一个标签。
+/// 3. **只影响 `intent_fit` 的偏置，不影响能力硬约束**：
+///    领域判断错了最多是「选了个偏弱但能用的模型」；
+///    若让它参与硬约束，判断错会变成「内容被静默丢弃」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDomain {
+    /// 认不出来时的落点。**这是默认值，也是唯一的失败落点。**
+    #[default]
+    General,
+    Coding,
+    Math,
+    DataAnalysis,
+    Writing,
+    Vision,
+}
+
+impl TaskDomain {
+    pub const ALL: [TaskDomain; 6] = [
+        TaskDomain::General,
+        TaskDomain::Coding,
+        TaskDomain::Math,
+        TaskDomain::DataAnalysis,
+        TaskDomain::Writing,
+        TaskDomain::Vision,
+    ];
+
+    /// 给界面与 `X-Route-Domain` 用的稳定标识。
+    pub fn code(self) -> &'static str {
+        match self {
+            TaskDomain::General => "general",
+            TaskDomain::Coding => "coding",
+            TaskDomain::Math => "math",
+            TaskDomain::DataAnalysis => "data_analysis",
+            TaskDomain::Writing => "writing",
+            TaskDomain::Vision => "vision",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TaskDomain::General => "通用",
+            TaskDomain::Coding => "编程",
+            TaskDomain::Math => "数学",
+            TaskDomain::DataAnalysis => "数据分析",
+            TaskDomain::Writing => "写作",
+            TaskDomain::Vision => "视觉",
+        }
+    }
+
+    /// 从显式写法解析（虚拟模型名、查询参数）。
+    ///
+    /// 认不出来返回 `None` —— **由调用方决定怎么处理**，
+    /// 而不是在这里悄悄给个 `General`：调用方需要能区分
+    /// 「没写」与「写了个我不认识的」。后者应当被报出来（配置写错了），
+    /// 而前者什么都不用做。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "general" | "auto" => Some(TaskDomain::General),
+            "coding" | "code" => Some(TaskDomain::Coding),
+            "math" => Some(TaskDomain::Math),
+            "data_analysis" | "data" | "analysis" => Some(TaskDomain::DataAnalysis),
+            "writing" | "write" => Some(TaskDomain::Writing),
+            "vision" | "image" => Some(TaskDomain::Vision),
+            _ => None,
+        }
+    }
+
+    /// 这个领域**靠哪些能力维度**衡量。返回维度下标与权重。
+    ///
+    /// 下标对应 [`crate::domain::ModelCapabilities::quality_dimensions`]
+    /// 的顺序：`[coding, reasoning, knowledge, math]`。
+    ///
+    /// 用下标而不是字段名，是为了让亲和度计算只写一遍 ——
+    /// 每个领域各写一遍 match 会在加维度时漏改。
+    fn affinity_weights(self) -> &'static [(usize, f32)] {
+        match self {
+            // 通用：不吃任何专项偏置。**空数组不是「没实现」**，
+            // 而是「通用任务不该因为某个专项分数高就偏向它」。
+            TaskDomain::General => &[],
+            TaskDomain::Coding => &[(0, 1.0), (1, 0.6)],
+            TaskDomain::Math => &[(3, 1.0), (1, 0.8)],
+            TaskDomain::DataAnalysis => &[(1, 1.0), (3, 0.7), (0, 0.4)],
+            TaskDomain::Writing => &[(2, 1.0), (1, 0.3)],
+            // 视觉的判据是**模态**而不是质量分，所以这里只吃通用推理。
+            // 真正的模态筛选在 `required_capabilities`（硬约束）里，不在这一层 ——
+            // 把模态塞进偏置会让「不支持图片的模型」只是分数低一点，
+            // 而它实际上会把图片静默丢掉。
+            TaskDomain::Vision => &[(1, 0.5)],
+        }
+    }
+
+    /// 某模型对这个领域的亲和度，0.0~1.0。**缺失维度不惩罚。**
+    ///
+    /// 返回 1.0（中性）当：
+    /// - 领域是 `General`（不吃偏置）
+    /// - 该领域关心的维度**一个都没有数据**
+    ///
+    /// 后者是关键：D1 的核心约束是「未知 ≠ 零分」。
+    /// 一个还没标定能力的模型若在这里被判 0，
+    /// 它会在所有专项请求里永远出局 —— 而我们对它其实一无所知。
+    pub fn affinity(self, caps: Option<&crate::domain::ModelCapabilities>) -> f32 {
+        let weights = self.affinity_weights();
+        if weights.is_empty() {
+            return 1.0;
+        }
+        let Some(caps) = caps else {
+            // 完全没有能力数据 ⇒ 中性，不惩罚
+            return 1.0;
+        };
+        let dims = caps.quality_dimensions();
+        let mut weighted = 0.0f32;
+        let mut total = 0.0f32;
+        for (index, weight) in weights {
+            if let Some(Some(value)) = dims.get(*index) {
+                weighted += value * weight;
+                total += weight;
+            }
+        }
+        if total <= 0.0 {
+            // 该领域关心的维度一个都没标 —— 同样中性
+            return 1.0;
+        }
+        (weighted / total).clamp(0.0, 1.0)
+    }
+}
+
+/// 关键词表。**刻意写得很短**：这一层只做「显式到不用猜」的判定，
+/// 剩下的交给 `General`。
+///
+/// 为什么不做成一个大而全的词表：领域误判的代价是「偏置给错方向」，
+/// 而偏置只影响排序、不影响硬约束 —— 所以宁可少判（落 `General`，
+/// 中性无偏置）也不要多判。这跟「难度判错会把图片发给看不懂的模型」
+/// 是两种完全不同的风险等级。
+const DOMAIN_KEYWORDS: &[(TaskDomain, &[&str])] = &[
+    (
+        TaskDomain::Coding,
+        &[
+            "代码",
+            "函数",
+            "报错",
+            "编译",
+            "重构",
+            "bug",
+            "debug",
+            "stack trace",
+            "python",
+            "rust",
+            "javascript",
+            "sql 报错",
+            "接口实现",
+        ],
+    ),
+    (
+        TaskDomain::Math,
+        &[
+            "证明",
+            "求解",
+            "方程",
+            "微积分",
+            "概率",
+            "矩阵",
+            "定理",
+            "计算下列",
+        ],
+    ),
+    (
+        TaskDomain::DataAnalysis,
+        &[
+            "数据分析",
+            "统计",
+            "回归",
+            "聚类",
+            "csv",
+            "数据表",
+            "指标口径",
+            "透视",
+        ],
+    ),
+    (
+        TaskDomain::Writing,
+        &[
+            "写一篇",
+            "文案",
+            "润色",
+            "改写成",
+            "起个标题",
+            "摘要",
+            "演讲稿",
+        ],
+    ),
+    (
+        TaskDomain::Vision,
+        &["这张图", "图中", "截图里", "识别图片", "看图"],
+    ),
+];
+
+/// D4：判定任务领域。
+///
+/// 判定顺序：**显式名字 → 关键词 → `General`**。
+/// 只有一级兜底，没有第二级 —— 卡片要求「不许出现第四个兜底层」，
+/// 这里对应的是「不许出现第四个分类层」：`TaskClass` 的三级递降原样保留，
+/// 领域判定只是在它旁边贴一个标签，判不出来就是 `General`。
+///
+/// 视觉的优先级最高：请求里带图时，领域**必须**是视觉，
+/// 否则一个「这张图里的代码有什么问题」会被关键词判成 `Coding`，
+/// 而它真正需要的是一个能看图的模型。
+pub fn detect_domain(input: &ClassifyInput) -> TaskDomain {
+    // 1) 显式虚拟模型名。认不出来时**不报错也不猜** —— 继续往下走关键词。
+    if let Some(domain) = TaskDomain::parse(input.requested_model) {
+        return domain;
+    }
+    // 2) 模态事实优先于文本关键词
+    if input.media.any() {
+        return TaskDomain::Vision;
+    }
+    // 3) 关键词
+    let text = input.last_user_text().to_lowercase();
+    if text.trim().is_empty() {
+        return TaskDomain::General;
+    }
+    let mut best: Option<(TaskDomain, usize)> = None;
+    for (domain, needles) in DOMAIN_KEYWORDS {
+        let hits = needles
+            .iter()
+            .filter(|n| text.contains(&n.to_lowercase()))
+            .count();
+        if hits == 0 {
+            continue;
+        }
+        // 命中数相同取**先出现的那个**（表里的顺序），保证结果稳定 ——
+        // 用 `>` 而不是 `>=`，否则后面的领域会覆盖前面同分的。
+        if best.map_or(true, |(_, best_hits)| hits > best_hits) {
+            best = Some((*domain, hits));
+        }
+    }
+    best.map(|(d, _)| d).unwrap_or(TaskDomain::General)
 }

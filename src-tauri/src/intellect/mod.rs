@@ -39,8 +39,8 @@ pub use bench::{
 };
 pub use calibrate::{build_report, CalibrationReport, LabeledSample, SampleOutcome};
 pub use classify::{
-    classify, classify_by_heuristic, classify_by_rules, ClassifierSource, ClassifyInput,
-    TaskIntent, REASONING_THRESHOLD,
+    classify, classify_by_heuristic, classify_by_rules, detect_domain, ClassifierSource,
+    ClassifyInput, TaskDomain, TaskIntent, REASONING_THRESHOLD,
 };
 pub use jev::{JevAnswer, JevClient, JevError};
 pub use refine::{RefineOutcome, RefineTarget};
