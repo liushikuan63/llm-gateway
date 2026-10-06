@@ -495,8 +495,11 @@ Authorization: <账号令牌>
    这也解释了为什么"打开活动页"看起来像在领奖、实际从来没领到当天的额度。
 4. 国际版与 CN 版是**两套独立域名**（`openapi.qoder.sh` / `openapi.qoder.com.cn`），
    抓包与实现都必须按域名区分。
-5. 这是 **L3 能力的实证**（0.7.0 §3.5 的 L4 红线），因此按既定裁决：
-   **仓库内不实现自动领取**，要做得走外部插件形态。
+5. 这是 **L3 能力的实证**（0.7.0 §3.5 的 L4 红线）。**用户 2026-10-06 明确要求
+   「尽可能实现在网关进行领取」**，因此按用户指令改为**在网关内实现**；
+   但实现必须守住 §四 的合规红线（只调公开接口、不伪造指纹/签名）。
+   > 说明：本节早先写的"仓库内不实现、走外部插件"已被该指令取代。
+   > 实现交接规格见 **§九**（含可直接采用的代码与全部踩坑记录）。
 
 **对照 A 的严格性说明（不许含糊）**：去掉 `cosy-machinetoken` 的那次返回 200 且
 `replayed:true`——因为当天的额度**已被前一次重放领走**，所以这一对照证明的是
@@ -560,7 +563,7 @@ POST https://openapi.qoder.sh/sash/api/v1/me/campaigns/01a0f1db-…/claim
 | C1 | **部分完成** | 9 个平台逐个核验：**geeknow 端点存在但功能开关关闭**（`checkin_enabled=false`）；agentrouter 有登录端点（要账号密码）；Qoder 有官方规则原文且 `/claim` 经双向取证不存在；commandcode 定位为账号型 Agent 产品；shitapi / zai / sensenova / maas / openrouter 未发现端点。**当前没有任何平台可自动领取** |
 | C2 | **部分取证完成**（代码未开始） | Qoder 额度读取有**实测路径**：客户端包里写死的 `/sash/api/v1/ai-conversations/credits-summary`、`/api/v2/quota/usage`、`/api/v2/user/plan`（见 C6 前置取证）；CLI 侧 `/usage` 面板字段已核到官方文档 |
 | C6 | ✅ **完成**（2026-10-06 13:08） | 判据 1/2/3 **全部通过**：客户端外 `POST …/me/campaigns/{id}/claim` 真实领到 100 Credits（`replayed:false`、`expiresAt` +30 天）；缺 `authorization` 被拒（401）；重复领取被服务端判 `replayed:true`。**结论：能脱离客户端领取，且只需 `authorization`——`cosy-machine*` 设备头不是门槛（早先推断已证伪）**；但必须打"当天可领"的那个 campaignId。国际版 `openapi.qoder.sh` / CN 版 `openapi.qoder.com.cn` 是两套域名 |
-| C3 | 未开始 | **暂无可做对象**——geeknow 开关关闭，其余平台无端点；等有平台开了再说 |
+| C3 | **可实施**：契约与规格见 §九（实现交给另一个任务） | Qoder 国际版/中国版的领取端点、鉴权、幂等与判据已全部实测并写入 §九；作者试写的一版已按要求撤回，工作区干净 |
 | C4 | 未开始 | |
 | C5 | 未开始 | |
 | C6 | **未开始**（卡已写好，含判据与红线） | 阻塞在**外部条件**：需要用户本人登录 Qoder 桌面端 + 在领取窗口内抓包；且抓包方式待拍板（§七 裁决点 7）。**当前不能动工**——`qoder status` = Not logged in |
@@ -580,3 +583,242 @@ POST https://openapi.qoder.sh/sash/api/v1/me/campaigns/01a0f1db-…/claim
 本轮 `web_search` 后端恢复注册后，返回结果与查询几乎无关（命中词典释义页），
 因此**未采信任何搜索结果**；全部结论来自 `web_fetch` 官方文档原文 + 对用户自用平台的
 不带凭据探测。后续若要做 §2.6 的剩余核验，优先用官方文档抓取而不是搜索。
+
+---
+
+## 九、实现交接：在网关内领取（C7）
+
+> **状态：待实现，交给另一个任务。** 本节是**自包含**的交接规格——接口契约、数据结构、
+> 落点、判据、踩坑全部在内，**不需要重新抓包或重新推导**。
+>
+> 交接前作者本人在本仓写过一版实现（`benefits.rs` 纯层 + 配置段 + `benefit_runs` 建表），
+> 编译通过、模块内 10 个单测全绿；按用户要求"不在这里实现"**已撤回**，
+> 工作区保持干净（`cargo check --lib` 退出码 0），因此实现任务从零开始、无历史包袱。
+> 撤回的那版代码在本节 §9.3 逐字给出，可直接采用。
+
+### 9.1 接口契约（已实测两次独立复现，勿再推导）
+
+| 平台 | key | host |
+|---|---|---|
+| Qoder 国际版 | `qoder` | `openapi.qoder.sh` |
+| Qoder 中国版 | `qoder_cn` | `openapi.qoder.com.cn` |
+
+```text
+读状态：GET  https://<host>/sash/api/v1/me/campaigns
+领取：  POST https://<host>/sash/api/v1/me/campaigns/{campaignId}/claim
+请求头：Authorization: <令牌>       ← 唯一必需；实测 authorization 必需、cosy-* 不参与校验
+        Accept: application/json
+```
+
+**GET 响应**（真实字段）：
+
+```json
+{ "uid": "...", "showCampaign": true, "claimable": false,
+  "campaignUrl": "https://<host>/growth-page/activity-iframe",
+  "campaigns": [
+    { "campaignId": "01a0f1cd-...", "campaignKey": "act-20260930-100",
+      "actionType": "CLAIM_BENEFIT", "claimStatus": "CLAIMABLE",
+      "startAt": 1791165600, "endAt": 1791251940,
+      "benefit": { "kind": "CREDITS", "amount": 100,
+                   "modelScope": { "modelSeries": { "key": "ALL_MODELS" } },
+                   "validity": { "mode": "RELATIVE_DAYS", "days": 30 } },
+      "placements": [ { "type": "POPUP", "campaignUrl": "...", "content": { "en": { ... } } } ] } ] }
+```
+
+**POST 响应**（发放 vs 重放，两种都要处理）：
+
+```json
+{ "grantId": "...", "status": "CLAIMED", "replayed": false,
+  "benefit": { "kind": "CREDITS", "amount": 100, "validity": { "mode": "RELATIVE_DAYS", "days": 30 } },
+  "campaignId": "...", "campaignKey": "act-20260930-551", "campaignVersion": 1,
+  "claimedAt": "2026-10-06T05:11:43.134053Z",
+  "grantedAt": "2026-10-06T05:11:43.189263Z",
+  "expiresAt": "2026-11-05T05:11:43.134053Z" }
+```
+
+**401 响应**：`{"code":"TOKEN_INVALID","message":"missing authorization token"}`
+
+**四条必须内化的语义**
+
+1. **`replayed: false` 才是真实发放**；`true` = 平台判定重复领取、**没有再发**。
+   界面与审计必须把两者分开，`replayed:true` 不能显示成"领取成功"。
+2. **必须挑 `claimStatus == "CLAIMABLE"` 的那条 campaign**。客户端自己打的是
+   **常驻 campaign**（永远 `CLAIMED`），对它的重放只会得到 `replayed:true`——
+   这是"看着像在领、其实从没领到当天额度"的根本原因。
+3. **`claimable` 总开关与逐条状态会不一致**（实测已领当天总开关仍为 `true`）→ **以逐条为准**，
+   并把不一致写进 `warnings`。
+4. **令牌有两种粘贴形态**：抓包复制得到的是整条头部值（可能含 `Bearer `），用户也可能只粘裸令牌。
+   两种都要能用：**含空格就当已带 scheme 原样用，否则补 `Bearer `**。
+
+### 9.2 落点与命名（照本仓既有惯例）
+
+| 层 | 文件 | 参照物 | 职责 |
+|---|---|---|---|
+| 纯层 | `src-tauri/src/benefits.rs` | `provider_quota.rs` | 平台识别、HTTP、响应解析；返回 `Result<_, String>`；**不碰数据库与状态** |
+| 应用层 | `src-tauri/src/benefit_center.rs` | `pricing_refresh.rs` | 读配置/密钥、编排「读状态 → 挑可领 → 领取 → 落库」；手动与自动**共用同一条路径** |
+| 建表 | `src-tauri/src/db/migrations.rs` | 现有 `app_secrets` 条目 | 追加 `benefit_runs`（见 §9.6） |
+| 访问 | `src-tauri/src/db/repo.rs` | `list_remote_access_keys` | `insert_benefit_run` / `list_benefit_runs` / `benefit_window_settled` |
+| 配置 | `src-tauri/src/config.rs` | `SearchConfig` + `auth_failure.validate()` | 新段 `[benefits]`（见 §9.4） |
+| 触发 | `src-tauri/src/proxy/server.rs` | 已有 `/gw/stats` | `/gw/benefits`、`/gw/benefits/claim`（见 §9.7） |
+| 命令 | `src-tauri/src/commands.rs` | 现有 provider 命令 | 4 个命令（见 §9.7） |
+| 定时 | `server.rs` 的 300s tick（现约 230 行） | `last_pricing_refresh` 的 due 模式 | 每日自动领取 |
+
+**不要新造调度器**：tick 里已有「`Option<Instant>` + 到期才跑」的模式，照抄即可。
+
+### 9.3 数据结构（撤回前已编译通过、10 例单测全绿，可直接采用）
+
+```rust
+pub enum ClaimPlatform { Qoder, QoderCn }        // key() / label() / host() / parse() / all()
+pub fn platform_for_host(host: &str) -> Option<ClaimPlatform>
+
+pub struct BenefitCampaign { campaign_id, campaign_key, claim_status, action_type,
+                             amount: Option<f64>, kind: Option<String>, valid_days: Option<u32> }
+impl BenefitCampaign { fn is_claimable(&self) -> bool   // claim_status == "CLAIMABLE"
+                       fn is_claimed(&self) -> bool
+                       fn describe(&self) -> String }   // "100 CREDITS"
+
+pub struct BenefitStatus { platform, claimable: bool, campaigns: Vec<BenefitCampaign>,
+                           source: String, warnings: Vec<String> }
+impl BenefitStatus { fn next_claimable(&self) -> Option<&BenefitCampaign> }
+
+pub struct ClaimOutcome { platform, campaign_id, campaign_key, status, replayed: bool,
+                          granted: bool,        // status==CLAIMED && !replayed
+                          amount, kind, claimed_at, expires_at, message }
+
+pub enum BenefitVerdict { Granted, Replayed, NoClaimable, Skipped, Error }
+impl BenefitVerdict { fn as_str(self) -> &'static str
+                      fn parse(value: &str) -> Option<Self>
+                      fn settles_window(self) -> bool }   // 只有 Granted/Replayed 为了结
+
+pub struct BenefitRunRecord { id, account_id, platform, window_key, campaign_key,
+                              verdict, amount, message, manual, created_at }
+
+pub fn auth_value(token: &str) -> String   // 含空格原样用，否则补 "Bearer "
+pub async fn fetch_status(platform, token, proxy) -> Result<BenefitStatus, String>
+pub async fn claim(platform, token, proxy, campaign_id) -> Result<ClaimOutcome, String>
+```
+
+纯层实现要点（都是踩过才写的，别简化掉）：
+
+- `ensure_token` 在**发请求之前**拦住空令牌，而不是发一个必然 401 的请求；
+- 响应体**带上限读取**（`BODY_LIMIT = 512 KiB`），不把内存交给对端；
+- `http_error(status, body)` 把 401/403 → 「凭据被拒 + 平台原文」，404 → 「接口不存在」，
+  **不能笼统说成凭据问题**（那会把排查方向指错）；
+- 401 错误信息里**绝不能带令牌原文**。
+
+### 9.4 配置段
+
+```toml
+[benefits]
+enabled = false                 # 总开关；关掉时任何路径都不发请求
+auto_claim = false              # 默认关：这是写操作，会真实消耗当天名额
+auto_claim_after_hour = 10      # 「不早于」本地几点（平台窗口各不相同）
+[[benefits.accounts]]
+id = "qoder-intl"               # 只能是字母/数字/-/_，非空，≤64
+platform = "qoder"              # 必须在 ClaimPlatform::all() 的 key 里
+label = "Qoder 国际版"
+enabled = true
+```
+
+`BenefitsConfig::validate()` 返回**问题清单**（不静默改值），并挂到 `AppConfig::validate_local()`
+（照 `self.auth_failure.validate()?` 的写法）。判据：`id` 非法/重复、平台未适配都要能报出来。
+
+### 9.5 密钥
+
+- 名称：`benefit:<account_id>:token`，值走 `crypto::encrypt` → `repo::set_secret`（`app_secrets`）。
+- **绝不进 `config.toml`**（明文落盘且随快照传播）。
+- 所有返回前端的结构体**只带掩码**，界面永不明文回显。
+- 令牌写入只走 **Tauri IPC**（沿用「没有 HTTP 写接口」的既有不变量）。
+
+### 9.6 表与幂等
+
+```sql
+CREATE TABLE IF NOT EXISTS benefit_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id   TEXT NOT NULL,
+    platform     TEXT NOT NULL,
+    window_key   TEXT NOT NULL,
+    campaign_key TEXT,
+    verdict      TEXT NOT NULL,
+    amount       REAL,
+    message      TEXT,
+    manual       INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_benefit_runs_account ON benefit_runs(account_id, created_at DESC);
+```
+
+- `window_key = platform + 本地日期(YYYY-MM-DD) + campaign_key`；
+- `benefit_window_settled(account, window_key)`：存在 `verdict ∈ {granted, replayed}` 的记录即为真；
+- **`error` 不为了结**——否则一次网络抖动会白扔当天额度（这是本设计最容易写错的一点）。
+
+### 9.7 触发面
+
+| 入口 | 形态 | 要求 |
+|---|---|---|
+| `GET /gw/benefits` | 只读：各账号状态（令牌掩码） | 沿用 `/gw/` 已有的**仅回环**约束（`server.rs` 约 396 行） |
+| `POST /gw/benefits/claim` | 手动领取：`{ accountId }` | 同一约束；未开启 `benefits.enabled` 时拒绝并说明 |
+| Tauri `benefits_overview` | 同上 | |
+| Tauri `claim_benefit_now` | 同上 | |
+| Tauri `set_benefit_token` / `clear_benefit_token` | 写密钥 | **只走 IPC** |
+| Tauri `benefit_runs` | 最近执行记录 | 供界面显示"最近一次什么时候领的、结果如何" |
+| tick 每日自动 | `auto_claim && enabled && 本地时刻 >= after_hour && 该窗口未了结` | 手动与自动**共用同一实现**，保证行为一致（照 `pricing_refresh` 的做法） |
+
+### 9.8 判据（每条都要能失败；括号里是必须同时存在的对照组）
+
+**纯层（mock 上游，形状五项对齐：方法 / 路径 / host / 返回结构 / 判定口径）**
+
+1. 状态解析挑出 `CLAIMABLE` 那条，而不是常驻那条；（对照：只有 `CLAIMED` 时 `next_claimable()` 为 `None`）
+2. `claimable` 总开关与逐条冲突时**以逐条为准**且产出 warning；
+3. `replayed:true` **不算发放**（`granted == false`），`replayed:false` 才算；
+4. 空令牌在**发请求之前**就报错（用 mock 断言**一次请求都没发出**）；
+5. 401 的错误信息包含平台原文且**不含令牌**；（对照：404 的信息必须指向"接口不存在"）
+6. `auth_value` 对裸令牌与整条头部值都能用；
+7. `platform_for_host` 对未知 host / 相似域名（`openapi.qoder.sh.evil.com`）返回 `None`。
+
+**应用层**
+
+8. 同一 `window_key` 第二次执行**不再发请求**（计数 mock 断言上游只被调一次）；
+9. `Granted`/`Replayed` 使窗口了结，**`Error` 不了结**（下一次仍会重试）；
+10. `benefits.enabled = false` 时**任何路径都不发请求**（断言上游命中 0）；
+11. 自动领取在 `auto_claim = false` 时不发生（对照组：打开后才发生），且不早于 `after_hour`。
+
+### 9.9 踩过的坑（实现时别重踩）
+
+1. **别造 `cosy-machine*` 头**：实测去掉它请求照样 200，它不是门槛；早先"设备绑定绕不过"的推断已被证伪。
+2. **别把 `claimable` 总开关当唯一依据**：实测已领当天它仍为 `true`，只看它会重复打请求。
+3. **别打错 campaign**：必须显式挑 `CLAIMABLE`；否则永远只得到重放（见 §9.1 第 2 条）。
+4. **两个域名是两套服务**：写抓包/探测脚本时 pattern 别写死 `.sh`，
+   作者就因为写死域名导致 CN 的请求**完全没被拦截**、客户端把当天额度先领掉了。
+5. **抓包头的两个视角**：`Network.requestWillBeSentExtraInfo`（注入后，含 `Authorization`/`cosy-*`）
+   vs `Fetch.requestPaused.request.headers`（注入前，**没有**这两个头）。
+   拿后者去重放会 401，从而误判"客户端外领不了"。
+6. **`ExtraInfo` 的头部含 HTTP/2 伪头**（`:authority`/`:method`/`:path`/`:scheme`），
+   拿去构造 `fetch`/`reqwest` 请求会被拒；要剔除伪头与 `host`/`content-length` 等自管头。
+7. **`Page.reload` 对跨源 iframe（OOPIF）无效**，要在 iframe 内跑 `location.reload()`。
+8. **收尾关进程别按进程名匹配**：国际版进程名 `Qoder`、CN 是 `Qoder CN.exe`，
+   按 `Qoder` 匹配会把用户开着的国际版一起关掉（作者真踩了）。要按命令行特征定位自己起的实例。
+
+### 9.10 明确不做（红线，不由实现者放宽）
+
+- **不伪造设备指纹、不构造签名、不绕验证码**；只调平台公开接口；
+- **不做浏览器/界面自动化**；
+- **不读第三方客户端的凭据文件**：令牌由用户在界面粘贴（裁决点 4 已定）；
+- `auto_claim` **默认关**，且必须有可见开关与最近一次执行记录（不允许静默失败）；
+- 平台条款若禁止自动化，该平台降级为「仅提醒」。
+
+### 9.11 交付验收
+
+| 验收项 | 判据 |
+|---|---|
+| 编译 | `cargo check --lib` 退出码 0（编译退出码是验收的一部分） |
+| 测试 | `cargo test --jobs 1` **0 failed**；新增用例含 §9.8 全部对照 |
+| mock 保真 | 夹具的 host/path/方法/返回结构/判定口径与 §9.1 逐项对齐 |
+| 真机 | 在**领取窗口内**（每日 10:00 UTC+8 后）经网关真领一次：`benefit_runs` 落 `granted` 且平台返回 `replayed:false`、`expiresAt` = +30 天 |
+| 幂等真机 | 同一天再触发一次：落 `replayed` 或直接跳过，**平台不重复发放** |
+| 界面（若做） | `npm run verify:ui` 退出码 0 **且**真的生成了新截图；未做视觉验证要显式写明 |
+
+> **真机验收的时间约束**：作者抓包当天（2026-10-06）两个账号的额度**都已被领走**，
+> 因此**当天只能验证 `replayed` 与"已领过"分支**；
+> 要证明网关能**真实发放**，必须在下一个窗口（2026-10-07 10:00 UTC+8 之后）跑，
+> 且当天**不要**先在客户端里领。
