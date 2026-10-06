@@ -1,6 +1,8 @@
 pub mod audit;
 pub mod autostart;
 pub mod boot;
+// 任务卡二 A5：账号型上游（Codex / Qoder / Claude Code…）。
+pub mod agent_upstream;
 pub mod budget;
 pub mod bundle;
 pub mod cache;
