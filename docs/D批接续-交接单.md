@@ -67,6 +67,26 @@ D 批 5 张卡里 **D1 完成、D2 差界面、D3 完成、D4 差级联执行层
    - **唯一分派点**：`proxy/server.rs` 里还没有「Provider 有 `runtime_id`
      就走适配器」那个判断。所以**数据全通了（字段→库→repo→IPC），
      但请求时仍一律走 HTTP 直连**。
+
+     **三块前置件已全部就绪**（2026-10-07）：
+     `AdapterRegistry::resolve`（可读错误）、`AgentAdapter::send`、
+     `AgentReply::into_chat_response`（已复用既有
+     `protocol::openai::to_openai_response`，形状必然一致）。
+     所以分派点**只剩一个分支**。
+
+     **落点（已侦察，别重复找）**：`proxy/server.rs` 有四个入口 ——
+     - `normal_dispatch`（**L3093**）：非流式聊天路径，**这是要改的那个**
+     - `stream_dispatch`（L3522）：流式路径
+     - `dispatch`（L2637）：总入口
+     - `passthrough_dispatch`（L916）：**非聊天**的透传（`/v1/embeddings`
+       那类），**不是聊天路径，别改这里**
+
+     **判据 2 的负向对照怎么做**：`runtime_id = NULL` 时那个分支
+     必须原样落到既有代码 —— 用 `server_e2e.rs` 的既有 fixture
+     比对**完整响应体逐字节**。分支写成
+     `if let Some(id) = provider.runtime_id.as_deref() { … }`
+     落空时**不进入任何新代码**，逐字节不变是结构性保证，
+     而不是「小心写出来的」。
    - **前端只读徽标**。这四个 IPC 因此**没有消费者** ——
      按铁律 9，它们现在是一笔欠账。
    - **卡片判据 2 没有失败证据**：它要求「`runtime_id = NULL` 的老
