@@ -280,6 +280,61 @@ impl Default for SmartRoutingConfig {
     }
 }
 
+/// D3 成本与实测效率进入路由。
+///
+/// **默认全关**：`enabled=false` 且两个权重都是 0.0。
+/// `x.powf(0.0) == 1.0`，所以默认配置下打分结果与 D3 之前**逐位相同**
+/// （CLAUDE.md 铁律 2：模式隔离）。模式只能由这个显式开关选择，
+/// 不允许自动降级或泄漏进常规路径。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CostRoutingConfig {
+    /// 总开关。关着时下面几个参数一律不生效。
+    pub enabled: bool,
+    /// 成本维度的权重。0.0 = 完全不看价格。
+    pub cost_weight: f32,
+    /// 实测效率（tok/s）维度的权重。0.0 = 完全不看吞吐。
+    pub efficiency_weight: f32,
+    /// 超过这个 prompt 长度才让成本参与（`simple` 类不受此限，一律计入）。
+    ///
+    /// 理由：长输入吃满配额，单价差 30 倍时一次请求的差额是真实的钱；
+    /// 短请求省下来的绝对值不值得让「便宜但差」的模型赢。
+    pub long_prompt_threshold_tokens: u32,
+    /// 实测吞吐的**最少样本数**。低于它视为「没有实测数据」，不参与打分。
+    ///
+    /// 与 `latency_score` 的 `0 => 1.0, // 无样本，不惩罚` 同源：
+    /// 一两个样本的 tok/s 抖动极大，用它排序等于随机。
+    pub min_efficiency_samples: u32,
+}
+
+impl Default for CostRoutingConfig {
+    fn default() -> Self {
+        Self {
+            // 默认关。打开是用户的显式动作。
+            enabled: false,
+            cost_weight: 0.0,
+            efficiency_weight: 0.0,
+            long_prompt_threshold_tokens: 32_000,
+            min_efficiency_samples: 5,
+        }
+    }
+}
+
+impl CostRoutingConfig {
+    /// 把参数夹到合法区间。
+    ///
+    /// 配置来自配置文件与前端，两者都可能给出越界值；
+    /// 权重超过 1.0 会让 `powf` 把差距放大到失真，
+    /// 而那种失真在排序里表现为「某个模型永远第一」，没有报错。
+    pub fn sanitized(mut self) -> Self {
+        self.cost_weight = self.cost_weight.clamp(0.0, 1.0);
+        self.efficiency_weight = self.efficiency_weight.clamp(0.0, 1.0);
+        self.long_prompt_threshold_tokens = self.long_prompt_threshold_tokens.clamp(1, 4_000_000);
+        // 最少 1 个样本：0 会让「无样本也参与」变成可能，与设计相反
+        self.min_efficiency_samples = self.min_efficiency_samples.clamp(1, 10_000);
+        self
+    }
+}
 /// 联网搜索后端。DuckDuckGo 不需要任何凭据，是最后兜底。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -395,6 +450,8 @@ pub struct AppConfig {
     pub local_models: LocalModelConfig,
     /// 智能模式：请求先分类再选模
     pub smart_routing: SmartRoutingConfig,
+    /// D3 成本与实测效率进入路由。默认全关。
+    pub cost_routing: CostRoutingConfig,
     /// 网关内置联网搜索（不含密钥）
     pub search: SearchConfig,
     /// 注入给 Ollama 上游的专属旋钮。客户端协议表达不了，必须网关侧给。
@@ -572,6 +629,7 @@ impl Default for AppConfig {
             takeover: TakeoverConfig::default(),
             local_models: LocalModelConfig::default(),
             smart_routing: SmartRoutingConfig::default(),
+            cost_routing: CostRoutingConfig::default(),
             search: SearchConfig::default(),
             ollama_options: OllamaOptionsConfig::default(),
             auth_failure: AuthFailureConfig::default(),

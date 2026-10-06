@@ -64,6 +64,76 @@ fn 区间与打分函数串起来能给出一致的排序() {
     assert!((scored[2].1 - 0.2).abs() < 1e-6, "最贵下界");
 }
 
+// ------------------------------ 配置项 ------------------------------
+
+#[test]
+fn 配置默认全关_且权重为零() {
+    use llm_gateway_lib::config::CostRoutingConfig;
+
+    // 铁律 2：默认配置下打分结果必须与 D3 之前逐位相同。
+    // 只要权重是 0.0，`x.powf(0.0) == 1.0` 就是恒等 —— 这一条是整个 D3
+    // 向后兼容的**唯一**依据，所以它必须是默认值而不是「文档里说默认关」。
+    let c = CostRoutingConfig::default();
+    assert!(!c.enabled, "默认必须是关的，打开是用户的显式动作");
+    assert_eq!(c.cost_weight, 0.0);
+    assert_eq!(c.efficiency_weight, 0.0);
+    assert_eq!(c.long_prompt_threshold_tokens, 32_000);
+    assert_eq!(c.min_efficiency_samples, 5, "卡片建议 N=5");
+}
+
+#[test]
+fn 老配置文件缺这一段也能解析出默认值() {
+    use llm_gateway_lib::config::{AppConfig, CostRoutingConfig};
+
+    // `#[serde(default)]` 让旧 config.toml（没有 cost_routing 段）
+    // 解析后拿到 `Default`，而不是解析失败或全零。
+    // 解析失败会让用户升级后**整个配置回默认**，那比这个功能没生效严重得多。
+    let parsed: CostRoutingConfig =
+        serde_json::from_value(serde_json::json!({})).expect("空对象应当解析成默认值");
+    assert_eq!(parsed, CostRoutingConfig::default());
+
+    // 整份 AppConfig 从「缺 cost_routing」的旧载荷解析
+    let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+    value.as_object_mut().unwrap().remove("cost_routing");
+    let back: AppConfig = serde_json::from_value(value).expect("旧载荷必须能解析");
+    assert_eq!(back.cost_routing, CostRoutingConfig::default());
+}
+
+#[test]
+fn 配置参数被夹到合法区间() {
+    use llm_gateway_lib::config::CostRoutingConfig;
+
+    let wild = CostRoutingConfig {
+        enabled: true,
+        cost_weight: 9.0,
+        efficiency_weight: -3.0,
+        long_prompt_threshold_tokens: 0,
+        min_efficiency_samples: 0,
+    }
+    .sanitized();
+    assert_eq!(wild.cost_weight, 1.0, "权重超过 1.0 会让差距放大到失真");
+    assert_eq!(wild.efficiency_weight, 0.0);
+    assert_eq!(
+        wild.long_prompt_threshold_tokens, 1,
+        "0 阈值语义不清，取最小合法值"
+    );
+    assert_eq!(
+        wild.min_efficiency_samples, 1,
+        "0 会让「无样本也参与」变成可能，与设计相反"
+    );
+    assert!(wild.enabled, "夹取不该顺手把开关关掉");
+
+    // 区间内的值不该被动
+    let normal = CostRoutingConfig {
+        enabled: true,
+        cost_weight: 0.3,
+        efficiency_weight: 0.2,
+        long_prompt_threshold_tokens: 50_000,
+        min_efficiency_samples: 5,
+    };
+    assert_eq!(normal.clone().sanitized(), normal);
+}
+
 // ------------------------------ 铁律：默认不改变行为 ------------------------------
 
 #[test]
