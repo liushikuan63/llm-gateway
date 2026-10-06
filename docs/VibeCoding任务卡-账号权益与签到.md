@@ -381,14 +381,15 @@ cosy-machineid    cosy-machinetoken   cosy-machinetype
 cosy-machinecode  cosy-machinehostname
 ```
 
-那组 `cosy-machine*` 是**设备标识 / 机器令牌**，它决定了这件事的性质：
+那组 `cosy-machine*` **看起来**是设备标识 / 机器令牌，当时据此推断它是门槛——
+**这个推断后来被实测证伪，见下方「C6 最终结果」**。保留在此是为了留下推断→证伪的轨迹：
 
-| 结论 | 依据 |
+| 当时的推断 | 最终实测结论 |
 |---|---|
-| 领取**不是**原生私有协议，就是普通 REST + JSON | 抓到的是标准 `POST` + `application/json` |
-| **可以**在客户端之外完成——前提是同时具备 `authorization` 与 `cosy-machinetoken` | 两者都是普通请求头，没有签名体、没有加密载荷 |
-| `cosy-machinetoken` 是**设备绑定**，不是账号凭据 | 名字与字段构成（machineid + machinetoken + machinecode + machinehostname + machineos + machinetype） |
-| 因此"脱离客户端"= **把本机已登录状态下的这组头复制出去**，而不是凭账号密码重新换取 | 本机已登录，这组头当下就存在 |
+| 领取**不是**原生私有协议，就是普通 REST + JSON | ✅ **成立**（标准 `POST` + `application/json`） |
+| 可以在客户端之外完成，但**必须同时具备** `authorization` 与 `cosy-machinetoken` | ❌ **证伪**：只要 `authorization`；去掉 `cosy-machinetoken` 仍 200 |
+| `cosy-machinetoken` 是设备绑定、绕不过 | ❌ **证伪**：领取端点不校验它 |
+| "脱离客户端"= 把本机已登录状态下的这组头复制出去 | ✅ 成立，但**只需复制一个头** |
 
 **判据验证结果**
 
@@ -396,9 +397,8 @@ cosy-machinecode  cosy-machinehostname
   `{"status":"CLAIMED","replayed":true,…,"claimedAt":"2026-09-02T05:20:18Z"}` ——
   **服务端明确把重复领取标记为 `replayed` 而不是再发一次**。这直接印证了 C3 幂等键的设计前提：
   拦重复的可靠性在服务端，客户端只做体验。
-- **判据 2（去掉鉴权必须失败）⏳ 未做**：需要在客户端外重放才谈得上做对照。
-- **判据 1（客户端外重放成功）⏳ 未做**：今天已领，重放只能得到 `replayed:true`；
-  真正能证明"能领"必须在**下一个窗口**（明天 10:00 后）重放一次。
+- **判据 2（去掉鉴权必须失败）✅ 通过**：见下方最终结果。
+- **判据 1（客户端外重放成功）✅ 通过**：见下方最终结果。
 
 **另一个发现：领取不需要点按钮。** 活动页加载后 1 秒内自动发出 `GET campaigns` → 紧接着
 自动 `POST …/claim`（因为该活动处于可领状态），服务端用 `replayed` 兜住重复，
@@ -409,11 +409,7 @@ UI 再据此显示「已领取」+ 按钮禁用。所以"打开活动页"这个�
 `modelScope.modelSeries.key = "ALL_MODELS"`、`actionType = "CLAIM_BENEFIT"`。
 `claimable` / `claimStatus` / `benefit.amount` 这三个字段就是 C2 要显示的东西，**全部可读**。
 
-**本轮实测的副作用：零。** 因为今天已领，服务端把所有重放都判成 `replayed`，没有重复发放。
-
-**剩下的唯一未验证格**（C6 收尾项）：下个窗口开启时，在客户端之外用同一组头重放一次
-`POST …/claim`。这需要把 `authorization` 与 `cosy-machinetoken` 读出来用——**属"要凭据"，
-须用户本人授权**；且按红线，令牌只进 `app_secrets`、不进文档与日志。
+**当时那次实测的副作用：零。** 因为当天已领，服务端把所有重放都判成 `replayed`，没有重复发放。
 
 **方法教训（三条，都是踩过的）**
 
@@ -458,8 +454,53 @@ node D:\Software\qoder-claim-verify\replay.mjs --claim
 拿 Fetch 那组头去重放会得到 401，然后会**误判成"客户端外领不了"**。重放必须用网络层头部。
 脚本里这两个视角分开存（`netHeaders` / `fetchHeaders`），并显式报告用的是哪一个。
 
-**判据状态**：判据 1 待下个窗口执行；判据 2/3 的执行方式已确定（脚本内建对照组 A/B）；
-判据 3 已提前通过（服务端 `replayed:true`）。
+#### C6 最终结果：判据 1 通过 —— **客户端外真实领到了 100 Credits**（2026-10-06 13:08）
+
+用户告知可领取后，用 **Qoder CN**（`openapi.qoder.com.cn`，其余闲、未启动，拉起无影响）执行：
+
+```text
+POST https://openapi.qoder.com.cn/sash/api/v1/me/campaigns/01a0f1cd-…/claim
+Authorization: <账号令牌>
+→ HTTP 200
+{"grantId":"…","status":"CLAIMED","replayed":false,
+ "benefit":{"kind":"CREDITS","amount":100,
+            "modelScope":{"modelSeries":{"key":"ALL_MODELS"}},
+            "validity":{"mode":"RELATIVE_DAYS","days":30}},
+ "campaignKey":"act-20260930-100","campaignVersion":1,
+ "claimedAt":"2026-10-06T05:08:58.441473Z",
+ "grantedAt":"2026-10-06T05:08:58.543833Z",
+ "expiresAt":"2026-11-05T05:08:58.441473Z"}
+```
+
+**`replayed:false` + `claimedAt` = 请求时刻 + `expiresAt` = 30 天后** ⇒ 这是一次**真实发放**，
+而且整个请求由**客户端之外**的进程发出。**判据 1 通过。**
+
+| 判据 | 结果 |
+|---|---|
+| 1 客户端外重放成功 | ✅ **通过**（`replayed:false`，100 Credits，`expiresAt` +30 天） |
+| 2 去掉 `authorization` 必须失败 | ✅ **通过**（`401 TOKEN_INVALID: missing authorization token`） |
+| 3 服务端幂等 | ✅ **通过**（重复请求返回 `replayed:true`，不重复发放） |
+
+**结论（推翻了两条早先的推断）**
+
+1. **能脱离客户端领取，而且只需 `authorization` 一个头。**
+2. **`cosy-machine*` 那 8 个设备头不是门槛**——去掉 `cosy-machinetoken` 后请求仍返回 200。
+   早先"设备绑定绕不过"的判断**是错的**；`cosy-*` 只是客户端习惯性携带的设备信息。
+3. 但**必须指定"当天可领"的那个 campaignId**：客户端每次打开活动页发的 claim 打的是
+   **常驻 campaign**（`act-20260901-922`，早已领过），对它重放只会得到 `replayed:true`。
+   这也解释了为什么"打开活动页"看起来像在领奖、实际从来没领到当天的额度。
+4. 国际版与 CN 版是**两套独立域名**（`openapi.qoder.sh` / `openapi.qoder.com.cn`），
+   抓包与实现都必须按域名区分。
+5. 这是 **L3 能力的实证**（0.7.0 §3.5 的 L4 红线），因此按既定裁决：
+   **仓库内不实现自动领取**，要做得走外部插件形态。
+
+**对照 A 的严格性说明（不许含糊）**：去掉 `cosy-machinetoken` 的那次返回 200 且
+`replayed:true`——因为当天的额度**已被前一次重放领走**，所以这一对照证明的是
+"缺机器令牌**不会被拒**"，而不是"缺机器令牌也能新领"。要做到后者必须在**未领状态下**
+再跑一次（等下一个窗口）。这不影响结论 1/2（`authorization` 必需、机器令牌不拦截），
+但严格性差异必须写清，不能当成同一件事。
+
+**判据状态：1 / 2 / 3 全部通过，C6 完成。**
 
 
 ## 七、待裁决（写文档时未定，实现前必须拍板）
@@ -482,7 +523,7 @@ node D:\Software\qoder-claim-verify\replay.mjs --claim
 |---|---|---|
 | C1 | **部分完成** | 9 个平台逐个核验：**geeknow 端点存在但功能开关关闭**（`checkin_enabled=false`）；agentrouter 有登录端点（要账号密码）；Qoder 有官方规则原文且 `/claim` 经双向取证不存在；commandcode 定位为账号型 Agent 产品；shitapi / zai / sensenova / maas / openrouter 未发现端点。**当前没有任何平台可自动领取** |
 | C2 | **部分取证完成**（代码未开始） | Qoder 额度读取有**实测路径**：客户端包里写死的 `/sash/api/v1/ai-conversations/credits-summary`、`/api/v2/quota/usage`、`/api/v2/user/plan`（见 C6 前置取证）；CLI 侧 `/usage` 面板字段已核到官方文档 |
-| C6 | **主体 + 收尾准备已完成**（2026-10-06 01:1x） | 甲方案跑通：领取端点 `POST openapi.qoder.sh/sash/api/v1/me/campaigns/{id}/claim`、鉴权 = `authorization` + `cosy-machine*` 设备组头（无 Cookie、由网络栈注入）、响应含 `replayed:true`。**结论：可在客户端外领取，但需复制设备绑定的机器令牌。** 重放脚本已就绪并干跑通过（在仓库外 `D:\Software\qoder-claim-verify\replay.mjs`）。**只剩判据 1**：下个窗口（2026-10-06 10:00 后）跑 `--claim` |
+| C6 | ✅ **完成**（2026-10-06 13:08） | 判据 1/2/3 **全部通过**：客户端外 `POST …/me/campaigns/{id}/claim` 真实领到 100 Credits（`replayed:false`、`expiresAt` +30 天）；缺 `authorization` 被拒（401）；重复领取被服务端判 `replayed:true`。**结论：能脱离客户端领取，且只需 `authorization`——`cosy-machine*` 设备头不是门槛（早先推断已证伪）**；但必须打"当天可领"的那个 campaignId。国际版 `openapi.qoder.sh` / CN 版 `openapi.qoder.com.cn` 是两套域名 |
 | C3 | 未开始 | **暂无可做对象**——geeknow 开关关闭，其余平台无端点；等有平台开了再说 |
 | C4 | 未开始 | |
 | C5 | 未开始 | |
