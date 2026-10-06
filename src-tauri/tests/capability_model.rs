@@ -294,7 +294,7 @@ async fn 旧配置_没有_capabilities_json_时回落到_provider_intelligence()
         .iter()
         .map(|p| (p.id.as_str(), p.intelligence))
         .collect();
-    by_intelligence.sort_by(|a, b| b.1.cmp(&a.1));
+    by_intelligence.sort_by_key(|p| std::cmp::Reverse(p.1));
 
     let order_from_fallback: Vec<&str> = by_fallback.iter().map(|(id, _)| *id).collect();
     let order_from_intelligence: Vec<&str> = by_intelligence.iter().map(|(id, _)| *id).collect();

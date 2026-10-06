@@ -4,6 +4,7 @@ pub mod boot;
 pub mod budget;
 pub mod bundle;
 pub mod cache;
+pub mod capability;
 pub mod cli_tools;
 mod commands;
 pub mod config;
