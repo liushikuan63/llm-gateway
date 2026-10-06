@@ -171,6 +171,30 @@ CREATE TABLE IF NOT EXISTS token_calibration (
 "#,
     ),
     (
+        // 任务卡二 A5：账号型上游的运行时定义。
+        //
+        // 单独一张表而不是塞进 providers 的 JSON 列：一个运行时会被
+        // **多个** Provider 引用（同一个 Codex 登录可以挂几个不同的模型行），
+        // 塞进 Provider 里会让「改一次登录配置要改 N 行」。
+        "agent_runtimes",
+        r#"
+CREATE TABLE IF NOT EXISTS agent_runtimes (
+    id         TEXT PRIMARY KEY,
+    -- 适配器标识，对应 AdapterRegistry 里的 key（如 'codex' / 'fake'）。
+    -- **不做外键**：适配器是代码里的东西，不是数据，
+    -- 而「代码里有但库里没有」与「库里有但代码里没有」两种情况
+    -- 都要能给出可读错误（后者见 AdapterRegistry::resolve）。
+    kind       TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    -- 运行时的附加配置（如可执行文件路径、模型别名表）。JSON 对象。
+    options_json TEXT,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#,
+    ),
+    (
         "meta",
         r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -293,6 +317,12 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     // 只留前者则冲突信息丢失（「用户填的没生效」永远查不出来）；
     // 只留后者则每次路由都要现算，且 D1 之前写的旧行没有账本。
     ensure_column(pool, "models", "capability_sources_json", "TEXT").await?;
+    // 任务卡二 A5：Provider 的第二种上游形态。
+    //
+    // **NULL 是默认且必须保持不变** —— 它表示「走原有的 HTTP 直连路径」，
+    // 而那是绝大多数 Provider 的现状（铁律：模式隔离）。
+    // 用 INTEGER 而不是布尔：这里放的是 `agent_runtimes.id`，是个引用。
+    ensure_column(pool, "providers", "runtime_id", "TEXT").await?;
     // B4 traceId 贯穿。**本地永远要有** —— 即使 OTLP 导出关着，
     // traceId 也必须落库并在审计页可见，否则「导不出」会退化成「查不到」。
     ensure_column(pool, "requests", "trace_id", "TEXT").await?;
