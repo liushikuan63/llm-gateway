@@ -22,17 +22,18 @@ D 批 5 张卡里 **D1 完成、D2 差界面、D3 差调用侧、D4/D5 未开工
 | --- | --- | --- |
 | D1 能力分下沉到模型级 | `74e94be` `1c87eb6` | 完整 |
 | D2 三条来源 | `be7ad05` `091bcb6` `73827c9` `0e218e3` `f83e0a8` | **差界面** |
-| D3 成本与效率进路由 | `29ce5a8` `1def853` `00661f8` `c618625` `11b6ece` | **差吞吐与长 prompt** |
+| D3 成本与效率进路由 | `29ce5a8` `1def853` `00661f8` `c618625` `11b6ece` `7989944` | **差流式吞吐、长 prompt、分档价** |
 
 ### 明确未做（不得当作已完成）
 
 1. **D3 已接通，但三个口子没接。** `11b6ece` 之后
    `cost_routing.enabled = true` **确实会改变排序**（成本维度生效）。
    仍缺三件：
-   - **吞吐维度恒为 `None`**：`ProviderHealth` 只有 `avg_latency_ms`，没有 tok/s。
-     要从 `requests` 表按 `completion_tokens / latency_ms` 现算，
-     并用 `min_efficiency_samples` 判样本充足性。
-     **不要拿延迟倒推一个假吞吐** —— 假的效率分会奖励「首包快但吐字慢」的模型。
+   - **流式路径没记吞吐**：`record_tps` 只接在**非流式**成功路径
+     （`server.rs` 里 `passthrough_usage` 那一处）。
+     流式的 `completion_tokens` 在另一个记账点，需要接上去。
+     统计口径已就绪（`HealthRegistry::record_tps` + `usable_tps`），
+     只是没有从流式路径调它。
    - **长 prompt 那一支没接**：`rank_with_intent` 签名里没有 prompt token 数，
      要加参数得改 `server.rs` 的 4 个调用点。现在只有 `Simple` 类拿到成本偏置。
    - **分档价 / 峰谷时段价 / 缓存价没生效**：只取了 `price.prompt` 基础价。
@@ -57,10 +58,15 @@ D 批 5 张卡里 **D1 完成、D2 差界面、D3 差调用侧、D4/D5 未开工
 `Weights::with_cost_routing` 与 `score::comparable_range` 都已就绪且有测试，
 照着用即可。
 
-**先做吞吐**（三件里唯一能让 efficiency 维度从 0 变有的）：
-`ProviderHealth` 要加 tok/s 字段，或从 `requests` 表现算
-（`completion_tokens / latency_ms`）。样本数 `< min_efficiency_samples`
-（配置默认 5）时视为没有实测数据，**不参与打分**。
+**两件都比接线麻烦**，因为它们要动签名，不是填空：
+
+1. **流式路径的吞吐**：`record_tps(provider_id, model, completion_tokens, latency_ms)`
+   已就绪且有测试，只需在流式成功路径上拿到 `completion_tokens` 后调它。
+   难点是流式的 usage 往往在最后一个 chunk 才出现。
+2. **长 prompt 那一支**：给 `rank_with_intent` 加一个 `estimated_prompt_tokens: u32`
+   参数，然后改 `server.rs` 的 4 个调用点。判据是
+   `cost_bias_applies(intent, tokens, threshold)` 返回 true 时
+   排序**确实变化**，而 `tokens < threshold` 时**逐位不变**。
 
 现状（`src/router/mod.rs` 的 `CostContext`）：`range` 已接、`tps_range` 恒 None、
 `cost_bias` 传的 prompt token 是 0。要改的就是后两项。
