@@ -90,6 +90,11 @@ pub struct Weights {
     /// 任务定性偏置的权重。只有 `Smart` 档非零；其余档恒为 0，
     /// 乘出来正好是 1.0，因此旧策略的排序结果逐位不变。
     pub intent: f32,
+    /// D3 相对价格分。**默认 0.0** —— `x.powf(0.0) == 1.0`，
+    /// 所以不启用成本维度时乘法结果逐位不变。
+    pub cost: f32,
+    /// D3 实测吞吐分。默认 0.0，理由同上。
+    pub efficiency: f32,
 }
 
 impl Default for Weights {
@@ -100,6 +105,8 @@ impl Default for Weights {
             capability: 0.2,
             latency: 0.2,
             intent: 0.0,
+            cost: 0.0,
+            efficiency: 0.0,
         }
     }
 }
@@ -115,6 +122,8 @@ impl Weights {
                 capability: 0.1,
                 latency: 0.1,
                 intent: 0.0,
+                cost: 0.0,
+                efficiency: 0.0,
             },
             RoutingStrategy::Balanced => Self {
                 health: 0.35,
@@ -122,6 +131,8 @@ impl Weights {
                 capability: 0.2,
                 latency: 0.2,
                 intent: 0.0,
+                cost: 0.0,
+                efficiency: 0.0,
             },
             RoutingStrategy::Smartest => Self {
                 health: 0.2,
@@ -129,6 +140,8 @@ impl Weights {
                 capability: 0.6,
                 latency: 0.05,
                 intent: 0.0,
+                cost: 0.0,
+                efficiency: 0.0,
             },
             RoutingStrategy::Fastest => Self {
                 health: 0.25,
@@ -136,6 +149,8 @@ impl Weights {
                 capability: 0.05,
                 latency: 0.55,
                 intent: 0.0,
+                cost: 0.0,
+                efficiency: 0.0,
             },
             RoutingStrategy::Reliable => Self {
                 health: 0.6,
@@ -143,6 +158,8 @@ impl Weights {
                 capability: 0.1,
                 latency: 0.05,
                 intent: 0.0,
+                cost: 0.0,
+                efficiency: 0.0,
             },
             RoutingStrategy::Custom => Self {
                 health: 0.4,
@@ -150,6 +167,8 @@ impl Weights {
                 capability: 0.2,
                 latency: 0.2,
                 intent: 0.0,
+                cost: 0.0,
+                efficiency: 0.0,
             },
             RoutingStrategy::Smart => Self {
                 // 智能模式以能力为底（0.30），把三成权重让给任务定性。
@@ -158,6 +177,8 @@ impl Weights {
                 capability: 0.30,
                 latency: 0.10,
                 intent: 0.20,
+                cost: 0.0,
+                efficiency: 0.0,
             },
         }
     }
@@ -184,6 +205,24 @@ pub struct ScoreInput {
     /// 智能模式的判定结果。`None` 表示本次请求没走分类（未开智能模式、
     /// 或用户显式点名了模型），此时不施加任何任务偏置。
     pub intent: Option<TaskClass>,
+    /// D3：**本次候选集**的相对价格区间 `(最便宜, 最贵)`，已折算成同一币种。
+    ///
+    /// `None` = 没有任何候选有可用价格 ⇒ 不施加成本偏置。
+    /// 归一化必须拿**整批候选**算，不能每个候选各算各的 ——
+    /// 「相对便宜」只有在同一批里比才有意义。
+    pub cost_range: Option<(f32, f32)>,
+    /// D3：本次候选集里**单个候选**的价格，已折算成同一币种。
+    pub candidate_cost: Option<f32>,
+    /// D3：**本次候选集**的实测吞吐区间 `(最低, 最高)` tok/s。
+    pub tps_range: Option<(f32, f32)>,
+    /// D3：本次候选集里**单个候选**的实测吞吐 tok/s。
+    pub candidate_tps: Option<f32>,
+    /// D3：这次请求是否适用成本偏置（阈值型代价，见 [`cost_bias_applies`]）。
+    ///
+    /// **默认应由调用方给 `false`**：不让代价维度悄悄生效。
+    /// 判断放在调用方而不是 `score()` 里，是因为它依赖 `TaskClass` 与 prompt 长度
+    /// —— 那些是**请求级**属性，每个候选重复算一遍容易得出不一致的结论。
+    pub cost_bias: bool,
 }
 
 /// 返回 0.0 ~ 1.0
@@ -198,14 +237,127 @@ pub fn score(c: &Candidate, input: &ScoreInput, w: &Weights) -> f32 {
         .map(|intent| intent_fit(intent, c).powf(w.intent))
         .unwrap_or(1.0);
 
-    let base =
-        h.powf(w.health) * hd.powf(w.headroom) * cap.powf(w.capability) * lat.powf(w.latency) * fit;
+    // D3：成本与实测效率。**两条路径都保证默认 1.0** ——
+    // 权重为 0（默认）或数据缺失时都给 1.0，
+    // 所以不启用这两个维度时乘法结果逐位不变（铁律 2）。
+    let cost = if input.cost_bias {
+        match (input.cost_range, input.candidate_cost) {
+            (Some((lo, hi)), Some(mine)) => cost_score(mine, lo, hi).powf(w.cost),
+            // 没有价格数据就不施加偏置 —— 不是「当成免费」，也不是「当成最贵」
+            _ => 1.0,
+        }
+    } else {
+        1.0
+    };
+    let eff = match (input.tps_range, input.candidate_tps) {
+        (Some((lo, hi)), Some(mine)) => efficiency_score(mine, lo, hi).powf(w.efficiency),
+        _ => 1.0,
+    };
+
+    let base = h.powf(w.health)
+        * hd.powf(w.headroom)
+        * cap.powf(w.capability)
+        * lat.powf(w.latency)
+        * fit
+        * cost
+        * eff;
 
     // 精确命中模型名的候选加分：用户点名要 deepseek-chat 时，
     // 不该因为另一家刚好更快就悄悄换了模型
     let bonus = if c.exact_match { 1.25 } else { 1.0 };
 
     (base * bonus).clamp(0.0, 1.0)
+}
+
+/// D3 相对价格分：**对数缩放**到 0.2~1.0，最便宜的得 1.0。
+///
+/// ## 为什么不能线性
+///
+/// 事实源 I.1 记着 GPT-4o 与 mini 差 16 倍、与 Flash 差 33 倍。
+/// 线性映射在 33 倍的跨度下会把**除最便宜那个之外的全部候选压成同一个值**
+/// （都贴近 0），于是「便宜 2 倍」与「便宜 30 倍」在排序里没有区别，
+/// 成本这个维度等于只对第一名起作用。
+///
+/// 取对数之后每一倍的差距贡献相同，16 倍与 33 倍才分得开。
+///
+/// ## 边界
+///
+/// - `dearest <= cheapest`（只有一个候选，或价格相同）⇒ 全部 1.0。
+///   此时「相对便宜」没有意义，不该凭空造出区分度。
+/// - `mine <= 0`（免费模型）⇒ 直接 1.0，不取对数（`ln(0)` 是负无穷）。
+pub fn cost_score(mine: f32, cheapest: f32, dearest: f32) -> f32 {
+    // 显式写清楚：非有限（NaN / inf）或非正数一律给满分。
+    // 不用 `!(mine > 0.0)` —— 那个写法对 NaN 恰好也对，但读的人
+    // 要把 NaN 的比较语义在脑子里过一遍才知道为什么，clippy 也会报。
+    if !mine.is_finite() || mine <= 0.0 {
+        return 1.0;
+    }
+    let lo = cheapest.max(f32::MIN_POSITIVE);
+    let hi = dearest.max(lo);
+    if hi <= lo {
+        return 1.0;
+    }
+    let span = (hi / lo).ln();
+    let position = if span > 0.0 {
+        ((mine / lo).ln() / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // 位置 0（最便宜）→ 1.0；位置 1（最贵）→ 0.2
+    //
+    // **必须显式夹回 [0.2, 1.0]**：`1.0 - 0.8 * 1.0` 在 f32/f64 下是
+    // `0.19999999999999996`（0.8 不是二进制精确值），比文档承诺的下界还小。
+    // 不夹的话「0.2~1.0」这个契约是假的 —— 而它会被下游当作区间前提用。
+    // 这是用例 `成本分始终落在合法区间内` 抓出来的。
+    (1.0 - 0.8 * position).clamp(0.2, 1.0)
+}
+
+/// D3 实测吞吐分：在**本次候选集**内归一化，最慢 0.2、最快 1.0。
+///
+/// 与 `latency_score` 取不同角度：延迟看「多久回」，吞吐看「回来得多快」。
+/// 一个首包很快但吐字极慢的模型，延迟分可能满分而体感很差 ——
+/// 这一维补的就是那个缺口。
+///
+/// `fastest <= slowest`（只有一个候选，或吞吐相同）⇒ 全部 1.0。
+pub fn efficiency_score(mine: f32, slowest: f32, fastest: f32) -> f32 {
+    // 显式写清楚：非有限（NaN / inf）或非正数一律给满分。
+    // 不用 `!(mine > 0.0)` —— 那个写法对 NaN 恰好也对，但读的人
+    // 要把 NaN 的比较语义在脑子里过一遍才知道为什么，clippy 也会报。
+    if !mine.is_finite() || mine <= 0.0 {
+        return 1.0;
+    }
+    let lo = slowest.max(f32::MIN_POSITIVE);
+    let hi = fastest.max(lo);
+    if hi <= lo {
+        return 1.0;
+    }
+    let position = ((mine - lo) / (hi - lo)).clamp(0.0, 1.0);
+    0.2 + 0.8 * position
+}
+
+/// D3 阈值型代价：**只在两种场景**下让成本参与打分。
+///
+/// 1. `simple` 类请求 —— 简单任务用贵模型是纯浪费
+/// 2. prompt 超过 `long_prompt_threshold` token —— 长输入吃满配额，
+///    单价差 30 倍时一次请求的差额是真实的钱
+///
+/// **刻意不对 `reasoning` 类请求计代价**：那会把「用强模型做难题」
+/// 变成需要解释的例外，正是 `CLAUDE.md` 反复警告的
+/// 「用贵的模型做简单活」的镜像错误。难题就该用强模型，不该因为贵而避开。
+///
+/// `intent` 为 `None`（没走分类 / 用户点名了模型）时返回 `false`：
+/// 没有任务定性就不该施加代价偏置。
+pub fn cost_bias_applies(
+    intent: Option<TaskClass>,
+    estimated_prompt_tokens: u32,
+    long_prompt_threshold: u32,
+) -> bool {
+    match intent {
+        Some(TaskClass::Simple) => true,
+        // 别的类别只在 prompt 很长时计入
+        Some(_) => estimated_prompt_tokens >= long_prompt_threshold,
+        None => false,
+    }
 }
 
 fn health_score(h: Option<&ProviderHealth>) -> f32 {

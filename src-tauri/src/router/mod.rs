@@ -122,6 +122,7 @@ impl Router {
                 price: None,
                 overrides: None,
                 local: None,
+                capabilities: None,
                 enabled: true,
             };
             let models = if p.models.is_empty() {
@@ -276,6 +277,15 @@ impl Router {
             health: Some(self.health.get(&c.provider.id, &c.model.upstream)),
             headroom: self.limiter.headroom(&key, &q),
             intent,
+            // D3：**默认不施加成本/效率偏置**。这里刻意留 None/false，
+            // 而不是顺手从候选集算出区间 —— 算出来但权重仍是 0.0 时
+            // 「看起来接了、其实没生效」，那种状态最难查。
+            // 真正接上要等 D3 的调用侧改造（配置项 + 区间计算）。
+            cost_range: None,
+            candidate_cost: None,
+            tps_range: None,
+            candidate_tps: None,
+            cost_bias: false,
         };
         score::score(c, &input, w)
     }
