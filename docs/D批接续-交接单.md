@@ -81,6 +81,16 @@ D 批 5 张卡里 **D1 完成、D2 差界面、D3 完成、D4 差级联执行层
      - `passthrough_dispatch`（L916）：**非聊天**的透传（`/v1/embeddings`
        那类），**不是聊天路径，别改这里**
 
+     **分支放哪里（2026-10-07 补充侦察）**：`normal_dispatch` 不是
+     「挑一个 provider 然后发」，而是把 `ranked` 交给 `FailoverChain`
+     逐候选发（`server.rs:3122`）。所以那个分支**放不到函数顶部** ——
+     它要进**链里的发送闭包**（每个候选各自判断「有没有 runtime_id」），
+     或者做成链前的短路（只对 `ranked[0]` 生效，那就丢掉了失败转移）。
+
+     推荐前者：**每个候选独立判断**与「Provider 决定上游形态」这个
+     语义一致，而且账号型 Provider 与 API 型 Provider 混在一批候选里
+     也能各自走对路。
+
      **判据 2 的负向对照怎么做**：`runtime_id = NULL` 时那个分支
      必须原样落到既有代码 —— 用 `server_e2e.rs` 的既有 fixture
      比对**完整响应体逐字节**。分支写成
