@@ -420,6 +420,10 @@ UI 再据此显示「已领取」+ 按钮禁用。所以"打开活动页"这个�
    但 `Page.reload` 不会真的重载它；要在 iframe 内 `location.reload()`。
 3. **Cookie 不在基础事件里**：`Network.requestWillBeSent` 的 `request.headers` 看不到 Cookie，
    必须读 `Network.requestWillBeSentExtraInfo`——否则会错误地得出"这个请求没有鉴权"。
+4. **收尾关进程不能按进程名匹配**：写 `Get-Process | Where ProcessName -match 'Qoder' | Stop-Process`
+   收尾时，**把用户开着的国际版 Qoder 一起关掉了**（国际版进程名是 `Qoder`，CN 版是 `Qoder CN.exe`，
+   两者都命中 `Qoder`）。要关自己起的实例，必须**按启动时间或命令行特征**精确定位，
+   例如匹配 `CommandLine -like '*--remote-debugging-port=<端口>*'`。已重新以正常模式启动国际版并确认窗口恢复。
 
 #### C6 收尾准备：重放脚本已就绪并干跑通过（2026-10-06 01:1x）
 
@@ -501,6 +505,38 @@ Authorization: <账号令牌>
 但严格性差异必须写清，不能当成同一件事。
 
 **判据状态：1 / 2 / 3 全部通过，C6 完成。**
+
+#### 国际版复现（2026-10-06 13:11）—— 两个账号各自独立通过
+
+用户要求把国际版也抓一遍，于是对 `openapi.qoder.sh` 复跑了完全相同的流程：
+
+```text
+POST https://openapi.qoder.sh/sash/api/v1/me/campaigns/01a0f1db-…/claim
+→ HTTP 200
+{"status":"CLAIMED","replayed":false,
+ "benefit":{"kind":"CREDITS","amount":100,"validity":{"mode":"RELATIVE_DAYS","days":30}},
+ "campaignKey":"act-20260930-551","campaignVersion":1,
+ "claimedAt":"2026-10-06T05:11:43.134053Z",
+ "expiresAt":"2026-11-05T05:11:43.134053Z"}
+```
+
+**这是第二次独立复现，不是同一次结果的重复计数**：不同账号、不同域名、不同 campaign id。
+端点路径**完全相同**，只有 host 不同——说明两版是同一套服务、同一套契约。
+
+| | CN 版 | 国际版 |
+|---|---|---|
+| host | `openapi.qoder.com.cn` | `openapi.qoder.sh` |
+| 当天可领 campaign | `act-20260930-100` | `act-20260930-551` |
+| 常驻（早已领）campaign | `act-20260901-922` | `act-20260901-493` |
+| 客户端外领取结果 | `replayed:false` ✅ | `replayed:false` ✅ |
+| 缺 `authorization` | `401 TOKEN_INVALID` | `401 TOKEN_INVALID` |
+| 缺 `cosy-machinetoken` | `200 replayed:true` | `200 replayed:true` |
+
+**两个账号当天的 100 Credits 都已实际到账**（各 100，`expiresAt` 均为 2026-11-05），
+且**两次发放都由客户端之外的进程完成**。
+
+**结论再确认**：`authorization` 是唯一必需的凭据；`cosy-machine*` 设备头**不参与拦截**；
+必须显式指定"当天可领"的 campaignId（客户端自己发的那个永远打常驻 campaign，只得到重放）。
 
 
 ## 七、待裁决（写文档时未定，实现前必须拍板）
