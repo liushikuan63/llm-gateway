@@ -351,3 +351,94 @@ async fn 能查出哪些_provider_引用了这个运行时() {
         .unwrap()
         .is_empty());
 }
+
+// ------------------------------ Provider 上的往返 ------------------------------
+
+/// 任务卡二 A5：`provider.runtime_id` 必须**真的落库并读得回来**。
+#[tokio::test]
+async fn provider_的_runtime_id_能写入读回并清空() {
+    use llm_gateway_lib::db::repo;
+    use llm_gateway_lib::domain::{AgentRuntime, Dialect, Provider};
+
+    let db = new_db().await;
+    repo::upsert_agent_runtime(db.pool(), &AgentRuntime::new("rt", "fake", "假"))
+        .await
+        .unwrap();
+
+    let now = chrono::Utc::now();
+    let mut p = Provider {
+        id: "p1".into(),
+        name: "p1".into(),
+        dialect: Dialect::OpenAI,
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key_enc: String::new(),
+        enabled: true,
+        priority: 0,
+        models: Vec::new(),
+        rpm_limit: 0,
+        intelligence: 50,
+        note: None,
+        runtime_id: Some("rt".into()),
+        created_at: now,
+        updated_at: now,
+    };
+    repo::upsert_provider(db.pool(), &p).await.unwrap();
+
+    let back = repo::list_providers(db.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == "p1")
+        .expect("应当读得回来");
+    assert_eq!(
+        back.runtime_id,
+        Some("rt".to_string()),
+        "runtime_id 必须真的落库 —— 只在结构体里加字段是读不回来的"
+    );
+
+    // 清空：把它改回 None，库里必须真的变成 NULL
+    p.runtime_id = None;
+    repo::upsert_provider(db.pool(), &p).await.unwrap();
+    let back = repo::list_providers(db.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == "p1")
+        .unwrap();
+    assert_eq!(
+        back.runtime_id, None,
+        "清空必须真的写进库 —— `ON CONFLICT DO UPDATE` 漏掉这一列的话它会留着旧值"
+    );
+}
+
+/// **卡片判据 2 的前半**：老 Provider（runtime_id 为 NULL）读出来必须是 `None`。
+///
+/// 后半（`/v1/chat/completions` 响应体逐字节不变）要等分派点接上
+/// 之后用既有 fixture 做负向对照 —— 见文件末尾说明。
+#[tokio::test]
+async fn 老_provider_读出来_runtime_id_是_none() {
+    use llm_gateway_lib::db::repo;
+
+    let db = new_db().await;
+    // 直接插一行**不带** runtime_id 的（模拟升级前就存在的库）
+    sqlx::query(
+        "INSERT INTO providers (id, name, dialect, base_url, api_key_enc, enabled, priority, \
+         rpm_limit, intelligence, created_at, updated_at) \
+         VALUES ('old','old','openai','http://127.0.0.1:1/v1','',1,0,0,50,
+                 '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let providers = repo::list_providers(db.pool()).await.unwrap();
+    let old = providers
+        .iter()
+        .find(|p| p.id == "old")
+        .expect("应当读得到");
+    assert_eq!(
+        old.runtime_id, None,
+        "老行必须读成 None —— 那是「走原有 HTTP 直连路径」的表示，\
+         也是模式隔离的入口"
+    );
+}

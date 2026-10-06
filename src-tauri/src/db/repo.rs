@@ -12,7 +12,7 @@ use crate::error::Result;
 pub async fn list_providers(pool: &SqlitePool) -> Result<Vec<Provider>> {
     let rows = sqlx::query(
         r#"SELECT id, name, dialect, base_url, api_key_enc, enabled, priority,
-                  rpm_limit, intelligence, note, created_at, updated_at
+                  rpm_limit, intelligence, note, runtime_id, created_at, updated_at
            FROM providers ORDER BY priority ASC, name ASC"#,
     )
     .fetch_all(pool)
@@ -34,7 +34,8 @@ pub async fn list_providers(pool: &SqlitePool) -> Result<Vec<Provider>> {
             rpm_limit: r.get("rpm_limit"),
             intelligence: r.get("intelligence"),
             note: r.get("note"),
-            runtime_id: None,
+            // 任务卡二 A5：老行是 NULL ⇒ `None` ⇒ 走原有 HTTP 直连路径。
+            runtime_id: r.get("runtime_id"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         });
@@ -124,12 +125,13 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
     let now = Utc::now();
     sqlx::query(
         r#"INSERT INTO providers
-             (id, name, dialect, base_url, api_key_enc, enabled, priority, rpm_limit, intelligence, note, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+             (id, name, dialect, base_url, api_key_enc, enabled, priority, rpm_limit, intelligence, note, runtime_id, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(id) DO UPDATE SET
              name=excluded.name, dialect=excluded.dialect, base_url=excluded.base_url,
              api_key_enc=excluded.api_key_enc, enabled=excluded.enabled, priority=excluded.priority,
              rpm_limit=excluded.rpm_limit, intelligence=excluded.intelligence, note=excluded.note,
+             runtime_id=excluded.runtime_id,
              updated_at=excluded.updated_at"#,
     )
     .bind(&p.id)
@@ -142,6 +144,7 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
     .bind(p.rpm_limit)
     .bind(p.intelligence)
     .bind(&p.note)
+    .bind(&p.runtime_id)
     .bind(now)
     .bind(now)
     .execute(pool)

@@ -64,7 +64,11 @@ async fn pool() -> sqlx::SqlitePool {
         .execute(&pool)
         .await
         .expect("建表");
-    sqlx::query("CREATE TABLE providers (id TEXT PRIMARY KEY, name TEXT, dialect TEXT, base_url TEXT, api_key_enc TEXT, enabled INTEGER, priority INTEGER, rpm_limit INTEGER, intelligence INTEGER, note TEXT, created_at TEXT, updated_at TEXT)")
+    // 手写建表：**加列时要跟着改这里**。
+    // D1 加了 `capabilities_json`、任务卡二 A5 加了 `runtime_id`，
+    // 漏加会让 upsert 报 "table providers has no column named runtime_id"
+    // —— 而这个文件里的用例与账号型上游无关，报错完全指不到原因。
+    sqlx::query("CREATE TABLE providers (id TEXT PRIMARY KEY, name TEXT, dialect TEXT, base_url TEXT, api_key_enc TEXT, enabled INTEGER, priority INTEGER, rpm_limit INTEGER, intelligence INTEGER, note TEXT, runtime_id TEXT, created_at TEXT, updated_at TEXT)")
         .execute(&pool)
         .await
         .expect("建表");
