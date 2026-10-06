@@ -735,6 +735,40 @@ export interface AuditExportResult {
   columns_doc: string | null;
 }
 
+// ---------- D2 能力集导出 / 导入 ----------
+
+/** 一个维度上一个来源给出的取值。 */
+export interface SourcedCapabilityValue {
+  value: number;
+  source: "measured" | "manual" | "community" | "catalog";
+}
+
+/**
+ * 多来源能力账本。
+ *
+ * `values` 的形状是 `{ 维度: { 来源: 取值 } }`。
+ * **每一维每个来源各留一条** —— 这样界面才能把「都有谁说过这一维是多少」
+ * 列出来。若后端只给胜出的那一个，用户看到「我填的没生效」时
+ * 就没有任何线索知道为什么。
+ */
+export interface CapabilitySet {
+  values: Record<string, Record<string, SourcedCapabilityValue | number>>;
+}
+
+/**
+ * 导入结果。**`skipped*` 三项界面必须显示** ——
+ * 静默跳过会让用户以为数据齐了。
+ */
+export interface ImportCapabilitiesResult {
+  written: number;
+  /** 本机没有、因而没有写入的键（`provider/alias`）。 */
+  skipped: string[];
+  /** 认不出来的维度名（新版本写的文件在老版本里读）。 */
+  skipped_dimensions: string[];
+  /** 认不出来的来源名。 */
+  skipped_sources: string[];
+}
+
 // 定价刷新结果：逐项报告，避免只说成功。
 export interface PricingRefreshOutcome {
   feed_models: number;
@@ -935,6 +969,26 @@ export const api = {
 
   exportRequests: (filter: AuditFilter, format: "jsonl" | "csv", destPath: string) =>
     invoke<AuditExportResult>("export_requests", { filter, format, destPath }),
+
+  // ---------- D2 能力集导出 / 导入 ----------
+
+  /**
+   * 导出全部模型的多来源能力账本，返回 JSON 文本。
+   *
+   * 形态：`{ "provider/alias": { values: {...} }, ... }`。
+   * 后端按 key 排序输出，同样数据导两次逐字节相同 ——
+   * 界面可以直接把它当文本给用户复制或写文件。
+   */
+  exportCapabilities: () => invoke<string>("export_capabilities"),
+
+  /**
+   * 导入能力账本。
+   *
+   * **返回里带 `skipped` 明细，界面必须显示出来。**
+   * 跨机器导入必然有本机没有的模型，静默丢弃会让用户以为数据齐了。
+   */
+  importCapabilities: (payload: string) =>
+    invoke<ImportCapabilitiesResult>("import_capabilities", { payload }),
 
   /**
    * 让用户选一个保存路径。取消时返回 `null`。
