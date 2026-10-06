@@ -1397,6 +1397,124 @@ pub async fn export_requests(
     })
 }
 
+/* --------------------------- D2 能力集导出 / 导入 --------------------------- */
+
+/// 导出**全部**模型的多来源能力账本。
+///
+/// 形态：`{ "<provider_id>/<alias>": { ...CapabilitySet... }, ... }`
+///
+/// 为什么要能带走（卡片原文）：「用户整理好一套能力数据后要能带走，
+/// 也能在另一台机器上复用。这条不做好，30 个模型逐个手填就没人愿意用了」。
+///
+/// 用 `BTreeMap` 语义（按 key 排序）而不是哈希序：同样数据导两次要逐字节相同，
+/// 否则 diff 与快照都没法用。
+#[tauri::command]
+pub async fn export_capabilities(state: State<'_, AppState>) -> Result<String, String> {
+    let providers = repo::list_providers(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut out: std::collections::BTreeMap<String, crate::capability::CapabilitySet> =
+        std::collections::BTreeMap::new();
+    for provider in providers {
+        for model in &provider.models {
+            if let Some(ledger) =
+                repo::read_capability_ledger(state.db.pool(), &provider.id, &model.alias)
+                    .await
+                    .map_err(|e| e.to_string())?
+            {
+                out.insert(format!("{}/{}", provider.id, model.alias), ledger);
+            }
+        }
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// 导入结果。**把跳过的东西回给用户看** ——
+/// 静默跳过会让他以为数据齐了。
+#[derive(Debug, Serialize)]
+pub struct ImportCapabilitiesResult {
+    /// 实际写进库的模型数。
+    pub written: usize,
+    /// 本机没有、因而**没有**写入的键。
+    pub skipped: Vec<String>,
+    /// 认不出来的维度名（新版本写的文件在老版本里读）。
+    pub skipped_dimensions: Vec<String>,
+    /// 认不出来的来源名。
+    pub skipped_sources: Vec<String>,
+}
+
+/// 导入能力账本。返回写入与跳过的明细。
+///
+/// **只写能力，不动别的字段** —— 不碰价格、不碰启用状态。
+/// 导入一份别人整理的能力集不该顺手改掉本机的定价。
+#[tauri::command]
+pub async fn import_capabilities(
+    state: State<'_, AppState>,
+    payload: String,
+) -> Result<ImportCapabilitiesResult, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(&payload).map_err(|e| format!("不是合法 JSON：{e}"))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "顶层必须是一个对象（形如 {\"provider/alias\": {...}}）".to_string())?;
+
+    let providers = repo::list_providers(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    // 先把「这台机器上有哪些模型」查出来 —— 导入一份来自别的机器的能力集时，
+    // 里面必然有本机没有的模型，那些要如实报出来而不是静默丢弃。
+    let known: std::collections::BTreeSet<String> = providers
+        .iter()
+        .flat_map(|p| {
+            p.models
+                .iter()
+                .map(move |m| format!("{}/{}", p.id, m.alias))
+        })
+        .collect();
+
+    let mut written = 0usize;
+    let mut skipped = Vec::new();
+    let mut skipped_dimensions = Vec::new();
+    let mut skipped_sources = Vec::new();
+
+    for (key, raw) in obj {
+        if !known.contains(key) {
+            skipped.push(key.clone());
+            continue;
+        }
+        let Some((provider_id, alias)) = key.split_once('/') else {
+            skipped.push(key.clone());
+            continue;
+        };
+        let (ledger, report) = crate::capability::CapabilitySet::import_json(&raw.to_string())?;
+        skipped_dimensions.extend(report.skipped_dimensions);
+        skipped_sources.extend(report.skipped_sources);
+        let hit = repo::write_capability_ledger(state.db.pool(), provider_id, alias, &ledger)
+            .await
+            .map_err(|e| e.to_string())?;
+        if hit {
+            written += 1;
+        } else {
+            skipped.push(key.clone());
+        }
+    }
+
+    // 导入改了**路由实际用的定值** ⇒ 两把锁都要刷（CLAUDE.md 铁律 7：
+    // 只改 AppState.config 会让界面显示「保存成功」而运行时毫无变化）。
+    state
+        .gateway
+        .reload_providers()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(ImportCapabilitiesResult {
+        written,
+        skipped,
+        skipped_dimensions,
+        skipped_sources,
+    })
+}
+
 /* --------------------------- CLI 工具接管（可选） --------------------------- */
 
 #[cfg(windows)]

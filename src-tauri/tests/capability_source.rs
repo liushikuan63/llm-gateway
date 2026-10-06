@@ -193,6 +193,150 @@ fn 从账本推定的值_与逐维取信任度最高者一致() {
     assert!(!empty.has_any_quality());
 }
 
+// ------------------------------ D2 第四笔：导出/导入的落库链路 ------------------------------
+
+/// 走一遍「写账本 → 导出 → 换个库导入」的完整链路。
+///
+/// 这是卡片第 4 条要的能力：整理好一套能力数据后带走、在另一台机器上复用。
+/// 只在内存里跑通不算 —— 导出必须从库里读、导入必须写回库。
+#[tokio::test]
+async fn 导出的账本能被另一个库完整导入() {
+    use llm_gateway_lib::db::{self, repo};
+
+    // 源库：两个模型各有一份账本
+    let source = db::Db::connect_in_memory().await.unwrap();
+    seed_model(&source).await;
+    let mut ledger = CapabilitySet::new();
+    ledger.apply_catalog(Dimension::Coding, 0.5);
+    ledger.insert(Dimension::Coding, CapabilitySource::Manual, 0.9);
+    ledger.insert(Dimension::Reasoning, CapabilitySource::Measured, 0.7);
+    repo::write_capability_ledger(source.pool(), "p1", "m1", &ledger)
+        .await
+        .unwrap();
+
+    // 导出：读库、拼成 key → 账本 的映射
+    let providers = repo::list_providers(source.pool()).await.unwrap();
+    let mut exported: std::collections::BTreeMap<String, CapabilitySet> =
+        std::collections::BTreeMap::new();
+    for provider in &providers {
+        for model in &provider.models {
+            if let Some(l) = repo::read_capability_ledger(source.pool(), &provider.id, &model.alias)
+                .await
+                .unwrap()
+            {
+                exported.insert(format!("{}/{}", provider.id, model.alias), l);
+            }
+        }
+    }
+    let json = serde_json::to_string_pretty(&exported).unwrap();
+    assert!(
+        json.contains("p1/m1"),
+        "导出应当带上 provider/alias 键：{json}"
+    );
+
+    // 目标库：同样结构，但账本是空的
+    let target = db::Db::connect_in_memory().await.unwrap();
+    seed_model(&target).await;
+    assert_eq!(
+        repo::read_capability_ledger(target.pool(), "p1", "m1")
+            .await
+            .unwrap(),
+        None,
+        "前置：目标库此刻没有账本"
+    );
+
+    // 导入
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    for (key, raw) in value.as_object().unwrap() {
+        let (provider_id, alias) = key.split_once('/').unwrap();
+        let (l, report) = CapabilitySet::import_json(&raw.to_string()).unwrap();
+        assert!(!report.has_skips());
+        assert!(
+            repo::write_capability_ledger(target.pool(), provider_id, alias, &l)
+                .await
+                .unwrap()
+        );
+    }
+
+    // 判据：目标库读出来的账本与源库**完全一致**，冲突也在
+    let back = repo::read_capability_ledger(target.pool(), "p1", "m1")
+        .await
+        .unwrap()
+        .expect("导入后应当有账本");
+    assert_eq!(back, ledger, "跨库往返不丢信息");
+    assert_eq!(back.covered_dimensions(), 2);
+    assert_eq!(
+        back.conflict(Dimension::Coding).map(|v| v.len()),
+        Some(2),
+        "冲突跨库也要还在"
+    );
+    // 定值也同步过去了
+    let resolved = repo::read_model_capabilities(target.pool(), "p1", "m1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.coding, Some(0.9));
+    assert!(
+        resolved.updated_at.is_some(),
+        "D2 第 3 条：写入要盖 updated_at"
+    );
+}
+
+#[tokio::test]
+async fn 导入时本机没有的模型被如实报出而不是静默丢弃() {
+    // 跨机器导入是常态：对方有而本机没有的模型必然存在。
+    // 静默丢弃会让用户以为「导进去了」。
+    use llm_gateway_lib::db::{self, repo};
+
+    let target = db::Db::connect_in_memory().await.unwrap();
+    seed_model(&target).await;
+
+    let payload = serde_json::json!({
+        "p1/m1": {"values": {"coding": {"manual": 0.9}}},
+        "p9/根本没有这个模型": {"values": {"coding": {"manual": 0.3}}},
+    })
+    .to_string();
+
+    let providers = repo::list_providers(target.pool()).await.unwrap();
+    let known: std::collections::BTreeSet<String> = providers
+        .iter()
+        .flat_map(|p| {
+            p.models
+                .iter()
+                .map(move |m| format!("{}/{}", p.id, m.alias))
+        })
+        .collect();
+
+    let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let mut written = 0;
+    let mut skipped = Vec::new();
+    for (key, raw) in value.as_object().unwrap() {
+        if !known.contains(key) {
+            skipped.push(key.clone());
+            continue;
+        }
+        let (pid, alias) = key.split_once('/').unwrap();
+        let (l, _) = CapabilitySet::import_json(&raw.to_string()).unwrap();
+        if repo::write_capability_ledger(target.pool(), pid, alias, &l)
+            .await
+            .unwrap()
+        {
+            written += 1;
+        }
+    }
+    assert_eq!(written, 1);
+    assert_eq!(skipped, vec!["p9/根本没有这个模型".to_string()]);
+    // 反向：已知的那个真的写进去了
+    assert_eq!(
+        repo::read_model_capabilities(target.pool(), "p1", "m1")
+            .await
+            .unwrap()
+            .unwrap()
+            .coding,
+        Some(0.9)
+    );
+}
+
 // ------------------------------ 卡片点名 ------------------------------
 
 #[test]

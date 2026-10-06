@@ -266,6 +266,8 @@ pub fn run() {
             commands::recent_requests,
             commands::query_requests,
             commands::export_requests,
+            commands::export_capabilities,
+            commands::import_capabilities,
             commands::apply_takeover,
             commands::export_bundle,
             commands::import_bundle,

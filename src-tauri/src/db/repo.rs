@@ -345,6 +345,11 @@ pub fn resolved_from_ledger(
         .max_by_key(|v| v.source.trust())
         .map(|v| v.source)
         .unwrap_or_default(),
+        // D2 第 3 条：每次写入更新 updated_at。
+        // 由**推定函数**盖时间戳而不是让每个调用方各盖一次 ——
+        // 漏盖的表现是「界面上这份数据永远显示成很久以前更新的」，
+        // 而用户据此判断「是不是该刷新了」。
+        updated_at: Some(chrono::Utc::now()),
         // 其余维度（上下文窗口 / 吞吐 / 单价…）由各自的通道维护，不由账本推
         ..Default::default()
     }
