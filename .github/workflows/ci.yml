@@ -85,9 +85,24 @@ jobs:
       # and verify:manual only inspects docs. Measured 2026-10-05: a broken
       # object literal in ui-smoke.cjs landed with CI fully green because
       # nothing ever parsed that file. Keep this step.
+      #
+      # FIXED 2026-10-06 (C4): this step used to have TWO `run:` keys in the
+      # same mapping --
+      #     run: for f in scripts/*.cjs; do node --check "$f"; done
+      #     run: npm run verify:manual
+      # A duplicate key means the last one wins, so the syntax check NEVER RAN
+      # and this step silently re-ran verify:manual (which already has its own
+      # step above). The guard that the comment calls "keep this step" was dead
+      # the whole time. Do not add a second `run:` here.
       - name: scripts syntax
-        run: for f in scripts/*.cjs; do node --check "$f"; done
-        run: npm run verify:manual
+        run: |
+          for f in scripts/*.cjs scripts/*.mjs scripts/*.js; do
+            [ -e "$f" ] || continue
+            node --check "$f"
+          done
+          # Fixture redaction scan (C3): samples come from vendor docs and must
+          # not carry credentials into the repo.
+          node scripts/check-fixture-redaction.mjs
 
       - name: npm run verify:release
         run: npm run verify:release

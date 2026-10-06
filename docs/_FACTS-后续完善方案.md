@@ -303,6 +303,61 @@ exporter 层，破例加依赖的实际代价比预想小」。**实测是没开
 
 ---
 
+## K. A/B/C 批落地台账（2026-10-06 盘点）
+
+> **这是台账，不是验收记录。** 每条都带提交号与实跑命令，
+> 但**行号会随代码变动过期** —— 引用行号前先复验。
+>
+> 上面的 §A–§I 是动手前的事实，多数已随落地而过期（触发条件见 §F 第 1、2 条）。
+> 本节记录**实际发生了什么**，包括没做完与没验证的部分。
+
+### 落地情况
+
+| 卡 | 状态 | 提交 | 实跑判据 |
+| --- | --- | --- | --- |
+| A0 CI 门禁 | 已落地 | 早于本批 | `.github/workflows/ci.yml` 存在 |
+| A2 日志轮转 | 已落地 | `6094e38` | 9 条测试 |
+| A3 路由金标准 | 已落地 | `c5ef37f` | 26 例 golden；负向对照矩阵 6 红 / 3 绿 |
+| A4 分类基准集 | **部分**：seeded 32 条已落地；owner 30 条待本人标注 | `1467538` `205a1cb` | 启发式总体 81.2%（simple 100% / vision 100% / reasoning 60%） |
+| B1 响应缓存 | 已落地 | `40cf991` | 19 单元 + 11 集成 |
+| B2 预算闸门 | 已落地 | `bd3b777` `db847b8` `720c552` | 18 单元 + 12 集成 + 6 条 UI 断言 |
+| B3 审计检索与导出 | 已落地 | `556aef6` | 27 单元 + 16 集成 |
+| B4 traceId + OTLP | 已落地 | `c293994` `b32e6f6` `c562f0e` | 13 + 14 单测；OTLP 四个 crate 已加 |
+| C1 MCP 网关 | 已落地 | `951c730` `7b0b0eb` | 27 单元 + 9 端到端（真进程） |
+| C2 Gemini 原生入站 | 已落地 | `2b11431` `0cc6c79` `cb9bd45` | 16 单元 + 10 端到端 |
+| C3 协议契约 golden | 已落地 | `8a15007` | 8 条用例 + 脱敏扫描接进 CI |
+| C4 文档回填 | 已落地 | 见本提交 | `AGENTS.md` 新建；`cargo-env.ps1` 死指针修复；`ci.yml` 重复 `run` 键修复 |
+
+**测试基线演进**：420（本批开工前）→ 691 passed / 0 failed / 15 ignored（C3 后实跑）。
+
+### 明确未做 / 未验证（不得当作已完成）
+
+| 事项 | 实情 |
+| --- | --- |
+| **OTLP 导出未实测真 collector** | `telemetry::init` 的 exporter 初始化路径**没有对着真 collector 跑过**。已验证的只有「关闭时 `init` 返回 `None` 且 `initialized_endpoint()` 为 `None`」。要验真需一个可达的 OTLP endpoint。 |
+| **Gemini CLI 接管未实测** | 两个地址键 `CODE_ASSIST_ENDPOINT`（官方文档有）与 `GOOGLE_GEMINI_BASE_URL`（官方文档无）**都写了**，哪个真生效**没实测**。要验真需真装一次 Gemini CLI 并发一次请求。 |
+| **C3 样本不是真实抓包** | 五个协议目录的 `provenance.json` 里 `kind: "documented-example"`。**不能证明上游没改版** —— 要拿到 `vendor-capture` 需各自的 key 打线上接口。 |
+| **A4 owner 30 条待标注** | `docs/A4-owner待标注清单.md` 已交付，等本人填。清单未回填前 owner 部分的分项准确率不可用。 |
+| **本机 `ci-local.ps1` 全量门禁被他人文件挡住** | `src-tauri/tests/auth_failover.rs` 里函数名 `鉴权失败后不得回落到免Key后端` 含大写 `Key`，触发 `non_snake_case`；而 `ci-local.ps1` 是 `$ErrorActionPreference='Stop'`，cargo 写到 stderr 的 warning 被当成命令失败 → clippy/check/test 三步 0 秒即红。该文件属于别的会话，本批未动。**一处机械改名即可解开。** |
+
+### 本批发现的两处「守卫是死的」
+
+1. **`.github/workflows/ci.yml` 的 `scripts syntax` 步有两个 `run:` 键** ——
+   同一 mapping 里的重复键，最后一个生效，所以 `node --check` **从未跑过**，
+   该步实际在重复执行 `verify:manual`。已修（`8a15007` 之后）。
+   同一步里原来的注释写着「Keep this step」，而它一直是死的。
+2. **`ci-local.ps1` 的 `Invoke-ScriptSyntaxStep` 只覆盖 `.cjs`** ——
+   `.mjs` 生成器脚本的语法错误只有在有人手跑时才暴露。已扩到 `.cjs/.mjs/.js`。
+
+### 一处口径澄清（2026-10-06 本人指出）
+
+CLAUDE.md 的「**密钥不进配置**」禁的是**明文**落进会随快照/导出传播的地方；
+`crypto::encrypt` 的存在说明**密文存储凭据是设计内的能力**。
+任务卡二的「不读第三方凭据文件」禁的是**读**别人的凭据。
+把网关自己的统一 Key 写进被接管工具的配置是既定做法，五家一致，写前备份。
+
+---
+
 ## F. 本文的过期条件
 
 出现下列任一情况，本文即失效，必须重新盘点而不是直接沿用：

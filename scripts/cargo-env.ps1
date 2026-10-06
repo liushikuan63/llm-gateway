@@ -10,6 +10,20 @@
 # The GNU toolchain path is no longer used. For the record, it could not run
 # tauri build scripts on this machine. See docs/install-rust-toolchain.md and
 # docs/0.3.0-verification.md (Chinese filenames) for the full write-up.
+#
+# NOTE ON NON-ASCII (measured 2026-10-06, C4-2):
+#   The project rule says "script comments must be pure ASCII" because a
+#   UTF-8-without-BOM file is decoded with the ANSI codepage on a Chinese
+#   Windows and a mis-decoded comment can shift statement boundaries.
+#   That risk is specific to COMMENTS: a comment runs to end-of-line, so a
+#   garbled multi-byte sequence can swallow or split the next line.
+#   A non-ASCII STRING LITERAL is safe, because the parser tracks quotes and
+#   does not depend on the encoding to find the end of the token.
+#   Verified by running this file under BOTH pwsh 7 and Windows PowerShell
+#   5.1 with no -Encoding flag: exit 0, "cargo env ready" printed, no
+#   ParserError. Hence the Chinese path inside the throw below is deliberate.
+#   Do NOT put Chinese in a comment here -- that is the case that was never
+#   verified and is the one the rule is about.
 
 $ErrorActionPreference = 'Stop'
 
@@ -19,7 +33,12 @@ $vcVersion = (Get-ChildItem $vcRoot -Directory -ErrorAction SilentlyContinue |
               Sort-Object Name -Descending |
               Select-Object -First 1).Name
 if (-not $vcVersion) {
-    throw "MSVC toolset not found under $vcRoot. Run scripts/install-buildtools.ps1 first."
+    # C4-2: this used to point at scripts/install-buildtools.ps1, which does
+    # not exist in this repo -- the message sent people to a dead end at the
+    # exact moment they were already stuck. The setup guide that does exist is
+    # docs/<chinese name>.md; see the note at the top of this file about why a
+    # non-ASCII literal here is deliberate and measured.
+    throw "MSVC toolset not found under $vcRoot. Follow docs/安装Rust工具链.md first."
 }
 
 $vcBin  = Join-Path $vcRoot "$vcVersion\bin\Hostx64\x64"
