@@ -280,6 +280,12 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .await?;
     ensure_column(pool, "sessions", "token_ratio", "REAL").await?;
+    // D1 模型级能力分。**存 TEXT 而不是若干 INTEGER 列** ——
+    // 能力是多维的（coding / reasoning / knowledge / math / 吞吐 / 首包 / 单价…），
+    // 拆成定宽列会让「加一个维度」变成一次表结构迁移，
+    // 而维度还会继续加（D2 就要接数据来源）。
+    // 与 `models.local_json` 同构，读写方式照抄。
+    ensure_column(pool, "models", "capabilities_json", "TEXT").await?;
     // B4 traceId 贯穿。**本地永远要有** —— 即使 OTLP 导出关着，
     // traceId 也必须落库并在审计页可见，否则「导不出」会退化成「查不到」。
     ensure_column(pool, "requests", "trace_id", "TEXT").await?;

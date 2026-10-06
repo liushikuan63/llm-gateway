@@ -194,6 +194,63 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
     Ok(())
 }
 
+/* ------------------------- D1 模型级能力分 ------------------------- */
+
+/// 从一行里解出模型能力。**解析失败返回 `None`，绝不 panic。**
+///
+/// 与 `read_local_meta` / `read_model_price` 同一取向：
+/// 一个坏 JSON 不该让整个模型列表读不出来 —— 那样用户看到的是
+/// 「所有模型都没了」，而根因在一个字段上。
+///
+/// 返回的是**原样解析结果**，不在这里判 `has_any_quality`：
+/// 只有价格、没有质量维度的能力数据是合法的（D2 会用到），
+/// 要不要回落到 provider 级是调用方的判断，不该在这一层替它决定。
+fn read_capabilities(row: &sqlx::sqlite::SqliteRow) -> Option<crate::domain::ModelCapabilities> {
+    let raw = row.get::<Option<String>, _>("capabilities_json")?;
+    serde_json::from_str::<crate::domain::ModelCapabilities>(&raw).ok()
+}
+
+/// 读某个模型的能力分。模型不存在或没有能力数据时返回 `None`。
+pub async fn read_model_capabilities(
+    pool: &SqlitePool,
+    provider_id: &str,
+    alias: &str,
+) -> Result<Option<crate::domain::ModelCapabilities>> {
+    let row =
+        sqlx::query("SELECT capabilities_json FROM models WHERE provider_id = ? AND alias = ?")
+            .bind(provider_id)
+            .bind(alias)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.as_ref().and_then(read_capabilities))
+}
+
+/// 写某个模型的能力分。返回是否命中了记录。
+///
+/// 写前 `clamp_scores`：来源数据（榜单、压测脚本）可能给出 1.5 或 -0.2，
+/// 而不夹的话 `capability_score` 的乘积会大于 1 ——
+/// 那种越界在排序里表现为「这个模型莫名其妙总是第一」，
+/// 且没有任何报错。入口夹一次比在每个消费点夹更可靠。
+pub async fn write_model_capabilities(
+    pool: &SqlitePool,
+    provider_id: &str,
+    alias: &str,
+    capabilities: &crate::domain::ModelCapabilities,
+) -> Result<bool> {
+    let mut sanitized = capabilities.clone();
+    sanitized.clamp_scores();
+    let encoded = serde_json::to_string(&sanitized)
+        .map_err(|e| crate::error::GatewayError::Other(e.into()))?;
+    let result =
+        sqlx::query("UPDATE models SET capabilities_json = ? WHERE provider_id = ? AND alias = ?")
+            .bind(encoded)
+            .bind(provider_id)
+            .bind(alias)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// 仅更新一个模型的价格 JSON，供「自动获取最新定价」使用。返回是否命中了记录。
 pub async fn update_model_price(
     pool: &SqlitePool,
