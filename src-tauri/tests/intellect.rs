@@ -189,6 +189,12 @@ fn intent_为_none_时打分与不启用智能模式完全一致() {
         health,
         headroom: 0.8,
         intent: None,
+        // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
+        cost_range: None,
+        candidate_cost: None,
+        tps_range: None,
+        candidate_tps: None,
+        cost_bias: false,
     };
     // 反向对照：给一个明确的 TaskClass 应当改变结果，
     // 否则下面那条断言就成了「什么都算对」的空断言。
@@ -197,6 +203,12 @@ fn intent_为_none_时打分与不启用智能模式完全一致() {
         health: with_none.health.clone(),
         headroom: 0.8,
         intent: Some(TaskClass::Simple),
+        // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
+        cost_range: None,
+        candidate_cost: None,
+        tps_range: None,
+        candidate_tps: None,
+        cost_bias: false,
     };
     for strategy in [
         RoutingStrategy::Priority,
@@ -928,6 +940,8 @@ fn 总开关关着时全局_smart_策略退化为_balanced() {
                 llm_gateway_lib::router::score::RequiredCapabilities::default(),
                 None,
                 intent,
+                // D3：路由金标准与分类夹具不施加长 prompt 代价（保持既有断言口径）
+                0,
             )
             .into_iter()
             .map(|c| c.model.alias)

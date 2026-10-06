@@ -756,3 +756,130 @@ fn 吞吐样本_没有条目时不创建() {
          它会让 get() 返回一个「健康且成功率 1.0」的假象"
     );
 }
+
+// ------------------------------ D3 长 prompt 型代价端到端 ------------------------------
+
+/// 造一个带指定输入单价的模型。
+///
+/// 用 serde 构造而不是结构体字面量：`ModelPrice` 有十来个字段，
+/// 逐个写出来会在加字段时到处编译失败，而这里只关心 `prompt` 与 `currency`。
+fn priced_model(alias: &str, prompt_price: f64) -> ModelRef {
+    let mut m = model(alias, alias);
+    m.price = Some(
+        serde_json::from_value(serde_json::json!({
+            "prompt": prompt_price,
+            "completion": prompt_price,
+            "currency": "usd"
+        }))
+        .expect("价格载荷应能解析"),
+    );
+    m
+}
+
+/// **这条是「长 prompt 型代价真的接进打分」的唯一端到端证据。**
+///
+/// 注违规自检实测过：把 `rank_with_intent` 里传给 `cost_bias_applies` 的
+/// `prompt_tokens` 改回 `0`，**全套用例仍全绿** —— 也就是说接线本身原本
+/// 没有任何用例守着。这条补上那个缺口。
+#[test]
+fn 长_prompt_型代价_reasoning_请求超过阈值时便宜的胜出() {
+    use llm_gateway_lib::intellect::TaskClass;
+    use llm_gateway_lib::router::score::RequiredCapabilities;
+
+    // 强但贵 vs 弱但便宜。intelligence 差 40 分，价格差 100 倍 ——
+    // 后者的差距必须能压过前者，否则成本维度等于没接。
+    let mut strong = provider("strong", 0, 90);
+    strong.models = vec![priced_model("m", 100.0)];
+    let mut cheap = provider("cheap", 0, 50);
+    cheap.models = vec![priced_model("m", 1.0)];
+
+    let providers = vec![strong, cheap];
+    let cfg = AppConfig {
+        routing_strategy: RoutingStrategy::Balanced,
+        cost_routing: llm_gateway_lib::config::CostRoutingConfig {
+            enabled: true,
+            cost_weight: 1.0,
+            long_prompt_threshold_tokens: 1000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let (router, _limiter, _health) = router();
+    let order = |prompt_tokens: u32| -> Vec<String> {
+        router
+            .rank_with_intent(
+                router.resolve("auto", &providers).expect("auto 应可用"),
+                &cfg,
+                RequiredCapabilities::default(),
+                None,
+                Some(TaskClass::Reasoning),
+                prompt_tokens,
+            )
+            .into_iter()
+            .map(|c| c.provider.id)
+            .collect()
+    };
+
+    // 短 prompt：不该计入成本 ⇒ 强的胜出
+    assert_eq!(
+        order(999),
+        vec!["strong".to_string(), "cheap".to_string()],
+        "阈值以下不该施加成本偏置"
+    );
+    // 长 prompt：计入成本 ⇒ 便宜 100 倍的那个胜出
+    assert_eq!(
+        order(5000),
+        vec!["cheap".to_string(), "strong".to_string()],
+        "阈值以上必须让成本生效，否则长 prompt 型代价是死的"
+    );
+}
+
+/// 对照组：**关了总开关时长 prompt 也不生效**。
+/// 只断言「开着时变了」是不够的 —— 那可能只是因为程序一直在改。
+#[test]
+fn 长_prompt_型代价_总开关关着时完全不生效() {
+    use llm_gateway_lib::intellect::TaskClass;
+    use llm_gateway_lib::router::score::RequiredCapabilities;
+
+    let mut strong = provider("strong", 0, 90);
+    strong.models = vec![priced_model("m", 100.0)];
+    let mut cheap = provider("cheap", 0, 50);
+    cheap.models = vec![priced_model("m", 1.0)];
+    let providers = vec![strong, cheap];
+
+    let cfg = AppConfig {
+        routing_strategy: RoutingStrategy::Balanced,
+        cost_routing: llm_gateway_lib::config::CostRoutingConfig {
+            enabled: false, // ← 唯一差别
+            cost_weight: 1.0,
+            long_prompt_threshold_tokens: 1000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let (router, _limiter, _health) = router();
+    let order = |prompt_tokens: u32| -> Vec<String> {
+        router
+            .rank_with_intent(
+                router.resolve("auto", &providers).expect("auto 应可用"),
+                &cfg,
+                RequiredCapabilities::default(),
+                None,
+                Some(TaskClass::Reasoning),
+                prompt_tokens,
+            )
+            .into_iter()
+            .map(|c| c.provider.id)
+            .collect()
+    };
+
+    // 关着时长短 prompt 的结果必须**一模一样**
+    assert_eq!(
+        order(0),
+        order(999_999),
+        "总开关关着时 prompt 长度不该影响任何排序"
+    );
+    assert_eq!(order(0), vec!["strong".to_string(), "cheap".to_string()]);
+}

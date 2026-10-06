@@ -2839,17 +2839,20 @@ async fn dispatch(
     let required = required_capabilities(&req);
     let media = crate::media::Media::of(&req);
 
+    // D3：长 prompt 型代价需要这个数，而它原本在**下面**才算出来，
+    // 所以上提到 rank 之前。重复计算一次没有意义，直接用同一个值。
+    let request_message_tokens = estimate_message_tokens(&req.messages);
     let mut ranked = state.router.rank_with_intent(
         candidates,
         &cfg,
         required,
         sticky.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
         preflight.intent.as_ref().map(|intent| intent.class),
+        request_message_tokens,
     );
     // 方言承载过滤要看到被剔除前的候选，才能区分「模型没勾选能力」与
     // 「该方言承载不了这种媒体」两种情况，给出可操作的错误。
     let media_rejections = filter_by_media_carry(&mut ranked, &media);
-    let request_message_tokens = estimate_message_tokens(&req.messages);
     ranked.retain(|candidate| {
         candidate_supports_context(
             candidate,

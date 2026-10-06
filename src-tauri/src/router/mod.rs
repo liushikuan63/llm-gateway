@@ -263,6 +263,11 @@ impl Router {
     }
 
     /// 候选链排序
+    ///
+    /// **不带 prompt token 数**：本入口的调用方（`/v1/models` 预览、
+    /// 不需要任务定性的旧路径）没有 `intent`，而长 prompt 型代价
+    /// 只在有 `TaskClass` 时才有意义（见 `cost_bias_applies`）。
+    /// 所以这里传 0 —— 它不会改变任何结果。
     pub fn rank(
         &self,
         candidates: Vec<Candidate>,
@@ -270,11 +275,15 @@ impl Router {
         required: RequiredCapabilities,
         sticky: Option<(&str, &str)>,
     ) -> Vec<Candidate> {
-        self.rank_with_intent(candidates, cfg, required, sticky, None)
+        self.rank_with_intent(candidates, cfg, required, sticky, None, 0)
     }
 
     /// 带任务定性的候选链排序。`intent` 为 `None` 时与既有 `rank` 完全等价——
     /// 这条等价关系由 `tests/router.rs` 的不变量用例守着。
+    /// `prompt_tokens` 是本次请求的 prompt token 估算值，供**长 prompt 型代价**
+    /// 判断用（D3）。由调用方传而不是在这里现算：估算是**请求级**的，
+    /// 而本函数拿不到 `req`，每个候选各算一遍也是浪费。
+    /// `intent` 为 `None` 时这个值不影响任何结果。
     pub fn rank_with_intent(
         &self,
         mut candidates: Vec<Candidate>,
@@ -282,6 +291,7 @@ impl Router {
         required: RequiredCapabilities,
         sticky: Option<(&str, &str)>,
         intent: Option<TaskClass>,
+        prompt_tokens: u32,
     ) -> Vec<Candidate> {
         // 1) 硬约束：缺少任一所需模态（工具/视觉/音频/视频）的直接剔除
         candidates.retain(|c| satisfies_hard_constraints(c, &required));
@@ -360,7 +370,7 @@ impl Router {
             // 而那正是卡片点名的第一场景。长 prompt 场景记为未接。
             cost_bias: score::cost_bias_applies(
                 intent,
-                0,
+                prompt_tokens,
                 cfg.cost_routing.long_prompt_threshold_tokens,
             ),
         };

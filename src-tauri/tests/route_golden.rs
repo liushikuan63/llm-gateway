@@ -193,6 +193,8 @@ fn run_case(case: &GoldenCase) -> Vec<String> {
             RequiredCapabilities::default(),
             None,
             intent,
+            // D3：路由金标准与分类夹具不施加长 prompt 代价（保持既有断言口径）
+            0,
         )
         .into_iter()
         .map(|c| c.provider.id)
