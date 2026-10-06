@@ -22,6 +22,7 @@ use llm_gateway_lib::intellect::classify::{
     classify_by_heuristic, classify_by_rules, ClassifierSource, ClassifyInput, REASONING_THRESHOLD,
 };
 use llm_gateway_lib::intellect::jev::JevAnswer;
+use llm_gateway_lib::intellect::TaskDomain;
 use llm_gateway_lib::media::Media;
 use llm_gateway_lib::router::score::{intent_fit, Candidate, TaskClass};
 
@@ -84,16 +85,16 @@ fn candidate(pid: &str, name: &str, thinking: bool, intelligence: i32) -> Candid
 fn simple_意图把思考模型压到_030() {
     let c = candidate("a", "thinker", true, 80);
     assert!(
-        (intent_fit(TaskClass::Simple, &c) - 0.30).abs() < 1e-6,
+        (intent_fit(TaskClass::Simple, &c, TaskDomain::General) - 0.30).abs() < 1e-6,
         "简单任务必须躲开会烧推理预算的模型，实际 {}",
-        intent_fit(TaskClass::Simple, &c)
+        intent_fit(TaskClass::Simple, &c, TaskDomain::General)
     );
 }
 
 #[test]
 fn simple_意图下低智能的非思考模型拿满分() {
     let c = candidate("a", "cheap", false, 20);
-    let fit = intent_fit(TaskClass::Simple, &c);
+    let fit = intent_fit(TaskClass::Simple, &c, TaskDomain::General);
     assert!(
         (fit - 1.0).abs() < 1e-6,
         "intelligence=20 时 1.15-0.09=1.06 应钳到 1.0，实际 {fit}"
@@ -103,29 +104,37 @@ fn simple_意图下低智能的非思考模型拿满分() {
 #[test]
 fn simple_意图按智能分轻微降权() {
     let c = candidate("a", "smart", false, 90);
-    let fit = intent_fit(TaskClass::Simple, &c);
+    let fit = intent_fit(TaskClass::Simple, &c, TaskDomain::General);
     assert!((fit - 0.745).abs() < 1e-4, "实际 {fit}");
     // 反向对照：**同一个不思考的候选**，在 Reasoning 下要被压得更低——
     // 简单任务不该因为「它不会思考」而吃亏，复杂任务则必须付出代价。
     // 这正是智能模式想做的事：简单任务绕开烧推理预算的模型。
     assert!(
-        intent_fit(TaskClass::Reasoning, &c) < fit,
+        intent_fit(TaskClass::Reasoning, &c, TaskDomain::General) < fit,
         "同一候选在 Reasoning 下应更不受欢迎（simple {fit} vs reasoning {}）",
-        intent_fit(TaskClass::Reasoning, &c)
+        intent_fit(TaskClass::Reasoning, &c, TaskDomain::General)
     );
 }
 
 #[test]
 fn reasoning_意图下不支持_thinking_的候选得_045() {
     let c = candidate("a", "plain", false, 90);
-    let fit = intent_fit(TaskClass::Reasoning, &c);
+    let fit = intent_fit(TaskClass::Reasoning, &c, TaskDomain::General);
     assert!((fit - 0.45).abs() < 1e-6, "实际 {fit}");
 }
 
 #[test]
 fn reasoning_意图按智能分给思考模型加分() {
-    let strong = intent_fit(TaskClass::Reasoning, &candidate("a", "t", true, 90));
-    let weak = intent_fit(TaskClass::Reasoning, &candidate("a", "t", true, 20));
+    let strong = intent_fit(
+        TaskClass::Reasoning,
+        &candidate("a", "t", true, 90),
+        TaskDomain::General,
+    );
+    let weak = intent_fit(
+        TaskClass::Reasoning,
+        &candidate("a", "t", true, 20),
+        TaskDomain::General,
+    );
     assert!(
         (strong - 1.0).abs() < 1e-6,
         "强模型应封顶 1.0，实际 {strong}"
@@ -138,7 +147,7 @@ fn reasoning_意图按智能分给思考模型加分() {
 fn vision_意图不引入额外偏置() {
     let c = candidate("a", "any", true, 99);
     assert!(
-        (intent_fit(TaskClass::Vision, &c) - 1.0).abs() < 1e-6,
+        (intent_fit(TaskClass::Vision, &c, TaskDomain::General) - 1.0).abs() < 1e-6,
         "视觉的能力硬约束已在打分前处理，这里必须恒为 1.0"
     );
 }
@@ -149,7 +158,11 @@ fn intent_fit_永远不返回零() {
     for class in [TaskClass::Simple, TaskClass::Vision, TaskClass::Reasoning] {
         for thinking in [true, false] {
             for intel in [0, 50, 100] {
-                let fit = intent_fit(class, &candidate("a", "m", thinking, intel));
+                let fit = intent_fit(
+                    class,
+                    &candidate("a", "m", thinking, intel),
+                    TaskDomain::General,
+                );
                 assert!(fit > 0.0 && fit <= 1.0, "{class:?} 得 {fit}");
             }
         }
@@ -189,6 +202,7 @@ fn intent_为_none_时打分与不启用智能模式完全一致() {
         health,
         headroom: 0.8,
         intent: None,
+        domain: TaskDomain::General,
         // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
         cost_range: None,
         candidate_cost: None,
@@ -203,6 +217,7 @@ fn intent_为_none_时打分与不启用智能模式完全一致() {
         health: with_none.health.clone(),
         headroom: 0.8,
         intent: Some(TaskClass::Simple),
+        domain: TaskDomain::General,
         // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
         cost_range: None,
         candidate_cost: None,
@@ -940,8 +955,9 @@ fn 总开关关着时全局_smart_策略退化为_balanced() {
                 llm_gateway_lib::router::score::RequiredCapabilities::default(),
                 None,
                 intent,
-                // D3：路由金标准与分类夹具不施加长 prompt 代价（保持既有断言口径）
+                // D3/D4：夹具不施加长 prompt 代价与领域偏置（保持既有断言口径）
                 0,
+                llm_gateway_lib::intellect::TaskDomain::General,
             )
             .into_iter()
             .map(|c| c.model.alias)
@@ -1067,4 +1083,119 @@ fn needsweb_纯本地任务不得误触发() {
             "「{q}」不该触发联网搜索，实际触发了 —— 会给每条普通请求白加一次网络往返"
         );
     }
+}
+
+/* --------------------- D4：领域偏置接进 intent_fit --------------------- */
+
+/// `General` 必须与 D4 之前**逐位相同**。
+///
+/// 这是整个 D4 向后兼容的依据：领域是新增维度，
+/// 而「没判出领域」是绝大多数请求的实际情况 —— 它绝不能改变排序。
+#[test]
+fn 领域偏置_general_时与改动前逐位相同() {
+    for (class, thinking, intel) in [
+        (TaskClass::Simple, true, 80),
+        (TaskClass::Simple, false, 20),
+        (TaskClass::Reasoning, true, 90),
+        (TaskClass::Reasoning, false, 50),
+        (TaskClass::Vision, true, 70),
+    ] {
+        let c = candidate("a", "m", thinking, intel);
+        let got = intent_fit(class, &c, TaskDomain::General);
+        // 手抄一份「只用难度」的算式对照 —— 与 D4 之前那版一致
+        let intel_f = c.provider.intelligence.clamp(0, 100) as f32 / 100.0;
+        let expected = match class {
+            TaskClass::Simple => {
+                if thinking {
+                    0.30
+                } else {
+                    (1.15 - 0.45 * intel_f).clamp(0.40, 1.0)
+                }
+            }
+            TaskClass::Vision => 1.0,
+            TaskClass::Reasoning => {
+                if thinking {
+                    (0.75 + 0.35 * intel_f).clamp(0.0, 1.0)
+                } else {
+                    0.45
+                }
+            }
+        };
+        assert_eq!(
+            got.to_bits(),
+            expected.to_bits(),
+            "{class:?}/thinking={thinking}/intel={intel} 时 General 领域改变了分数"
+        );
+    }
+}
+
+/// 领域真的在起作用：同一个候选、同一个难度，换领域会换分数。
+///
+/// **反向判据**：只断言「某个领域下分数是多少」是不够的 ——
+/// 一个忽略 `domain` 参数的实现也能满足它。必须断言**两个领域不同**。
+#[test]
+fn 领域偏置_换领域会换分数() {
+    let mut c = candidate("a", "m", false, 80);
+    c.model.capabilities = Some(llm_gateway_lib::domain::ModelCapabilities {
+        coding: Some(0.95),
+        knowledge: Some(0.10),
+        reasoning: Some(0.5),
+        ..Default::default()
+    });
+
+    let coding = intent_fit(TaskClass::Reasoning, &c, TaskDomain::Coding);
+    let writing = intent_fit(TaskClass::Reasoning, &c, TaskDomain::Writing);
+    let general = intent_fit(TaskClass::Reasoning, &c, TaskDomain::General);
+
+    assert_ne!(
+        coding, writing,
+        "换领域必须换分数，否则 domain 参数等于没接"
+    );
+    assert!(
+        coding > writing,
+        "这个候选 coding=0.95 / knowledge=0.10，编程领域该比写作领域高：\
+         coding={coding} writing={writing}"
+    );
+    // General 不参与，所以它是「难度分」本身
+    assert_eq!(
+        general.to_bits(),
+        intent_fit(TaskClass::Reasoning, &c, TaskDomain::General).to_bits()
+    );
+}
+
+/// 能力未知的候选在**任何**领域下都不该被惩罚（D1 约束的延续）。
+#[test]
+fn 领域偏置_能力未知时不惩罚() {
+    let c = candidate("a", "m", false, 80);
+    assert!(c.model.capabilities.is_none(), "前置：这个候选没有能力数据");
+    let base = intent_fit(TaskClass::Reasoning, &c, TaskDomain::General);
+    for d in TaskDomain::ALL {
+        assert_eq!(
+            intent_fit(TaskClass::Reasoning, &c, d).to_bits(),
+            base.to_bits(),
+            "{} 在能力未知时不该改变分数",
+            d.label()
+        );
+    }
+}
+
+/// 领域偏置的下界：最差也只到 0.7 倍，不能把一个好模型打死。
+#[test]
+fn 领域偏置_最差不超过三成惩罚() {
+    let mut c = candidate("a", "m", false, 80);
+    // 完全不适合编程的模型
+    c.model.capabilities = Some(llm_gateway_lib::domain::ModelCapabilities {
+        coding: Some(0.0),
+        reasoning: Some(0.0),
+        ..Default::default()
+    });
+    let base = intent_fit(TaskClass::Reasoning, &c, TaskDomain::General);
+    let worst = intent_fit(TaskClass::Reasoning, &c, TaskDomain::Coding);
+    let ratio = worst / base;
+    assert!(
+        (0.7..=1.0).contains(&ratio),
+        "领域惩罚必须落在 0.7~1.0，实际 {ratio}（领域是启发式判定，\
+         判错不该颠覆排序）"
+    );
+    assert!((ratio - 0.7).abs() < 1e-5, "coding=0 应当打到下界 0.7");
 }

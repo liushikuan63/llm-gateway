@@ -192,6 +192,7 @@ fn score_uses_multiplicative_decay_when_quota_is_exhausted() {
     };
     let healthy = ScoreInput {
         intent: None,
+        domain: llm_gateway_lib::intellect::TaskDomain::General,
         // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
         cost_range: None,
         candidate_cost: None,
@@ -203,6 +204,7 @@ fn score_uses_multiplicative_decay_when_quota_is_exhausted() {
     };
     let exhausted = ScoreInput {
         intent: None,
+        domain: llm_gateway_lib::intellect::TaskDomain::General,
         // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
         cost_range: None,
         candidate_cost: None,
@@ -276,6 +278,7 @@ fn invalid_health_has_zero_score_and_does_not_auto_recover() {
             &candidate,
             &ScoreInput {
                 intent: None,
+                domain: llm_gateway_lib::intellect::TaskDomain::General,
                 // D3：默认不施加成本/效率偏置（铁律 2：不启用时逐位不变）
                 cost_range: None,
                 candidate_cost: None,
@@ -815,6 +818,7 @@ fn 长_prompt_型代价_reasoning_请求超过阈值时便宜的胜出() {
                 None,
                 Some(TaskClass::Reasoning),
                 prompt_tokens,
+                llm_gateway_lib::intellect::TaskDomain::General,
             )
             .into_iter()
             .map(|c| c.provider.id)
@@ -869,6 +873,7 @@ fn 长_prompt_型代价_总开关关着时完全不生效() {
                 None,
                 Some(TaskClass::Reasoning),
                 prompt_tokens,
+                llm_gateway_lib::intellect::TaskDomain::General,
             )
             .into_iter()
             .map(|c| c.provider.id)

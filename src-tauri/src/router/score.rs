@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::RoutingStrategy;
 use crate::domain::{Health, ModelRef, Provider, ProviderHealth};
+// D4：领域是「难度之上」的第二个维度，定义在 `intellect::classify` 里。
+// 那边反过来 `use crate::router::score::TaskClass` —— Rust 的模块没有声明顺序，
+// 互相引用是允许的。**不要**为了「消除循环」把 `TaskDomain` 挪进这个文件：
+// 它属于分类器（判定输入是请求内容），挪过来只会让分类模块反过来依赖路由模块。
+use crate::intellect::TaskDomain;
 
 /// 智能模式给出的任务定性。分三类是因为这三类对模型的要求正好互斥：
 /// 简单任务要快且便宜，图像任务必须能看，复杂任务必须能想。
@@ -54,7 +59,39 @@ impl TaskClass {
 ///
 /// 返回值恒在 `0.30..=1.0`，没有 0：智能模式是**偏置**不是**准入**，
 /// 真把候选压到 0 会让能力硬约束之外的东西（健康、额度）失去话语权。
-pub fn intent_fit(class: TaskClass, c: &Candidate) -> f32 {
+pub fn intent_fit(class: TaskClass, c: &Candidate, domain: TaskDomain) -> f32 {
+    // D4：领域是在**难度之上**的第二个维度（事实源 I.1：
+    // 「一个简单的医学问题和一个复杂的医学问题都该走医学模型」）。
+    // 它只调制偏置，不参与硬约束 —— 硬约束判错会把图片静默丢掉，
+    // 而偏置判错最多是选了个略弱的模型。
+    domain_factor(domain, c) * intent_fit_by_class(class, c)
+}
+
+/// D4：领域偏置因子，范围 `[0.7, 1.0]`。
+///
+/// ## 为什么是**只罚不奖**的非对称区间
+///
+/// 做成 `[0.7, 1.0]` 而不是 `[0.7, 1.3]`：奖励一个「领域很匹配」的模型
+/// 需要先知道候选集里有没有更好的选择，而这是整个排序在做的事。
+/// 单维再叠一层奖励等于把同一件事算两遍，且会放大已有偏好。
+/// 惩罚则没有这个问题 —— 「这个模型明显不适合这类活」是一个
+/// 独立于其他候选的事实。
+///
+/// ## 为什么最差只到 0.7
+///
+/// 领域判定是**启发式**（关键词表刻意写得很短）。让它能把一个候选
+/// 打到 0.3 的话，一次误判就足以颠覆排序 —— 而误判方向是不可预知的。
+/// 0.7 的下界保证「判错领域」最多让一个好模型退到第二、第三，
+/// 不会让它彻底出局。
+///
+/// `General` 与「能力未知」都给 1.0：前者是「不吃偏置」，
+/// 后者是 D1 的核心约束（未知 ≠ 零分）。
+fn domain_factor(domain: TaskDomain, c: &Candidate) -> f32 {
+    let affinity = domain.affinity(c.model.capabilities.as_ref());
+    0.7 + 0.3 * affinity
+}
+
+fn intent_fit_by_class(class: TaskClass, c: &Candidate) -> f32 {
     let thinking = c.model.supports_thinking;
     let intel = c.provider.intelligence.clamp(0, 100) as f32 / 100.0;
     match class {
@@ -235,6 +272,11 @@ pub struct ScoreInput {
     /// 智能模式的判定结果。`None` 表示本次请求没走分类（未开智能模式、
     /// 或用户显式点名了模型），此时不施加任何任务偏置。
     pub intent: Option<TaskClass>,
+    /// D4：任务领域。`intent` 为 `None`（没走分类）时**这个值不参与任何计算** ——
+    /// 与 `intent` 绑在一起，因为领域本身就是分类的产物。
+    ///
+    /// 默认 `General` ⇒ 因子恒为 1.0 ⇒ 与 D4 之前逐位相同。
+    pub domain: TaskDomain,
     /// D3：**本次候选集**的相对价格区间 `(最便宜, 最贵)`，已折算成同一币种。
     ///
     /// `None` = 没有任何候选有可用价格 ⇒ 不施加成本偏置。
@@ -264,7 +306,7 @@ pub fn score(c: &Candidate, input: &ScoreInput, w: &Weights) -> f32 {
     // 权重为 0 时 x.powf(0.0) 恒等于 1.0，因此旧策略多乘这一项不改变结果。
     let fit = input
         .intent
-        .map(|intent| intent_fit(intent, c).powf(w.intent))
+        .map(|intent| intent_fit(intent, c, input.domain).powf(w.intent))
         .unwrap_or(1.0);
 
     // D3：成本与实测效率。**两条路径都保证默认 1.0** ——

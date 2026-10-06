@@ -23,6 +23,10 @@ use crate::router::score::{
     satisfies_hard_constraints, Candidate, RequiredCapabilities, ScoreInput, TaskClass, Weights,
 };
 
+use crate::intellect::TaskDomain;
+#[allow(unused_imports)]
+use {};
+
 pub struct Router {
     limiter: Arc<RateLimiter>,
     health: Arc<HealthRegistry>,
@@ -324,7 +328,15 @@ impl Router {
         required: RequiredCapabilities,
         sticky: Option<(&str, &str)>,
     ) -> Vec<Candidate> {
-        self.rank_with_intent(candidates, cfg, required, sticky, None, 0)
+        self.rank_with_intent(
+            candidates,
+            cfg,
+            required,
+            sticky,
+            None,
+            0,
+            TaskDomain::General,
+        )
     }
 
     /// 带任务定性的候选链排序。`intent` 为 `None` 时与既有 `rank` 完全等价——
@@ -333,6 +345,13 @@ impl Router {
     /// 判断用（D3）。由调用方传而不是在这里现算：估算是**请求级**的，
     /// 而本函数拿不到 `req`，每个候选各算一遍也是浪费。
     /// `intent` 为 `None` 时这个值不影响任何结果。
+    // 8 个参数确实多。**正确的修法是把「分类产物」打包成一个结构体**
+    // （`intent` + `prompt_tokens` + `domain` 都是分类的输出，
+    // 拆成三个裸参数会让「只传了其中两个」这种不一致有机会出现）。
+    // 本笔先放行：那需要同时改 6 个调用点，而本笔已经在改它们了 ——
+    // 打包留作单独一笔，免得一次改动同时承担「接线」与「重构」两件事
+    // （出问题时无法二分定位是哪一件引起的）。
+    #[allow(clippy::too_many_arguments)]
     pub fn rank_with_intent(
         &self,
         mut candidates: Vec<Candidate>,
@@ -341,6 +360,7 @@ impl Router {
         sticky: Option<(&str, &str)>,
         intent: Option<TaskClass>,
         prompt_tokens: u32,
+        domain: TaskDomain,
     ) -> Vec<Candidate> {
         // 1) 硬约束：缺少任一所需模态（工具/视觉/音频/视频）的直接剔除
         candidates.retain(|c| satisfies_hard_constraints(c, &required));
@@ -431,8 +451,8 @@ impl Router {
         };
 
         candidates.sort_by(|a, b| {
-            let sa = self.score_of(a, &w, intent, &cost);
-            let sb = self.score_of(b, &w, intent, &cost);
+            let sa = self.score_of(a, &w, intent, &cost, domain);
+            let sb = self.score_of(b, &w, intent, &cost, domain);
             let score_order = sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal);
             if custom_rules_active {
                 custom_rule_boost(b, &custom_rules)
@@ -468,6 +488,7 @@ impl Router {
         w: &Weights,
         intent: Option<TaskClass>,
         cost: &CostContext,
+        domain: TaskDomain,
     ) -> f32 {
         let key = rate_key(&c.provider, &c.model);
         let q = quota_of(&c.provider);
@@ -475,6 +496,7 @@ impl Router {
             health: Some(self.health.get(&c.provider.id, &c.model.upstream)),
             headroom: self.limiter.headroom(&key, &q),
             intent,
+            domain,
             cost_range: cost.range,
             candidate_cost: cost.candidate_cost(c),
             tps_range: cost.tps_range,

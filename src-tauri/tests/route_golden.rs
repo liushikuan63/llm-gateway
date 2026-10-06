@@ -193,8 +193,9 @@ fn run_case(case: &GoldenCase) -> Vec<String> {
             RequiredCapabilities::default(),
             None,
             intent,
-            // D3：路由金标准与分类夹具不施加长 prompt 代价（保持既有断言口径）
+            // D3/D4：夹具不施加长 prompt 代价与领域偏置（保持既有断言口径）
             0,
+            llm_gateway_lib::intellect::TaskDomain::General,
         )
         .into_iter()
         .map(|c| c.provider.id)

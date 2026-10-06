@@ -2849,6 +2849,17 @@ async fn dispatch(
         sticky.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
         preflight.intent.as_ref().map(|intent| intent.class),
         request_message_tokens,
+        // D4：领域从请求内容判定。**与 `intent` 同源**（都在这一层），
+        // 因为两者都是分类的产物；分开算会让「难度说 reasoning、
+        // 领域说 vision」这种不一致有机会出现。
+        crate::intellect::detect_domain(&crate::intellect::ClassifyInput {
+            messages: &req.messages,
+            media,
+            // 与 L1913 那处**同款判定**。两处口径不同会让
+            // 「分类说有工具、领域判定说没有」这种不一致有机会出现。
+            has_tools: req.tools.is_some(),
+            requested_model: &req.model,
+        }),
     );
     // 方言承载过滤要看到被剔除前的候选，才能区分「模型没勾选能力」与
     // 「该方言承载不了这种媒体」两种情况，给出可操作的错误。
