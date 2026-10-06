@@ -219,7 +219,7 @@ async fn 对照组_strict模式下必须立刻终止不换家也不复测() {
 }
 
 #[tokio::test]
-async fn 鉴权失败后不得回落到免Key后端() {
+async fn 鉴权失败后不得回落到免密钥后端() {
     // 候选顺序：带 Key 的坏供应商 → 免 Key 的本地模型。
     let cands = [
         candidate(provider("bad", "m", true)),
