@@ -1,0 +1,4 @@
+{"kind":"request","payload":{"model":"gpt-4o","instructions":"You are a helpful assistant.","input":[{"role":"user","content":[{"type":"input_text","text":"Hello"}]}],"max_output_tokens":64,"temperature":0.7,"stream":false}}
+{"kind":"response","payload":{"id":"resp_<REDACTED_ID>","object":"response","created_at":1759700000,"status":"completed","model":"gpt-4o","output":[{"id":"msg_<REDACTED_ID>","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hi there","annotations":[]}]}],"usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}
+{"kind":"stream_event","event":"response.output_text.delta","payload":{"type":"response.output_text.delta","delta":"Hi there"}}
+{"kind":"stream_event","event":"response.completed","payload":{"type":"response.completed","response":{"id":"resp_<REDACTED_ID>","status":"completed","output":[]}}}

@@ -1,0 +1,6 @@
+{"kind":"request","payload":{"model":"claude-3-5-sonnet-latest","max_tokens":64,"system":"You are a helpful assistant.","temperature":0.7,"messages":[{"role":"user","content":"Hello"}]}}
+{"kind":"response","payload":{"id":"msg_<REDACTED_ID>","type":"message","role":"assistant","model":"claude-3-5-sonnet-latest","content":[{"type":"text","text":"Hi there"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":9,"output_tokens":2}}}
+{"kind":"stream_event","event":"message_start","payload":{"type":"message_start","message":{"id":"msg_<REDACTED_ID>","type":"message","role":"assistant","model":"claude-3-5-sonnet-latest","content":[],"stop_reason":null,"usage":{"input_tokens":9,"output_tokens":0}}}}
+{"kind":"stream_event","event":"content_block_delta","payload":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi there"}}}
+{"kind":"stream_event","event":"message_delta","payload":{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}}
+{"kind":"stream_event","event":"message_stop","payload":{"type":"message_stop"}}

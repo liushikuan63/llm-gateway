@@ -25,7 +25,10 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('fmt', 'clippy', 'check', 'test', 'build', 'manual', 'release', 'plan', 'all')]
+    # 'scripts' is listed so the syntax + fixture-redaction step can be run on
+    # its own. Without it, `-Step scripts` is rejected by ValidateSet and the
+    # only way to reach that step is a full `-Step all` run.
+    [ValidateSet('scripts', 'fmt', 'clippy', 'check', 'test', 'build', 'manual', 'release', 'plan', 'all')]
     [string]$Step = 'all'
 )
 
@@ -92,9 +95,17 @@ function Invoke-RustSteps {
 # literal in ui-smoke.cjs was committed with CI fully green, because
 # nothing ever parsed it. `node --check` costs ~0.1s and closes that gap.
 function Invoke-ScriptSyntaxStep {
-    $scripts = Get-ChildItem (Join-Path $RepoRoot 'scripts') -Filter *.cjs -File
+    # .cjs AND .mjs: the generator scripts added for the protocol contracts are
+    # .mjs, and a syntax error there would otherwise only surface when someone
+    # happens to run them by hand.
+    $scripts = Get-ChildItem (Join-Path $RepoRoot 'scripts') -File |
+        Where-Object { $_.Extension -in '.cjs', '.mjs', '.js' }
     Invoke-Step 'scripts' {
         foreach ($s in $scripts) { & node --check $s.FullName }
+        # Fixture redaction scan. Kept inside this step rather than getting its
+        # own: it only walks tests/fixtures (milliseconds), and a separate step
+        # would make `-Step scripts` behave differently from `-Step all`.
+        & node (Join-Path $RepoRoot 'scripts/check-fixture-redaction.mjs')
     }
 }
 
@@ -114,6 +125,11 @@ try {
     $rustSteps = @('fmt', 'clippy', 'check', 'test')
     switch ($Step) {
         'all'     { Import-RustEnv; Invoke-ScriptSyntaxStep; Invoke-RustSteps; Invoke-FrontendSteps }
+        # Without this case `-Step scripts` falls into the default branch below,
+        # whose inner switch has no 'scripts' arm: nothing runs, and reading
+        # $LASTEXITCODE then trips StrictMode ("检索不到变量 $LASTEXITCODE").
+        # Adding the ValidateSet entry without this line makes it a failing step.
+        'scripts' { Invoke-ScriptSyntaxStep }
         default   {
             if ($rustSteps -contains $Step) {
                 Import-RustEnv

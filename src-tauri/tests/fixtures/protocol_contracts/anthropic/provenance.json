@@ -1,0 +1,6 @@
+{
+  "kind": "documented-example",
+  "source": "https://docs.anthropic.com/en/api/messages",
+  "retrieved_at": "2026-10-06",
+  "note": "按官方 Messages API 文档记载的字段名构造。证明不了 Anthropic 是否已改版；真实抓包需带 key 打一次线上接口。"
+}

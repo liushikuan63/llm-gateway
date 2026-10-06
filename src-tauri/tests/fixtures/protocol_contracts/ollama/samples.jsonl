@@ -1,0 +1,4 @@
+{"kind":"request","payload":{"model":"qwen2.5:7b","messages":[{"role":"user","content":"Hello"}],"stream":false,"options":{"num_ctx":4096,"temperature":0.7}}}
+{"kind":"response","payload":{"model":"qwen2.5:7b","created_at":"2026-10-06T00:00:00Z","message":{"role":"assistant","content":"Hi there"},"done":true,"done_reason":"stop","total_duration":1234567,"load_duration":12345,"prompt_eval_count":9,"prompt_eval_duration":234567,"eval_count":2,"eval_duration":345678}}
+{"kind":"stream_chunk","payload":{"model":"qwen2.5:7b","created_at":"2026-10-06T00:00:00Z","message":{"role":"assistant","content":"Hi there"},"done":false}}
+{"kind":"stream_chunk","payload":{"model":"qwen2.5:7b","created_at":"2026-10-06T00:00:00Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":9,"eval_count":2}}

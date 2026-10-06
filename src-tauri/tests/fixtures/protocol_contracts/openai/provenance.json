@@ -1,0 +1,6 @@
+{
+  "kind": "documented-example",
+  "source": "https://platform.openai.com/docs/api-reference/chat",
+  "retrieved_at": "2026-10-06",
+  "note": "按官方 Chat Completions 文档记载的字段名构造。证明不了 OpenAI 是否已改版；真实抓包需带 key 打一次线上接口。"
+}

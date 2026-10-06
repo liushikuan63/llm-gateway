@@ -1,0 +1,4 @@
+{"kind":"request","payload":{"systemInstruction":{"parts":[{"text":"You are a helpful assistant."}]},"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"temperature":0.7,"maxOutputTokens":64}}}
+{"kind":"response","payload":{"candidates":[{"content":{"role":"model","parts":[{"text":"Hi there"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":2,"totalTokenCount":11},"modelVersion":"gemini-2.5-pro"}}
+{"kind":"stream_chunk","payload":{"candidates":[{"content":{"role":"model","parts":[{"text":"Hi there"}]},"index":0}],"modelVersion":"gemini-2.5-pro"}}
+{"kind":"stream_chunk","payload":{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":2,"totalTokenCount":11},"modelVersion":"gemini-2.5-pro"}}
