@@ -21,10 +21,12 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
   const provider = (id, name, dialect, url, models) => ({ id, name, dialect, base_url: url, api_key_masked: "已保存", models, enabled: true, priority: 10, rpm_limit: 0, intelligence: 70, note: null, is_active: false, health: { health: "healthy", success_rate: 1, avg_latency_ms: 100 } });
   window.__fixtureProviders = [
     { ...provider("openrouter", "OpenRouter", "openai", "https://openrouter.ai/api/v1", [model("openrouter/free", 131072), model("my-chat")]), is_active: true },
-    provider("anthropic", "Anthropic", "anthropic", "https://api.anthropic.com/v1", [model("claude-sonnet", 200000)]),
+    // A5：走账号型上游的一家（runtime_id 指向下面那个运行时）。
+    { ...provider("anthropic", "Anthropic", "anthropic", "https://api.anthropic.com/v1", [model("claude-sonnet", 200000)]), runtime_id: "codex-work" },
     provider("ollama", "本地 Ollama", "ollama", "http://localhost:11434", [model("qwen-local")]),
     provider("multimodal", "多模态服务", "openai", "https://example.test/v1", [model("vision-model", 65536, peakValleyPrice, { supports_vision: true, supports_audio: true, supports_video: true })]),
-    { ...provider("disabled", "备用服务", "openai", "https://example.test/v1", [model("backup-chat")]), enabled: false },
+    // 指向一个**不存在**的运行时：界面必须当场说出来，而不是等请求时才报错。
+    { ...provider("disabled", "备用服务", "openai", "https://example.test/v1", [model("backup-chat")]), enabled: false, runtime_id: "ghost" },
   ];
   // B2 远程 Key 夹具：两条 —— 一条设了预算+白名单、一条全不限，
   // 这样「不限」与「已设」两种渲染都能被断言到。
@@ -82,8 +84,14 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       },
     },
   };
-  window.__fixtureSearchKey = { masked: "tvly-****-abc", configured: true };
-  // 搜索设置快照。`get_search_settings` 与 `update_search_settings` 共用它，
+  // A5 运行时清单。夹具里**故意不包含** "ghost" —— 好让
+  // 「runtime_id 指向一个不存在的运行时」这条分支真的被渲染出来
+  // （它是最容易被写成静默的那种情况：只显示 id 而不说找不到）。
+  window.__fixtureAgentRuntimes = [
+    { id: "codex-work", kind: "codex", label: "Codex（工作）", options: null, enabled: true,
+      created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-01T00:00:00Z" },
+  ];
+  window.__fixtureSearchKey = { masked: "tvly-****-abc", configured: true };  // 搜索设置快照。`get_search_settings` 与 `update_search_settings` 共用它，
   // 这样"保存后重新打开页面设置仍是新值"这条断言才不是自说自话。
   const searchSettings = () => {
     const s = window.__fixtureConfig.search;
@@ -295,6 +303,10 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       // （`values[维度][来源] = { value, source }`）—— 形状不对时页面会静默
       // 显示「数据不足」，那与「真的没有数据」看起来一模一样。
       case "export_capabilities": return JSON.stringify(window.__fixtureCapabilities ?? {});
+      // A5：运行时清单与适配器表。徽标要靠前者把 runtime_id 翻成人话；
+      // 漏了这个 case 会让整页 `Promise.all` 失败 —— 那是白屏，不是「没有徽标」。
+      case "list_agent_runtimes": return structuredClone(window.__fixtureAgentRuntimes ?? []);
+      case "list_agent_adapters": return [["fake", "假适配器（不需要登录）"], ["codex", "Codex CLI"], ["qoder", "Qoder CLI"]];
       case "discover_provider_models":
         if (args.input.base_url.includes("broken")) throw new Error("上游返回 HTTP 401，请检查密钥权限");
         return { base_url: "https://example.test/v1", warnings: [], models: [
@@ -754,6 +766,53 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.waitForFunction(
       () => window.__fixtureConfig?.routing_strategy === "balanced", null, { timeout: 5000 },
     );
+
+    /* ------------------------------------------------------------------ */
+    /* A5 账号型上游徽标                                                    */
+    /* ------------------------------------------------------------------ */
+    // 夹具里两家配了 runtime_id：一张指向存在的运行时、一张指向不存在的。
+    //
+    // 截图前必须收起「更多」菜单：它展开时会**盖住徽标文字**，
+    // 而断言读的是 innerText —— 那种情况下断言全绿、图上看不见，
+    // 视觉验证就白做了（这一次真的踩到了）。
+    //
+    // 【为什么要循环点】这个菜单是**受控的** `<details open={...}>`，
+    // Escape 与点空白都不会关它，只有点 summary 才 toggle。
+    // 顺带记一笔：「Escape 关不掉菜单」本身是个可用性缺陷（已写进交接单）。
+    while (await page.locator(".provider-more[open] > summary").count() > 0) {
+      await page.locator(".provider-more[open] > summary").first().click();
+      await page.waitForTimeout(120);
+    }
+    assert.equal(await page.locator(".provider-more[open]").count(), 0, "截图前菜单必须已收起");
+    const runtimeBadges = page.locator(".provider-card .provider-runtime");
+    assert.equal(
+      await runtimeBadges.count(), 2,
+      `夹具里有两家配了运行时（一条正常、一条指向不存在的），实际 ${await runtimeBadges.count()}`,
+    );
+    const runtimeCard = page.locator(".provider-card").filter({ hasText: "Anthropic" }).first();
+    await runtimeCard.scrollIntoViewIfNeeded();
+    const runtimeCardText = await runtimeCard.innerText();
+    assert(runtimeCardText.includes("账号型上游"), `徽标要说明这是账号型上游：${runtimeCardText}`);
+    // 只显示 id 等于没显示：用户配的是 label，界面上却是 codex-work。
+    assert(runtimeCardText.includes("Codex（工作）"), `runtime_id 必须翻成人话：${runtimeCardText}`);
+    assert(
+      runtimeCardText.includes("不走上面的地址"),
+      `必须说清请求不走 base_url —— 否则那一行「API Key：已保存」看起来仍然在生效：${runtimeCardText}`,
+    );
+
+    // 指向不存在的运行时必须在**卡片上**就报出来。
+    // 少了这条，用户要等到真发请求时才看到「未知账号运行时」，离操作已经很远。
+    const ghostCard = page.locator(".provider-card").filter({ hasText: "备用服务" }).first();
+    const ghostText = await ghostCard.innerText();
+    assert(ghostText.includes("找不到这个运行时"), `指向不存在的运行时必须当场说出来：${ghostText}`);
+
+    // 反向：没配运行时的供应商**不该**出现这个徽标。
+    const plainCard = page.locator(".provider-card").filter({ hasText: "本地 Ollama" }).first();
+    assert(
+      !(await plainCard.innerText()).includes("账号型上游"),
+      "没配运行时的供应商不该出现这个徽标 —— 否则用户以为所有请求都走本机 CLI",
+    );
+    await runtimeCard.screenshot({ path: path.join(output, "provider-runtime-badge.png") });
 
     // 工具栏按钮组必须单行排开，且完整落在视口内。
     // 2026-10-05 用户报：标题文字长时三个按钮折成两行，「添加供应商」被挤到

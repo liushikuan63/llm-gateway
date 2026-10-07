@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, AppConfig, CascadePolicy, DIALECT_LABEL, HEALTH_LABEL, PricingRefreshOutcome, PricingStatus, ProviderInput, ProviderView, StaleScanResult } from "../api";
+import { api, AgentRuntime, AppConfig, CascadePolicy, DIALECT_LABEL, HEALTH_LABEL, PricingRefreshOutcome, PricingStatus, ProviderInput, ProviderView, StaleScanResult } from "../api";
 import ProviderEditor from "./ProviderEditor";
 import ProviderQuota from "./ProviderQuota";
 import { blankForm, errorText, formatContext, ProviderForm } from "./providerPresets";
@@ -103,6 +103,8 @@ export default function ProvidersPage() {
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [testResult, setTestResult] = useState<{ id: string; latency: number } | null>(null);
   const [pricing, setPricing] = useState<PricingStatus | null>(null);
+  // 任务卡二 A5：账号型上游运行时的清单，供卡片上的徽标把 runtime_id 翻成人话。
+  const [runtimes, setRuntimes] = useState<AgentRuntime[]>([]);
     const [stale, setStale] = useState<StaleScanResult | null>(null);
     const [stalePicked, setStalePicked] = useState<Set<string>>(new Set());
     const [scanning, setScanning] = useState(false);
@@ -114,9 +116,9 @@ export default function ProvidersPage() {
     const version = ++loadVersion.current;
     setLoading(true);
     try {
-      const [providers, config, pricingStatus] = await Promise.all([api.listProviders(), api.getConfig(), api.pricingStatus()]);
+      const [providers, config, pricingStatus, agentRuntimes] = await Promise.all([api.listProviders(), api.getConfig(), api.pricingStatus(), api.listAgentRuntimes()]);
       if (version !== loadVersion.current) return false;
-      setList(providers); setCfg(config); setPricing(pricingStatus); return true;
+      setList(providers); setCfg(config); setPricing(pricingStatus); setRuntimes(agentRuntimes); return true;
     } catch (error) {
       if (version !== loadVersion.current) return false;
       setMessage({ kind: "err", text: `加载失败：${errorText(error)}` });
@@ -125,6 +127,18 @@ export default function ProvidersPage() {
     } finally { if (version === loadVersion.current) setLoading(false); }
   };
   useEffect(() => { void load(); return () => { loadVersion.current++; }; }, []);
+
+  /**
+   * 任务卡二 A5：把 `runtime_id` 翻成人话。
+   *
+   * **找不到就明说找不到** —— 只显示 id 会让用户以为配好了，
+   * 而那个错误要等到真发请求时才报「未知账号运行时」，离操作已经很远。
+   */
+  const runtimeLabel = (id: string) => {
+    const hit = runtimes.find((r) => r.id === id);
+    // 用 `·` 而不是再套一对括号：`Codex（工作）（codex）` 两个括号连着读不断句。
+    return hit ? `${hit.label} · ${hit.kind}` : `${id}（找不到这个运行时）`;
+  };
   const run = async (id: string, operation: () => Promise<unknown>, text: string) => {
     setBusy(id); setMessage(null);
     try { await operation(); if (await load(true)) setMessage({ kind: "ok", text }); }
@@ -284,7 +298,7 @@ export default function ProvidersPage() {
         const stateText = !p.enabled ? "已停用" : health ? HEALTH_LABEL[health] ?? health : "待测试";
         return <article className={`provider-card ${p.is_active ? "active" : ""}`} key={p.id}>
           <header><div className={`provider-avatar dialect-${p.dialect}`} aria-hidden="true">{p.name.slice(0, 2)}</div><div className="provider-card-name"><h3>{p.name}</h3><span>{DIALECT_LABEL[p.dialect]}</span></div>{p.is_active && <span className="tag primary-tag">主用</span>}<span className={`tag ${stateClass}`}>{stateText}</span></header>
-          <div className="provider-address mono" title={p.base_url}>{p.base_url}</div><div className="provider-secret"><span>API Key</span><span className="mono">{p.api_key_masked || "未设置"}</span></div>
+          <div className="provider-address mono" title={p.base_url}>{p.base_url}</div>{p.runtime_id ? <div className="provider-runtime"><span className="tag runtime-tag">账号型上游</span><span className="mono">{runtimeLabel(p.runtime_id)}</span><span className="muted">请求经本机 CLI 发出，不走上面的地址</span></div> : null}<div className="provider-secret"><span>API Key</span><span className="mono">{p.api_key_masked || "未设置"}</span></div>
           <div className="provider-model-preview"><div><span>可用映射</span><strong>{p.models.length}</strong></div><div className="provider-model-tags">{p.models.slice(0, 4).map(m => <span className="tag" key={m.alias} title={`${m.upstream} · ${formatContext(m.context_window)} tokens`}>{m.alias}</span>)}{p.models.length > 4 && <span className="tag">+{p.models.length - 4}</span>}{!p.models.length && <span className="muted">未配置模型映射</span>}</div></div>
           <div className="provider-meta"><span>{p.rpm_limit ? `${p.rpm_limit} RPM` : "RPM 不限"}</span><span>优先级 {p.priority}</span>{testResult?.id === p.id && <span className="test-latency">实测 {testResult.latency} ms</span>}</div>
           <footer><div className="row"><button className="ghost" disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), note: p.note ?? "" })}>配置</button><button className="ghost" disabled={busy !== null} onClick={() => void test(p)}>{busy === p.id ? "处理中…" : "测试连接"}</button><button className="ghost" disabled={busy !== null || !p.enabled || p.is_active} onClick={() => void run(p.id, () => api.setActive(p.id), `${p.name} 已设为主用`)}>{p.is_active ? "已主用" : "设为主用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void toggleEnabled(p)}>{p.enabled ? "停用" : "启用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void duplicate(p)} title="复制配置并落库，API Key 留空需自行填写">复制</button></div>

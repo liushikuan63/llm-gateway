@@ -99,6 +99,13 @@ export interface ProviderView {
   intelligence: number;
   note: string | null;
   is_active: boolean;
+  /**
+   * 账号型上游运行时（任务卡二 A5）。`null`/缺省 = 走 HTTP 直连。
+   *
+   * 界面必须把它显示出来：同一张卡片上写着「API Key：已保存」，
+   * 而请求其实没走 HTTP 时，那个 Key 是摆设。
+   */
+  runtime_id?: string | null;
   health?: {
     health: string;
     success_rate: number;
@@ -744,6 +751,25 @@ export interface AuditExportResult {
   columns_doc: string | null;
 }
 
+// ---------- 任务卡二 A5：账号型上游运行时 ----------
+
+/**
+ * 一个账号型上游的运行时。
+ *
+ * `id` 是用户起的名字（被 `provider.runtime_id` 引用），`kind` 指向适配器。
+ * 分开是为了让「同一家配两次」和「换一家实现」两件事都能做。
+ */
+export interface AgentRuntime {
+  id: string;
+  kind: string;
+  label: string;
+  /** 附加配置（可执行文件路径、模型别名表…）。`null` = 没配。 */
+  options: Record<string, unknown> | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
 // ---------- D2 能力集导出 / 导入 ----------
 
 /** 一个维度上一个来源给出的取值。 */
@@ -998,6 +1024,27 @@ export const api = {
    */
   importCapabilities: (payload: string) =>
     invoke<ImportCapabilitiesResult>("import_capabilities", { payload }),
+
+  /* ---- 任务卡二 A5：账号型上游运行时 ---- */
+
+  /**
+   * 全部运行时。**返回体里不带任何凭据** —— 登录态由各家 CLI 自己管
+   * （`~/.codex/auth.json` 那类），网关不读也不存。
+   */
+  listAgentRuntimes: () => invoke<AgentRuntime[]>("list_agent_runtimes"),
+
+  /**
+   * 已注册的适配器，`[id, label]`。
+   *
+   * 两个都要：只显示 `label` 用户配不出正确的 `kind`，
+   * 只显示 `id` 则屏幕上全是 `codex`/`qoder` 这种没有上下文的词。
+   */
+  listAgentAdapters: () => invoke<Array<[string, string]>>("list_agent_adapters"),
+
+  saveAgentRuntime: (runtime: AgentRuntime) =>
+    invoke<void>("save_agent_runtime", { runtime }),
+
+  deleteAgentRuntime: (id: string) => invoke<void>("delete_agent_runtime", { id }),
 
   /**
    * 让用户选一个保存路径。取消时返回 `null`。

@@ -53,6 +53,13 @@ pub struct ProviderView {
     pub health: Option<crate::domain::ProviderHealth>,
     /// 当前主用 Provider 仅在内存中保存；前端据此避免把“设为主用”误当成启停。
     pub is_active: bool,
+    /// 任务卡二 A5：这个 Provider 走的是**账号型上游**（非 `None` 时指向
+    /// `agent_runtimes.id`）还是 HTTP 直连（`None`）。
+    ///
+    /// 必须回给前端：不显示的话，用户在同一张卡片上看到「API Key：已保存」
+    /// 却完全不知道请求其实**没走 HTTP**，那个 Key 是摆设。
+    /// 账号型上游的登录态由各家 CLI 自己管，网关不读不存（卡片红线）。
+    pub runtime_id: Option<String>,
 }
 
 impl ProviderView {
@@ -85,6 +92,7 @@ impl ProviderView {
             note: p.note,
             health,
             is_active,
+            runtime_id: p.runtime_id,
         }
     }
 }

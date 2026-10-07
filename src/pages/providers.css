@@ -79,6 +79,11 @@
 .cascade-strip .cascade-fields label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
 .cascade-strip .cascade-fields input { width: 100%; }
 .cascade-strip .error { color: var(--danger); }
+/* A5 账号型上游徽标：必须与「API Key」那行挨着 —— 用户要能一眼看出
+   这个 Provider 的请求其实不走 base_url，那个 Key 是摆设。 */
+.provider-runtime { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; font-size: 12px; }
+.provider-runtime .runtime-tag { color: var(--accent); border-color: var(--accent); }
+.provider-runtime .muted { font-size: 11px; }
 .route-strip strong { font-size: 13px; }
 .route-strip select { min-width: 150px; }
 .provider-editor-mask { padding: 24px; backdrop-filter: blur(4px); background: #10221dcc; }
