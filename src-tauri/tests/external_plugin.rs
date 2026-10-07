@@ -8,7 +8,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use llm_gateway_lib::agent_upstream::plugin::{
-    parse_manifest, validate_manifest, PluginManifest, SUPPORTED_PROTOCOL,
+    encode_request, parse_manifest, pick_response, validate_manifest, PluginManifest,
+    PluginRequest, PluginRequestKind, PluginResponse, SUPPORTED_PROTOCOL,
 };
 
 /// 一个能用的最小描述文件。
@@ -156,4 +157,109 @@ fn 描述文件路径不存在时报可读错误() {
     )
     .unwrap_err();
     assert!(err.contains("无法解析"), "{err}");
+}
+
+// ======================= 协议编解码与请求配对 =======================
+
+/// 三种请求都编成**单行**，且 `type` 与各自字段在同一层。
+///
+/// `type` 在不在同一层是协议形状问题：写进子对象的话，插件作者按文档写成平的、
+/// 按实现写成嵌的，两边对不上时**只有运行时才发现**。
+#[test]
+fn 三种请求都编成单行且字段在同一层() {
+    let probe = encode_request(&PluginRequest {
+        request_id: "r1".into(),
+        kind: PluginRequestKind::Probe,
+    })
+    .unwrap();
+    assert_eq!(probe, r#"{"request_id":"r1","type":"probe"}"#);
+    assert!(!probe.contains('\n'), "JSONL 的一行里不能有裸换行");
+
+    let list = encode_request(&PluginRequest {
+        request_id: "r2".into(),
+        kind: PluginRequestKind::ListModels,
+    })
+    .unwrap();
+    assert_eq!(list, r#"{"request_id":"r2","type":"list_models"}"#);
+
+    let complete = encode_request(&PluginRequest {
+        request_id: "r3".into(),
+        kind: PluginRequestKind::Complete {
+            model: "m".into(),
+            prompt: "你好".into(),
+        },
+    })
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&complete).unwrap();
+    assert_eq!(value["type"], "complete");
+    assert_eq!(value["model"], "m");
+    assert_eq!(value["prompt"], "你好");
+    assert_eq!(value["request_id"], "r3");
+}
+
+/// **核心判据**：配对应跳过日志行与别的请求的响应。
+///
+/// 插件的 stdout 里混着它自己的日志是常态。把「解析不了的行」当协议破坏，
+/// 会让一个爱打日志的插件完全不可用 —— 而那种失败看起来像「网关坏了」。
+#[test]
+fn 配对时跳过日志行与别的请求的响应() {
+    let lines = vec![
+        "[plugin] starting up",
+        r#"{"request_id":"other","result":{"text":"别人的"}}"#,
+        "not json at all",
+        r#"{"request_id":"r9","result":{"text":"就是它"}}"#,
+        r#"{"request_id":"r9","result":{"text":"重复的，不该被选中"}}"#,
+    ];
+    let hit = pick_response(lines, "r9").expect("应当配对到 r9");
+    assert_eq!(
+        hit.text().unwrap(),
+        "就是它",
+        "必须取**第一条**匹配的响应，而不是最后一条"
+    );
+}
+
+/// 响应带 `error` ⇒ 返回可读错误（而不是把它当成成功）。
+#[test]
+fn 插件报告失败时返回可读错误() {
+    let lines = vec![r#"{"request_id":"r1","error":"未登录，请先 codex login"}"#];
+    let err = pick_response(lines, "r1").unwrap_err();
+    assert!(err.contains("未登录"), "错误要原样带出插件的话：{err}");
+    assert!(err.contains("插件报告失败"), "{err}");
+}
+
+/// 等不到响应时，报错**必须带上原文** —— 否则用户没有任何可操作性。
+#[test]
+fn 等不到响应时报错带上原文() {
+    let lines = vec!["正在加载模型…", "还是没动静"];
+    let err = pick_response(lines, "r1").unwrap_err();
+    assert!(err.contains("r1"), "{err}");
+    assert!(
+        err.contains("正在加载模型") && err.contains("还是没动静"),
+        "要把插件最后几行原样带出来：{err}"
+    );
+
+    // 一行都没有时也要说清，而不是给一个空的「最后几行：」
+    let err = pick_response(Vec::<&str>::new(), "r1").unwrap_err();
+    assert!(err.contains("一行都没有"), "{err}");
+}
+
+/// 结果形状不对时，访问器要报错并**带上原文**：不是 panic，也不是静默给默认值。
+#[test]
+fn 结果形状不对时报错并带原文() {
+    let bad: PluginResponse =
+        serde_json::from_str(r#"{"request_id":"r1","result":{"models":"不是数组"}}"#).unwrap();
+    let err = bad.text().unwrap_err();
+    assert!(err.contains("text"), "{err}");
+    assert!(err.contains("不是数组"), "要带出原始 JSON 便于排查：{err}");
+    assert!(bad.models().is_err());
+    assert!(bad.ready().is_err());
+
+    // 形状对时三个访问器都要能取到值
+    let ok: PluginResponse = serde_json::from_str(
+        r#"{"request_id":"r1","result":{"text":"好","models":["a","b"],"ready":true}}"#,
+    )
+    .unwrap();
+    assert_eq!(ok.text().unwrap(), "好");
+    assert_eq!(ok.models().unwrap(), vec!["a".to_string(), "b".to_string()]);
+    assert!(ok.ready().unwrap());
 }

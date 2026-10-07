@@ -130,3 +130,155 @@ pub fn validate_manifest(
     }
     Ok(())
 }
+
+// ============================ 协议编解码 ============================
+//
+// 一行一个 JSON 对象（卡片原文）。`request_id` 由**网关**生成、响应原样带回 ——
+// 它是这个协议唯一的配对手段，因为子进程的 stdout 里可能混着它自己的日志。
+
+/// 一次请求的三种形态。`type` 字段的取值就是下面的 snake_case 名。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginRequestKind {
+    /// 探活：插件能不能干活（不加载模型、不发请求）。
+    Probe,
+    /// 列出它支持的模型名。
+    ListModels,
+    /// 跑一轮对话。
+    Complete { model: String, prompt: String },
+}
+
+/// 请求信封：`request_id` 与三个变体拼在同一层。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PluginRequest {
+    pub request_id: String,
+    #[serde(flatten)]
+    pub kind: PluginRequestKind,
+}
+
+/// 响应信封。
+///
+/// `result` 刻意是**自由的 JSON** 而不是枚举：三种请求的结果形状不同
+/// （`ready` / `models` / `text`），用枚举会逼着插件作者按我们的类型写，
+/// 而协议的价值在于**最小**。形状由下面的访问器负责解释与报错。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PluginResponse {
+    pub request_id: String,
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// 插件可以带回原始行，供排查用。**不参与判定**。
+    #[serde(default)]
+    pub raw: Option<String>,
+}
+
+impl PluginResponse {
+    /// `complete` 的文本。
+    pub fn text(&self) -> Result<String, String> {
+        self.result
+            .as_ref()
+            .and_then(|value| value.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("响应里没有 text 字段：{}", self.describe()))
+    }
+
+    /// `list_models` 的模型名。
+    pub fn models(&self) -> Result<Vec<String>, String> {
+        self.result
+            .as_ref()
+            .and_then(|value| value.get("models"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .ok_or_else(|| format!("响应里没有 models 数组：{}", self.describe()))
+    }
+
+    /// `probe` 的就绪位。
+    pub fn ready(&self) -> Result<bool, String> {
+        self.result
+            .as_ref()
+            .and_then(|value| value.get("ready"))
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| format!("响应里没有 ready 布尔：{}", self.describe()))
+    }
+
+    fn describe(&self) -> String {
+        self.raw
+            .clone()
+            .unwrap_or_else(|| serde_json::to_string(self).unwrap_or_default())
+    }
+}
+
+/// 把一次请求编成**一行**。
+///
+/// 必须压成单行：协议是 JSONL，行内出现裸换行会把一条消息劈成两条。
+/// `serde_json::to_string` 不产生裸换行（字符串里的换行会转义）✓ ——
+/// 这里仍然断言一次，免得将来有人换成 pretty 打印。
+pub fn encode_request(request: &PluginRequest) -> Result<String, String> {
+    let line = serde_json::to_string(request).map_err(|e| format!("请求无法序列化：{e}"))?;
+    if line.contains('\n') || line.contains('\r') {
+        return Err("编码后的请求里出现了裸换行，会破坏 JSONL 分帧".into());
+    }
+    Ok(line)
+}
+
+/// 解析一行响应。**只解析，不配对**。
+pub fn parse_response(line: &str) -> Result<PluginResponse, String> {
+    serde_json::from_str(line).map_err(|e| format!("这一行不是合法的响应 JSON：{e}"))
+}
+
+/// 从子进程吐出的若干行里挑出 `request_id` 匹配的那一条。
+///
+/// ## 为什么不匹配的行直接跳过
+///
+/// 插件的 stdout 里**混着它自己的日志**是常态（它是个普通进程，
+/// 没人能禁止它 `println!`）。把「解析不了的行」一律当协议破坏，
+/// 会让一个爱打日志的插件完全不可用 —— 而那种失败看起来像
+/// 「网关坏了」，排查方向完全错。
+///
+/// ## 找不到时的报错必须带上原文
+///
+/// 「没等到响应」本身没有任何可操作性。把最后几行原样带出来，
+/// 用户才能看出是「插件根本没起来」「它在等输入」还是「它说了别的东西」。
+pub fn pick_response<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    request_id: &str,
+) -> Result<PluginResponse, String> {
+    let mut tail: Vec<String> = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // 只留最后几行，避免一个话痨插件把错误消息撑成几兆。
+        tail.push(trimmed.chars().take(200).collect());
+        if tail.len() > 3 {
+            tail.remove(0);
+        }
+        let Ok(response) = parse_response(trimmed) else {
+            continue; // 日志行，跳过
+        };
+        if response.request_id != request_id {
+            continue; // 别的请求的响应，跳过
+        }
+        if let Some(error) = response.error.as_deref() {
+            return Err(format!("插件报告失败：{error}"));
+        }
+        return Ok(response);
+    }
+    Err(format!(
+        "没有等到 request_id = {request_id} 的响应。插件最后几行输出：{}",
+        if tail.is_empty() {
+            "（一行都没有）".to_string()
+        } else {
+            tail.join(" ⏎ ")
+        }
+    ))
+}
