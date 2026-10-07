@@ -84,6 +84,16 @@
 .provider-runtime { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; font-size: 12px; }
 .provider-runtime .runtime-tag { color: var(--accent); border-color: var(--accent); }
 .provider-runtime .muted { font-size: 11px; }
+/* A5 运行时管理：默认折叠 —— 大多数用户用不到它，但需要时必须找得到。 */
+.agent-runtimes-strip { margin-top: 18px; }
+.agent-runtimes { border: 1px solid var(--border); border-radius: 11px; padding: 16px 20px; }
+.agent-runtimes summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.agent-runtimes > p { font-size: 12px; color: var(--muted); line-height: 1.8; margin: 12px 0; }
+.agent-runtime-list { list-style: none; margin: 0 0 14px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.agent-runtime-list li { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.agent-runtime-list li .mono { min-width: 120px; }
+.agent-runtime-new { display: flex; gap: 8px; flex-wrap: wrap; }
+.agent-runtime-new input, .agent-runtime-new select { min-width: 160px; }
 .route-strip strong { font-size: 13px; }
 .route-strip select { min-width: 150px; }
 .provider-editor-mask { padding: 24px; backdrop-filter: blur(4px); background: #10221dcc; }

@@ -12,6 +12,81 @@ function providerInput(p: ProviderView, overrides: Partial<ProviderInput> = {}):
 const STRATEGIES = { priority: "手工优先级", balanced: "综合均衡", smartest: "能力优先", fastest: "速度优先", reliable: "稳定优先", custom: "自定义规则", smart: "智能模式（先分类再选模）", cascade: "级联（先便宜，不够自信再升级）" };
 
 /**
+ * 任务卡二 A5：账号型上游运行时的清单与管理。
+ *
+ * 【为什么必须有这一块】没有它就没法建运行时 —— 而建不出运行时，
+ * 供应商卡片上那个「账号型上游」徽标永远是空的，
+ * 等于一个「开着没反应的开关」（CLAUDE.md 铁律 9）。
+ *
+ * 删除若被后端拒绝（还有 Provider 在用它），错误里带着「是谁在用」——
+ * 这里如实显示，不做级联删除：用户点的是「删运行时」，
+ * 不是「删那几个供应商」，多删的东西不会自己回来。
+ */
+function AgentRuntimes({ runtimes, adapters, onChanged, onError }: {
+  runtimes: AgentRuntime[];
+  adapters: Array<[string, string]>;
+  onChanged: () => Promise<unknown>;
+  onError: (text: string) => void;
+}) {
+  const [id, setId] = useState("");
+  const [kind, setKind] = useState("");
+  const [label, setLabel] = useState("");
+  const [working, setWorking] = useState(false);
+
+  // 适配器表到了就默认选第一个：留空会让用户以为配不出 kind。
+  useEffect(() => { if (!kind && adapters.length) setKind(adapters[0][0]); }, [adapters, kind]);
+
+  const create = async () => {
+    const trimmed = id.trim();
+    if (!trimmed) { onError("运行时 id 不能为空（供应商引用的是它）"); return; }
+    setWorking(true);
+    try {
+      // 时间戳给一个合法 RFC3339：后端只在新建时读它，
+      // 空串会在 IPC 反序列化阶段就失败（报错离操作很远）。
+      const now = new Date().toISOString();
+      await api.saveAgentRuntime({
+        id: trimmed, kind, label: label.trim() || trimmed,
+        options: null, enabled: true, created_at: now, updated_at: now,
+      });
+      setId(""); setLabel("");
+      await onChanged();
+    } catch (cause) { onError(errorText(cause)); } finally { setWorking(false); }
+  };
+
+  const remove = async (target: AgentRuntime) => {
+    if (!window.confirm(`确定删除运行时「${target.label}」吗？还有供应商在用它时后端会拒绝。`)) return;
+    setWorking(true);
+    try { await api.deleteAgentRuntime(target.id); await onChanged(); }
+    catch (cause) { onError(errorText(cause)); } finally { setWorking(false); }
+  };
+
+  return <details className="agent-runtimes">
+    <summary>账号型上游运行时（{runtimes.length}）</summary>
+    <p>
+      账号型上游的请求由本机 CLI（Codex / Qoder…）发出，登录态由各家自己管，
+      网关不读也不存凭据。供应商卡片上的「账号型上游」徽标指向这里的某一条。
+    </p>
+    {runtimes.length > 0
+      ? <ul className="agent-runtime-list">{runtimes.map((r) => <li key={r.id}>
+          <span className="mono">{r.id}</span>
+          <span>{r.label}</span>
+          <span className="tag">{r.kind}</span>
+          {!r.enabled && <span className="muted">已停用</span>}
+          <button className="danger" disabled={working} onClick={() => void remove(r)}>删除</button>
+        </li>)}</ul>
+      : <p className="muted">还没有运行时。建一个之后，就能把某个供应商指到它上面去。</p>}
+    <div className="row agent-runtime-new">
+      <input aria-label="运行时 id" placeholder="id（供应商引用它，唯一）" value={id} onChange={(e) => setId(e.target.value)} />
+      <input aria-label="运行时显示名" placeholder="显示名" value={label} onChange={(e) => setLabel(e.target.value)} />
+      <select aria-label="运行时类型" value={kind} onChange={(e) => setKind(e.target.value)}>
+        {adapters.map(([value, text]) => <option value={value} key={value}>{text}（{value}）</option>)}
+      </select>
+      <button className="primary" disabled={working} onClick={() => void create()}>新建运行时</button>
+    </div>
+  </details>;
+}
+
+/**
  * D4 级联的两个参数。
  *
  * **只在策略选成 `cascade` 时渲染**：其余档位下这两个值不参与任何决策，
@@ -105,6 +180,8 @@ export default function ProvidersPage() {
   const [pricing, setPricing] = useState<PricingStatus | null>(null);
   // 任务卡二 A5：账号型上游运行时的清单，供卡片上的徽标把 runtime_id 翻成人话。
   const [runtimes, setRuntimes] = useState<AgentRuntime[]>([]);
+  // 已注册的适配器 `[id, label]`，供「新建运行时」的 kind 下拉用。
+  const [adapters, setAdapters] = useState<Array<[string, string]>>([]);
     const [stale, setStale] = useState<StaleScanResult | null>(null);
     const [stalePicked, setStalePicked] = useState<Set<string>>(new Set());
     const [scanning, setScanning] = useState(false);
@@ -116,9 +193,9 @@ export default function ProvidersPage() {
     const version = ++loadVersion.current;
     setLoading(true);
     try {
-      const [providers, config, pricingStatus, agentRuntimes] = await Promise.all([api.listProviders(), api.getConfig(), api.pricingStatus(), api.listAgentRuntimes()]);
+      const [providers, config, pricingStatus, agentRuntimes, agentAdapters] = await Promise.all([api.listProviders(), api.getConfig(), api.pricingStatus(), api.listAgentRuntimes(), api.listAgentAdapters()]);
       if (version !== loadVersion.current) return false;
-      setList(providers); setCfg(config); setPricing(pricingStatus); setRuntimes(agentRuntimes); return true;
+      setList(providers); setCfg(config); setPricing(pricingStatus); setRuntimes(agentRuntimes); setAdapters(agentAdapters); return true;
     } catch (error) {
       if (version !== loadVersion.current) return false;
       setMessage({ kind: "err", text: `加载失败：${errorText(error)}` });
@@ -315,6 +392,7 @@ export default function ProvidersPage() {
     </div>}
     {cfg && <section className="route-strip"><div><strong>自动路由策略</strong><p>主用供应商优先；其余候选按策略与可用性排序。</p></div><select aria-label="路由策略" disabled={busy !== null} value={cfg.routing_strategy} onChange={e => { const strategy = e.target.value; void run("strategy", async () => { const result = await api.updateConfig({ ...cfg, routing_strategy: strategy }); setCfg(result.config); window.dispatchEvent(new CustomEvent("llm-gateway-config-changed", { detail: result.config })); }, "路由策略已更新，后续请求立即生效"); }}>{Object.entries(STRATEGIES).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></section>}
     {cfg && cfg.routing_strategy === "cascade" && <CascadeStrip cfg={cfg} onSaved={setCfg} />}
+    <section className="agent-runtimes-strip"><AgentRuntimes runtimes={runtimes} adapters={adapters} onChanged={load} onError={(text) => setMessage({ kind: "err", text })} /></section>
     {editor && <ProviderEditor initial={editor} onClose={() => setEditor(null)} onSaved={async () => { if (await load()) setMessage({ kind: "ok", text: "供应商配置已保存；已启用的供应商将参与后续路由。" }); }} />}
     {quotaProvider && <ProviderQuota provider={quotaProvider} onClose={() => setQuotaProvider(null)} />}
   </div>;

@@ -307,6 +307,18 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       // 漏了这个 case 会让整页 `Promise.all` 失败 —— 那是白屏，不是「没有徽标」。
       case "list_agent_runtimes": return structuredClone(window.__fixtureAgentRuntimes ?? []);
       case "list_agent_adapters": return [["fake", "假适配器（不需要登录）"], ["codex", "Codex CLI"], ["qoder", "Qoder CLI"]];
+      // A5：运行时的两个写操作。删除被引用时**模拟后端的拒绝** ——
+      // 那条可读错误（「还有 N 个供应商在用它」）正是这一格最该被看见的行为：
+      // 它把「删了会留下指向空气的 runtime_id」这个后果挡在了操作当时。
+      case "save_agent_runtime": {
+        const rest = (window.__fixtureAgentRuntimes ?? []).filter(r => r.id !== args.runtime.id);
+        window.__fixtureAgentRuntimes = [...rest, args.runtime];
+        return null;
+      }
+      case "delete_agent_runtime":
+        if (args.id === "codex-work") throw new Error("还有 1 个供应商在用它：Anthropic。请先把它们改成别的上游，或换掉它们的运行时。");
+        window.__fixtureAgentRuntimes = (window.__fixtureAgentRuntimes ?? []).filter(r => r.id !== args.id);
+        return null;
       case "discover_provider_models":
         if (args.input.base_url.includes("broken")) throw new Error("上游返回 HTTP 401，请检查密钥权限");
         return { base_url: "https://example.test/v1", warnings: [], models: [
@@ -813,6 +825,54 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       "没配运行时的供应商不该出现这个徽标 —— 否则用户以为所有请求都走本机 CLI",
     );
     await runtimeCard.screenshot({ path: path.join(output, "provider-runtime-badge.png") });
+
+    /* A5 运行时管理：让另外三个 IPC 真的有消费者                        */
+    const runtimesPanel = page.locator(".agent-runtimes");
+    await runtimesPanel.scrollIntoViewIfNeeded();
+    await runtimesPanel.locator("summary").click();
+    await page.waitForTimeout(150);
+    const panelText = await runtimesPanel.innerText();
+    assert(panelText.includes("codex-work"), `夹具里的运行时必须列出来：${panelText}`);
+    assert(panelText.includes("Codex（工作）"), `显示名要出来，只给 id 等于没给：${panelText}`);
+    await runtimesPanel.screenshot({ path: path.join(output, "agent-runtimes.png") });
+
+    // 新建：kind 下拉必须给出适配器表里的全部选项（只给 label 配不出 id）。
+    const kindOptions = await runtimesPanel.getByLabel("运行时类型").locator("option").allInnerTexts();
+    assert.equal(kindOptions.length, 3, `适配器下拉应有 3 项，实际 ${kindOptions.join("|")}`);
+    assert(kindOptions.some(text => text.includes("codex")), `选项要同时给出 id 与人话：${kindOptions.join("|")}`);
+
+    await runtimesPanel.getByLabel("运行时 id").fill("qoder-home");
+    await runtimesPanel.getByLabel("运行时显示名").fill("Qoder（家里）");
+    await runtimesPanel.getByLabel("运行时类型").selectOption("qoder");
+    await runtimesPanel.getByRole("button", { name: "新建运行时" }).click();
+    await page.waitForFunction(
+      () => window.__fixtureAgentRuntimes?.some(r => r.id === "qoder-home"), null, { timeout: 5000 },
+    );
+    assert.equal(
+      await page.evaluate(() => window.__fixtureAgentRuntimes.find(r => r.id === "qoder-home").kind), "qoder",
+      "kind 必须来自下拉选择，不能是空串",
+    );
+    await page.waitForFunction(
+      () => document.querySelector(".agent-runtimes")?.innerText.includes("qoder-home"), null, { timeout: 5000 },
+    );
+
+    // 删除被引用的那条：后端拒绝，界面必须把理由显示出来 ——
+    // 静默失败会让用户以为删掉了，而 Provider 上还挂着一个指向空气的 runtime_id。
+    await runtimesPanel.locator("li").filter({ hasText: "codex-work" }).getByRole("button", { name: "删除" }).click();
+    await page.waitForFunction(
+      () => document.querySelector(".providers-page")?.innerText.includes("还有 1 个供应商在用它"),
+      null, { timeout: 5000 },
+    );
+    assert(
+      await page.evaluate(() => window.__fixtureAgentRuntimes.some(r => r.id === "codex-work")),
+      "被拒绝的删除不能真把它删掉",
+    );
+
+    // 删除没人用的那条：成功，且真的从清单里消失。
+    await runtimesPanel.locator("li").filter({ hasText: "qoder-home" }).getByRole("button", { name: "删除" }).click();
+    await page.waitForFunction(
+      () => !window.__fixtureAgentRuntimes?.some(r => r.id === "qoder-home"), null, { timeout: 5000 },
+    );
 
     // 工具栏按钮组必须单行排开，且完整落在视口内。
     // 2026-10-05 用户报：标题文字长时三个按钮折成两行，「添加供应商」被挤到
