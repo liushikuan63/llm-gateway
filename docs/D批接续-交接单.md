@@ -250,7 +250,6 @@ summary 的 onClick 补 `stopPropagation`（否则「打开」会立刻被 docum
 ---
 
 ## 〇·六、B8 开工：外部适配器协议（第一格已落，`8a89a8c`）
-
 任务卡二里 **B7 / B8** 都不依赖登录与凭据，属于「文档里能推进」的那一类。
 本格做 B8 的判据 2、3（两条负向实验）：
 
@@ -324,6 +323,37 @@ summary 的 onClick 补 `stopPropagation`（否则「打开」会立刻被 docum
 写 stdin、读 stdout 行流、超时杀树）。卡片判据 1 是用**假 transport** 验的
 （协议层因此完全可测），但把协议接到真实子进程上那一层还没有 ——
 它要处理「读行流 + 超时 + 与 `kill_tree` 配合」，是独立一格。
+
+---
+
+## 〇·七、B7 凭据治理与日志脱敏：三条判据全部落地
+
+**判据 1 + 2**（`b8fc46d`）：`scripts/check-log-redaction.mjs`。
+规则是「日志语句 + 敏感标识符」的逐行启发式，扫 `src-tauri/src/**/*.rs`。
+判据 2（「故意打印一次凭据，测试必须红」）的正确形态是**扫描器自带样本自测**：
+`--self-test` 有 11 条样本。已接线到 `npm run verify:redaction` 与
+`ci-local.ps1 -Step redaction`（**ValidateSet 也要加**，否则单步跑不了 —— 实测被拒过一次）。
+
+两条规则是踩出来的：`api[_-]?key` 用 `\b` 收尾会漏掉 `api_key_enc`
+（`_` 是词字符）；`\bmask` 在 `api_key_masked` 里永远不成立。
+白名单标记 `// leak-check: allow <理由>` **必须带非空理由**，且认当前行与**上一行**。
+
+**判据实测**：`verify:redaction` 退出码 0（84 个文件无命中）；
+`ci-local.ps1 -Step redaction` 退出码 0；**端到端注入自检** —— 往 `health.rs`
+插一行真泄漏 ⇒ 退出码 1 并精确报出 `health.rs:295 (api-key)`，恢复后回到 0。
+
+**判据 3**（`tests/secret_permissions.rs`）：本项目**不落明文凭据文件**
+（凭据在 SQLite 的 `app_secrets` 表里，AES-256-GCM），但**主密钥 `master.key`
+是落盘的**（DPAPI 信封 + EFS）—— 它才是这条判据真正的对象：
+**谁能读它，谁就能解开库里那些密文**。
+
+用 `icacls` 读 ACL（本仓不许加依赖），断言不含宽泛主体（Everyone / Users /
+Authenticated Users 及其 SID）。**解析器自身也被测**：它错了的话整条检查会
+安静地放行一切。**本机实测通过**：`master.key` 与 `gateway.db` 的 ACL 都只有
+`SYSTEM` / `Administrators` / 当前用户。
+
+判据：全量 **1001 passed / 0 failed**；clippy 与 fmt 退出码 0；
+自检（宽泛主体判定恒 false）⇒ 恰好 2 条红。
 
 ### 文档里「能推进」与「推不动」的分界（2026-10-07 22:5x 盘点）
 
