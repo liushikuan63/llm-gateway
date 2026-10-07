@@ -39,6 +39,49 @@ fn 日志<'a>(
     }
 }
 
+/// D4 级联的两列：写进去要能读回来。
+///
+/// 这条能抓 **bind 顺序错位** —— 30 列对 30 个占位符、一个不多一个不少，
+/// 但值串了位置时，只有「读回来的值对不对」能发现。
+/// （本项目真的栽过一次错位：`access_key_id` 曾跟在 `rate_label` 后面。）
+#[tokio::test]
+async fn 级联信息能写进审计并读回() {
+    let db = Db::connect_in_memory().await.unwrap();
+    let mut log = 日志("auto", Some("s1"), Some("m1"));
+    log.route.cascade_attempts = 3;
+    log.route.cascade_stop = Some("max_escalations".into());
+    repo::log_request_at(db.pool(), 1_700_000_000, log)
+        .await
+        .unwrap();
+
+    let (attempts, stop): (i64, Option<String>) = sqlx::query_as(
+        "SELECT cascade_attempts, cascade_stop FROM requests ORDER BY rowid DESC LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attempts, 3, "发了几次要如实落库");
+    assert_eq!(stop.as_deref(), Some("max_escalations"));
+
+    // 对照组：没走级联的请求两列必须是 0 与 NULL，
+    // 而不是继承了上一条的值 —— 少了这条，把值写成常量也能过。
+    repo::log_request_at(
+        db.pool(),
+        1_700_000_001,
+        日志("auto", Some("s1"), Some("m1")),
+    )
+    .await
+    .unwrap();
+    let (attempts2, stop2): (i64, Option<String>) = sqlx::query_as(
+        "SELECT cascade_attempts, cascade_stop FROM requests ORDER BY rowid DESC LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attempts2, 0, "没走级联时次数必须是 0");
+    assert!(stop2.is_none(), "没走级联时原因必须是 NULL");
+}
+
 async fn 取一列(db: &Db, column: &str) -> i64 {
     // 用白名单拼列名：调用方是测试自己，不是外部输入。
     let sql = format!("SELECT {column} FROM requests ORDER BY rowid DESC LIMIT 1");

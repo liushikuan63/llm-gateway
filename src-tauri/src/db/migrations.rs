@@ -346,6 +346,11 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_req_session ON requests(session_id, ts)")
         .execute(pool)
         .await?;
+    // D4 级联：**为什么这次没升级**。此前只有 tracing 日志里有它，
+    // 审计页看不到 —— 于是「级联到底有没有生效」只能靠猜。
+    // 存 code 不存中文：中文措辞随时会改，而落库的值是数据字典的一部分。
+    ensure_column(pool, "requests", "cascade_attempts", "INTEGER DEFAULT 0").await?;
+    ensure_column(pool, "requests", "cascade_stop", "TEXT").await?;
     // 索引：审计页要「按 traceId 串联一次请求的全部尝试」，
     // 没有索引时那是全表扫。`CREATE INDEX IF NOT EXISTS` 是幂等的，
     // 对已有库重复执行安全。

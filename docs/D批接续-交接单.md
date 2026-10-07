@@ -326,6 +326,36 @@ summary 的 onClick 补 `stopPropagation`（否则「打开」会立刻被 docum
 
 ---
 
+## 〇·八、级联的审计可见性（D4 遗留账，已还）
+
+**问题**：级联的「发了几次、为什么没升级」此前只有 `tracing` 日志里有 ——
+而日志会轮转、会被清掉，审计页看不到，于是「级联到底有没有生效」只能靠猜。
+
+**做法**：`requests` 加两列（`cascade_attempts INTEGER DEFAULT 0` /
+`cascade_stop TEXT`），值经 `RouteTrace` 传给 `log_request_at`。
+`RouteTrace` 里加字段的**改动面极小**：9 处调用点里 6 处是 `Default::default()`、
+2 处传变量、**只有 1 处是字面量**（编译器直接报出那一处）。
+`normal_dispatch` 在级联结论算出后回填 `audit_route`（审计用那份 clone；
+响应头那份**不动** —— 级联信息不进对外头，避免改对外契约）。
+
+**存 code 不存中文**：`stop_code()` 与 `stop_label()` 刻意分开 ——
+中文措辞随时会改，而落库的值一旦写进历史行就成了数据字典的一部分。
+`每种停止原因都有唯一且稳定的 code` 由用例钉住。
+
+**判据**：`cargo test --lib router::cascade` 11 passed、`--test db` 14 passed；
+全量 **1003 passed / 0 failed**；clippy 与 fmt 退出码 0；
+自检（把 stop 写死成 `confident`）⇒ `级联信息能写进审计并读回` 恰好 1 条红。
+
+**clippy 抓到我一条假断言**：先前写的
+`all.iter().map(|s| stop_label(*s)).count()` 恒等于 `all.len()`，
+是**同义反复**（两边都算过等于没写）。`clippy::map_count` 直接把它拦下。
+已改成逐变体断言 label 与 code 都非空。
+
+**仍未做**：`server.rs` 里那段回填**没有测试**（要端到端跑一次级联才能验），
+现在守的是「列通不通、值会不会错位」这一层。已记在下面。
+
+---
+
 ## 〇·七、B7 凭据治理与日志脱敏：三条判据全部落地
 
 **判据 1 + 2**（`b8fc46d`）：`scripts/check-log-redaction.mjs`。

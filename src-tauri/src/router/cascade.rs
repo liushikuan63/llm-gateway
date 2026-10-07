@@ -161,6 +161,24 @@ pub fn stop_label(stop: CascadeStop) -> &'static str {
     }
 }
 
+/// 把 `CascadeStop` 译成**存进审计的稳定 code**。
+///
+/// 与 [`stop_label`] 的分工：那个是给人看的中文，措辞随时可能改；
+/// 这个是**落库的取值**，一旦发布就进了历史行的数据字典，改它等于让
+/// 「按 code 筛审计」这个用法失效。所以两者**刻意分开**，
+/// 而 `每种停止原因都有唯一 code` 这条由用例钉住 ——
+/// 漏一个或写重一个，筛选就会悄悄错。
+pub fn stop_code(stop: CascadeStop) -> &'static str {
+    match stop {
+        CascadeStop::Confident => "confident",
+        CascadeStop::MaxEscalations => "max_escalations",
+        CascadeStop::Streaming => "streaming",
+        CascadeStop::NoConfidenceChannel => "no_confidence_channel",
+        CascadeStop::Exhausted => "exhausted",
+        CascadeStop::Disabled => "disabled",
+    }
+}
+
 // ============================ 执行层（D4 ② 的第二半） ============================
 
 /// 一次级联运行的**整轮现场**。
@@ -527,5 +545,42 @@ mod tests {
             stop_label(CascadeStop::Streaming),
             "流式请求不升级（首个字节已发出）"
         );
+    }
+
+    /// 落库用的 code：**互不相同、非空、是稳定的 ASCII 短串**。
+    ///
+    /// 这条不是形式主义：code 一旦写进历史行就成了数据字典的一部分，
+    /// 「按 code 筛审计」这个用法靠的就是它唯一。漏一个或写重一个，
+    /// 筛选会**悄悄**给出错的集合 —— 不报错，只是结果不对。
+    #[test]
+    fn 每种停止原因都有唯一且稳定的_code() {
+        let all = [
+            CascadeStop::Confident,
+            CascadeStop::MaxEscalations,
+            CascadeStop::Streaming,
+            CascadeStop::NoConfidenceChannel,
+            CascadeStop::Exhausted,
+            CascadeStop::Disabled,
+        ];
+        let mut codes: Vec<&str> = all.iter().map(|s| stop_code(*s)).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), all.len(), "code 必须互不相同：{codes:?}");
+        assert!(
+            codes
+                .iter()
+                .all(|c| !c.is_empty() && c.is_ascii() && !c.contains(' ')),
+            "code 是落库值，必须是稳定的 ASCII 短串（不含空格）：{codes:?}"
+        );
+        // label 与 code 必须覆盖**同一批**变体，且两边的值都非空。
+        // 先前这里写的是 `all.iter().map(|s| stop_label(*s)).count()` ——
+        // 那个恒等于 `all.len()`，是**同义反复**（两边都算过等于没写），
+        // clippy 的 `map_count` 直接把它抓了出来。
+        for stop in all {
+            assert!(!stop_label(stop).is_empty(), "{stop:?} 缺中文标签");
+            assert!(!stop_code(stop).is_empty(), "{stop:?} 缺落库 code");
+        }
+        // 钉一个具体值：改它等于改数据字典，应当让某条断言红。
+        assert_eq!(stop_code(CascadeStop::MaxEscalations), "max_escalations");
     }
 }

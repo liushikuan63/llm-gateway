@@ -1355,6 +1355,15 @@ pub struct RouteTrace {
     pub refined: Option<bool>,
     /// 改写前后的字符数，写成 `原文→新文` 的形式便于人工核对改写幅度。
     pub refine_note: Option<String>,
+    /// D4 级联：这次请求**实际发出几次**（含被升级丢掉的）。
+    /// `0` = 没走级联（关着，或不是 cascade 档）。
+    pub cascade_attempts: i64,
+    /// D4 级联：停止升级的原因 code（见 `router::cascade::stop_code`）。
+    /// `None` = 没走级联。
+    ///
+    /// 存 code 不存中文：中文措辞随时可能改，而落库的值一旦写进历史行
+    /// 就成了数据字典的一部分。
+    pub cascade_stop: Option<String>,
 }
 
 pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
@@ -1381,7 +1390,7 @@ pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> 
               cost, currency, rate_label, estimated_prompt_tokens, attempts_json,
               route_intent, route_classifier, route_search, route_search_hits,
               route_refined, route_refine_note, access_key_id, refined_prompt, trace_id,
-              user_pinned_model, session_model_switches)
+              user_pinned_model, session_model_switches, cascade_attempts, cascade_stop)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
              COALESCE((SELECT CASE WHEN routed_model IS ?
                                    THEN session_model_switches
@@ -1389,7 +1398,8 @@ pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> 
                          FROM requests
                         WHERE session_id = ?
                         ORDER BY ts DESC, rowid DESC
-                        LIMIT 1), 0))"#,
+                        LIMIT 1), 0),
+             ?, ?)"#,
     )
     .bind(ts)
     .bind(log.session_id)
@@ -1438,6 +1448,10 @@ pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> 
     // 也要算「没换」；用 `=` 的话 NULL 永不相等，每一行都会被记成换过。
     .bind(log.routed_model)
     .bind(log.session_id)
+    // D4 级联的最后两位：第 29 / 30 列。由调用方经 `route` 传进来 ——
+    // 级联信息只有 `normal_dispatch` 知道，算不出来。
+    .bind(log.route.cascade_attempts)
+    .bind(log.route.cascade_stop.as_deref())
     .execute(pool)
     .await?;
 

@@ -2320,6 +2320,11 @@ fn route_trace_of(
                 .clone()
                 .unwrap_or_else(|| format!("{}→{} 字", outcome.original_chars, outcome.final_chars))
         }),
+        // D4 级联：这两个值**在这里还拿不到** —— 发了几次、为什么停，
+        // 要等请求真的跑完才知道。`normal_dispatch` 拿到之后回填进
+        // `audit_route`（审计用的是 clone 出来那份，响应头那份不动）。
+        cascade_attempts: 0,
+        cascade_stop: None,
     }
 }
 
@@ -3397,7 +3402,8 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let route = input.route_trace();
     // `tokio::spawn(async move { … })` 是**按值**捕获用到的变量，
     // 所以下面的后台任务要用的是一份克隆，原变量留给响应头。
-    let audit_route = route.clone();
+    // `mut` 是因为 D4 级联的两个字段要等请求跑完才回填（见下面）。
+    let mut audit_route = route.clone();
     let DispatchInput {
         cache_session,
         trace_id,
@@ -3686,6 +3692,11 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             cheap_first = cascade_ordered,
             "级联路由执行完毕"
         );
+        // 同时落审计（`cascade_attempts` / `cascade_stop` 两列，2026-10-08 加）。
+        // 在此之前这里只有日志 —— 而「级联到底有没有生效」是用户真的会问的问题，
+        // 答案不该只存在于一个会轮转、会被清掉的日志文件里。
+        audit_route.cascade_attempts = cascade_attempts as i64;
+        audit_route.cascade_stop = Some(crate::router::cascade::stop_code(stop).to_string());
     }
 
     match outcome {
