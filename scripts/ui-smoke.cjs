@@ -44,6 +44,9 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     },
   ];
   window.__fixtureConfig = { bind: "127.0.0.1", port: 15721, allow_lan: false, unified_key: "fixture-only", routing_strategy: "balanced", custom_rules: [], max_fallback_attempts: 3, upstream_timeout_secs: 90, sticky_ttl_secs: 1800, compact_threshold_tokens: 60000, compact_keep_recent: 12, analytics_retention_days: 30, http_proxy: null, failover_enabled: true, catalog_auto_update: false, catalog_feed_url: null, remote_mode: { enabled: false, public_url: null }, takeover: { claude_code: false, codex: false, gemini_cli: false, opencode: false, crush: false },
+    // D4 级联：夹具必须带这一段，否则 `cfg.cascade` 在真环境里是 undefined，
+    // 页面会白屏而测试全绿（CLAUDE.md 铁律 10 点名的正是这个坑）。
+    cascade: { max_escalations: 0, min_confidence: 0.6 },
     smart_routing: {
       enabled: true, classifier: "jev",
       jev: { base_url: "http://127.0.0.1:8009/v1/systemone", model: "rl-agent", timeout_ms: 1200, max_state_chars: 4000,
@@ -662,6 +665,75 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.screenshot({ path: path.join(output, "stale-models.png"), fullPage: true });
 
     await page.screenshot({ path: path.join(output, "providers-desktop.png"), fullPage: true });
+
+    // D4 级联设置：只在策略选成 cascade 时出现，且改动必须往返到配置。
+    //
+    // 「别的档位下不渲染」这条是重点：级联的两个参数在其余七档里
+    // 不参与任何决策，摆在那里就是「开着没反应的开关」。
+    const strategySelect = page.getByLabel("路由策略");
+    await strategySelect.selectOption("balanced");
+    await page.waitForTimeout(150);
+    assert.equal(await page.locator(".cascade-strip").count(), 0, "非级联档位下不该出现级联设置");
+    assert.equal(
+      await strategySelect.locator("option").count(), 8,
+      "策略下拉必须给出全部 8 档（含 smart 与 cascade），漏档等于用户选不到",
+    );
+
+    await strategySelect.selectOption("cascade");
+    const cascadeStrip = page.locator(".cascade-strip");
+    await cascadeStrip.waitFor({ timeout: 5000 });
+    assert.equal(
+      await page.evaluate(() => window.__fixtureConfig.cascade.max_escalations), 0,
+      "夹具默认必须是关闭状态",
+    );
+    const cascadeText = await cascadeStrip.innerText();
+    assert(cascadeText.includes("当前未启用"), `max_escalations=0 时必须说明级联未启用：${cascadeText}`);
+    // 代价必须写在用户看得见的地方：改这个数字会把一次请求变成多次真实账单。
+    assert(/非流式/.test(cascadeText), `必须写明只在非流式上生效：${cascadeText}`);
+    assert(/不可用/.test(cascadeText), `必须写明决策端点不可用时不升级：${cascadeText}`);
+    // 页面滚动发生在内部容器上，`fullPage` 截不到 route-strip 这一段 ——
+    // 实测第一版截图里根本没有级联区（而断言全绿）。必须滚进视口再截。
+    await cascadeStrip.scrollIntoViewIfNeeded();
+    assert.equal(await cascadeStrip.isVisible(), true, "级联设置必须真的渲染在视口里");
+    await page.screenshot({ path: path.join(output, "cascade-settings.png") });
+    await cascadeStrip.screenshot({ path: path.join(output, "cascade-strip.png") });
+
+    await cascadeStrip.getByLabel("最多升级次数", { exact: true }).fill("2");
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.cascade?.max_escalations === 2, null, { timeout: 5000 },
+    );
+    assert.equal(
+      await page.evaluate(() => window.__fixtureConfig.cascade.min_confidence), 0.6,
+      "改升级次数不得抹掉阈值（spread 写错就是这种症状）",
+    );
+    await cascadeStrip.getByLabel("置信度低于它才升级", { exact: true }).fill("0.8");
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.cascade?.min_confidence === 0.8, null, { timeout: 5000 },
+    );
+    assert.equal(
+      await page.evaluate(() => window.__fixtureConfig.cascade.max_escalations), 2,
+      "改阈值不得抹掉升级次数",
+    );
+    assert((await cascadeStrip.innerText()).includes("最多升 2 次"), "说明文字要跟着实际值走");
+    await cascadeStrip.scrollIntoViewIfNeeded();
+    await cascadeStrip.screenshot({ path: path.join(output, "cascade-settings-enabled.png") });
+
+    // 越界值必须被界面夹住：配置可能被手改过，而 max_escalations=9
+    // 在界面上看不出任何异常，却意味着最多 10 次真实上游调用。
+    await cascadeStrip.getByLabel("最多升级次数", { exact: true }).fill("9");
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.cascade?.max_escalations === 3, null, { timeout: 5000 },
+    );
+    assert.equal(
+      await cascadeStrip.getByLabel("最多升级次数", { exact: true }).inputValue(), "3",
+      "输入框本身也要显示夹取后的值",
+    );
+
+    // 切回去：后面的断言不该被这一次策略切换污染。
+    await strategySelect.selectOption("balanced");
+    await page.waitForFunction(
+      () => window.__fixtureConfig?.routing_strategy === "balanced", null, { timeout: 5000 },
+    );
 
     // 工具栏按钮组必须单行排开，且完整落在视口内。
     // 2026-10-05 用户报：标题文字长时三个按钮折成两行，「添加供应商」被挤到

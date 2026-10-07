@@ -122,6 +122,14 @@ export interface CustomRouteRule {
   action: CustomRouteRuleAction;
 }
 
+/** D4 级联路由（FrugalGPT）：先发最便宜的合格候选，置信度不够就升级。 */
+export interface CascadePolicy {
+  /** 最多升级几次。**0 = 不级联**（默认）。上限 3 —— 再多也不会更准，只会多花钱。 */
+  max_escalations: number;
+  /** 置信度**低于**它才升级（0..1）。越接近 1 越容易升级，也就越贵。 */
+  min_confidence: number;
+}
+
 export interface AppConfig {
   bind: string;
   port: number;
@@ -149,6 +157,7 @@ export interface AppConfig {
   };
   local_models: LocalModelConfig;
   smart_routing: SmartRoutingConfig;
+  cascade: CascadePolicy;
   search: SearchConfig;
 }
 

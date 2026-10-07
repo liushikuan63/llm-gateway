@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, AppConfig, DIALECT_LABEL, HEALTH_LABEL, PricingRefreshOutcome, PricingStatus, ProviderInput, ProviderView, StaleScanResult } from "../api";
+import { api, AppConfig, CascadePolicy, DIALECT_LABEL, HEALTH_LABEL, PricingRefreshOutcome, PricingStatus, ProviderInput, ProviderView, StaleScanResult } from "../api";
 import ProviderEditor from "./ProviderEditor";
 import ProviderQuota from "./ProviderQuota";
 import { blankForm, errorText, formatContext, ProviderForm } from "./providerPresets";
@@ -9,7 +9,64 @@ function providerInput(p: ProviderView, overrides: Partial<ProviderInput> = {}):
   return { id: p.id, name: p.name, dialect: p.dialect, base_url: p.base_url, api_key: "", enabled: p.enabled,
     priority: p.priority, models: p.models, rpm_limit: p.rpm_limit, intelligence: p.intelligence, note: p.note, ...overrides };
 }
-const STRATEGIES = { priority: "手工优先级", balanced: "综合均衡", smartest: "能力优先", fastest: "速度优先", reliable: "稳定优先", custom: "自定义规则" };
+const STRATEGIES = { priority: "手工优先级", balanced: "综合均衡", smartest: "能力优先", fastest: "速度优先", reliable: "稳定优先", custom: "自定义规则", smart: "智能模式（先分类再选模）", cascade: "级联（先便宜，不够自信再升级）" };
+
+/**
+ * D4 级联的两个参数。
+ *
+ * **只在策略选成 `cascade` 时渲染**：其余档位下这两个值不参与任何决策，
+ * 摆在那里就是「开着没反应的开关」（CLAUDE.md 铁律 9）。
+ *
+ * 三句说明都不能省，否则一个把 `max_escalations` 调到 3 的用户不会知道
+ * 自己刚刚把一次请求变成了最多 4 次真实账单。
+ */
+function CascadeStrip({ cfg, onSaved }: { cfg: AppConfig; onSaved: (next: AppConfig) => void }) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  // 老配置 / 夹具可能没有这一段；缺字段就按「关闭」渲染，绝不因此白屏。
+  const policy = cfg.cascade ?? { max_escalations: 0, min_confidence: 0.6 };
+  const enabled = policy.max_escalations > 0;
+
+  const save = async (next: CascadePolicy) => {
+    setBusy(true); setMessage(null);
+    try {
+      const result = await api.updateConfig({ ...cfg, cascade: next });
+      onSaved(result.config);
+      window.dispatchEvent(new CustomEvent("llm-gateway-config-changed", { detail: result.config }));
+      setMessage({ kind: "ok", text: "级联设置已保存，后续请求立即生效" });
+    } catch (error) {
+      setMessage({ kind: "error", text: errorText(error) });
+    } finally { setBusy(false); }
+  };
+
+  return <section className="route-strip cascade-strip" aria-label="级联设置">
+    <div>
+      <strong>级联路由{enabled ? "" : "（当前未启用）"}</strong>
+      <p>
+        先把请求发给「最便宜」的合格候选；置信度不够再升到下一档重发，最多升 {policy.max_escalations} 次。
+        每次升级都是一次真实的上游调用与账单。
+      </p>
+      <p>
+        只在非流式请求上生效（流式首个字节发出后不能换家）。
+        决策端点不可用（没启动 / 超时 / 返回非法结构）时不升级，直接用当前这档的结果。
+      </p>
+    </div>
+    <div className="cascade-fields">
+      <label>最多升级次数
+        <input aria-label="最多升级次数" type="number" min={0} max={3} disabled={busy}
+          value={policy.max_escalations}
+          onChange={e => void save({ ...policy, max_escalations: Math.max(0, Math.min(3, Number(e.target.value) || 0)) })} />
+      </label>
+      <label>置信度低于它才升级
+        <input aria-label="置信度低于它才升级" type="number" min={0} max={1} step={0.05} disabled={busy}
+          value={policy.min_confidence}
+          onChange={e => void save({ ...policy, min_confidence: Math.max(0, Math.min(1, Number(e.target.value) || 0)) })} />
+      </label>
+      {message && <small className={message.kind === "error" ? "error" : "muted"}>{message.text}</small>}
+    </div>
+  </section>;
+}
+
 
 /** 刷新结果的完整说明：更新了几条、跳过几条手工价、哪些模型目录里没有。 */
 function refreshSummary(outcome: PricingRefreshOutcome) {
@@ -243,6 +300,7 @@ export default function ProvidersPage() {
       })}
     </div>}
     {cfg && <section className="route-strip"><div><strong>自动路由策略</strong><p>主用供应商优先；其余候选按策略与可用性排序。</p></div><select aria-label="路由策略" disabled={busy !== null} value={cfg.routing_strategy} onChange={e => { const strategy = e.target.value; void run("strategy", async () => { const result = await api.updateConfig({ ...cfg, routing_strategy: strategy }); setCfg(result.config); window.dispatchEvent(new CustomEvent("llm-gateway-config-changed", { detail: result.config })); }, "路由策略已更新，后续请求立即生效"); }}>{Object.entries(STRATEGIES).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></section>}
+    {cfg && cfg.routing_strategy === "cascade" && <CascadeStrip cfg={cfg} onSaved={setCfg} />}
     {editor && <ProviderEditor initial={editor} onClose={() => setEditor(null)} onSaved={async () => { if (await load()) setMessage({ kind: "ok", text: "供应商配置已保存；已启用的供应商将参与后续路由。" }); }} />}
     {quotaProvider && <ProviderQuota provider={quotaProvider} onClose={() => setQuotaProvider(null)} />}
   </div>;
