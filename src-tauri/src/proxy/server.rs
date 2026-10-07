@@ -5300,6 +5300,7 @@ impl GatewayState {
                 .map(|row| (calibration_key(&row.provider_id, &row.model), row.ratio))
                 .collect(),
             Err(error) => {
+                // leak-check: allow 这里的「token 校准表」指 LLM 的计数校准，不是凭据
                 tracing::warn!("读取 token 校准表失败，本次按未校准处理: {error}");
                 CalibrationMap::new()
             }

@@ -28,7 +28,7 @@ param(
     # 'scripts' is listed so the syntax + fixture-redaction step can be run on
     # its own. Without it, `-Step scripts` is rejected by ValidateSet and the
     # only way to reach that step is a full `-Step all` run.
-    [ValidateSet('scripts', 'fmt', 'clippy', 'check', 'test', 'build', 'manual', 'release', 'plan', 'all')]
+    [ValidateSet('scripts', 'fmt', 'clippy', 'check', 'test', 'build', 'manual', 'release', 'plan', 'redaction', 'all')]
     [string]$Step = 'all'
 )
 
@@ -110,12 +110,16 @@ function Invoke-ScriptSyntaxStep {
 }
 
 function Invoke-FrontendSteps {
-    foreach ($n in @('build', 'manual', 'release', 'plan')) {
+    foreach ($n in @('build', 'manual', 'release', 'plan', 'redaction')) {
         switch ($n) {
             'build'   { Invoke-Step $n { & npm run build } }
             'manual'  { Invoke-Step $n { & npm run verify:manual } }
             'release' { Invoke-Step $n { & npm run verify:release } }
             'plan'    { Invoke-Step $n { & npm run verify:plan } }
+            # B7 判据 1/2：日志里不得出现凭据标识符。
+            # 脚本自带样本自测（判据 2 的「故意泄漏必须红」），
+            # 所以这一步同时验扫描器本身还在工作。
+            'redaction' { Invoke-Step $n { & npm run verify:redaction } }
         }
     }
 }
@@ -149,6 +153,7 @@ try {
                         'manual'  { & npm run verify:manual }
                         'release' { & npm run verify:release }
                         'plan'    { & npm run verify:plan }
+                        'redaction' { & npm run verify:redaction }
                     }
                 }
             }
