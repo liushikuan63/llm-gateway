@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 /// 一个运行时的配额。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AgentQuota {
     /// 每分钟请求上限。**0 = 不限**。
     pub rpm: u32,

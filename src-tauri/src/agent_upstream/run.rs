@@ -379,6 +379,8 @@ mod tests {
                 enabled,
                 workspace_root: Some(base.clone()),
                 exec_timeout_secs: 5,
+                // 配额测试另有用例（`quota.rs`），这里不限。
+                quota: crate::agent_upstream::AgentQuota::default(),
             },
             base,
         )

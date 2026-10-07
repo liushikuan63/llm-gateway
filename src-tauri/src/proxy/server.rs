@@ -136,6 +136,13 @@ pub struct GatewayState {
     /// 它拿到的只有 `GatewayState`。注册表是无状态只读的，`Arc` 共享，
     /// 两个 state 各持一份 `Arc` 即可。
     pub adapters: Arc<crate::agent_upstream::AdapterRegistry>,
+    /// 任务卡二 B5 判据 5：**网关侧**的配额账本。
+    ///
+    /// 用 `parking_lot::Mutex` 而不是 `RwLock`：这个锁只在
+    /// 「判定 + 记账」那一瞬间持有（几纳秒），没有读者可以并行的场景。
+    /// 而且**判定与记账必须在同一个临界区**里 —— 分成两次加锁的话，
+    /// 两个并发请求可能都判过、都记账，于是上限被突破一次。
+    pub agent_quota: Arc<parking_lot::Mutex<crate::agent_upstream::QuotaBook>>,
 }
 
 impl GatewayState {
@@ -169,6 +176,9 @@ impl GatewayState {
             // 两处各建一份是**可以的**（适配器无状态），
             // 合成一个全局单例反而要多引入一层共享。
             adapters: Arc::new(crate::agent_upstream::AdapterRegistry::with_builtins()),
+            agent_quota: Arc::new(parking_lot::Mutex::new(
+                crate::agent_upstream::QuotaBook::new(),
+            )),
         }
     }
 
@@ -683,6 +693,36 @@ async fn gw_agent_run(
 ) -> Response {
     let cfg = state.cfg_snapshot();
     let started = Instant::now();
+
+    // ===== B5 判据 5：**网关自己的**配额，判定 + 记账同一个临界区 =====
+    //
+    // 卡片原文：「把日上限配成 2，第 3 次必须**被网关拒绝**，
+    // 断言里的错误来源是**网关自己的配额器**，而不是上游返回的 429。」
+    //
+    // 顺序：**配额在跑之前判** —— 先跑再判的话，
+    // 超限的那次已经在用户机器上跑完了（Agent 会写文件、花额度）。
+    //
+    // 判定与记账在同一个锁里：分成两次加锁的话，两个并发请求可能
+    // 都判过、都记账，于是上限被突破一次。
+    if let Err(rejection) =
+        state
+            .agent_quota
+            .lock()
+            .check_and_record(&req.runtime, cfg.agent.quota, chrono::Utc::now())
+    {
+        // **429**：与上游的 429 状态码相同，但错误体自报家门
+        // （见 `QuotaRejection::message`）。用户能一眼看出是本地拦的。
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": rejection.message(),
+                // 机器可读的来源标记 —— 让客户端不必解析自然语言。
+                "source": "gateway_quota",
+            })),
+        )
+            .into_response();
+    }
+
     let outcome = crate::agent_upstream::run_agent_request(
         &cfg.agent,
         &state.adapters,

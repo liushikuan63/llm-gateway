@@ -508,6 +508,12 @@ pub struct AgentConfig {
     /// 依据是实测：`codex exec --json` 会**静默挂住**（90 秒零输出且不结束），
     /// 所以这个值不是「给慢一点的请求留余量」，而是**必然会用到的上限**。
     pub exec_timeout_secs: u64,
+    /// B5 判据 5：**网关侧**的配额。裁决 4：
+    /// 「RPM + 每日次数上限由网关侧拒绝」——
+    /// 不能指望上游替我们拦（它拦的是它的额度，不是用户的预算）。
+    ///
+    /// 两个值都为 0 = 不限（与项目里 `rpm_limit` 等既有口径一致）。
+    pub quota: crate::agent_upstream::AgentQuota,
 }
 
 impl Default for AgentConfig {
@@ -516,6 +522,9 @@ impl Default for AgentConfig {
             enabled: false,
             workspace_root: None,
             exec_timeout_secs: 300,
+            // 默认不限 —— 加一个「默认就限额」的能力会让升级变成
+            // 「我的脚本跑了几天突然开始 429」。
+            quota: crate::agent_upstream::AgentQuota::default(),
         }
     }
 }
@@ -1094,6 +1103,10 @@ mod agent_config_tests {
             enabled: true,
             workspace_root: Some(std::path::PathBuf::from("D:/ws")),
             exec_timeout_secs: 60,
+            quota: crate::agent_upstream::AgentQuota {
+                rpm: 10,
+                daily_limit: 100,
+            },
         };
         let toml = toml::to_string(&c).expect("应当能序列化");
         let back: AgentConfig = toml::from_str(&toml).expect("应当能反序列化");
