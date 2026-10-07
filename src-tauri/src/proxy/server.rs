@@ -351,6 +351,9 @@ pub async fn serve(state: Arc<GatewayState>) -> Result<()> {
         .route("/healthz", get(healthz))
         .route("/gw/stats", get(gw_stats))
         .route("/gw/health", get(gw_health))
+        // 任务卡二 A8：Agent 型入口。**与 LLM 透传分开**（裁决之一）——
+        // 它让外部 CLI 在本地干活并产出文件，不是一个「聊天补全」接口。
+        .route("/gw/agent/run", post(gw_agent_run))
         // axum 0.7 推荐顺序：先 layer，最后 with_state
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
         // 非信任客户端的超大请求体会同时挤占内存和上游配额，按方案书限制为 8 MiB。
@@ -649,7 +652,61 @@ async fn gw_stats(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     }
 }
 
-/// OpenAI 兼容入口
+/// 任务卡二 A8：Agent 型入口。
+///
+/// 请求体：`{ "runtime": "<runtime_id>", "model": "...", "prompt": "..." }`
+///
+/// ## 与 `/v1/chat/completions` 的区别（裁决之一）
+///
+/// 那个是 **LLM 透传**：发一轮对话、拿一段文本、不落任何文件。
+/// 这个是 **Agent 型入口**：让外部 CLI 在隔离目录里干活、**产出文件**，
+/// 并把产物清单报回来。两者刻意分开 —— 混在一起的话，
+/// 「我这次会不会被写文件」就说不清了。
+///
+/// ## 状态码：一律 4xx，不用 500
+///
+/// 开关没开、运行时不存在、`runtime_id` 越界、适配器起不来 ——
+/// 全是**用户能改的配置或环境问题**。给 500 会把他引向「服务端有 bug」
+/// 这个错误方向。（与 A5 判据 3、A7 判据 2 同一条口径。）
+#[derive(serde::Deserialize)]
+struct AgentRunRequest {
+    runtime: String,
+    #[serde(default)]
+    model: String,
+    prompt: String,
+}
+
+async fn gw_agent_run(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<AgentRunRequest>,
+) -> Response {
+    let cfg = state.cfg_snapshot();
+    match crate::agent_upstream::run_agent_request(
+        &cfg.agent,
+        &state.adapters,
+        &req.runtime,
+        &req.model,
+        &req.prompt,
+    )
+    .await
+    {
+        Ok(outcome) => Json(serde_json::json!({
+            "text": outcome.text,
+            "transport": outcome.transport,
+            "artifacts": outcome.artifacts,
+        }))
+        .into_response(),
+        // 4xx：这些原因都在用户那一侧（配置 / 环境），不在服务端。
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": message,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<GatewayState>>,
     Extension(auth): Extension<AuthContext>,
