@@ -23,6 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::Result;
+
 /// 级联的升级策略。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -156,6 +158,164 @@ pub fn stop_label(stop: CascadeStop) -> &'static str {
         CascadeStop::NoConfidenceChannel => "置信度通道不可用，不升级",
         CascadeStop::Exhausted => "没有下一档候选",
         CascadeStop::Disabled => "级联未启用",
+    }
+}
+
+// ============================ 执行层（D4 ② 的第二半） ============================
+
+/// 一次级联运行的**整轮现场**。
+///
+/// 与 [`CascadeAttempt`] 的分工：那个描述「**某一次**尝试之后」，
+/// 这个描述「**整轮请求**」—— 候选有多少、是不是流式，整个循环里都不变。
+#[derive(Debug, Clone, Copy)]
+pub struct CascadeRunRequest {
+    /// 候选总数。用于判断「还有没有下一档」。
+    pub candidates: usize,
+    /// 本轮请求是否流式。
+    ///
+    /// **这里只是如实转达，不做判断**：流式不升级这条硬约束只在
+    /// [`decide`] 里实现**一次**。若本函数自己再判一遍，两处迟早漂移
+    /// （改了一处忘了另一处），而那正是「约束写两遍」的典型后果。
+    ///
+    /// 调用方（非流式的 `normal_dispatch`）传 `false`；流式路径压根
+    /// 不调用本函数。传 `true` 的行为仍有用例钉着 —— 它保证
+    /// 「万一有调用方接错线」时结果依然是「发一次就收手」。
+    pub streaming: bool,
+}
+
+/// Jev 那一次读数的结果形态。
+///
+/// `available == false` 覆盖**三种**情况：服务没启动、超时、返回非法结构。
+/// 三者在决策上必须**同样处理** —— 对「这个置信度可不可信」而言它们没有区别。
+#[derive(Debug, Clone, Copy)]
+pub struct ConfidenceReading {
+    pub available: bool,
+    pub value: f32,
+}
+
+impl ConfidenceReading {
+    /// 拿到了一次可用读数。
+    pub fn available(value: f32) -> Self {
+        Self {
+            available: true,
+            value,
+        }
+    }
+
+    /// 通道不可用（服务没起来 / 超时 / 结构非法）。
+    pub fn unavailable() -> Self {
+        Self {
+            available: false,
+            value: 0.0,
+        }
+    }
+}
+
+/// 一次级联运行的结果。
+#[derive(Debug)]
+pub struct CascadeRun<T> {
+    /// **最终采纳**的那一档的结果。
+    ///
+    /// 升级前那些尝试的结果被丢弃 —— 这与 FrugalGPT 的机制一致：
+    /// 前面的钱确实花了，但用户只该看到最后那次回答。
+    pub value: T,
+    /// 实际发出的请求次数（含被丢弃的）。上限是 `max_escalations + 1`。
+    pub attempts: usize,
+    /// 停止升级的**具体原因**，直接用于审计与界面解释。
+    pub stop: CascadeStop,
+    /// 每次尝试拿到的置信度，`None` 表示那次通道不可用。
+    ///
+    /// 长度等于**真正读过通道的次数**。启用时它恒等于 `attempts`；
+    /// **关着时它是空的** —— 那种情况下连读都不读（见 [`run_cascade`]）。
+    pub readings: Vec<Option<f32>>,
+}
+
+/// 跑一轮级联：先发最便宜那档，置信度不够就换下一档重发，
+/// **最多升级 `max_escalations` 次**。
+///
+/// ## 为什么是一个泛型函数而不是直接写在 `normal_dispatch` 里
+///
+/// 卡片要的判据是**计数型**的（「mock 上游调用次数 == N+1」）。
+/// 埋在 470 行的异步函数里就只能靠真实 HTTP 端到端去数，
+/// 而那要造 `AppState` + mock 上游 + 带 usage 的响应 ——
+/// 成本高到「干脆不测」。把循环抽成不依赖任何 IO 的形状之后，
+/// `send` 与 `confidence` 都是注入进来的，计数与顺序可以直接断言。
+///
+/// ## 两个闭包的契约
+///
+/// - `send(start)`：**从第 `start` 档开始**发一次请求。传下标而不是
+///   单个候选，是为了让调用方仍能把 `ranked[start..]` 交给失败转移链 ——
+///   否则「升级到下一档」会顺手丢掉候选内部的失败转移。
+/// - `confidence(&T)`：对**刚拿到的那个结果**取一次读数。
+///   这是 FrugalGPT 的「响应置信度」口径（事实源 I.2），
+///   不是请求分类的置信度 —— 后者在整个循环里是个常数，
+///   拿它做升级判据会让「置信度低」这种请求一次升到顶。
+///
+/// 任一 `send` 返回 `Err` 即整体返回该错误：链内部已经做过失败转移，
+/// 从这一档到链尾都发不出去时，再往上「升级」也没有意义。
+pub async fn run_cascade<T, S, Sf, C, Cf>(
+    policy: &CascadePolicy,
+    run: CascadeRunRequest,
+    mut send: S,
+    mut confidence: C,
+) -> Result<CascadeRun<T>>
+where
+    S: FnMut(usize) -> Sf,
+    Sf: std::future::Future<Output = Result<T>>,
+    C: FnMut(&T) -> Cf,
+    Cf: std::future::Future<Output = ConfidenceReading>,
+{
+    let policy = policy.sanitized();
+    // 【铁律 2 模式隔离】关着时**连置信度都不读**。
+    //
+    // 读一次 Jev 是一次真实调用：有超时预算、要占本机推理、可能拉起一个
+    // 子进程。而「关着」的语义是「与没有这个功能时一样」——
+    // 让它在后台悄悄多打一次决策端点，正是模式隔离要禁止的「泄漏进常规路径」。
+    //
+    // `decide` 里那条 `Disabled` 分支仍然保留：它是纯函数自己的兜底
+    // （调用方忘了短路时行为依旧安全），由单测钉着；而这里是**性能与隔离**
+    // 的短路。两处结果一致（都是「发一次就收手」），所以不算「约束写两遍」。
+    if !policy.enabled() {
+        let value = send(0).await?;
+        return Ok(CascadeRun {
+            value,
+            attempts: 1,
+            stop: CascadeStop::Disabled,
+            readings: Vec::new(),
+        });
+    }
+    let mut readings: Vec<Option<f32>> = Vec::new();
+    let mut start = 0usize;
+    loop {
+        let value = send(start).await?;
+        let reading = confidence(&value).await;
+        readings.push(reading.available.then_some(reading.value));
+        // 从 0 开始数：第 1 次尝试是 0，`max_escalations = N` 时
+        // 尝试 0..=N-1 都会升级、第 N 次到顶 ⇒ 总发送次数 N+1。
+        let attempt = readings.len() - 1;
+        let (decision, stop) = decide(
+            &policy,
+            &CascadeAttempt {
+                attempt,
+                streaming: run.streaming,
+                confidence_available: reading.available,
+                confidence: reading.value,
+                candidates: run.candidates,
+            },
+        );
+        if decision == CascadeDecision::Escalate {
+            start = attempt + 1;
+            continue;
+        }
+        // `Accept` 的每一种原因（够自信 / 到上限 / 没有下一档 / 通道不可用 /
+        // 流式 / 关着）都走这一条返回路径。分开写会造出「原因不同、
+        // 结果也不同」的假分叉，而它们的结果本来就该一样：用手里这个。
+        return Ok(CascadeRun {
+            value,
+            attempts: readings.len(),
+            stop,
+            readings,
+        });
     }
 }
 

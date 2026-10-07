@@ -285,3 +285,211 @@ fn 默认档位不是级联() {
     );
     assert_ne!(RoutingStrategy::default(), RoutingStrategy::Cascade);
 }
+
+// ==================== ② 级联的执行层（D4 的第二半） ====================
+
+use std::cell::{Cell, RefCell};
+
+use llm_gateway_lib::error::GatewayError;
+use llm_gateway_lib::router::cascade::{
+    run_cascade, CascadePolicy, CascadeRun, CascadeRunRequest, CascadeStop, ConfidenceReading,
+};
+
+/// 执行层的测试脚手架：记录**每次发送的起始档**，按预设序列给出置信度读数。
+///
+/// 返回 `(运行结果, 起始档序列, 置信度通道被问了几次)`。
+/// 三个都是「可失败判据」要用的原始事实 —— 尤其第二个：
+/// 卡片要求的是**计数型**断言，而计数一旦从实现里现算就失去意义。
+async fn 跑一轮(
+    policy: CascadePolicy,
+    streaming: bool,
+    candidates: usize,
+    readings: Vec<Option<f32>>,
+) -> (CascadeRun<String>, Vec<usize>, usize) {
+    let sent: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+    let preset: RefCell<Vec<Option<f32>>> = RefCell::new(readings);
+    let asked = Cell::new(0usize);
+
+    let out = run_cascade(
+        &policy,
+        CascadeRunRequest {
+            candidates,
+            streaming,
+        },
+        |start| {
+            sent.borrow_mut().push(start);
+            async move { Ok::<String, GatewayError>(format!("回答来自第 {start} 档")) }
+        },
+        |_value| {
+            asked.set(asked.get() + 1);
+            let next = {
+                let mut queue = preset.borrow_mut();
+                if queue.is_empty() {
+                    None
+                } else {
+                    queue.remove(0)
+                }
+            };
+            async move {
+                match next {
+                    Some(v) => ConfidenceReading::available(v),
+                    None => ConfidenceReading::unavailable(),
+                }
+            }
+        },
+    )
+    .await
+    .expect("级联运行不该失败");
+
+    let sent_calls = sent.borrow().clone();
+    (out, sent_calls, asked.get())
+}
+
+fn 开启(max_escalations: u8) -> CascadePolicy {
+    CascadePolicy {
+        max_escalations,
+        min_confidence: 0.6,
+    }
+}
+
+#[tokio::test]
+async fn 级联在简单请求上_只调用一次_最便宜的() {
+    let (out, sent, asked) = 跑一轮(开启(2), false, 3, vec![Some(0.9)]).await;
+
+    assert_eq!(
+        sent,
+        vec![0],
+        "第一次就够自信时只能发一次，且必须从最便宜那档（下标 0）起"
+    );
+    assert_eq!(out.attempts, 1);
+    assert_eq!(out.stop, CascadeStop::Confident);
+    assert_eq!(asked, 1, "置信度通道每次尝试问一次");
+    assert_eq!(out.value, "回答来自第 0 档");
+}
+
+#[tokio::test]
+async fn 级联在低置信度时升级到下一档() {
+    let (out, sent, _) = 跑一轮(开启(2), false, 3, vec![Some(0.1), Some(0.9)]).await;
+
+    assert_eq!(
+        sent,
+        vec![0, 1],
+        "置信度 0.1 < 0.6 必须升级；起始档依次是 0、1"
+    );
+    assert_eq!(
+        out.value, "回答来自第 1 档",
+        "采纳的必须是**后一次**的结果 —— 前一次的响应已经丢弃，\
+         返回它会让「升级」白花钱还给出旧答案"
+    );
+    assert_eq!(out.stop, CascadeStop::Confident);
+    assert_eq!(out.readings, vec![Some(0.1), Some(0.9)]);
+}
+
+#[tokio::test]
+async fn 升级次数达到上限后_不再升级() {
+    // 卡片点名的计数型断言：mock 上游调用次数 == N+1。
+    let (out, sent, _) = 跑一轮(开启(2), false, 10, vec![Some(0.0); 8]).await;
+
+    assert_eq!(sent, vec![0, 1, 2], "N=2 时必须恰好发 3 次，不是 2 次也不是 4 次");
+    assert_eq!(sent.len(), 3, "N+1 口径：上限是「升级 N 次」而不是「发 N 次」");
+    assert_eq!(out.stop, CascadeStop::MaxEscalations);
+    assert_eq!(out.readings.len(), 3, "每发一次读一次");
+    assert_eq!(out.value, "回答来自第 2 档");
+}
+
+#[tokio::test]
+async fn 候选耗尽时不再升级() {
+    let (out, sent, _) = 跑一轮(开启(2), false, 2, vec![Some(0.0); 4]).await;
+
+    assert_eq!(sent, vec![0, 1], "只有两档候选，第二次之后没有下一档了");
+    assert_eq!(
+        out.stop,
+        CascadeStop::Exhausted,
+        "原因必须报「没有下一档」而不是「到上限」——\
+         前者要用户加候选，后者要用户改配置，两者动作不同"
+    );
+}
+
+#[tokio::test]
+async fn jev_不可用时不升级() {
+    let (out, sent, asked) = 跑一轮(开启(3), false, 5, vec![None; 5]).await;
+
+    assert_eq!(
+        sent,
+        vec![0],
+        "通道不可用时**不升级**（卡片硬约束 3）：宁可用最便宜那档的结果"
+    );
+    assert_eq!(asked, 1, "问还是要问一次 —— 「不可用」是问出来的结果");
+    assert_eq!(out.stop, CascadeStop::NoConfidenceChannel);
+    assert_eq!(out.readings, vec![None]);
+}
+
+#[tokio::test]
+async fn 流式请求不走级联_直接单档() {
+    let (out, sent, asked) = 跑一轮(开启(3), true, 5, vec![Some(0.0); 5]).await;
+
+    assert_eq!(
+        sent,
+        vec![0],
+        "流式请求即使置信度为 0、上限为 3，也只能发一次 ——\
+         首个字节发出后换家需要缓冲重放（卡片硬约束 1）"
+    );
+    assert_eq!(asked, 1);
+    assert_eq!(out.stop, CascadeStop::Streaming);
+}
+
+#[tokio::test]
+async fn 级联关闭时只发一次_且不读置信度通道() {
+    // 铁律 2（模式隔离）：关着时必须与「没有这个功能」完全一样。
+    let (out, sent, asked) = 跑一轮(CascadePolicy::default(), false, 5, vec![Some(0.0); 5]).await;
+
+    assert_eq!(sent, vec![0]);
+    assert_eq!(
+        asked, 0,
+        "关着时连一次 Jev 都不该打 —— 读一次是真实调用（超时预算 + 本机推理），\
+         在后台悄悄多打一次就是「模式泄漏进常规路径」"
+    );
+    assert_eq!(out.stop, CascadeStop::Disabled);
+    assert!(out.readings.is_empty(), "没读过通道，读数就必须是空的");
+}
+
+#[tokio::test]
+async fn 越界的升级次数按夹取后的值执行() {
+    // 配置可能来自前端载荷或手改的 config.toml，`sanitized()` 只在保存路径上跑。
+    let (out, sent, _) = 跑一轮(开启(250), false, 100, vec![Some(0.0); 100]).await;
+
+    assert_eq!(
+        sent.len(),
+        4,
+        "夹取后 N=3 ⇒ N+1=4 次；不夹取就会打 100 次真实账单"
+    );
+    assert_eq!(out.stop, CascadeStop::MaxEscalations);
+}
+
+#[tokio::test]
+async fn 发送失败时直接上抛_不吞错也不重试() {
+    let policy = 开启(2);
+    let sent: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+    let error = run_cascade(
+        &policy,
+        CascadeRunRequest {
+            candidates: 3,
+            streaming: false,
+        },
+        |start| {
+            sent.borrow_mut().push(start);
+            async move { Err::<String, GatewayError>(GatewayError::ModelNotFound("全挂了".into())) }
+        },
+        |_value| async { ConfidenceReading::available(0.9) },
+    )
+    .await
+    .expect_err("从这一档到链尾都发不出去时必须报错，而不是凭空造一个结果");
+
+    assert!(matches!(error, GatewayError::ModelNotFound(_)), "{error:?}");
+    assert_eq!(
+        sent.borrow().clone(),
+        vec![0],
+        "发送失败由失败转移链内部处理（它已经逐个候选试过），\
+         级联这一层不该再换档重试 —— 那会把 N 次尝试变成 N×候选数"
+    );
+}
