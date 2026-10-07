@@ -129,9 +129,16 @@
 `raw / weight / contribution / note()`（note 回答「为什么贡献是 1.0」：
 没有数据 / 权重为 0 / 已计入）。
 
-**未做的第二半**：`ScoreBreakdown.factors` 与 `note()` **还没有界面消费者**。
-接 IPC 与界面时要把 `rank_with_intent` 里的 `CostContext` 构造抽出来复用
-（否则前端拿到的是另一套口径）。**单独一笔做。**
+**第二半也已完成**（`2483e70`）：`explain_candidates` → `explain_routing` IPC → 界面明细表。
+`score_input` 与 `cost_context` 都从 `rank_with_intent` 的路径里抽出来复用，
+所以界面上的分数**就是排序用的那个数**；不参与的候选照给并标原因
+（真实路由会 retain 掉它们，解释视图若照做，用户就看不到「我的模型为什么没出现」）；
+`ScoreFactor.reason` 改为由**后端算好**（原先是个 `note()` 方法，前端得按 raw/weight 自己推一遍）。
+判据：`cargo test --test router` → 31 passed；全量 **971 passed / 0 failed**；
+`.ui-smoke-out/capability-explain.png` 已人工确认。
+
+**D5 至此两半都完成。** 剩下的是本轮之外的两条小账
+（`total.to_bits()` 逐位对照、Escape 关菜单）与 **D4 ③**。
 
 ### 【实测结论】`route_golden` 抓不到连乘顺序的变化
 
