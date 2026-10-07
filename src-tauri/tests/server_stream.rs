@@ -263,6 +263,43 @@ async fn spawn_gateway(upstream_url: String) -> (db::Db, AppConfig, JoinHandle<(
     spawn_gateway_with_providers(vec![mock_provider(upstream_url)]).await
 }
 
+/// 同上，但把 `GatewayState` 也交出来。
+///
+/// **存在的唯一理由**：进程内验证「流式完成后健康统计确实涨了」。
+///
+/// 既有 helper 只给 `base_url`，用例拿不到 `HealthRegistry` 句柄 ——
+/// 于是「流式路径真的调了 `record_success_with_throughput`」这件事
+/// 一直没有用例守着：**把那行调用删掉，全套用例仍然全绿**
+/// （`server.rs` 里那行代码的注释就写着这句话）。
+///
+/// 走 HTTP 拿不到句柄是因为那个统计**没有对外端点**，而给它加端点属于
+/// 对外可见的接口变更，得先给方案再拍板。所以换个方向：
+/// 不暴露接口，让测试直接拿到同进程里的那个状态。
+async fn spawn_gateway_with_state(
+    providers: Vec<Provider>,
+) -> (db::Db, AppConfig, JoinHandle<()>, String, Arc<GatewayState>) {
+    let config = AppConfig {
+        port: unused_loopback_port().await,
+        unified_key: "stream-test-key".into(),
+        ..Default::default()
+    };
+    let db = db::Db::connect_in_memory().await.unwrap();
+    for provider in providers {
+        repo::upsert_provider(db.pool(), &provider).await.unwrap();
+    }
+    let gateway = Arc::new(GatewayState::new(db.clone(), config.clone()));
+    gateway.reload_providers().await.unwrap();
+    let task = tokio::spawn({
+        let gateway = gateway.clone();
+        async move {
+            let _ = serve(gateway).await;
+        }
+    });
+    let base_url = format!("http://{}:{}", config.bind, config.port);
+    wait_for_gateway(&base_url).await;
+    (db, config, task, base_url, gateway)
+}
+
 fn openai_stream_body(message: &str) -> serde_json::Value {
     serde_json::json!({
         "model": "integration-model",
@@ -794,6 +831,59 @@ async fn anthropic_and_responses_streams_emit_complete_item_lifecycles() {
     assert_eq!(responses_upstream["messages"][0]["content"], "use a tool");
     assert_eq!(responses_upstream["tools"][0]["function"]["name"], "lookup");
 
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+/// **D3 唯一没被验证的那条接线**：流式完成路径要记吞吐。
+///
+/// `server.rs` 里 `record_success_with_throughput` 那行的注释写着
+/// 「单独删时没有用例会红」—— 这条用例就是来消掉那句话的。
+#[tokio::test]
+async fn 流式完成后健康统计记下吞吐() {
+    let (upstream_url, _mock_state, upstream_task) = spawn_mock_upstream().await;
+    let (db, config, gateway_task, base_url, gateway) =
+        spawn_gateway_with_state(vec![mock_provider(upstream_url)]).await;
+    let client = reqwest::Client::new();
+
+    // 起点必须是 0：否则「后来涨到 1」可能只是别处先记过一笔，
+    // 那条断言就与流式路径无关了。
+    assert_eq!(
+        gateway
+            .health
+            .get("stream-mock", "integration-model")
+            .tps_samples,
+        0,
+        "刚起的网关不该有吞吐样本"
+    );
+
+    let response = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(&config.unified_key)
+        .header("x-session-id", "stream-tps")
+        .json(&openai_stream_body("hello"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("[DONE]"), "流要正常跑完：{body}");
+
+    // 收到 [DONE] 之后统计必须**已经**记好 —— 与上下文落库同一个口径：
+    // 不靠 sleep 等后台任务，否则「等久一点就绿」会把真问题盖住。
+    let after = gateway.health.get("stream-mock", "integration-model");
+    assert_eq!(
+        after.tps_samples, 1,
+        "流式成功路径必须记吞吐样本；为 0 说明那行 record_success_with_throughput \
+         没生效或被删了（这正是本条要守的东西）"
+    );
+    assert!(
+        after.avg_tps > 0.0,
+        "记了样本就要能算出吞吐，实际 {}",
+        after.avg_tps
+    );
+
+    let _ = db;
     gateway_task.abort();
     upstream_task.abort();
 }

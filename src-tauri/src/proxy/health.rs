@@ -311,6 +311,12 @@ impl HealthRegistry {
 /// `tests/server_stream.rs` 走真实 HTTP（`wait_for_gateway`），
 /// 拿不到 `HealthRegistry` 句柄，断言不了「流完之后 `tps_samples` 涨了」。
 ///
+/// **2026-10-08 补充**：那个「拿不到句柄」的结论只对**走 HTTP 的**用例成立。
+/// `server_stream.rs` 的 gateway 本来就在**同进程**里起（helper 返回
+/// `JoinHandle`），只是没把 `GatewayState` 交出来。让它多返回一个句柄之后，
+/// 那条 `流式完成后健康统计记下吞吐` 就能进程内直接断言 —— 所以现在
+/// **删掉流式路径那行调用会红**，两道保障同时在（本函数的单元用例 + 那条端到端）。
+///
 /// 收敛成一个函数之后，这行代码就**不可能被单独删掉**：
 /// 删它必然让 `tests/agent_upstream.rs` 里直接调本函数的用例失败。
 /// 这比「再补一条绕过 HTTP 的集成用例」省事得多，也更难绕过。

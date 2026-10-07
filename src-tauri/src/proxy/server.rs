@@ -4360,8 +4360,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         let completion_tokens = final_usage.completion_tokens;
         let total_tokens = final_usage.total_tokens;
         let latency = started.elapsed().as_millis() as u64;
-        // 记账收敛到共享函数：**删不掉那行吞吐记录**
-        // （单独删时没有用例会红，见 `record_success_with_throughput` 的注释）。
+        // 记账收敛到共享函数。**删掉下面这几行现在会红**：
+        // `server_stream.rs` 的 `流式完成后健康统计记下吞吐` 就是为它写的
+        // （在此之前这里的注释说的是「单独删时没有用例会红」—— 那句话已经过期）。
         crate::proxy::health::record_success_with_throughput(
             stream_state.health.as_ref(),
             &provider_id,

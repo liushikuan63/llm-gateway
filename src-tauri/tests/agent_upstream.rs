@@ -458,6 +458,13 @@ async fn 老_provider_读出来_runtime_id_是_none() {
 /// 流式与非流式都调 `record_success_with_throughput`，
 /// 于是「吞吐」与「成功率」这两件事**绑在一起**，删不掉其中一半
 /// —— 删掉就会让这条用例红，而它是进程内的、不依赖任何 HTTP。
+///
+/// **2026-10-08 补充**：上面那句「解法不是再补一条绕过 HTTP 的集成用例」
+/// 后来被推翻了 —— 那条路其实**没那么贵**。`server_stream.rs` 的 gateway
+/// 本来就在同进程里起，只要让它的 helper 多返回一个 `Arc<GatewayState>`，
+/// 用例就能直接读 `health`（`流式完成后健康统计记下吞吐`）。
+/// 所以现在是两道保障：这条验函数本身，那条验**流式路径真的调了它**
+/// （实测：把 `server.rs` 里那行调用注释掉，只有那条会红）。
 #[test]
 fn 流式成功路径的记账包含吞吐() {
     use llm_gateway_lib::proxy::health::{record_success_with_throughput, HealthRegistry};
