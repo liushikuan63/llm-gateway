@@ -43,6 +43,20 @@ pub struct AttemptRecord {
     pub ok: bool,
     /// 该次失败是否允许继续降级；成功时为 `false`。
     pub retryable: bool,
+    /// 任务卡二 A5/A6：这一跳走的是账号型上游时，它的运行时种类
+    /// （`codex` / `qoder`…）。`None` = 普通 API 上游。
+    ///
+    /// 【为什么放在这里而不是给 `requests` 表加列】
+    /// 卡片 A6 判据 1 要求审计能看出「这次走的是账号型上游」，
+    /// 而逐跳明细经 `attempts_json` 列**已经**进审计了。
+    /// 加一列要改 11 处 `RequestLog` 字面量（我连试两次都失败了，
+    /// 失败轨迹见 `docs/D批接续-交接单.md`）；
+    /// 而这里只需改 `AttemptRecord` 自己的构造点，**编译器会列全**。
+    ///
+    /// 更重要的是**粒度更对**：一次请求可能先撞账号型、再降级到 API 型，
+    /// 「这次是什么上游」在请求级别本来就说不清 —— 逐跳才说得清。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_kind: Option<String>,
 }
 
 const MAX_ATTEMPT_ERROR_CHARS: usize = 300;
@@ -66,6 +80,10 @@ impl AttemptRecord {
             latency_ms,
             ok: false,
             retryable: error.retryable(),
+            // 账号型上游的一跳：记下它的运行时种类。
+            // 从 `provider.runtime_id` 取 —— 那正是分派点用来选路的同一个值，
+            // 不另存一份状态（两份状态迟早不一致）。
+            runtime_kind: provider.runtime_id.clone(),
         }
     }
 
@@ -79,6 +97,7 @@ impl AttemptRecord {
             latency_ms,
             ok: true,
             retryable: false,
+            runtime_kind: provider.runtime_id.clone(),
         }
     }
 

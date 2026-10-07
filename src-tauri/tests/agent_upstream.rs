@@ -611,3 +611,123 @@ fn 消息拼成提示词是无损的() {
     // 空历史不 panic，给出空串
     assert_eq!(flatten_messages(&[]), "");
 }
+
+// ---------------- A6 判据 1：账号型上游要在审计里看得出来 ----------------
+
+/// 逐跳明细里要能看出「这一跳走的是账号型上游」。
+///
+/// ## 为什么断言在 `AttemptRecord` 上而不是审计行的列上
+///
+/// 卡片 A6 判据 1 要求审计能看出这次走的是账号型、以及实际走的 L1/L3。
+/// 实现路径选的是**逐跳明细**（经 `attempts_json` 列进审计），
+/// 而不是给 `requests` 表加列 —— 理由见 `AttemptRecord::runtime_kind`
+/// 的注释（列要改 11 处 `RequestLog` 字面量；逐跳的粒度也更对：
+/// 一次请求可能先撞账号型再降级到 API 型）。
+///
+/// 这条用例守的是「那个字段真的会被序列化进审计 JSON」——
+/// 只加字段不序列化的话，卡片判据仍然是空的。
+#[test]
+fn 账号型上游的逐跳明细带_runtime_kind() {
+    use llm_gateway_lib::domain::{Dialect, Provider};
+    use llm_gateway_lib::router::failover::AttemptRecord;
+
+    let now = chrono::Utc::now();
+    let agent_provider = Provider {
+        id: "p-codex".into(),
+        name: "codex 账号".into(),
+        dialect: Dialect::OpenAI,
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key_enc: String::new(),
+        enabled: true,
+        priority: 0,
+        models: Vec::new(),
+        rpm_limit: 0,
+        intelligence: 50,
+        note: None,
+        runtime_id: Some("codex-work".into()),
+        created_at: now,
+        updated_at: now,
+    };
+
+    let record = AttemptRecord::success(&agent_provider, "gpt-5", 100);
+    let json = serde_json::to_value(&record).expect("应当能序列化");
+    assert_eq!(
+        json.get("runtime_kind").and_then(|v| v.as_str()),
+        Some("codex-work"),
+        "审计明细里必须带 runtime_kind，实际：{json}"
+    );
+}
+
+/// **对照组**：普通 API 上游（`runtime_id` 为 `None`）不该出现这个字段。
+///
+/// 没有这一条的话，「所有明细都带 runtime_kind」也能让上面那条通过 ——
+/// 而那样审计里就分不出「谁是账号型」了。
+#[test]
+fn 普通上游的逐跳明细不带_runtime_kind() {
+    use llm_gateway_lib::domain::{Dialect, Provider};
+    use llm_gateway_lib::router::failover::AttemptRecord;
+
+    let now = chrono::Utc::now();
+    let api_provider = Provider {
+        id: "p-api".into(),
+        name: "普通 API".into(),
+        dialect: Dialect::OpenAI,
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key_enc: String::new(),
+        enabled: true,
+        priority: 0,
+        models: Vec::new(),
+        rpm_limit: 0,
+        intelligence: 50,
+        note: None,
+        runtime_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let record = AttemptRecord::success(&api_provider, "gpt-5", 100);
+    let json = serde_json::to_value(&record).expect("应当能序列化");
+    assert!(
+        json.get("runtime_kind").is_none(),
+        "普通上游不该带 runtime_kind（skip_serializing_if 守着它），实际：{json}"
+    );
+}
+
+/// 失败路径也要带 —— 这才是排查时最需要的（账号型挂了要看得出来）。
+#[test]
+fn 账号型上游的失败明细也带_runtime_kind() {
+    use llm_gateway_lib::domain::{Dialect, Provider};
+    use llm_gateway_lib::error::GatewayError;
+    use llm_gateway_lib::router::failover::AttemptRecord;
+
+    let now = chrono::Utc::now();
+    let provider = Provider {
+        id: "p-qoder".into(),
+        name: "qoder 账号".into(),
+        dialect: Dialect::OpenAI,
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key_enc: String::new(),
+        enabled: true,
+        priority: 0,
+        models: Vec::new(),
+        rpm_limit: 0,
+        intelligence: 50,
+        note: None,
+        runtime_id: Some("qoder-main".into()),
+        created_at: now,
+        updated_at: now,
+    };
+
+    let err = GatewayError::Timeout("qoder 在 300 秒内没有结束".into());
+    let record = AttemptRecord::failure(&provider, "auto", &err, 300_000);
+    let json = serde_json::to_value(&record).expect("应当能序列化");
+    assert_eq!(
+        json.get("runtime_kind").and_then(|v| v.as_str()),
+        Some("qoder-main"),
+        "失败明细同样要带，实际：{json}"
+    );
+    assert_eq!(
+        json.get("ok").and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+}
