@@ -202,6 +202,59 @@ impl AgentAdapter for QoderAdapter {
 mod tests {
     use super::*;
 
+    /// **抓取实际命令行** —— 卡片 B5 判据 1 明确要求：
+    /// 「用**抓取实际命令行**的测试断言，不许只断言配置字段」。
+    ///
+    /// `stream_args` 的断言只证明「我构造的参数对」；这条证明
+    /// **参数真的被传给了子进程**（`run_json_cli` 没把它们丢掉、
+    /// 没重排、没吃掉以 `=` 结尾的那种）。
+    ///
+    /// 做法：让一个 mock 程序**把自己的 argv 原样回显**出来，
+    /// 然后断言回显内容。回显是子进程视角的证据，不是我的构造。
+    #[tokio::test]
+    async fn 实际命令行里带的是无工具参数() {
+        // mock：把收到的每个参数用 `|` 连起来打到 stdout。
+        // Windows 用 cmd 的 `%*`；非 Windows 用 sh 的 `$@`。
+        #[cfg(windows)]
+        let (program, _extra) = ("cmd".to_string(), ());
+        #[cfg(windows)]
+        let mut argv = vec!["/C".to_string(), "echo %*".to_string()];
+        #[cfg(not(windows))]
+        let (program, mut argv) = (
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "echo \"$@\"".to_string(),
+                "sh".to_string(),
+            ],
+        );
+
+        // 把被测参数接到 mock 自己的参数之后
+        let real = stream_args("提示词");
+        argv.extend(real.iter().cloned());
+
+        let captured = super::super::run_json_cli(&program, &argv, 30_000, "argv-probe")
+            .await
+            .expect("mock 应当正常退出");
+
+        // ① 无工具参数**确实到了子进程**
+        assert!(
+            captured.contains("--tools="),
+            "实际命令行里必须带 `--tools=`（空值）—— 卡片要求「工具默认关闭」，\
+             而实测省略它时 CLI 默认带 31 个工具。抓到的命令行：{captured:?}"
+        );
+        // ② 提示词也到了
+        assert!(
+            captured.contains("提示词"),
+            "提示词必须真的传给子进程，抓到：{captured:?}"
+        );
+        // ③ 绝不出现绕过沙箱的开关
+        assert!(
+            !captured.contains("dangerously") && !captured.contains("bypass"),
+            "绝不许绕过沙箱，抓到：{captured:?}"
+        );
+    }
+
     /// 实测事件流（未登录，逐字取自 2026-10-07 的抓包，只截掉无关字段）。
     const REAL_UNAUTH: &str = r#"{"type":"system","subtype":"init","qodercli_version":"1.1.65","protocol_version":"1.5.0","tools":[],"session_id":"e7bed54a"}
 {"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"Not logged in 路 Please run /login"}]},"session_id":"e7bed54a","error":"authentication_failed"}
