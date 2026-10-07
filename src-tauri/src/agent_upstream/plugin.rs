@@ -282,3 +282,110 @@ pub fn pick_response<'a>(
         }
     ))
 }
+
+// ============================ 适配器 ============================
+
+/// 一次往返的传输层。
+///
+/// 抽成 trait 的目的很具体：**协议逻辑不该依赖真进程**。
+/// 真实现（子进程 + stdin/stdout）与测试用的假实现各一份，而
+/// 「请求编码对不对、响应怎么配对、插件报错怎么办」这些能在假实现上全测完 ——
+/// 真进程那一格就只剩「起进程 / 收流 / 超时杀树 / 孤儿清理」。
+///
+/// `timeout_ms` 由调用方给而不是 transport 自己定：超时是**请求级**的
+/// （`AgentRequest.timeout_ms`），传输层只是执行者。
+#[async_trait::async_trait]
+pub trait PluginTransport: Send + Sync {
+    /// 送一行出去，回它吐出来的行。
+    async fn exchange(&self, line: &str, timeout_ms: u64) -> Result<Vec<String>, String>;
+}
+
+/// 按 B8 协议与外部插件对话的适配器。
+pub struct ExternalAdapter {
+    id: &'static str,
+    label: &'static str,
+    transport: std::sync::Arc<dyn PluginTransport>,
+}
+
+impl ExternalAdapter {
+    /// 用描述文件与一个 transport 建适配器。
+    ///
+    /// 【为什么要 `Box::leak`】`AgentAdapter::id()` 的契约是 `&'static str`
+    /// —— A5 刻意用它逼 id 在编译期定死，因为改名等于破坏用户配置里的引用。
+    /// 而外部插件的 id 来自**运行时的描述文件**，两者天然冲突。
+    /// 插件在进程生命周期内不会被卸载，泄漏的是每插件几十字节；
+    /// 为一个桥接需求去改整个 trait 契约（进而动到 A5/A6/A7 全部适配器）
+    /// 是拿大炮打蚊子。**这条冲突本身记在交接单里**，将来若要动态卸载插件
+    /// 就得回来改契约。
+    pub fn new(manifest: &PluginManifest, transport: std::sync::Arc<dyn PluginTransport>) -> Self {
+        Self {
+            id: Box::leak(manifest.id.clone().into_boxed_str()),
+            label: Box::leak(manifest.kind.clone().into_boxed_str()),
+            transport,
+        }
+    }
+
+    /// 一次完整的往返：生成 request_id → 编码 → 送出去 → 按 id 配对。
+    ///
+    /// `request_id` 由**网关**生成（不是让插件回显它收到的）：插件可以不回显，
+    /// 而网关必须能区分「这条响应是不是我要的那条」。
+    async fn round_trip(
+        &self,
+        kind: PluginRequestKind,
+        timeout_ms: u64,
+    ) -> Result<PluginResponse, String> {
+        let request_id = uuid::Uuid::new_v4().simple().to_string();
+        let line = encode_request(&PluginRequest {
+            request_id: request_id.clone(),
+            kind,
+        })?;
+        let lines = self.transport.exchange(&line, timeout_ms).await?;
+        pick_response(lines.iter().map(String::as_str), &request_id)
+    }
+
+    /// 探活。
+    pub async fn probe(&self, timeout_ms: u64) -> Result<bool, String> {
+        self.round_trip(PluginRequestKind::Probe, timeout_ms)
+            .await?
+            .ready()
+    }
+
+    /// 列出插件支持的模型。
+    pub async fn list_models(&self, timeout_ms: u64) -> Result<Vec<String>, String> {
+        self.round_trip(PluginRequestKind::ListModels, timeout_ms)
+            .await?
+            .models()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::agent_upstream::AgentAdapter for ExternalAdapter {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn label(&self) -> &'static str {
+        self.label
+    }
+
+    async fn send(
+        &self,
+        request: crate::agent_upstream::AgentRequest,
+    ) -> Result<crate::agent_upstream::AgentReply, String> {
+        let response = self
+            .round_trip(
+                PluginRequestKind::Complete {
+                    model: request.model,
+                    prompt: request.prompt,
+                },
+                request.timeout_ms,
+            )
+            .await?;
+        Ok(crate::agent_upstream::AgentReply {
+            text: response.text()?,
+            // 如实回报走了哪条传输：这是一个**外部插件**，
+            // 与内置的 L1/L3/fake 都不是一回事，审计里要能分开。
+            transport: "external".into(),
+        })
+    }
+}

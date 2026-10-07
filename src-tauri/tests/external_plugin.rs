@@ -8,9 +8,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use llm_gateway_lib::agent_upstream::plugin::{
-    encode_request, parse_manifest, pick_response, validate_manifest, PluginManifest,
-    PluginRequest, PluginRequestKind, PluginResponse, SUPPORTED_PROTOCOL,
+    encode_request, parse_manifest, pick_response, validate_manifest, ExternalAdapter,
+    PluginManifest, PluginRequest, PluginRequestKind, PluginResponse, PluginTransport,
+    SUPPORTED_PROTOCOL,
 };
+use llm_gateway_lib::agent_upstream::{AgentAdapter, AgentRequest};
 
 /// 一个能用的最小描述文件。
 fn 描述文件(id: &str) -> String {
@@ -262,4 +264,157 @@ fn 结果形状不对时报错并带原文() {
     assert_eq!(ok.text().unwrap(), "好");
     assert_eq!(ok.models().unwrap(), vec!["a".to_string(), "b".to_string()]);
     assert!(ok.ready().unwrap());
+}
+
+// ==================== 最小参考插件：三个请求跑通 ====================
+
+/// 一个**最小参考插件**：按协议回答三种请求，只回固定文本。
+///
+/// 它同时也是「插件爱往 stdout 打日志」的模拟器 —— 那是最容易被忽略、
+/// 又最容易让整套东西不可用的情形。
+struct 参考插件 {
+    收到的: std::sync::Mutex<Vec<serde_json::Value>>,
+    啰嗦: bool,
+}
+
+impl 参考插件 {
+    fn new(啰嗦: bool) -> Self {
+        Self {
+            收到的: std::sync::Mutex::new(Vec::new()),
+            啰嗦,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PluginTransport for 参考插件 {
+    async fn exchange(&self, line: &str, _timeout_ms: u64) -> Result<Vec<String>, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("网关发来的不是合法 JSON：{e}"))?;
+        self.收到的.lock().unwrap().push(value.clone());
+        let request_id = value["request_id"]
+            .as_str()
+            .ok_or("请求里没有 request_id")?
+            .to_string();
+        let mut out = Vec::new();
+        if self.啰嗦 {
+            // 插件自己的日志。协议要求网关能跳过它。
+            out.push("[ref-plugin] 收到一条请求，正在处理".to_string());
+        }
+        let result = match value["type"].as_str().unwrap_or("") {
+            "probe" => serde_json::json!({ "ready": true }),
+            "list_models" => serde_json::json!({ "models": ["ref-small", "ref-large"] }),
+            "complete" => serde_json::json!({
+                "text": format!(
+                    "参考插件收到了：{}",
+                    value["prompt"].as_str().unwrap_or("")
+                )
+            }),
+            other => {
+                out.push(
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "error": format!("不认识的请求类型 {other}"),
+                    })
+                    .to_string(),
+                );
+                return Ok(out);
+            }
+        };
+        out.push(serde_json::json!({ "request_id": request_id, "result": result }).to_string());
+        Ok(out)
+    }
+}
+
+fn 建适配器(啰嗦: bool) -> (ExternalAdapter, std::sync::Arc<参考插件>) {
+    let manifest = parse_manifest(&描述文件("ref")).unwrap();
+    let transport = std::sync::Arc::new(参考插件::new(啰嗦));
+    (
+        ExternalAdapter::new(&manifest, transport.clone()),
+        transport,
+    )
+}
+
+/// **卡片判据 1**：用一个最小参考插件跑通三个请求。
+#[tokio::test]
+async fn 最小参考插件跑通三个请求() {
+    let (adapter, 插件) = 建适配器(false);
+
+    assert!(adapter.probe(2_000).await.expect("probe 应当成功"));
+    assert_eq!(
+        adapter
+            .list_models(2_000)
+            .await
+            .expect("list_models 应当成功"),
+        vec!["ref-small".to_string(), "ref-large".to_string()]
+    );
+
+    let reply = adapter
+        .send(AgentRequest {
+            model: "ref-small".into(),
+            prompt: "你好".into(),
+            timeout_ms: 2_000,
+        })
+        .await
+        .expect("complete 应当成功");
+    assert!(
+        reply.text.contains("你好"),
+        "提示词要真的送到插件手里：{}",
+        reply.text
+    );
+    // 传输要如实回报 —— 审计靠它区分内置适配器与外部插件
+    assert_eq!(reply.transport, "external");
+
+    // 三条请求各发了一次，且**类型没串**
+    let 收到 = 插件.收到的.lock().unwrap();
+    assert_eq!(收到.len(), 3, "三个请求应当各发一次");
+    let 类型: Vec<&str> = 收到
+        .iter()
+        .map(|v| v["type"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(类型, vec!["probe", "list_models", "complete"]);
+    // 每次请求的 request_id 必须不同 —— 复用会让配对串到别的响应上
+    let ids: std::collections::HashSet<&str> = 收到
+        .iter()
+        .map(|v| v["request_id"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(ids.len(), 3, "三次请求的 request_id 不能重复");
+}
+
+/// 插件往 stdout 打日志时，三个请求**照样**要跑通。
+#[tokio::test]
+async fn 插件啰嗦时三个请求照样跑通() {
+    let (adapter, _) = 建适配器(true);
+    assert!(adapter.probe(2_000).await.expect("probe 应当成功"));
+    assert_eq!(adapter.list_models(2_000).await.unwrap().len(), 2);
+    let reply = adapter
+        .send(AgentRequest {
+            model: "ref-small".into(),
+            prompt: "再说一次".into(),
+            timeout_ms: 2_000,
+        })
+        .await
+        .unwrap();
+    assert!(reply.text.contains("再说一次"));
+}
+
+/// 插件报错 ⇒ 网关拿到可读错误（而不是一个空的成功回复）。
+#[tokio::test]
+async fn 不认识的请求类型能报错() {
+    struct 只回错误;
+    #[async_trait::async_trait]
+    impl PluginTransport for 只回错误 {
+        async fn exchange(&self, line: &str, _timeout_ms: u64) -> Result<Vec<String>, String> {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let id = value["request_id"].as_str().unwrap();
+            Ok(vec![
+                serde_json::json!({ "request_id": id, "error": "不认识的请求类型" }).to_string(),
+            ])
+        }
+    }
+    let manifest = parse_manifest(&描述文件("ref")).unwrap();
+    let adapter = ExternalAdapter::new(&manifest, std::sync::Arc::new(只回错误));
+    let err = adapter.probe(1_000).await.unwrap_err();
+    assert!(err.contains("插件报告失败"), "{err}");
+    assert!(err.contains("不认识的请求类型"), "{err}");
 }
