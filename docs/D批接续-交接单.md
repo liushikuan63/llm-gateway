@@ -448,3 +448,39 @@ codex exec --json --skip-git-repo-check --ephemeral "say hi"
 
 要还它需要：`requests` 表加 `runtime_kind` 与 `transport` 两列 +
 审计写入点带上它们。**独立一笔**，不要和别的改动混在一起。
+
+### 还这笔账时**别踩我踩过的坑**（2026-10-07 实测失败轨迹）
+
+我按「在 `RequestLog { … }` 字面量的收尾 `}` 前插入两个字段」写了个脚本，
+**11 处全插错了位置**，编译报 `expected identifier, found ':'`。
+
+**根因**：`RequestLog { … }` 在 `server.rs` 里是**嵌套**的 ——
+外层还有一个结构体字面量（`log: RequestLog { … }` 只是其中一个字段），
+所以我那套「`{`/`}` 计数到负就当收尾」的启发式**先撞上了内层
+`route: Default::default(),` 那个块的 `}`**。
+
+插入结果长这样（`server.rs:1095`）：
+
+```rust
+                        route: Default::default(),
+                    },
+                )
+                .await;
+                runtime_kind: None,      // ← 插到了 await 之后
+                agent_transport: None,
+            });
+```
+
+**已全部回滚**（`git checkout --` 那 6 个文件），`cargo check --all-targets`
+退出码 0 确认仓库回到干净状态。
+
+**下次正确做法**（二选一）：
+1. **别写脚本**：11 处而已，逐个用 `edit` 工具改 —— 它按真实文本匹配，
+   且能一眼看见插在哪。**嵌套结构上，脚本的省事是假的。**
+2. 真要写脚本，锚点用**字段名**而不是括号：找到 `trace_id: …` 那一行
+   （它在每个字面量里都有且唯一），在它**后面**插。这比括号计数稳得多。
+
+**教训归一句话**：括号计数只在「字面量没有嵌套」时成立，
+而 Rust 的结构体字面量**天然会嵌套**。这跟本会话前面那条
+「多行 `String.Replace` 在 CRLF 文件上必然失败」是同一类问题 ——
+**用文本启发式改代码，先确认启发式的前提在这个文件里成立。**
