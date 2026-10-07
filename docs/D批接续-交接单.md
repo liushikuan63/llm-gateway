@@ -185,6 +185,34 @@ Rust：`cargo test --jobs 1 -- --skip 真机_` → **970 passed / 0 failed / exi
 
 ---
 
+## 〇·四、D4 ③ 落地：三格全部完成（2026-10-07 22:0x）
+
+`175f409`：`requests` 加 `user_pinned_model` / `session_model_switches` 两列
+（`INTEGER DEFAULT 0`，让历史行如实落到「没有信号」），采集**只做不训练**。
+两个值都在 `log_request_at` 内部算，**9 个调用点一行没改**；
+虚拟模型名的判定收敛到 `config::is_explicit_model_name`（与 `RoutingStrategy`
+的档位名同源），分类器与采集共用一份。
+
+判据：`cargo test --test db` → 13 passed；全量 **975 passed / 0 failed**；
+clippy / fmt 退出码 0；注违规自检（每次 +1）⇒ 恰好 1 条红。
+
+### 【重要教训】异步写入路径上**不要多加一次 round-trip**
+
+第一版把换模型计数写成「先 SELECT 最近一条，再 INSERT」。结果
+`tests/budget_gate.rs` **三条看起来毫无关系**的断言同时变红：
+`access_key_id` 归属（期望 1 查到 0）、403 不写行（期望 0 查到 1）、
+429 前计数（期望 1 查到 2）。
+
+根因不是列、不是绑定顺序 —— 是**审计写入在异步路径上**，而调用方在请求
+返回后立刻查计数。多一次 round-trip 让写入慢了一拍，于是「查的时候还没写完」。
+改成 `INSERT ... VALUES (..., COALESCE((SELECT CASE WHEN routed_model IS ? …, 0))`
+之后三条立刻恢复。语义还更准：`IS` 而不是 `=`，两边都是 NULL 也算「没换」。
+
+**下次在 `log_request_at` 这类被异步调用的写入函数里加查询前，先跑一遍
+`budget_gate` 与 `server_e2e`。**
+
+---
+
 ## 一、当前状态（一眼看懂）
 
 **分支** `main`，与 `origin` 同步。任务卡一 A/B/C 三批完成；
