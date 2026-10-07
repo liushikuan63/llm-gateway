@@ -101,6 +101,52 @@ impl WorkspaceRoot {
     }
 }
 
+/// 卡片 A8 的默认产物根：`<base>/runtimes/<id>/workspace`。
+///
+/// ## `runtime_id` 必须**消毒**，它来自用户配置
+///
+/// 直接把用户给的字符串拼进路径的话，`runtime_id = "../../.."` 或
+/// `"C:\Windows"` 就能把产物根**指到任何地方** —— 而产物根是
+/// 「agent 能写哪里」的唯一决定点，它被指走等于落盘边界整个失效。
+///
+/// 所以规则是**白名单**：只允许 ASCII 字母、数字、`-`、`_`、`.`，
+/// 且不允许 `.` / `..` 这两个组件本身。别的字符一律拒绝并报错 ——
+/// **不是替换成 `_`**：替换会让 `a/b` 与 `a_b` 撞成同一个目录，
+/// 两个运行时共用产物根，那是更难查的问题。
+pub fn default_workspace_root(
+    base: impl AsRef<Path>,
+    runtime_id: &str,
+) -> Result<WorkspaceRoot, String> {
+    if runtime_id.is_empty() {
+        return Err("运行时 id 为空，无法确定产物根".into());
+    }
+    if runtime_id == "." || runtime_id == ".." {
+        return Err(format!(
+            "运行时 id 是路径组件 `{runtime_id}`，拒绝用它做产物根"
+        ));
+    }
+    let bad: Vec<char> = runtime_id
+        .chars()
+        .filter(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.'))
+        .collect();
+    if !bad.is_empty() {
+        return Err(format!(
+            "运行时 id `{runtime_id}` 含不允许的字符：{:?}。\
+             只允许 ASCII 字母、数字、`-`、`_`、`.` —— \
+             它是目录名的一部分，不能含分隔符或盘符",
+            bad
+        ));
+    }
+    // 到这里 id 已是单一路径组件（无分隔符、非 `.`/`..`），
+    // join 不可能逃出 base。再走一遍 WorkspaceRoot 的构造做最终确认。
+    WorkspaceRoot::new(
+        base.as_ref()
+            .join("runtimes")
+            .join(runtime_id)
+            .join("workspace"),
+    )
+}
+
 /// 规范化：把 `..` / `.` 消解掉，并对**已存在的最深祖先**做
 /// `canonicalize`（处理软链接与大小写）。
 fn normalize(path: &Path, _root: &Path) -> Option<PathBuf> {
@@ -230,6 +276,88 @@ mod tests {
         let r = root("dots");
         assert!(r.contains("./a.txt"));
         assert!(r.contains("sub/././b.txt"));
+    }
+
+    // ------------------- 默认产物根（A8） -------------------
+
+    fn base(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("llmgw-ws-base-{name}"));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn 默认产物根拼成_runtimes_id_workspace() {
+        let b = base("layout");
+        let ws = default_workspace_root(&b, "codex-work").expect("应当能建");
+        assert!(
+            ws.as_path().ends_with(
+                std::path::Path::new("runtimes")
+                    .join("codex-work")
+                    .join("workspace")
+            ),
+            "路径形状要与卡片一致，实际：{}",
+            ws.as_path().display()
+        );
+        // 而且它确实在 base 之下
+        let canon_base = b.canonicalize().expect("base 应当已建出来");
+        assert!(ws.as_path().starts_with(&canon_base));
+    }
+
+    /// **穿越攻击必须被拒** —— 这是这个函数存在的全部理由。
+    #[test]
+    fn 运行时_id_里的路径穿越被拒() {
+        let b = base("traverse");
+        for evil in [
+            "..",
+            ".",
+            "../..",
+            "..\\..",
+            "a/b",
+            "a\\b",
+            "C:\\Windows",
+            "/etc",
+            "con:",   // Windows 保留名的一种写法
+            "a b",    // 空格（不在白名单里）
+            "运行时", // 非 ASCII
+            "",       // 空
+        ] {
+            let r = default_workspace_root(&b, evil);
+            assert!(
+                r.is_err(),
+                "id `{evil}` 必须被拒 —— 它能逃出基准目录或与别的 id 撞车"
+            );
+        }
+    }
+
+    /// 对照组：正常 id 必须能用。
+    /// 没有这一条的话，「全都拒绝」也能让上面那条通过。
+    #[test]
+    fn 合法的运行时_id_能通过() {
+        let b = base("valid");
+        for ok in [
+            "codex",
+            "codex-work",
+            "codex_work",
+            "qoder.1",
+            "a",
+            "A1-b_2.c",
+        ] {
+            assert!(
+                default_workspace_root(&b, ok).is_ok(),
+                "合法 id `{ok}` 不该被拒"
+            );
+        }
+    }
+
+    /// 两个不同 id 的产物根**必须不同** ——
+    /// 这正是「用替换而不是拒绝」会踩的坑（`a/b` 与 `a_b` 会撞成同一个）。
+    #[test]
+    fn 不同_id_的产物根不重合() {
+        let b = base("distinct");
+        let a = default_workspace_root(&b, "alpha").unwrap();
+        let c = default_workspace_root(&b, "beta").unwrap();
+        assert_ne!(a.as_path(), c.as_path());
     }
 
     #[test]
