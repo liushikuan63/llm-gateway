@@ -678,18 +678,86 @@ struct AgentRunRequest {
 
 async fn gw_agent_run(
     State(state): State<Arc<GatewayState>>,
+    Extension(auth): Extension<AuthContext>,
     Json(req): Json<AgentRunRequest>,
 ) -> Response {
     let cfg = state.cfg_snapshot();
-    match crate::agent_upstream::run_agent_request(
+    let started = Instant::now();
+    let outcome = crate::agent_upstream::run_agent_request(
         &cfg.agent,
         &state.adapters,
         &req.runtime,
         &req.model,
         &req.prompt,
     )
+    .await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    // ===== 审计：`route_intent = "agent"` + 产物清单（卡片 A8 要求）=====
+    //
+    // 【为什么零 schema 变更】`attempts_json` 是**自由形态**的 TEXT 列，
+    // 而 `route.intent` 已有独立列。语义上也对：`attempts_json` 是
+    // 「这次请求逐次尝试的明细」，一次 Agent 执行正是一次尝试。
+    //
+    // 对一个「加列要改 11 处 `RequestLog` 字面量」的表来说，
+    // 「不用加列」这件事很重要 —— 那笔账本会话连败两次，
+    // 见 `docs/D批接续-交接单.md`。
+    let detail = match &outcome {
+        Ok(o) => serde_json::json!([{
+            "runtime_kind": req.runtime,
+            "transport": o.transport,
+            "artifacts": o.artifacts,
+            "ok": true,
+        }]),
+        Err(message) => serde_json::json!([{
+            "runtime_kind": req.runtime,
+            "error": message,
+            "ok": false,
+        }]),
+    };
+    let detail_json = serde_json::to_string(&detail).ok();
+    let trace_id = crate::trace::new_trace_id();
+    let status = if outcome.is_ok() { 200 } else { 400 };
+    let error_text = outcome.as_ref().err().cloned();
+    // 审计写失败**不该影响响应** —— 用户已经拿到结果了。
+    // 但必须留一条日志，否则「审计丢了」这件事没人知道。
+    if let Err(e) = repo::log_request(
+        state.db.pool(),
+        repo::RequestLog {
+            session_id: None,
+            client: auth.client.as_deref(),
+            requested_model: &req.model,
+            // 账号型上游里 `runtime_id` 就是「谁服务的」，
+            // 与普通上游的 provider 同义。
+            routed_provider: Some(&req.runtime),
+            routed_model: Some(&req.model),
+            status: Some(status),
+            latency_ms: latency_ms as i64,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            fallback_attempts: 0,
+            error: error_text.as_deref(),
+            cost: None,
+            currency: None,
+            rate_label: None,
+            estimated_prompt_tokens: None,
+            attempts_json: detail_json.as_deref(),
+            access_key_id: crate::budget::access_key_id_of(auth.client.as_deref()),
+            refined_prompt: None,
+            trace_id: &trace_id,
+            route: repo::RouteTrace {
+                // 卡片原文要求新增 `route_intent=agent`。
+                intent: Some("agent".to_string()),
+                ..Default::default()
+            },
+        },
+    )
     .await
     {
+        tracing::warn!("Agent 执行的审计写入失败：{e}");
+    }
+
+    match outcome {
         Ok(outcome) => Json(serde_json::json!({
             "text": outcome.text,
             "transport": outcome.transport,
