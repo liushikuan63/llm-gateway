@@ -19,10 +19,12 @@
 pub mod adapter;
 pub mod codex;
 pub mod fake;
+pub mod qoder;
 
 pub use adapter::{AgentAdapter, AgentReply, AgentRequest};
 pub use codex::CodexAdapter;
 pub use fake::FakeAdapter;
+pub use qoder::QoderAdapter;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -55,6 +57,9 @@ impl AdapterRegistry {
         // 未登录会在 `send` 时给出可读错误，而不是在注册时失败。
         // 这样「配了但没登录」的用户拿到的是明确提示，而不是「找不到适配器」。
         registry.register(Arc::new(CodexAdapter::default()));
+        // A7：Qoder。**它的存在就是 A5 抽象的验收** —— 加它只做了三件事：
+        // 实现 trait、注册一行、写 qoder.rs。**没有改动 A5 的任何抽象。**
+        registry.register(Arc::new(QoderAdapter::default()));
         registry
     }
 
@@ -189,7 +194,6 @@ pub async fn call_agent(
         })?;
     Ok(reply.into_chat_response(model))
 }
-
 
 /// 跑一个「输出 JSON 行」的外部 CLI，带**超时 + 杀进程树 + cwd 隔离**。
 ///

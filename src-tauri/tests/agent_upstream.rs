@@ -138,16 +138,15 @@ async fn 迁移可重入_重复跑不报错也不丢数据() {
 // ------------------------------ 抽象层 ------------------------------
 
 #[test]
-fn 注册表装着假适配器与_codex() {
+fn 注册表装着三个适配器() {
     use llm_gateway_lib::agent_upstream::AdapterRegistry;
     let r = AdapterRegistry::with_builtins();
     assert_eq!(
         r.ids(),
-        vec!["codex", "fake"],
-        "生产注册表：假适配器（A5）+ Codex（A6 L3）。\
-         A7 加 qoder、以及以后每加一个适配器，这条断言都要跟着改 —— \
-         它是**刻意的**：注册表是「用户能配哪些运行时」的唯一来源，\
-         多一个少一个都该被人看见"
+        vec!["codex", "fake", "qoder"],
+        "生产注册表：假适配器（A5）+ Codex（A6 L3）+ Qoder（A7 L3）。\
+         以后每加一个适配器这条断言都要跟着改 —— 它是**刻意的**：\
+         注册表是「用户能配哪些运行时」的唯一来源，多一个少一个都该被人看见"
     );
 }
 
