@@ -442,3 +442,59 @@ async fn 老_provider_读出来_runtime_id_是_none() {
          也是模式隔离的入口"
     );
 }
+
+// ------------------ D3 流式吞吐：把「删得掉的那行」钉住 ------------------
+
+/// **这条用例的存在本身就是为了让某个删除动作失败。**
+///
+/// 背景：流式路径的 `record_tps` 曾被注违规自检发现「删掉它整套用例仍全绿」
+/// —— `tests/server_stream.rs` 走真实 HTTP（`wait_for_gateway`），
+/// 拿不到 `HealthRegistry` 句柄，断言不了「流完之后 `tps_samples` 涨了」。
+///
+/// 解法不是再补一条绕过 HTTP 的集成用例（那要造 `AppState` + mock 上游 +
+/// 带 usage 的流式响应），而是把两条路径的记账**收敛成一个函数**：
+/// 流式与非流式都调 `record_success_with_throughput`，
+/// 于是「吞吐」与「成功率」这两件事**绑在一起**，删不掉其中一半
+/// —— 删掉就会让这条用例红，而它是进程内的、不依赖任何 HTTP。
+#[test]
+fn 流式成功路径的记账包含吞吐() {
+    use llm_gateway_lib::proxy::health::{record_success_with_throughput, HealthRegistry};
+
+    let health = HealthRegistry::new();
+    // 一次成功的流式请求：1.5 秒、吐了 750 token ⇒ 500 tok/s
+    record_success_with_throughput(&health, "p", "m", 1_500, 750);
+
+    let got = health.get("p", "m");
+    // ① 成功率/延迟照旧被记（这一半是原有行为）
+    assert_eq!(got.avg_latency_ms, 1_500, "延迟必须仍然被记");
+    // ② **吞吐这一半也必须被记** —— 这条就是那根钉子
+    assert_eq!(
+        got.tps_samples, 1,
+        "流式成功路径必须记吞吐样本；为 0 说明 record_success_with_throughput \
+         里的 record_tps 那一行被拿掉了"
+    );
+    assert!(
+        (got.avg_tps - 500.0).abs() < 1e-3,
+        "750 token / 1.5s 应当是 500 tok/s，实际 {}",
+        got.avg_tps
+    );
+}
+
+/// 对照组：`completion_tokens = 0` 时**不记样本**（不是记成 0）。
+///
+/// 流式的 usage 往往在最后一个 chunk 才出现，中间帧没有它。
+/// 把 0 记进去会把 EWMA 拉向 0，而 0 在约定里表示「无样本」——
+/// 两者混起来之后 `min_efficiency_samples` 就判不准了。
+#[test]
+fn 没有完成_token_时不记吞吐样本() {
+    use llm_gateway_lib::proxy::health::{record_success_with_throughput, HealthRegistry};
+
+    let health = HealthRegistry::new();
+    record_success_with_throughput(&health, "p", "m", 1_000, 0);
+    let got = health.get("p", "m");
+    // 延迟照记（成功就是成功）
+    assert_eq!(got.avg_latency_ms, 1_000);
+    // 但吞吐**没有样本**，而不是「0 tok/s」
+    assert_eq!(got.tps_samples, 0);
+    assert_eq!(got.avg_tps, 0.0);
+}

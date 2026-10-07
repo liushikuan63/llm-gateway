@@ -300,3 +300,33 @@ impl HealthRegistry {
         }
     }
 }
+
+/// 上游一次**成功**之后的完整记账：成功率/延迟 + 实测吞吐。
+///
+/// ## 为什么必须是一个共享函数（这段注释是有用例支撑的）
+///
+/// 非流式与流式两条路径原先各写各的 `record_success`，而
+/// 「记实测吞吐」只加在了非流式那处。把流式那处补上之后做注违规自检发现：
+/// **把补的那行删掉，整套用例仍然全绿** —— 因为
+/// `tests/server_stream.rs` 走真实 HTTP（`wait_for_gateway`），
+/// 拿不到 `HealthRegistry` 句柄，断言不了「流完之后 `tps_samples` 涨了」。
+///
+/// 收敛成一个函数之后，这行代码就**不可能被单独删掉**：
+/// 删它必然让 `tests/agent_upstream.rs` 里直接调本函数的用例失败。
+/// 这比「再补一条绕过 HTTP 的集成用例」省事得多，也更难绕过。
+///
+/// 两个参数 `latency_ms` 与 `completion_tokens` 都来自**同一个**
+/// 上游结果 —— 分开传值而不是传一个结构体，是因为两个调用点手里的
+/// 变量名不同（`o.value.usage` / `final_usage`），
+/// 硬凑一个结构体只会多一层转换。
+pub fn record_success_with_throughput(
+    health: &HealthRegistry,
+    provider_id: &str,
+    model: &str,
+    latency_ms: u32,
+    completion_tokens: u32,
+) {
+    health.record_success(provider_id, model, latency_ms);
+    // 这一行是**被用例钉住的**：删它 → `流式成功路径的记账包含吞吐` 变红。
+    health.record_tps(provider_id, model, completion_tokens, latency_ms);
+}

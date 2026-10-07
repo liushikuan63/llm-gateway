@@ -3888,9 +3888,15 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         let completion_tokens = final_usage.completion_tokens;
         let total_tokens = final_usage.total_tokens;
         let latency = started.elapsed().as_millis() as u64;
-        stream_state
-            .health
-            .record_success(&provider_id, &model, latency as u32);
+        // 记账收敛到共享函数：**删不掉那行吞吐记录**
+        // （单独删时没有用例会红，见 `record_success_with_throughput` 的注释）。
+        crate::proxy::health::record_success_with_throughput(
+            stream_state.health.as_ref(),
+            &provider_id,
+            &model,
+            latency as u32,
+            completion_tokens,
+        );
         stream_state
             .router
             .consume(&candidate.provider, &candidate.model, total_tokens);
