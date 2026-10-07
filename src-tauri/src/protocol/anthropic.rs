@@ -350,6 +350,8 @@ pub fn anthropic_to_internal(v: &serde_json::Value) -> crate::domain::ChatRespon
     let u = v.get("usage").cloned().unwrap_or(json!({}));
 
     crate::domain::ChatResponse {
+        // 普通 API 上游没有「传输」这个概念（A6 判据 1 只对账号型上游有意义）。
+        transport: None,
         id: v
             .get("id")
             .and_then(|x| x.as_str())

@@ -271,6 +271,8 @@ fn openai_tool_calls_round_trip_with_type_not_internal_kind() {
             id: "id_1".into(),
             model: "gpt-4o".into(),
             content: String::new(),
+            // 这里构造的是**普通 API 上游**的响应，没有「传输」概念。
+            transport: None,
             tool_calls: Some(vec![tool_call("call_1", "get_weather", "{}")]),
             finish_reason: Some("tool_calls".into()),
             usage: Some(Usage {

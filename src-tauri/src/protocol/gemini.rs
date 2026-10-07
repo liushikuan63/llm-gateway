@@ -275,6 +275,8 @@ pub fn from_gemini_response(v: &serde_json::Value) -> ChatResponse {
 
     let u = v.get("usageMetadata").cloned().unwrap_or(json!({}));
     ChatResponse {
+        // 普通 API 上游没有「传输」这个概念（A6 判据 1 只对账号型上游有意义）。
+        transport: None,
         id: uuid::Uuid::new_v4().to_string(),
         model: v
             .get("modelVersion")

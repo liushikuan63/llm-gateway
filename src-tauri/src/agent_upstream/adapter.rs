@@ -74,6 +74,10 @@ impl AgentReply {
     pub fn into_chat_response(self, model: impl Into<String>) -> crate::domain::ChatResponse {
         crate::domain::ChatResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+            // 先取 transport —— 下面的 `content: self.text` 会把 `self` 的字段移走。
+            // 它是**适配器如实回报**的值（假适配器报 "fake"、真适配器报 "L3"），
+            // 卡片 A6 判据 1 要的正是这个「实际走了哪条路」。
+            transport: Some(self.transport),
             model: model.into(),
             content: self.text,
             // 【裁决之二：默认无工具】账号型上游走的是**一次对话**，
@@ -109,6 +113,31 @@ mod tests {
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
         // id 必须像 OpenAI 的 `chatcmpl-` —— 客户端有按前缀判定的
         assert!(r.id.starts_with("chatcmpl-"), "实际 id：{}", r.id);
+    }
+
+    #[test]
+    fn transport_如实进到_chat_response() {
+        // 卡片 A6 判据 1 要的是「**实际**走了 L1 还是 L3」。
+        // 适配器回报什么就得是什么 —— 这里用 "L3" 验它原样传过去，
+        // 而不是被写成常量或丢掉。
+        let r = AgentReply {
+            text: "x".into(),
+            transport: "L3".into(),
+        }
+        .into_chat_response("m");
+        assert_eq!(
+            r.transport.as_deref(),
+            Some("L3"),
+            "适配器回报的 transport 必须原样进 ChatResponse"
+        );
+
+        // 换个值再验一次：只验一次的话，实现里写死 "L3" 也能过
+        let r2 = AgentReply {
+            text: "x".into(),
+            transport: "fake".into(),
+        }
+        .into_chat_response("m");
+        assert_eq!(r2.transport.as_deref(), Some("fake"));
     }
 
     #[test]

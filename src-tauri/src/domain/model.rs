@@ -182,6 +182,17 @@ pub struct ChatResponse {
     pub tool_calls: Option<Vec<ToolCall>>,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
+    /// 任务卡二 A6 判据 1：账号型上游**实际**走的传输（`L1` / `L3`）。
+    ///
+    /// `None` = 走的是普通 API 上游（HTTP 直连），没有「传输」这个概念。
+    ///
+    /// 【为什么必须由适配器一路带到这里，而不是在审计侧推断】
+    /// 卡片原文要求记录「**实际**走了 L1 还是 L3」。「实际」二字是关键：
+    /// 只有适配器自己知道它最后用了哪条路（可能 L1 起不来、回落到了 L3）。
+    /// 审计侧按配置去猜的话，记下来的是「打算走哪条」而不是「走了哪条」——
+    /// 而上游改协议、exec-server 起不来这类问题，恰恰只在后者里看得见。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

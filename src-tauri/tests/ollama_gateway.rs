@@ -128,6 +128,8 @@ fn ollama_non_stream_response_preserves_tool_calls_and_usage() {
             id: "response-1".into(),
             model: "llama3.3".into(),
             content: internal.content,
+            // 普通 API 上游，没有「传输」概念。
+            transport: None,
             tool_calls: internal.tool_calls,
             finish_reason: internal.finish_reason,
             usage: Some(Usage {

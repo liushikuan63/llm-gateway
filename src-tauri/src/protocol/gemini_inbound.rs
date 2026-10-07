@@ -570,6 +570,8 @@ mod tests {
 
     fn response(content: &str) -> ChatResponse {
         ChatResponse {
+            // 普通 API 上游没有「传输」这个概念（A6 判据 1 只对账号型上游有意义）。
+            transport: None,
             id: "id-1".into(),
             model: "gemini-2.5-pro".into(),
             content: content.into(),
