@@ -83,8 +83,17 @@ pub fn sanitize_id(id: &str) -> String {
 /// 前缀匹配同时覆盖旧的单文件台账（`plugin-processes.txt`）——
 /// 升级上来的机器上可能还留着它。
 pub fn sweep_all() -> Result<usize, String> {
-    let dir = crate::config::app_data_dir();
-    let entries = match std::fs::read_dir(&dir) {
+    sweep_all_in(&crate::config::app_data_dir())
+}
+
+/// [`sweep_all`] 的可测版本：目录由调用方给。
+///
+/// **拆开是因为原来那份不可测**：它硬编码 `app_data_dir()`，
+/// 而用例不该去动用户真实的应用数据目录。结果就是这段目录扫描逻辑
+/// 一行都没被验过 —— 端到端实测它在真机上返回 0（孤儿进程没被清掉），
+/// 而当时**没有任何用例能告诉我为什么**。
+pub fn sweep_all_in(dir: &Path) -> Result<usize, String> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // 目录还不存在（全新环境）不是错误。
         Err(_) => return Ok(0),
@@ -124,10 +133,17 @@ pub fn encode(entries: &[PluginProcess]) -> String {
 ///
 /// 台账是崩溃现场留下来的文件，它本身可能只写了一半。为了一个坏行
 /// 放弃整份台账，等于放弃清理 —— 而清理正是这个文件存在的唯一目的。
+///
+/// **行首要吃掉 BOM**：这个文件可能被外部工具（编辑器、PowerShell 的
+/// `Set-Content -Encoding utf8`）重写过，而带 BOM 时首行会变成
+/// `"\u{feff}1234\tcmd.exe"` —— `parse::<u32>()` 直接失败、整行被跳过，
+/// 表现是**整份台账静默失效**：文件被删掉、进程一个没杀、日志只说「台账为空」。
+/// 实测踩到过，排查了一整轮。
 pub fn parse(raw: &str) -> Vec<PluginProcess> {
     raw.lines()
         .filter_map(|line| {
-            let (pid, exe) = line.trim().split_once('\t')?;
+            let line = line.trim().trim_start_matches('\u{feff}');
+            let (pid, exe) = line.split_once('\t')?;
             let pid = pid.trim().parse::<u32>().ok()?;
             let exe = exe.trim();
             if exe.is_empty() {

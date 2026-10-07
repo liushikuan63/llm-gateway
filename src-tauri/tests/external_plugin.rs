@@ -48,6 +48,26 @@ fn 台账编解码往返且坏行跳过() {
         }],
         "只应留下唯一那一行合法的"
     );
+
+    // **带 BOM 的文件也要能解析**。外部工具重写过它时会出现 BOM，
+    // 而带 BOM 的首行 `"\u{feff}1234\tok.exe"` 会让 `parse::<u32>()` 失败、
+    // 整行被跳过 —— 表现是**整份台账静默失效**（文件被删、进程一个没杀、
+    // 日志只说「台账为空」）。实测排查了一整轮才定位到这里。
+    let with_bom = "\u{feff}1234\tok.exe\n5678\tsecond.exe\n";
+    assert_eq!(
+        parse(with_bom),
+        vec![
+            PluginProcess {
+                pid: 1234,
+                exe: "ok.exe".into()
+            },
+            PluginProcess {
+                pid: 5678,
+                exe: "second.exe".into()
+            },
+        ],
+        "BOM 不该让首行失效，更不该让整份台账失效"
+    );
 }
 
 /// exe 归一成 basename：两种分隔符都要认。
@@ -214,6 +234,76 @@ fn 台账按插件分文件且_id_被消毒() {
     assert!(!sanitize_id("").is_empty());
     // 超长 id 要截断，否则文件名会超系统上限
     assert!(sanitize_id(&"x".repeat(500)).len() <= 64);
+}
+
+/// **`sweep_all` 的目录扫描**：多份台账都要清，且不碰无关文件。
+///
+/// 这条用例补的是一个真实的漏：`sweep_all` 原先硬编码应用数据目录、
+/// 因此不可测，那段扫描逻辑一行都没被验过。端到端实测它返回 0
+/// （孤儿进程没被清掉），而当时没有用例能说明为什么。
+#[test]
+fn 扫目录下所有台账且不碰无关文件() {
+    use llm_gateway_lib::agent_upstream::plugin_process::sweep_all_in;
+
+    let dir = 临时目录("sweepall");
+    let mut a = Command::new("cmd")
+        .args(["/c", "ping -n 900 127.0.0.1 > nul"])
+        .spawn()
+        .expect("起第一个长跑进程");
+    let mut b = Command::new("cmd")
+        .args(["/c", "ping -n 900 127.0.0.1 > nul"])
+        .spawn()
+        .expect("起第二个长跑进程");
+    write_ledger(
+        &dir.join("plugin-processes-one.txt"),
+        &[PluginProcess {
+            pid: a.id(),
+            exe: "cmd.exe".into(),
+        }],
+    )
+    .unwrap();
+    write_ledger(
+        &dir.join("plugin-processes-two.txt"),
+        &[PluginProcess {
+            pid: b.id(),
+            exe: "cmd.exe".into(),
+        }],
+    )
+    .unwrap();
+    // 无关文件：名字不匹配前缀，不该被读、更不该被删
+    fs::write(dir.join("unrelated.txt"), "别动我").unwrap();
+    // 旧形态的单文件台账也要覆盖（升级上来的机器上会有）
+    write_ledger(
+        &dir.join("plugin-processes.txt"),
+        &[PluginProcess {
+            pid: 4_000_000_000,
+            exe: "cmd.exe".into(),
+        }],
+    )
+    .unwrap();
+
+    let killed = sweep_all_in(&dir).expect("扫描应当成功");
+    assert_eq!(killed, 2, "两份活台账各清掉一个；pid 不存在的那份不算数");
+    assert!(!dir.join("plugin-processes-one.txt").exists());
+    assert!(!dir.join("plugin-processes-two.txt").exists());
+    assert!(!dir.join("plugin-processes.txt").exists(), "旧形态也要清掉");
+    assert!(
+        dir.join("unrelated.txt").exists(),
+        "名字不匹配前缀的文件不该被碰"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        a.try_wait().map(|s| s.is_some()).unwrap_or(true),
+        "第一个进程必须已被清掉"
+    );
+    assert!(
+        b.try_wait().map(|s| s.is_some()).unwrap_or(true),
+        "第二个进程必须已被清掉"
+    );
+    let _ = a.kill();
+    let _ = b.kill();
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// 真进程与台账是**联动的**：起了就记、收尾就清。

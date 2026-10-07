@@ -75,6 +75,28 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
     if let Some(warning) = config_warning {
         boot.mark_warning(warning);
     }
+    // B8 判据 4：清掉上一次运行遗留的插件进程。
+    //
+    // 【为什么在这里，而不是在 `serve()` 里】`serve()` 也是**测试**走的路径
+    // （`tests/server_stream.rs` 那批直接 `serve(gateway)`），而这一扫会去动
+    // **真实应用数据目录**下台账里记着的 pid —— 放进 `serve()` 等于让测试
+    // 去杀用户本机正在跑的插件进程。启动路径只有真实的 `run()` 会走。
+    //
+    // 【为什么现在才发现】台账与清扫函数早就写好了，但 `sweep_all` 一直没有
+    // 调用者 —— 于是「网关崩溃后重启会清理孤儿」这条判据**实际上不成立**：
+    // 台账会被写下来，而重启后没有任何人去读它。函数有测试、接线没有，
+    // 这正是「测试全绿 ≠ 功能可用」的又一例。
+    match crate::agent_upstream::plugin_process::sweep_all() {
+        Ok(0) => tracing::info!(
+            "插件进程台账为空，无需清理（扫描目录 {}）",
+            crate::config::app_data_dir().display()
+        ),
+        Ok(killed) => tracing::info!("清理了 {killed} 个上次遗留的插件进程"),
+        // 清不掉不该拦住启动：最坏是留下几个孤儿进程，
+        // 那比「网关因为清理失败起不来」轻得多。
+        Err(error) => tracing::warn!("清理插件进程台账失败：{error}"),
+    }
+
     let db = match db::Db::connect(&cfg).await {
         Ok(db) => db,
         Err(error) => {
