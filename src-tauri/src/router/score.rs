@@ -316,33 +316,115 @@ pub struct ScoreInput {
     pub cost_bias: bool,
 }
 
+/// 打分的**一项**：原始值、权重、以及它贡献进乘积的那个因子。
+///
+/// 【为什么三项都要】只给最终贡献的话，用户分不清「这一维得了 1.0」是
+/// 「它满分」还是「权重是 0，它压根没参与」—— 而后者正是默认状态。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ScoreFactor {
+    /// 维度名。用 `&'static str` 而不是枚举：它是**给人看的标签**，
+    /// 不进任何判定逻辑，加一维时不需要改两处。
+    pub name: &'static str,
+    /// 原始值。`None` = 这一维**没有数据**（不是 0 分）。
+    pub raw: Option<f32>,
+    pub weight: f32,
+    /// 该项在乘积里的实际因子：`raw^weight`。
+    /// **无数据时是 1.0**（不惩罚），权重为 0 时也是 1.0（`x^0 == 1`）。
+    pub contribution: f32,
+}
+
+impl ScoreFactor {
+    /// 「这一维为什么是这个贡献」——界面直接用这句话，不各自解释一遍。
+    pub fn note(&self) -> &'static str {
+        if self.raw.is_none() {
+            "没有数据，不参与打分（按 1.0 处理，不是 0 分）"
+        } else if self.weight == 0.0 {
+            "权重为 0，没有参与"
+        } else {
+            "已按权重计入"
+        }
+    }
+}
+
+/// 打分的完整分解。`total` 与 [`score`] 的返回值**逐位相同** ——
+/// 两者是同一个函数的两种出口，不是两套实现。
+///
+/// 只 `Serialize` 不 `Deserialize`：`name` 是 `&'static str`，反序列化会让
+/// 它要求 `'de: 'static`；而这个结构只有一个方向（后端算、前端看）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScoreBreakdown {
+    /// 各维因子，顺序固定（与连乘顺序一致）。
+    pub factors: Vec<ScoreFactor>,
+    /// 精确命中模型名的加成（1.25 / 1.0）。
+    pub exact_match_bonus: f32,
+    pub total: f32,
+}
+
 /// 返回 0.0 ~ 1.0
 pub fn score(c: &Candidate, input: &ScoreInput, w: &Weights) -> f32 {
+    explain(c, input, w).total
+}
+
+/// [`score`] 的**可解释**版本：把每一维的原始值、权重、贡献摊开。
+///
+/// ## 为什么不是一个独立的算式
+///
+/// 复制一份算式再各自维护，两边迟早不一致 —— 而那种不一致的表现是
+/// 「界面上解释的和实际排序依据的不一样」，比不解释更糟。
+/// 所以这里**就是** `score()` 的实现，`score()` 只是取它的 `total`。
+///
+/// ## 连乘顺序保持原样（但**别把它当成有测试守着**）
+///
+/// 浮点乘法不满足结合律，所以下面 `base` 的相乘顺序与重构前逐字相同 ——
+/// 这是保守做法，不是被证明必要的做法。
+///
+/// **2026-10-07 实测**：把 `fit` 提到最前面重跑，`tests/route_golden.rs`
+/// 的 8 条**仍然全绿**。也就是说现有金标准**抓不到**连乘顺序的变化 ——
+/// 想真正钉住「逐位不变」，需要一条直接对照 `total.to_bits()` 的判据
+/// （已记进交接单，尚未加）。在那之前，别在这条注释上承诺更多。
+pub fn explain(c: &Candidate, input: &ScoreInput, w: &Weights) -> ScoreBreakdown {
+    let raw_health = input.health.as_ref().map(|h| health_score(Some(h)));
+    let raw_headroom = Some(input.headroom.clamp(0.0, 1.0));
+    let raw_capability = Some(capability_score(&c.provider, &c.model));
+    // 延迟的原始值：有健康数据才算「有样本」。`latency_score(0)` 给 1.0
+    // （无样本不惩罚），与 `usable_tps` 的 `0 => 无样本` 同源。
+    let raw_latency = input
+        .health
+        .as_ref()
+        .filter(|x| x.avg_latency_ms > 0)
+        .map(|x| latency_score(x.avg_latency_ms));
+    let raw_fit = input
+        .intent
+        .map(|intent| intent_fit(intent, c, input.domain));
+
     let h = health_score(input.health.as_ref());
     let hd = input.headroom.clamp(0.0, 1.0);
     let cap = capability_score(&c.provider, &c.model);
     let lat = latency_score(input.health.as_ref().map(|x| x.avg_latency_ms).unwrap_or(0));
     // 权重为 0 时 x.powf(0.0) 恒等于 1.0，因此旧策略多乘这一项不改变结果。
-    let fit = input
-        .intent
-        .map(|intent| intent_fit(intent, c, input.domain).powf(w.intent))
-        .unwrap_or(1.0);
+    let fit = raw_fit.map(|v| v.powf(w.intent)).unwrap_or(1.0);
 
     // D3：成本与实测效率。**两条路径都保证默认 1.0** ——
     // 权重为 0（默认）或数据缺失时都给 1.0，
     // 所以不启用这两个维度时乘法结果逐位不变（铁律 2）。
-    let cost = if input.cost_bias {
+    let (raw_cost, cost) = if input.cost_bias {
         match (input.cost_range, input.candidate_cost) {
-            (Some((lo, hi)), Some(mine)) => cost_score(mine, lo, hi).powf(w.cost),
+            (Some((lo, hi)), Some(mine)) => (
+                Some(cost_score(mine, lo, hi)),
+                cost_score(mine, lo, hi).powf(w.cost),
+            ),
             // 没有价格数据就不施加偏置 —— 不是「当成免费」，也不是「当成最贵」
-            _ => 1.0,
+            _ => (None, 1.0),
         }
     } else {
-        1.0
+        (None, 1.0)
     };
-    let eff = match (input.tps_range, input.candidate_tps) {
-        (Some((lo, hi)), Some(mine)) => efficiency_score(mine, lo, hi).powf(w.efficiency),
-        _ => 1.0,
+    let (raw_eff, eff) = match (input.tps_range, input.candidate_tps) {
+        (Some((lo, hi)), Some(mine)) => {
+            let v = efficiency_score(mine, lo, hi);
+            (Some(v), v.powf(w.efficiency))
+        }
+        _ => (None, 1.0),
     };
 
     let base = h.powf(w.health)
@@ -357,7 +439,54 @@ pub fn score(c: &Candidate, input: &ScoreInput, w: &Weights) -> f32 {
     // 不该因为另一家刚好更快就悄悄换了模型
     let bonus = if c.exact_match { 1.25 } else { 1.0 };
 
-    (base * bonus).clamp(0.0, 1.0)
+    ScoreBreakdown {
+        factors: vec![
+            ScoreFactor {
+                name: "health",
+                raw: raw_health,
+                weight: w.health,
+                contribution: h.powf(w.health),
+            },
+            ScoreFactor {
+                name: "headroom",
+                raw: raw_headroom,
+                weight: w.headroom,
+                contribution: hd.powf(w.headroom),
+            },
+            ScoreFactor {
+                name: "capability",
+                raw: raw_capability,
+                weight: w.capability,
+                contribution: cap.powf(w.capability),
+            },
+            ScoreFactor {
+                name: "latency",
+                raw: raw_latency,
+                weight: w.latency,
+                contribution: lat.powf(w.latency),
+            },
+            ScoreFactor {
+                name: "intent_fit",
+                raw: raw_fit,
+                weight: w.intent,
+                contribution: fit,
+            },
+            ScoreFactor {
+                name: "cost",
+                raw: raw_cost,
+                weight: w.cost,
+                contribution: cost,
+            },
+            ScoreFactor {
+                name: "efficiency",
+                raw: raw_eff,
+                weight: w.efficiency,
+                contribution: eff,
+            },
+        ],
+        exact_match_bonus: bonus,
+        total: (base * bonus).clamp(0.0, 1.0),
+    }
 }
 
 /// D3 相对价格分：**对数缩放**到 0.2~1.0，最便宜的得 1.0。

@@ -5,7 +5,7 @@ use llm_gateway_lib::domain::{Dialect, Health, ModelRef, ModelType, Provider};
 use llm_gateway_lib::error::GatewayError;
 use llm_gateway_lib::proxy::health::HealthRegistry;
 use llm_gateway_lib::router::ratelimit::{Quota, RateLimiter};
-use llm_gateway_lib::router::score::{score, Candidate, ScoreInput, Weights};
+use llm_gateway_lib::router::score::{explain, score, Candidate, ScoreInput, Weights};
 use llm_gateway_lib::router::{RouteRule, Router, RuleAction};
 
 fn model(alias: &str, upstream: &str) -> ModelRef {
@@ -219,6 +219,182 @@ fn score_uses_multiplicative_decay_when_quota_is_exhausted() {
 
     assert!(score(&candidate, &healthy, &weights) > 0.5);
     assert!(score(&candidate, &exhausted, &weights) < 1e-6);
+}
+
+// ---------------------- D5 打分分解（`explain`） ----------------------
+
+fn 分解输入(
+    headroom: f32,
+    health: Option<llm_gateway_lib::domain::ProviderHealth>,
+) -> ScoreInput {
+    ScoreInput {
+        intent: None,
+        domain: llm_gateway_lib::intellect::TaskDomain::General,
+        cost_range: None,
+        candidate_cost: None,
+        tps_range: None,
+        candidate_tps: None,
+        cost_bias: false,
+        health,
+        headroom,
+    }
+}
+
+fn 分解候选() -> Candidate {
+    Candidate {
+        provider: provider("smart", 1, 100),
+        model: ModelRef {
+            context_window: 200_000,
+            ..model("mock-model", "mock-model")
+        },
+        requested_model: "mock-model".into(),
+        exact_match: false,
+        virtual_strategy: None,
+    }
+}
+
+/// 分解的**结构性**判据：各因子按声明顺序连乘必须等于 `total`。
+///
+/// 这条能失败：分解里漏了一项、或者 `total` 用了另一套算式，乘出来就不等。
+/// 注意必须**按同一顺序**乘 —— 浮点乘法不满足结合律，换个顺序就可能不等，
+/// 而那正说明「分解与总分不是同一条路径」。
+#[test]
+fn 打分分解的各因子连乘等于最终分() {
+    let candidate = 分解候选();
+    let input = 分解输入(0.6, Some(HealthRegistry::new().get("smart", "mock-model")));
+    let weights = Weights::for_strategy(RoutingStrategy::Balanced);
+
+    let breakdown = explain(&candidate, &input, &weights);
+    let mut product = 1.0f32;
+    for factor in &breakdown.factors {
+        product *= factor.contribution;
+    }
+    let expected = (product * breakdown.exact_match_bonus).clamp(0.0, 1.0);
+    assert_eq!(
+        breakdown.total.to_bits(),
+        expected.to_bits(),
+        "各因子按顺序连乘必须逐位等于最终分：factors={:?}",
+        breakdown.factors
+    );
+    // 分解与 `score()` 是同一个函数的两种出口 —— 顺带钉住这条关系
+    assert_eq!(
+        breakdown.total.to_bits(),
+        score(&candidate, &input, &weights).to_bits()
+    );
+}
+
+/// 权重为 0 的维度，贡献必须**恒为 1.0**（`x^0 == 1`）。
+///
+/// 这是「老策略多乘一维不改变结果」的全部依据。写成 `raw * weight` 的话，
+/// 关着的新维度会把分数乘成 0 —— 而那种错误的表现是「所有候选都 0 分、
+/// 排序退化成注册顺序」，不报任何错。
+#[test]
+fn 权重为零的维度贡献恒为一() {
+    let candidate = 分解候选();
+    let input = 分解输入(0.3, Some(HealthRegistry::new().get("smart", "mock-model")));
+    let all_zero = Weights {
+        health: 0.0,
+        headroom: 0.0,
+        capability: 0.0,
+        latency: 0.0,
+        intent: 0.0,
+        cost: 0.0,
+        efficiency: 0.0,
+    };
+    let breakdown = explain(&candidate, &input, &all_zero);
+    for factor in &breakdown.factors {
+        assert_eq!(
+            factor.contribution, 1.0,
+            "{} 的权重为 0 时贡献必须恒为 1.0（x^0 == 1），实际 {}",
+            factor.name, factor.contribution
+        );
+    }
+    // `note()` 的优先级是「没有数据」压过「权重为 0」—— 后者会掩盖
+    // 「这一维其实没数据」这个事实。所以只有**确实有原始值**的维度
+    // 才该说「权重为 0」；headroom 是调用方直接传进来的，一定有值。
+    let headroom = breakdown
+        .factors
+        .iter()
+        .find(|f| f.name == "headroom")
+        .expect("headroom 因子");
+    assert!(headroom.raw.is_some(), "headroom 一定有原始值");
+    assert_eq!(headroom.note(), "权重为 0，没有参与");
+    assert_eq!(breakdown.total, 1.0, "全部权重为 0 时最终分恒为 1.0");
+}
+
+/// 没有数据的维度：原始值是 `None`，贡献是 1.0 —— **不是 0 分**。
+#[test]
+fn 无数据的维度原始值是_none_而贡献是一() {
+    let candidate = 分解候选();
+    // 健康数据缺失 + 成本偏置关着 ⇒ 两维都没有数据
+    let input = 分解输入(1.0, None);
+    let breakdown = explain(
+        &candidate,
+        &input,
+        &Weights::for_strategy(RoutingStrategy::Balanced),
+    );
+
+    let health = breakdown
+        .factors
+        .iter()
+        .find(|f| f.name == "health")
+        .expect("health 因子");
+    assert_eq!(
+        health.raw, None,
+        "没有健康数据时原始值必须是 None，不是 0 分"
+    );
+    assert_eq!(health.contribution, 1.0, "没有数据不惩罚");
+    assert!(health.note().contains("没有数据"), "{}", health.note());
+
+    let latency = breakdown
+        .factors
+        .iter()
+        .find(|f| f.name == "latency")
+        .expect("latency 因子");
+    assert_eq!(latency.raw, None, "没有样本时延迟原始值也是 None");
+
+    let cost = breakdown
+        .factors
+        .iter()
+        .find(|f| f.name == "cost")
+        .expect("cost 因子");
+    assert_eq!(cost.raw, None);
+    assert_eq!(cost.contribution, 1.0, "成本偏置关着时成本不参与");
+}
+
+/// 反例组：成本偏置**开着**且有数据时，成本项必须真的参与。
+///
+/// 少了这条，上面那条「关着时是 1.0」可能只是因为成本维度压根没接上。
+#[test]
+fn 成本偏置开着且有权重时成本项真的参与() {
+    let candidate = 分解候选();
+    let mut input = 分解输入(1.0, Some(HealthRegistry::new().get("smart", "mock-model")));
+    input.cost_bias = true;
+    input.cost_range = Some((1.0, 100.0));
+    // 取区间里最贵的那个 ⇒ 成本分应当低于 1.0
+    input.candidate_cost = Some(100.0);
+    let weights = Weights {
+        health: 0.25,
+        headroom: 0.15,
+        capability: 0.3,
+        latency: 0.1,
+        intent: 0.0,
+        cost: 0.2,
+        efficiency: 0.0,
+    };
+    let breakdown = explain(&candidate, &input, &weights);
+    let cost = breakdown
+        .factors
+        .iter()
+        .find(|f| f.name == "cost")
+        .expect("cost 因子");
+    assert!(cost.raw.is_some(), "有价格数据时原始值必须给出");
+    assert!(
+        cost.contribution < 1.0,
+        "最贵的候选在成本维上必须低于 1.0，实际 {}",
+        cost.contribution
+    );
+    assert!(cost.note().contains("已按权重计入"), "{}", cost.note());
 }
 
 #[test]
