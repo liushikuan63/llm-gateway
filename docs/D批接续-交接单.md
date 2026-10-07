@@ -521,3 +521,86 @@ codex exec --json --skip-git-repo-check --ephemeral "say hi"
 能把整张地图放在脑子里，而当前会话的上下文已经放不下了。
 
 **建议：这一格交给新会话**，把本节作为起点。
+
+---
+
+## 八、本会话最有价值的一条方法：**改结构体时，让编译器列出调用点**
+
+前面两次失败（给 `requests` 加列要改 11 处 `RequestLog` 字面量）
+的根因是**我自己去找调用点**：先括号计数、再「第一条正则匹配」，
+两次都把改动打在了错的地方。
+
+后来换成：**先加字段，再 `cargo check`**。编译器给出的是
+**完备且精确**的清单：
+
+```
+error[E0063]: missing field `transport` in initializer of `ChatResponse`
+  --> src\agent_upstream\adapter.rs:75:9
+  --> src\protocol\anthropic.rs:352:5
+  --> src\protocol\convert.rs:101:5
+  --> src\protocol\gemini.rs:277:5
+  --> src\protocol\gemini_inbound.rs:572:9
+  --> src\protocol\ollama.rs:170:5
+  --> src\protocol\responses.rs:144:5
+```
+
+随后又补出 `tests/protocol.rs:270` 与 `tests/ollama_gateway.rs:127` ——
+**两次编译就收敛，零猜测**。同一天用同一招还做成了
+`AttemptRecord.runtime_kind`（2 处）与 `AttemptRecord.transport`（4 处）。
+
+**结论：Rust 里没有「找不到调用点」这回事。**
+拿不准就加个字段让它报错，比写任何脚本都准。
+**本条应放在踩坑清单的第一条。**
+
+### 配套的一条：按行号改代码，必须先断言「那一行是什么」
+
+`ChatResponse` 那批字面量很长（字段值跨多行），没法用字段名做锚点。
+做法是**插在编译器给出的起始行之后**（Rust 结构体字面量字段顺序无关）。
+但按行号改正是我栽过的地方，所以加了两道校验：
+
+1. 写入前**断言该行内容匹配** `ChatResponse\s*\{\s*$`，不匹配就跳过并报出来；
+2. **从大到小**处理行号，避免前面的插入影响后面的。
+
+我先还试过一版配对脚本 —— 它统计的字面量数与实际不符，
+**校验直接拦下、全部跳过、零破坏**。那道校验就是失败换来的。
+
+---
+
+## 九、任务卡二的完整落地清单（2026-10-07）
+
+| 卡 | 状态 | 提交 |
+| --- | --- | --- |
+| A5 抽象 | **主体完成**：trait + 注册表 + 假适配器 + 表/列 + 领域类型 + 持久层 + 4 个 IPC + **唯一分派点** | `1c95b3d` `bf41e43` `0f95660` `7ebf80c` `d0a7dac` `7116fd3` `2f51d48` `112faf5` |
+| A6 Codex | **L3 落地 + 判据 1 数据链路收口** | `a399e95` `65ae096` `4d8cd43` `d05a518` `9d1af6c` |
+| A7 Qoder | **L3 落地 + 协议版本守卫**（抓到了真实 JSONL 形状） | `24f006a` |
+| A8 | **只落了路径地基** `WorkspaceRoot`（无调用者） | `b37eb06` |
+
+### `AgentReply.transport` 的完整链路（已打通，未真跑）
+
+```
+适配器如实回报 AgentReply.transport
+  → ChatResponse.transport            (d05a518)
+  → AttemptRecord.transport 调用方回填 (9d1af6c)
+  → attempts_json 列 → 审计页可见
+```
+
+**回填**而不是在 `AttemptRecord::success` 里传：失败转移链是
+`run_with_auth_policy<T>`，**对响应类型泛型**，链内部读不到
+`ChatResponse.transport`；硬加 trait 约束会把泛型复杂度传染给每个调用方。
+回填点 `o.value` 有具体类型，改动从「加参数 + 改泛型」缩到 3 行。
+
+### 三处如实标注的 `None`（**都不是「没有传输」**）
+
+1. **失败的一跳**：如实的空 —— 适配器没走完就报错，确实没发生传输。
+2. **复测路径**（`confirm_success`）：**已知缺口**。复测同样走适配器，
+   只是响应在鉴权重试逻辑里没传到这里。要补需把响应带进那个函数。
+3. **流式路径**：如实的空 —— 适配器目前只支持非流式（一次跑一轮拿全文）。
+
+### 三件仍未做（都在卡片的判据里）
+
+- **A6/A7 判据 1 的端到端从未真跑过** —— 需要 `codex login` / `qoder login`。
+  现在能证明「每一跳都接上了」+「普通上游不受影响」，
+  **不能**证明「真账号下 L3 确实返回内容」。
+- **A6 的 L1（`exec-server`）**、**A7 的 L1（Agent SDK JSONL）** 未做。
+- **A8 的其余全部**：`/gw/agent/run` 路由、`run_agent()`、
+  产物清单审计字段。`WorkspaceRoot` 现在**没有调用者**。
