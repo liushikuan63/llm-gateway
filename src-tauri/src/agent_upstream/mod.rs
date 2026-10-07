@@ -17,9 +17,11 @@
 //! 加一条负向对照守着 —— 见 `tests/agent_upstream.rs`。
 
 pub mod adapter;
+pub mod codex;
 pub mod fake;
 
 pub use adapter::{AgentAdapter, AgentReply, AgentRequest};
+pub use codex::CodexAdapter;
 pub use fake::FakeAdapter;
 
 use std::collections::BTreeMap;
@@ -49,6 +51,10 @@ impl AdapterRegistry {
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(FakeAdapter::default()));
+        // A6：Codex（L3 = `codex exec --json`）。它**不需要登录也能注册** ——
+        // 未登录会在 `send` 时给出可读错误，而不是在注册时失败。
+        // 这样「配了但没登录」的用户拿到的是明确提示，而不是「找不到适配器」。
+        registry.register(Arc::new(CodexAdapter::default()));
         registry
     }
 
@@ -94,7 +100,6 @@ impl AdapterRegistry {
         }
     }
 }
-
 
 // ==================== A5：唯一分派点用的两个入口 ====================
 
@@ -183,6 +188,115 @@ pub async fn call_agent(
             }
         })?;
     Ok(reply.into_chat_response(model))
+}
+
+
+/// 跑一个「输出 JSON 行」的外部 CLI，带**超时 + 杀进程树 + cwd 隔离**。
+///
+/// ## 三件事都不是防御性代码
+///
+/// 1. **超时**：实测 `codex exec --json` 会静默挂住（90 秒零输出且不结束）。
+///    没有超时的话这个请求会永远挂住，而用户看到的是「一直在转」。
+/// 2. **杀进程树**：`codex` 在本机是包装器脚本（`.cmd` + `.ps1`），
+///    真正的 node 进程是**孙进程**。只杀直接子进程会留下它继续占资源 ——
+///    见 `crate::proc_util`（那份实现有真起孙进程的用例守着）。
+/// 3. **cwd 隔离**：账号型 CLI 会在 cwd 里读写文件（甚至改 git 仓库）。
+///    让它们跑在网关进程的 cwd 里等于把用户的项目目录交给一个
+///    「不受我们控制的工具」去操作。每个 runtime kind 一个隔离目录。
+///
+/// `label` 只用于错误文本（如 `codex`），让用户知道是**哪个**工具出的问题。
+pub async fn run_json_cli(
+    program: &str,
+    args: &[String],
+    timeout_ms: u64,
+    label: &str,
+) -> Result<String, String> {
+    use std::process::Stdio;
+
+    let workdir = crate::mcp::stdio::isolated_workdir(&format!("agent-{label}"));
+    // 目录建不出来就报错而不是退回当前目录 —— 「悄悄跑在用户的项目目录里」
+    // 比「起不来」危险得多。
+    std::fs::create_dir_all(&workdir).map_err(|e| {
+        format!(
+            "创建 {label} 的隔离工作目录失败（{}）：{e}",
+            workdir.display()
+        )
+    })?;
+
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .current_dir(&workdir)
+        .stdin(Stdio::null()) // 交互式 CLI 读到 stdin 会等输入 —— 直接关掉
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            // 「命令不存在」是最常见的失败，给一句能照做的提示
+            format!("启动 {label} 失败（{program}）：{e}。请确认它已安装并在 PATH 里")
+        })?;
+
+    // 【为什么不用 `wait_with_output`】它**取走** `child`（`self` 按值），
+    // 于是超时分支里再也没有 `child` 可杀 —— 而 `kill_on_drop(true)` 会先
+    // 杀掉直接子进程，之后 `taskkill /T` **就找不到孙进程了**
+    // （树是从父进程往上走的）。所以必须：先取走两根管道、并发读，
+    // 让 `child` 一直活到超时分支里。
+    use tokio::io::AsyncReadExt;
+    let mut out_pipe = child.stdout.take().ok_or("拿不到 stdout 管道")?;
+    let mut err_pipe = child.stderr.take().ok_or("拿不到 stderr 管道")?;
+    // 并发读，避免「输出塞满管道缓冲 → 子进程阻塞 → 永远等不到超时结束」
+    let out_task = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = out_pipe.read_to_string(&mut s).await;
+        s
+    });
+    let err_task = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = err_pipe.read_to_string(&mut s).await;
+        s
+    });
+
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            crate::proc_util::kill_tree(&mut child).await;
+            return Err(format!("{label} 进程异常：{e}"));
+        }
+        Err(_) => {
+            // 超时：**杀树**，不是杀进程。此刻 `child` 还活着，
+            // 树是完整的，`taskkill /T` 才走得通。
+            crate::proc_util::kill_tree(&mut child).await;
+            let secs = timeout_ms / 1000;
+            return Err(format!(
+                "{label} 在 {secs} 秒内没有结束，已终止。\
+                 常见原因：未登录（试 `{label} login`）、需要交互输入、或网络不通"
+            ));
+        }
+    };
+    let stdout = out_task.await.unwrap_or_default();
+    let stderr = err_task.await.unwrap_or_default();
+
+    if !status.success() {
+        let stderr = stderr.as_str();
+        // 失败时把 stderr 的**前几行**带上 —— 那里面通常就是原因
+        // （未登录、配置错、模型名不对），比一个退出码有用得多。
+        let hint: String = stderr.lines().take(3).collect::<Vec<_>>().join(" / ");
+        return Err(format!(
+            "{label} 退出码 {}：{}",
+            status.code().unwrap_or(-1),
+            if hint.trim().is_empty() {
+                "（stderr 为空）".to_string()
+            } else {
+                hint
+            }
+        ));
+    }
+    Ok(stdout)
 }
 
 #[cfg(test)]
