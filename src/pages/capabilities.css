@@ -44,3 +44,19 @@
 .missing { color: var(--muted); font-style: italic; }
 .front-tag { color: var(--accent); border-color: var(--accent); }
 .dominated-tag { color: var(--muted); }
+
+/* D5：打分分解。 */
+.explain-section { display: flex; flex-direction: column; gap: 10px; }
+.explain-section h3 { font-size: 15px; margin: 0; }
+.explain-input { display: flex; gap: 8px; }
+.explain-input input { min-width: 240px; }
+.explain-candidate { border: 1px solid var(--border); border-radius: 9px; padding: 10px 14px; }
+.explain-candidate summary { display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 13px; }
+.explain-score { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
+/* 不参与的候选必须一眼看出来：它的分数没有参与排序。 */
+.ineligible-tag { color: var(--danger); border-color: var(--danger); }
+.explain-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+.explain-table th, .explain-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.explain-table th { color: var(--muted); font-weight: 500; }
+.explain-total td { font-weight: 600; border-top: 1px solid var(--border); }
+.explain-candidate code { font-size: 11px; }

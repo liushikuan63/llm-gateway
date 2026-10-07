@@ -26,12 +26,38 @@ use crate::error::{GatewayError, Result};
 use crate::proxy::health::HealthRegistry;
 use crate::router::ratelimit::{Quota, RateLimiter};
 use crate::router::score::{
-    satisfies_hard_constraints, Candidate, RequiredCapabilities, ScoreInput, TaskClass, Weights,
+    satisfies_hard_constraints, Candidate, RequiredCapabilities, ScoreBreakdown, ScoreInput,
+    TaskClass, Weights,
 };
 
 use crate::intellect::TaskDomain;
 #[allow(unused_imports)]
 use {};
+
+/// D5：一个候选的打分明细。
+///
+/// 卡片要求「每个候选摊开显示各维度原始值与加权后贡献，以及最终分」——
+/// 这是那个「摊开」的载体。
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateExplanation {
+    pub provider_id: String,
+    /// 供应商显示名（界面直接用，不必自己再查一遍表）。
+    pub provider_name: String,
+    /// 模型别名（用户认得的那个）。
+    pub model: String,
+    /// 实际发出去的上游模型名。**与别名可能不同** ——
+    /// 排查「为什么上游报模型不存在」时，差的就是这个名字。
+    pub upstream: String,
+    /// 最终分（与排序用的是同一个函数）。
+    pub score: f32,
+    pub breakdown: ScoreBreakdown,
+    /// 它是否**真的会参与**本轮路由。不健康 / 冷却中 / 额度耗尽的候选
+    /// 会被 `rank_with_intent` 过滤掉，而它们的分数没有意义 ——
+    /// 界面必须标出来，否则用户会拿一个没参与排序的分数去推演。
+    pub eligible: bool,
+    /// 不参与时的原因（中文，界面直接用）。
+    pub ineligible_reason: Option<String>,
+}
 
 pub struct Router {
     limiter: Arc<RateLimiter>,
@@ -602,32 +628,7 @@ impl Router {
         // 两处各算一遍的话，D5 的前沿视图与实际路由会在跨分钟的那一刻用不同的
         // 时段价，而那种不一致不报错，只表现为「图上和实际选的不一样」。
         let minute_of_day = crate::proxy::server::utc_minute_of_day();
-        let cost = CostContext {
-            range: comparable_cost_range(&candidates, prompt_tokens as i64, minute_of_day),
-            // D3：实测吞吐区间。**样本数不足的候选整条跳过**
-            // （与「无价格 = 不主张币种」同款处理）：
-            // 一两个样本的 tok/s 抖动极大，用它排序等于随机。
-            // 阈值来自配置的 `min_efficiency_samples`（默认 5）。
-            tps_range: score::value_range(candidates.iter().filter_map(|c| {
-                let h = self.health.get(&c.provider.id, &c.model.upstream);
-                usable_tps(&h, cfg.cost_routing.min_efficiency_samples)
-            })),
-            min_tps_samples: cfg.cost_routing.min_efficiency_samples,
-            prompt_tokens: prompt_tokens as i64,
-            minute_of_day,
-            health: self.health.clone(),
-            // 【已接】长 prompt 型代价用调用方传来的真实估算值
-            // （`ffb2528` 接的；此前这里传 0，注释也停在那个状态上，
-            // 2026-10-07 复验时一并订正）。
-            // `prompt_tokens` 是**请求级**的估算，由 `server.rs` 用
-            // `estimate_message_tokens(&req.messages)` 算好后传进来 ——
-            // 在这里现算拿不到 `req`，每个候选各算一遍也是浪费。
-            cost_bias: score::cost_bias_applies(
-                intent,
-                prompt_tokens,
-                cfg.cost_routing.long_prompt_threshold_tokens,
-            ),
-        };
+        let cost = self.cost_context(&candidates, cfg, intent, prompt_tokens, minute_of_day);
 
         candidates.sort_by(|a, b| {
             let sa = self.score_of(a, &w, intent, &cost, domain);
@@ -669,9 +670,25 @@ impl Router {
         cost: &CostContext,
         domain: TaskDomain,
     ) -> f32 {
+        score::score(c, &self.score_input(c, cost, intent, domain), w)
+    }
+
+    /// 构造一个候选的打分输入。
+    ///
+    /// **抽出来是为了让 [`Self::explain_candidates`] 与 [`Self::score_of`]
+    /// 拿到同一个输入** —— 各构造一遍的话，界面上的解释与真实排序依据的
+    /// 就不是同一组数，而那种不一致不报错，只表现为「解释得头头是道、
+    /// 顺序却对不上」。
+    fn score_input(
+        &self,
+        c: &Candidate,
+        cost: &CostContext,
+        intent: Option<TaskClass>,
+        domain: TaskDomain,
+    ) -> ScoreInput {
         let key = rate_key(&c.provider, &c.model);
         let q = quota_of(&c.provider);
-        let input = ScoreInput {
+        ScoreInput {
             health: Some(self.health.get(&c.provider.id, &c.model.upstream)),
             headroom: self.limiter.headroom(&key, &q),
             intent,
@@ -681,8 +698,116 @@ impl Router {
             tps_range: cost.tps_range,
             candidate_tps: cost.candidate_tps(c),
             cost_bias: cost.cost_bias,
-        };
-        score::score(c, &input, w)
+        }
+    }
+
+    /// D3/D5：**整批候选一次算出来**的成本上下文。
+    ///
+    /// 区间必须整批算一次：每个候选各算一遍会得出「成本用了含免费模型的区间、
+    /// 效率用了不含的」这类不一致，而那种不一致不报错，只表现为排序偶尔不对。
+    ///
+    /// `prompt_tokens` 是**请求级**的估算（由 `server.rs` 用
+    /// `estimate_message_tokens(&req.messages)` 算好后传进来）——
+    /// 在这里现算拿不到 `req`，每个候选各算一遍也是浪费。
+    /// 非请求路径（D5 的解释视图）传 0：那时没有具体请求，用基础档价。
+    fn cost_context(
+        &self,
+        candidates: &[Candidate],
+        cfg: &AppConfig,
+        intent: Option<TaskClass>,
+        prompt_tokens: u32,
+        minute_of_day: u16,
+    ) -> CostContext {
+        CostContext {
+            range: comparable_cost_range(candidates, prompt_tokens as i64, minute_of_day),
+            // D3：实测吞吐区间。**样本数不足的候选整条跳过**
+            // （与「无价格 = 不主张币种」同款处理）：
+            // 一两个样本的 tok/s 抖动极大，用它排序等于随机。
+            // 阈值来自配置的 `min_efficiency_samples`（默认 5）。
+            tps_range: score::value_range(candidates.iter().filter_map(|c| {
+                let h = self.health.get(&c.provider.id, &c.model.upstream);
+                usable_tps(&h, cfg.cost_routing.min_efficiency_samples)
+            })),
+            min_tps_samples: cfg.cost_routing.min_efficiency_samples,
+            prompt_tokens: prompt_tokens as i64,
+            minute_of_day,
+            health: self.health.clone(),
+            cost_bias: score::cost_bias_applies(
+                intent,
+                prompt_tokens,
+                cfg.cost_routing.long_prompt_threshold_tokens,
+            ),
+        }
+    }
+
+    /// D5：把路由打分**摊开**给用户看。
+    ///
+    /// 卡片原话：「现有界面只显示排序结果，用户无法判断路由器在想什么 ——
+    /// 这正是『改了权重排序变了但没人知道为什么』的根源。」
+    ///
+    /// ## 与真实排序的关系
+    ///
+    /// 权重、成本区间、偏置**全部走 [`Self::rank_with_intent`] 用的那几个函数**，
+    /// 只是不真的排序而已。分数因此就是排序用的那个数。
+    ///
+    /// ## 不参与的候选也照给
+    ///
+    /// 健康检查判不可用 / 冷却中 / 额度耗尽的候选会被真实路由 `retain` 掉。
+    /// 这里**仍然返回它们**并标 `eligible = false` + 原因 ——
+    /// 不返回的话，用户看到的「候选」比实际少，却没有任何线索知道少了谁。
+    /// 但它们的分数字段不该被当作排序依据，所以必须显式标出来。
+    pub fn explain_candidates(
+        &self,
+        providers: &[Provider],
+        cfg: &AppConfig,
+        requested: &str,
+    ) -> Result<Vec<CandidateExplanation>> {
+        let candidates = self.resolve(requested, providers)?;
+        let (strategy, _) = self.effective_strategy(&candidates, cfg);
+        let w = Weights::with_cost_routing(Weights::for_strategy(strategy), &cfg.cost_routing);
+        let minute_of_day = crate::proxy::server::utc_minute_of_day();
+        let cost = self.cost_context(&candidates, cfg, None, 0, minute_of_day);
+
+        let mut out: Vec<CandidateExplanation> = candidates
+            .iter()
+            .map(|c| {
+                let key = rate_key(&c.provider, &c.model);
+                let q = quota_of(&c.provider);
+                let healthy = self.health.is_available(&c.provider.id, &c.model.upstream);
+                let half_open = self
+                    .health
+                    .allow_half_open(&c.provider.id, &c.model.upstream);
+                let allowed = self.limiter.allows(&key, &q);
+                // 顺序与 `rank_with_intent` 的过滤顺序一致：报出的是**第一个**
+                // 拦住它的原因，而不是把所有原因都堆上（后者读起来像「它有三宗罪」）。
+                let reason = if !healthy {
+                    Some("健康检查判定为不可用")
+                } else if !half_open {
+                    Some("冷却中，尚未到半开探测时机")
+                } else if !allowed {
+                    Some("额度已耗尽")
+                } else {
+                    None
+                };
+                let input = self.score_input(c, &cost, None, TaskDomain::General);
+                CandidateExplanation {
+                    provider_id: c.provider.id.clone(),
+                    provider_name: c.provider.name.clone(),
+                    model: c.model.alias.clone(),
+                    upstream: c.model.upstream.clone(),
+                    score: score::score(c, &input, &w),
+                    breakdown: score::explain(c, &input, &w),
+                    eligible: reason.is_none(),
+                    ineligible_reason: reason.map(str::to_string),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(out)
     }
 
     /// 请求成功后记账（供后续额度判断）

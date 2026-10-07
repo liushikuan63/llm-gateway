@@ -279,6 +279,7 @@ pub fn run() {
             commands::export_requests,
             commands::export_capabilities,
             commands::capability_pareto,
+            commands::explain_routing,
             commands::list_agent_runtimes,
             commands::list_agent_adapters,
             commands::save_agent_runtime,

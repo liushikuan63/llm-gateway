@@ -318,7 +318,7 @@ fn 权重为零的维度贡献恒为一() {
         .find(|f| f.name == "headroom")
         .expect("headroom 因子");
     assert!(headroom.raw.is_some(), "headroom 一定有原始值");
-    assert_eq!(headroom.note(), "权重为 0，没有参与");
+    assert_eq!(headroom.reason, "权重为 0，没有参与");
     assert_eq!(breakdown.total, 1.0, "全部权重为 0 时最终分恒为 1.0");
 }
 
@@ -344,7 +344,7 @@ fn 无数据的维度原始值是_none_而贡献是一() {
         "没有健康数据时原始值必须是 None，不是 0 分"
     );
     assert_eq!(health.contribution, 1.0, "没有数据不惩罚");
-    assert!(health.note().contains("没有数据"), "{}", health.note());
+    assert!(health.reason.contains("没有数据"), "{}", health.reason);
 
     let latency = breakdown
         .factors
@@ -394,7 +394,73 @@ fn 成本偏置开着且有权重时成本项真的参与() {
         "最贵的候选在成本维上必须低于 1.0，实际 {}",
         cost.contribution
     );
-    assert!(cost.note().contains("已按权重计入"), "{}", cost.note());
+    assert!(cost.reason.contains("已按权重计入"), "{}", cost.reason);
+}
+
+/// D5：解释视图必须**把不参与的候选也列出来**并说明原因。
+///
+/// 真实路由会 `retain` 掉不健康 / 冷却中 / 额度耗尽的候选。解释视图若照做，
+/// 用户看到的「候选」比实际少，却没有任何线索知道少了谁 ——
+/// 而「我的模型怎么没出现」恰恰是这个界面存在的理由。
+///
+/// 但它们的分数**不该被当作排序依据**，所以必须显式标 `eligible = false`。
+#[test]
+fn 解释视图列出不参与的候选并给出原因() {
+    let (router, _, _) = router();
+    let a = provider("a", 1, 50);
+    let mut b = provider("b", 2, 50);
+    // **必须给一个额度上限**：`rpm_limit = 0` 在我们的约定里表示「不限」，
+    // 那时 `allows()` 恒为 true、`mark_rate_limited` 也无效 ——
+    // 第一版用例就栽在这里（断言写「额度耗尽」，却怎么也耗尽不了）。
+    b.rpm_limit = 1;
+    let providers = vec![a, b];
+
+    // 让 b 的额度耗尽 —— 真实路由到这一步会把它 `retain` 掉。
+    let b_provider = providers[1].clone();
+    let b_model = b_provider.models[0].clone();
+    router.consume(&b_provider, &b_model, 1);
+
+    let out = router
+        .explain_candidates(&providers, &AppConfig::default(), "auto")
+        .expect("auto 应当解析出候选");
+
+    assert_eq!(out.len(), 2, "两个候选都必须出现，哪怕其中一个不参与");
+    let hit_a = out
+        .iter()
+        .find(|e| e.provider_id == "a")
+        .expect("a 在结果里");
+    assert!(hit_a.eligible, "a 没有理由被排除");
+    assert!(hit_a.ineligible_reason.is_none());
+    let hit_b = out
+        .iter()
+        .find(|e| e.provider_id == "b")
+        .expect("b 在结果里");
+    assert!(!hit_b.eligible, "额度耗尽的候选必须被标成不参与");
+    assert!(
+        hit_b
+            .ineligible_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("额度"),
+        "原因要能读懂，实际 {:?}",
+        hit_b.ineligible_reason
+    );
+    // 降序：界面直接照着渲染，不该由前端再排一次。
+    assert!(
+        out[0].score >= out[1].score,
+        "解释视图必须按分数降序给出：{:?}",
+        out.iter()
+            .map(|e| (e.provider_id.as_str(), e.score))
+            .collect::<Vec<_>>()
+    );
+    // 分解要跟着一起来，否则界面只能显示一个孤零零的分数。
+    assert!(!hit_a.breakdown.factors.is_empty());
+    assert!(hit_a.breakdown.factors.iter().any(|f| f.name == "health"));
+    assert!(hit_a
+        .breakdown
+        .factors
+        .iter()
+        .any(|f| f.name == "capability"));
 }
 
 #[test]

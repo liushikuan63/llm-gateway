@@ -1421,6 +1421,32 @@ pub async fn export_requests(
 
 /* ------------------- D5 可解释性与 Pareto 前沿 ------------------- */
 
+/// D5：把路由打分摊开给用户看。
+///
+/// `model` 省略或为空时按 `auto` 解析 —— 那正是「我不点名、你帮我选」
+/// 这个最常见的情形，也最需要解释。
+///
+/// 权重、成本区间、偏置全部走 `rank_with_intent` 用的那几个函数，
+/// 所以这里给出的分数**就是排序用的那个数**。
+#[tauri::command]
+pub async fn explain_routing(
+    state: State<'_, AppState>,
+    model: Option<String>,
+) -> Result<Vec<crate::router::CandidateExplanation>, String> {
+    let cfg = state.gateway.cfg_snapshot();
+    let providers = repo::list_providers(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    let requested = model
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| "auto".into());
+    state
+        .gateway
+        .router
+        .explain_candidates(&providers, &cfg, &requested)
+        .map_err(|e| e.to_string())
+}
+
 /// D5：质量 × 速度 × 价格的三维前沿视图。
 ///
 /// 三个维度的取值口径**全部在 `Router::pareto_view` 里**（与路由同源），

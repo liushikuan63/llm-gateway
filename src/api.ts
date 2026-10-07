@@ -751,6 +751,38 @@ export interface AuditExportResult {
   columns_doc: string | null;
 }
 
+// ---------- D5 打分分解 ----------
+
+/** 打分的一项。`reason` 由**后端算好**，前端直接显示，不要自己推。 */
+export interface ScoreFactor {
+  name: string;
+  /** 原始值。`null` = 这一维没有数据（不是 0 分）。 */
+  raw: number | null;
+  weight: number;
+  /** 该项在乘积里的实际因子（`raw^weight`）。 */
+  contribution: number;
+  reason: string;
+}
+
+export interface ScoreBreakdown {
+  factors: ScoreFactor[];
+  exact_match_bonus: number;
+  total: number;
+}
+
+export interface CandidateExplanation {
+  provider_id: string;
+  provider_name: string;
+  model: string;
+  /** 实际发往上游的模型名，与别名可能不同。 */
+  upstream: string;
+  score: number;
+  breakdown: ScoreBreakdown;
+  /** 是否真的会参与本轮路由。不健康 / 冷却 / 额度耗尽的会被过滤掉。 */
+  eligible: boolean;
+  ineligible_reason: string | null;
+}
+
 // ---------- D5 可解释性与 Pareto 前沿 ----------
 
 /**
@@ -1053,6 +1085,15 @@ export const api = {
    * 表现是「前沿图上看到的和实际路由选的不一样」。
    */
   capabilityPareto: () => invoke<ParetoView>("capability_pareto"),
+
+  /**
+   * D5：把路由打分摊开。
+   *
+   * `model` 省略时按 `auto` 解析 —— 那正是「我不点名、你帮我选」这个
+   * 最常见、也最需要解释的情形。
+   */
+  explainRouting: (model?: string) =>
+    invoke<CandidateExplanation[]>("explain_routing", { model: model ?? null }),
 
   /**
    * 导入能力账本。

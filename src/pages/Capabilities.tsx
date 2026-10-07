@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
-import { api, CapabilitySet, ParetoView } from "../api";
+import { api, CandidateExplanation, CapabilitySet, ParetoView } from "../api";
 import { errorText } from "./providerPresets";
 import "./capabilities.css";
+
+/** 七个打分维度的中文名。**只是标签** —— 判定逻辑不在前端。 */
+const FACTOR_LABEL: Record<string, string> = {
+  health: "健康", headroom: "剩余额度", capability: "能力", latency: "延迟",
+  intent_fit: "任务匹配", cost: "成本", efficiency: "效率",
+};
 
 /**
  * D2：多来源能力账本的**冲突视图**。
@@ -62,22 +68,30 @@ function rowsOf(set: CapabilitySet | undefined): DimensionRow[] {
 export default function CapabilitiesPage() {
   const [ledger, setLedger] = useState<Record<string, CapabilitySet> | null>(null);
   const [pareto, setPareto] = useState<ParetoView | null>(null);
+  const [explain, setExplain] = useState<CandidateExplanation[] | null>(null);
+  const [explainModel, setExplainModel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const load = async () => {
+  const load = async (model = explainModel) => {
     setBusy(true);
     setError(null);
     try {
-      const [raw, view] = await Promise.all([api.exportCapabilities(), api.capabilityPareto()]);
+      const [raw, view, ranking] = await Promise.all([
+        api.exportCapabilities(),
+        api.capabilityPareto(),
+        api.explainRouting(model.trim() || undefined),
+      ]);
       setLedger(JSON.parse(raw) as Record<string, CapabilitySet>);
       setPareto(view);
+      setExplain(ranking);
     } catch (cause) {
       // 读不到就明确报出来，并且**不留半张表** —— 空表看起来像「没有冲突」，
       // 而那与「读失败」是完全相反的结论。
       setError(errorText(cause));
       setLedger({});
       setPareto(null);
+      setExplain(null);
     } finally {
       setBusy(false);
     }
@@ -103,6 +117,68 @@ export default function CapabilitiesPage() {
       </header>
 
       {error && <div className="capability-error" role="alert">读取能力账本失败：{error}</div>}
+
+      {/* D5：打分分解。卡片原话——「现有界面只显示排序结果，用户无法判断
+          路由器在想什么，这正是『改了权重排序变了但没人知道为什么』的根源」。 */}
+      {explain && (
+        <section className="explain-section">
+          <h3>为什么选了它</h3>
+          <p className="capability-hint">
+            每个候选的七个维度都摊开：原始值、权重、以及它贡献进乘积的那个因子。
+            分数与真实排序用的是同一个函数，所以这里看到的顺序就是实际会用的顺序。
+          </p>
+          <div className="explain-input">
+            <input
+              aria-label="解释哪个模型"
+              placeholder="模型名（留空按 auto 解释）"
+              value={explainModel}
+              onChange={(e) => setExplainModel(e.target.value)}
+            />
+            <button type="button" disabled={busy} onClick={() => void load()}>重新解释</button>
+          </div>
+          {explain.length === 0 && (
+            <p className="capability-hint">没有解析出候选 —— 检查模型名是否存在于已启用的供应商里。</p>
+          )}
+          {explain.map((item, index) => (
+            <details className="explain-candidate" key={`${item.provider_id}/${item.model}`} open={index === 0}>
+              <summary>
+                <span>{item.provider_name} · {item.model}</span>
+                <span className="explain-score">{item.score.toFixed(4)}</span>
+                {!item.eligible && (
+                  <span className="tag ineligible-tag">不参与：{item.ineligible_reason}</span>
+                )}
+              </summary>
+              <table className="explain-table">
+                <thead>
+                  <tr><th>维度</th><th>原始值</th><th>权重</th><th>贡献</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                  {item.breakdown.factors.map((f) => (
+                    <tr key={f.name}>
+                      <td>{FACTOR_LABEL[f.name] ?? f.name}</td>
+                      <td>{f.raw === null ? <span className="missing">数据不足</span> : f.raw.toFixed(3)}</td>
+                      <td>{f.weight.toFixed(2)}</td>
+                      <td>{f.contribution.toFixed(4)}</td>
+                      <td className="muted">{f.reason}</td>
+                    </tr>
+                  ))}
+                  <tr className="explain-total">
+                    <td colSpan={3}>
+                      最终分（精确命中加成 ×{item.breakdown.exact_match_bonus}）
+                    </td>
+                    <td>{item.breakdown.total.toFixed(4)}</td>
+                    <td />
+                  </tr>
+                </tbody>
+              </table>
+              <p className="capability-hint">
+                实际发往上游的模型名：<code>{item.upstream}</code>
+                {item.upstream !== item.model && "（与别名不同 —— 上游报「模型不存在」时差的就是这个名字）"}
+              </p>
+            </details>
+          ))}
+        </section>
+      )}
 
       {/* D5：三维前沿。缺数据的维度显示「数据不足」而不是 0 或空白 ——
           0 会被读成「这一维得了 0 分」，而事实是「我们没有这一维的数据」。 */}

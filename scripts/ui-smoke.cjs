@@ -105,6 +105,38 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     dominated_by: { "multimodal/vision-model": ["anthropic/claude-sonnet"] },
     currency_note: null,
   };
+  // D5 打分分解：三条覆盖三种情形 —— 正常参与、缺数据、不参与。
+  // `reason` 由**后端**给（前端不按 raw/weight 自己推），夹具必须照抄这个分工。
+  const 因子 = (name, raw, weight, contribution, reason) => ({ name, raw, weight, contribution, reason });
+  window.__fixtureExplain = [
+    {
+      provider_id: "openrouter", provider_name: "OpenRouter", model: "openrouter/free",
+      upstream: "vendor/chat:free", score: 0.42, eligible: true, ineligible_reason: null,
+      breakdown: {
+        exact_match_bonus: 1, total: 0.42,
+        factors: [
+          因子("health", 1, 0.35, 1, "已按权重计入"),
+          因子("headroom", 1, 0.25, 1, "已按权重计入"),
+          因子("capability", 0.6, 0.2, 0.903, "已按权重计入"),
+          因子("latency", null, 0.2, 1, "没有数据，不参与打分（按 1.0 处理，不是 0 分）"),
+          因子("intent_fit", null, 0, 1, "没有数据，不参与打分（按 1.0 处理，不是 0 分）"),
+          因子("cost", null, 0, 1, "权重为 0，没有参与"),
+          因子("efficiency", null, 0, 1, "权重为 0，没有参与"),
+        ],
+      },
+    },
+    {
+      provider_id: "ollama", provider_name: "本地 Ollama", model: "qwen-local",
+      upstream: "qwen-local", score: 0.9, eligible: false, ineligible_reason: "额度已耗尽",
+      breakdown: {
+        exact_match_bonus: 1, total: 0.9,
+        factors: [
+          因子("health", 1, 0.35, 1, "已按权重计入"),
+          因子("headroom", 0, 0.25, 0, "已按权重计入"),
+        ],
+      },
+    },
+  ];
   window.__fixtureSearchKey = { masked: "tvly-****-abc", configured: true };  // 搜索设置快照。`get_search_settings` 与 `update_search_settings` 共用它，
   // 这样"保存后重新打开页面设置仍是新值"这条断言才不是自说自话。
   const searchSettings = () => {
@@ -321,6 +353,8 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       // 形状必须与 `ParetoView` 一致，否则页面会静默渲染成空表。
       case "capability_pareto":
         return structuredClone(window.__fixturePareto ?? { points: [], front: [], dominated_by: {}, currency_note: null });
+      // D5：打分分解。形状必须与 `CandidateExplanation` 一致。
+      case "explain_routing": return structuredClone(window.__fixtureExplain ?? []);
       // A5：运行时清单与适配器表。徽标要靠前者把 runtime_id 翻成人话；
       // 漏了这个 case 会让整页 `Promise.all` 失败 —— 那是白屏，不是「没有徽标」。
       case "list_agent_runtimes": return structuredClone(window.__fixtureAgentRuntimes ?? []);
@@ -1160,6 +1194,38 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
       "数据不足的候选不能被判成被支配 —— 缺数据既不是更好也不是更差",
     );
     await page.screenshot({ path: path.join(output, "capability-pareto.png"), fullPage: true });
+
+    /* ------------------------------------------------------------------ */
+    /* D5 打分分解                                                         */
+    /* ------------------------------------------------------------------ */
+    const explainSection = page.locator(".explain-section");
+    await explainSection.waitFor({ timeout: 5000 });
+    const candidates = explainSection.locator(".explain-candidate");
+    assert.equal(await candidates.count(), 2, "夹具给了两个候选");
+    // 第一条默认展开：用户进来第一眼就该看到明细，而不是一个折叠标题。
+    const firstTable = candidates.first().locator(".explain-table");
+    await firstTable.waitFor({ timeout: 5000 });
+    const firstText = await firstTable.innerText();
+    // 七个维度都要摊开（卡片要求「每个候选摊开显示各维原始值与加权后贡献」）。
+    for (const label of ["健康", "剩余额度", "能力", "延迟", "任务匹配", "成本", "效率"]) {
+      assert(firstText.includes(label), `维度「${label}」必须出现：${firstText}`);
+    }
+    assert(firstText.includes("0.600"), `能力原始值要显示：${firstText}`);
+    assert(firstText.includes("0.35"), `权重要显示：${firstText}`);
+    // 诚实性：没有数据的维度显示「数据不足」，说明列由**后端**给。
+    assert(firstText.includes("数据不足"), `缺数据的维度要说明：${firstText}`);
+    assert(firstText.includes("权重为 0，没有参与"), `权重为 0 的原因要写清：${firstText}`);
+    assert(firstText.includes("不是 0 分"), `缺数据不等于 0 分：${firstText}`);
+    // 不参与的候选必须标出来 —— 它的分数没有参与排序。
+    const secondText = await candidates.nth(1).innerText();
+    assert(secondText.includes("不参与"), `不参与的候选要标出来：${secondText}`);
+    assert(secondText.includes("额度已耗尽"), `不参与的原因要显示：${secondText}`);
+    // 上游名与别名不同时要提示 —— 上游报「模型不存在」时差的就是这个名字。
+    assert(
+      (await candidates.first().innerText()).includes("vendor/chat:free"),
+      "实际发往上游的模型名要显示",
+    );
+    await page.screenshot({ path: path.join(output, "capability-explain.png"), fullPage: true });
 
     /* ------------------------------------------------------------------ */
     /* 本地模型与智能模式                                                  */

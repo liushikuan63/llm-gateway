@@ -331,17 +331,28 @@ pub struct ScoreFactor {
     /// 该项在乘积里的实际因子：`raw^weight`。
     /// **无数据时是 1.0**（不惩罚），权重为 0 时也是 1.0（`x^0 == 1`）。
     pub contribution: f32,
+    /// 「为什么贡献是这个值」——**后端算好**，前端直接显示。
+    ///
+    /// 不让前端按 `raw`/`weight` 自己推：那样展示规则就在两处各写一遍，
+    /// 改了一处另一处会不一致 —— 而这一整批功能防的就是这件事。
+    pub reason: &'static str,
 }
 
 impl ScoreFactor {
-    /// 「这一维为什么是这个贡献」——界面直接用这句话，不各自解释一遍。
-    pub fn note(&self) -> &'static str {
-        if self.raw.is_none() {
+    fn new(name: &'static str, raw: Option<f32>, weight: f32, contribution: f32) -> Self {
+        let reason = if raw.is_none() {
             "没有数据，不参与打分（按 1.0 处理，不是 0 分）"
-        } else if self.weight == 0.0 {
+        } else if weight == 0.0 {
             "权重为 0，没有参与"
         } else {
             "已按权重计入"
+        };
+        Self {
+            name,
+            raw,
+            weight,
+            contribution,
+            reason,
         }
     }
 }
@@ -441,48 +452,18 @@ pub fn explain(c: &Candidate, input: &ScoreInput, w: &Weights) -> ScoreBreakdown
 
     ScoreBreakdown {
         factors: vec![
-            ScoreFactor {
-                name: "health",
-                raw: raw_health,
-                weight: w.health,
-                contribution: h.powf(w.health),
-            },
-            ScoreFactor {
-                name: "headroom",
-                raw: raw_headroom,
-                weight: w.headroom,
-                contribution: hd.powf(w.headroom),
-            },
-            ScoreFactor {
-                name: "capability",
-                raw: raw_capability,
-                weight: w.capability,
-                contribution: cap.powf(w.capability),
-            },
-            ScoreFactor {
-                name: "latency",
-                raw: raw_latency,
-                weight: w.latency,
-                contribution: lat.powf(w.latency),
-            },
-            ScoreFactor {
-                name: "intent_fit",
-                raw: raw_fit,
-                weight: w.intent,
-                contribution: fit,
-            },
-            ScoreFactor {
-                name: "cost",
-                raw: raw_cost,
-                weight: w.cost,
-                contribution: cost,
-            },
-            ScoreFactor {
-                name: "efficiency",
-                raw: raw_eff,
-                weight: w.efficiency,
-                contribution: eff,
-            },
+            ScoreFactor::new("health", raw_health, w.health, h.powf(w.health)),
+            ScoreFactor::new("headroom", raw_headroom, w.headroom, hd.powf(w.headroom)),
+            ScoreFactor::new(
+                "capability",
+                raw_capability,
+                w.capability,
+                cap.powf(w.capability),
+            ),
+            ScoreFactor::new("latency", raw_latency, w.latency, lat.powf(w.latency)),
+            ScoreFactor::new("intent_fit", raw_fit, w.intent, fit),
+            ScoreFactor::new("cost", raw_cost, w.cost, cost),
+            ScoreFactor::new("efficiency", raw_eff, w.efficiency, eff),
         ],
         exact_match_bonus: bonus,
         total: (base * bonus).clamp(0.0, 1.0),
