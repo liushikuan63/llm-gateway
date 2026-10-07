@@ -85,6 +85,85 @@ impl QuotaRejection {
     }
 }
 
+/// 任务卡二 B5 判据 4：**并发上限**，「第 N+1 次并发请求返回 429
+/// 且**不排队**」。
+///
+/// ## 「不排队」这件事由**签名**保证
+///
+/// [`try_enter`](ConcurrencyGate::try_enter) 是**同步**函数
+/// （不是 `async`、不返回 future）。想要「排队」，它就必须是 async
+/// 或者返回一个 future —— 而它两者都不是。
+///
+/// 这比「实现里写了 `try_acquire` 而不是 `acquire`」更强：
+/// **类型层面就没有等待的可能**。用例里那条
+/// `不排队的判据是签名本身` 就是在钉这一点。
+///
+/// ## 已知缺口：跨 `try_enter` / `leave` 的 panic 会漏掉一个槽位
+///
+/// 严格的做法是 RAII guard（`Drop` 时自动 `leave`），
+/// 但那要求把这个结构放在 `Arc<Mutex<…>>` 后面并让 guard 持有它 ——
+/// 是另一层设计。当前调用点在 `run_agent_request` 里不 panic
+/// （失败都以 `Result` 返回），所以这个缺口**在实践中不触发**。
+/// 写在这里免得以后当 bug 查。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConcurrencyRejection {
+    pub limit: usize,
+    pub active: usize,
+}
+
+impl ConcurrencyRejection {
+    pub fn message(&self) -> String {
+        format!(
+            "网关并发上限：最多 {} 个 Agent 同时执行，当前已有 {} 个在跑。\
+             这是**本地网关**的限制，与上游无关；\
+             本次请求**未被排队**（排队会让它在上限恢复后突然开始跑，\
+             而客户端早已超时）。请稍后重试。",
+            self.limit, self.active
+        )
+    }
+}
+
+/// 并发闸门。**不做队列** —— 满了就拒。
+#[derive(Debug, Default)]
+pub struct ConcurrencyGate {
+    active: usize,
+}
+
+impl ConcurrencyGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 尝试进入。满了就**立刻**返回错误（不等待、不排队）。
+    ///
+    /// `limit == 0` 表示**不限**（与项目里其它上限的口径一致）。
+    pub fn try_enter(&mut self, limit: usize) -> Result<(), ConcurrencyRejection> {
+        if limit == 0 {
+            // 不限时也要计数：`active` 会被 `peek` 用来显示「当前在跑几个」。
+            self.active += 1;
+            return Ok(());
+        }
+        if self.active >= limit {
+            return Err(ConcurrencyRejection {
+                limit,
+                active: self.active,
+            });
+        }
+        self.active += 1;
+        Ok(())
+    }
+
+    /// 退出。**必须与 `try_enter` 配对** —— 漏调用会让槽位永久占住，
+    /// 表现为「跑过几次之后再也进不来」。
+    pub fn leave(&mut self) {
+        self.active = self.active.saturating_sub(1);
+    }
+
+    pub fn peek(&self) -> usize {
+        self.active
+    }
+}
+
 /// 一个运行时的用量计数。
 #[derive(Debug, Clone)]
 struct Usage {
@@ -352,6 +431,104 @@ mod tests {
             (1, 1),
             "被拒 5 次之后用量仍应是 1 —— 被拒的不该记账"
         );
+    }
+
+    // ---------------- B5 判据 4：并发上限 ----------------
+
+    /// **卡片原文场景**：上限 2，第 3 个并发必须被拒。
+    #[test]
+    fn 并发上限为二时第三个被拒() {
+        let mut gate = ConcurrencyGate::new();
+        assert!(gate.try_enter(2).is_ok(), "第 1 个应进");
+        assert!(gate.try_enter(2).is_ok(), "第 2 个应进");
+        let err = gate.try_enter(2).expect_err("第 3 个并发必须被拒");
+        assert_eq!(
+            err,
+            ConcurrencyRejection {
+                limit: 2,
+                active: 2
+            }
+        );
+    }
+
+    /// **「不排队」的判据是签名本身。**
+    ///
+    /// `try_enter` 是**同步**函数（不是 async、不返回 future）——
+    /// 类型层面就没有等待的可能。阻塞版必然得是 async 才能挂起调用方。
+    ///
+    /// 这条用例在**编译期**成立：把 `try_enter` 改成 async 的话，
+    /// 本文件里所有同步调用点都会编译失败。所以它不需要运行时断言 ——
+    /// 写出来是为了让这个论证**留在代码里**，而不是只在某个提交信息里。
+    #[test]
+    fn 不排队的判据是签名本身() {
+        // 这一行**没有 .await** —— 它就是证据。
+        let mut gate = ConcurrencyGate::new();
+        let _: Result<(), ConcurrencyRejection> = gate.try_enter(1);
+        assert_eq!(gate.peek(), 1);
+    }
+
+    #[test]
+    fn 退出后槽位会被放回() {
+        let mut gate = ConcurrencyGate::new();
+        gate.try_enter(1).unwrap();
+        assert!(gate.try_enter(1).is_err(), "满了");
+        gate.leave();
+        assert_eq!(gate.peek(), 0);
+        assert!(gate.try_enter(1).is_ok(), "退出后必须能再进");
+    }
+
+    /// **漏调用 `leave` 的后果可见** —— 这是「必须配对」的证据。
+    #[test]
+    fn 漏掉_leave_会让槽位永久占住() {
+        let mut gate = ConcurrencyGate::new();
+        for _ in 0..3 {
+            gate.try_enter(3).unwrap();
+            // 故意不 leave
+        }
+        assert_eq!(gate.peek(), 3);
+        assert!(
+            gate.try_enter(3).is_err(),
+            "三次都没 leave ⇒ 槽位占满 ⇒ 之后再也进不来"
+        );
+    }
+
+    #[test]
+    fn 并发上限为零表示不限但仍计数() {
+        let mut gate = ConcurrencyGate::new();
+        for _ in 0..50 {
+            assert!(gate.try_enter(0).is_ok(), "0 = 不限");
+        }
+        // 不限时**仍然计数** —— `peek` 要用来显示「当前在跑几个」
+        assert_eq!(gate.peek(), 50);
+    }
+
+    /// 多出来的 `leave` 不该把计数搞成负数（那会让上限永久失效）。
+    #[test]
+    fn 多余的_leave_不会让计数变负() {
+        let mut gate = ConcurrencyGate::new();
+        gate.leave();
+        gate.leave();
+        assert_eq!(gate.peek(), 0, "saturating_sub 守着它");
+        // 计数没变负 ⇒ 上限仍然有效
+        gate.try_enter(1).unwrap();
+        assert!(gate.try_enter(1).is_err());
+    }
+
+    /// 错误文本要自报家门 + 说清「没排队」。
+    #[test]
+    fn 并发拒绝的文本自报家门且说明未排队() {
+        let msg = ConcurrencyRejection {
+            limit: 3,
+            active: 3,
+        }
+        .message();
+        assert!(msg.contains("网关并发上限"), "要自报家门：{msg}");
+        assert!(msg.contains("与上游无关"), "要排除上游：{msg}");
+        assert!(
+            msg.contains("未被排队"),
+            "要说清没排队 —— 否则用户以为等一等就能跑：{msg}"
+        );
+        assert!(msg.contains("稍后重试"), "要给下一步：{msg}");
     }
 
     #[test]
