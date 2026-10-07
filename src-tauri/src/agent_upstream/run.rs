@@ -123,6 +123,48 @@ fn vet_artifacts(workspace: &WorkspaceRoot, artifacts: &[String]) -> Result<(), 
     Ok(())
 }
 
+/// 一次 Agent 型请求的完整解析链：**配置门禁 → 产物根 → 适配器 → 执行**。
+///
+/// ## 为什么把这条链单独抽出来
+///
+/// HTTP 路由只该做「取参数 / 转 JSON」；上面这四步**每一步都可能被拒绝**
+/// （开关关着、产物根建不出来、适配器不存在、执行失败），
+/// 而它们的错误文本是给用户看的。混在处理器里就只能靠端到端碰运气测。
+///
+/// ## 【铁律 2：模式隔离】开关关着时**第一步就返回**
+///
+/// `agent.enabled` 默认 `false`。关着时这个函数**不解析产物根、
+/// 不碰文件系统、不调适配器** —— 直接返回错误。
+/// 这样「没开这个能力」与「开了但失败」在**副作用上**就区分得开：
+/// 前者一定没有创建任何目录。用例守着这一条。
+pub async fn run_agent_request(
+    config: &crate::config::AgentConfig,
+    registry: &super::AdapterRegistry,
+    runtime_id: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<AgentRunOutcome, String> {
+    // ① 开关。**必须排在最前** —— 关着时不许有任何副作用。
+    if !config.enabled {
+        return Err("Agent 型入口未启用。它是让外部 CLI 在本地读写文件的能力，\
+             默认关闭；确认需要后请在配置里打开 agent.enabled"
+            .to_string());
+    }
+
+    // ② 适配器。解析不出就报可读错误（与 A5 判据 3 同一条口径）。
+    let adapter = registry
+        .resolve(Some(runtime_id))?
+        .ok_or_else(|| format!("未知账号运行时：{runtime_id}"))?;
+
+    // ③ 产物根。`runtime_id` 的消毒在 `default_workspace_root` 里。
+    let base = config.resolve_base()?;
+    let workspace = super::workspace::default_workspace_root(&base, runtime_id)?;
+
+    // ④ 执行。超时来自配置（默认 300s，依据是实测 codex 会静默挂住）。
+    let timeout_ms = config.exec_timeout_secs.saturating_mul(1000).max(1);
+    run_agent(adapter.as_ref(), model, prompt, timeout_ms, &workspace).await
+}
+
 /// 列出产物根下的所有文件：**相对路径 → 修改时间戳**。
 ///
 /// 用「修改时间」而不是「文件大小」判断改动：agent 完全可能
@@ -322,6 +364,98 @@ mod tests {
             "混杂清单里有越界项时必须整体拒绝 —— 悄悄丢掉那一项会让\
              用户以为「没有越界」"
         );
+    }
+
+    // ---------------- 完整解析链（A8 路由的内核） ----------------
+
+    fn enabled_config(
+        name: &str,
+        enabled: bool,
+    ) -> (crate::config::AgentConfig, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("llmgw-req-{name}"));
+        let _ = std::fs::remove_dir_all(&base);
+        (
+            crate::config::AgentConfig {
+                enabled,
+                workspace_root: Some(base.clone()),
+                exec_timeout_secs: 5,
+            },
+            base,
+        )
+    }
+
+    /// **铁律 2 的副作用隔离**：开关关着时，**不许创建任何目录**。
+    ///
+    /// 只断言「返回了错误」是不够的 —— 一个「先建目录再检查开关」的实现
+    /// 也能通过那种断言，而它在**关着的时候**就已经在用户机器上落了盘。
+    #[tokio::test]
+    async fn 开关关着时连目录都不建() {
+        let (cfg, base) = enabled_config("gateoff", false);
+        let registry = super::super::AdapterRegistry::with_builtins();
+
+        let err = run_agent_request(&cfg, &registry, "fake", "m", "你好")
+            .await
+            .expect_err("开关关着必须拒绝");
+        assert!(err.contains("未启用"), "错误要说清原因：{err}");
+        assert!(err.contains("agent.enabled"), "要告诉用户怎么开：{err}");
+
+        // **副作用判据**：那个目录连父目录都不该存在
+        assert!(
+            !base.exists(),
+            "开关关着时不许碰文件系统，但 {} 被创建了",
+            base.display()
+        );
+    }
+
+    /// 对照组：开关打开时**确实**会建出产物根。
+    /// 没有这一条的话，上面那条可能只是因为「实现从来不建目录」而通过。
+    #[tokio::test]
+    async fn 开关打开时会建出产物根() {
+        let (cfg, base) = enabled_config("gateon", true);
+        let registry = super::super::AdapterRegistry::with_builtins();
+
+        let out = run_agent_request(&cfg, &registry, "fake", "m", "你好")
+            .await
+            .expect("开了就该跑起来");
+        assert!(out.text.contains("你好"));
+
+        let expected = base.join("runtimes").join("fake").join("workspace");
+        assert!(
+            expected.is_dir(),
+            "产物根应当被建出来：{}",
+            expected.display()
+        );
+    }
+
+    /// 未知运行时：给出可读错误，且**不创建任何目录**
+    /// （适配器解析排在产物根之前，正是为了这个）。
+    #[tokio::test]
+    async fn 未知运行时不建目录也不调适配器() {
+        let (cfg, base) = enabled_config("unknown", true);
+        let registry = super::super::AdapterRegistry::with_builtins();
+
+        let err = run_agent_request(&cfg, &registry, "codexx", "m", "你好")
+            .await
+            .expect_err("未知运行时必须报错");
+        assert_eq!(err, "未知账号运行时：codexx");
+        assert!(
+            !base.exists(),
+            "适配器解析失败时不该留下产物根：{}",
+            base.display()
+        );
+    }
+
+    /// `runtime_id` 的消毒在这一层也生效（越界 id 不许建目录）。
+    #[tokio::test]
+    async fn 穿越型_runtime_id_被拒且不建目录() {
+        let (cfg, base) = enabled_config("traverse", true);
+        let registry = super::super::AdapterRegistry::with_builtins();
+
+        let err = run_agent_request(&cfg, &registry, "..", "m", "你好")
+            .await
+            .expect_err("穿越 id 必须被拒");
+        assert!(!err.is_empty());
+        assert!(!base.exists(), "被拒时不该留下任何目录");
     }
 
     #[test]
