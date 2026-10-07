@@ -3281,6 +3281,18 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     match outcome {
         Ok(o) => {
             let latency = started.elapsed().as_millis() as u64;
+            // 任务卡二 A6 判据 1：把适配器如实回报的**传输**回填进逐跳明细。
+            //
+            // 【为什么在这里回填，而不是在 `AttemptRecord::success` 里传】
+            // 失败转移链对响应类型是**泛型**的（`run_with_auth_policy<T>`），
+            // 链内部读不到 `ChatResponse.transport`；硬加 trait 约束会把
+            // 泛型复杂度传染给每个调用方。而这里 `o.value` 是有具体类型的。
+            //
+            // 回填**最后一条**是准确的：`o` 就是链最后成功的那一跳。
+            // 普通 API 上游的 `transport` 是 `None`，回填等于没改。
+            if let Some(last) = attempt_records.last_mut() {
+                last.transport = o.value.transport.clone();
+            }
             health.record_success(&o.provider_id, &o.model, latency as u32);
             if let Some(p) = ranked.iter().find(|c| c.provider.id == o.provider_id) {
                 if let Some(m) = p.provider.models.iter().find(|m| m.upstream == o.model) {

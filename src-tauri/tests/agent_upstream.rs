@@ -731,3 +731,84 @@ fn 账号型上游的失败明细也带_runtime_kind() {
         Some(false)
     );
 }
+
+/// `transport` 从 `ChatResponse` 回填进逐跳明细 —— **这条是回填逻辑的钉子**。
+///
+/// 非流式成功分支里那句 `last.transport = o.value.transport.clone()`
+/// 没有直接的单元测试（它在 `normal_dispatch` 的深处），
+/// 但回填的**语义**可以在这里钉住：
+/// `AttemptRecord.success` 建出来的记录 `transport` 是 `None`，
+/// 而调用方回填之后它变成适配器回报的值。
+#[test]
+fn 回填_transport_的语义() {
+    use llm_gateway_lib::domain::{Dialect, Provider};
+    use llm_gateway_lib::router::failover::AttemptRecord;
+
+    let now = chrono::Utc::now();
+    let provider = Provider {
+        id: "p-codex".into(),
+        name: "codex".into(),
+        dialect: Dialect::OpenAI,
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key_enc: String::new(),
+        enabled: true,
+        priority: 0,
+        models: Vec::new(),
+        rpm_limit: 0,
+        intelligence: 50,
+        note: None,
+        runtime_id: Some("codex-work".into()),
+        created_at: now,
+        updated_at: now,
+    };
+
+    // ① `success` 建出来时是 None（链内部读不到泛型响应的字段）
+    let mut record = AttemptRecord::success(&provider, "gpt-5", 100);
+    assert!(
+        record.transport.is_none(),
+        "链内部建出来的记录不该凭空有 transport"
+    );
+
+    // ② 调用方回填之后才有值
+    record.transport = Some("L3".to_string());
+    let json = serde_json::to_value(&record).expect("应当能序列化");
+    assert_eq!(
+        json.get("transport").and_then(|v| v.as_str()),
+        Some("L3"),
+        "回填之后必须出现在审计 JSON 里，实际：{json}"
+    );
+}
+
+/// **对照组**：普通 API 上游回填 `None`，字段不该出现在审计 JSON 里。
+#[test]
+fn 普通上游回填后仍不带_transport() {
+    use llm_gateway_lib::domain::{Dialect, Provider};
+    use llm_gateway_lib::router::failover::AttemptRecord;
+
+    let now = chrono::Utc::now();
+    let provider = Provider {
+        id: "p-api".into(),
+        name: "api".into(),
+        dialect: Dialect::OpenAI,
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key_enc: String::new(),
+        enabled: true,
+        priority: 0,
+        models: Vec::new(),
+        rpm_limit: 0,
+        intelligence: 50,
+        note: None,
+        runtime_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let mut record = AttemptRecord::success(&provider, "gpt-5", 100);
+    // 模拟回填：普通上游的 ChatResponse.transport 是 None
+    record.transport = None;
+    let json = serde_json::to_value(&record).expect("应当能序列化");
+    assert!(
+        json.get("transport").is_none(),
+        "普通上游不该出现 transport 字段，实际：{json}"
+    );
+}

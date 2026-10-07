@@ -57,6 +57,13 @@ pub struct AttemptRecord {
     /// 「这次是什么上游」在请求级别本来就说不清 —— 逐跳才说得清。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_kind: Option<String>,
+    /// 任务卡二 A6 判据 1：账号型上游**实际**走的传输（`L1` / `L3`）。
+    ///
+    /// 由适配器一路带上来（`AgentReply.transport` → `ChatResponse.transport`
+    /// → 这里），**不是审计侧按配置推断的** —— 卡片要的是「实际走了哪条」，
+    /// 而只有适配器自己知道（可能 L1 起不来、回落到了 L3）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 const MAX_ATTEMPT_ERROR_CHARS: usize = 300;
@@ -80,6 +87,9 @@ impl AttemptRecord {
             latency_ms,
             ok: false,
             retryable: error.retryable(),
+            // 失败的一跳拿不到 transport —— 适配器没走完就报错了。
+            // `None` 是**如实的空**，不是「不知道」：这一跳确实没有任何传输发生过。
+            transport: None,
             // 账号型上游的一跳：记下它的运行时种类。
             // 从 `provider.runtime_id` 取 —— 那正是分派点用来选路的同一个值，
             // 不另存一份状态（两份状态迟早不一致）。
@@ -87,6 +97,14 @@ impl AttemptRecord {
         }
     }
 
+    /// ## 为什么 transport 不在这里传
+    ///
+    /// 失败转移链对**响应类型是泛型**的（`run_with_auth_policy<T>`），
+    /// 所以链内部读不到 `ChatResponse.transport`。硬加 trait 约束会把
+    /// 泛型复杂度传染给每个调用方。
+    ///
+    /// 做法改为：链返回后由**调用方回填**最后一条记录
+    /// （见 `server.rs` 的非流式成功分支）。那里的响应是有具体类型的。
     pub fn success(provider: &Provider, model: &str, latency_ms: u64) -> Self {
         Self {
             provider_id: provider.id.clone(),
@@ -98,12 +116,17 @@ impl AttemptRecord {
             ok: true,
             retryable: false,
             runtime_kind: provider.runtime_id.clone(),
+            // 由调用方在链返回后回填（见 `success` 的注释）。
+            transport: None,
         }
     }
 
     /// 复测**成功**的记录。必须有标记：否则审计里只剩「一次失败 + 一次成功」，
     /// 看不出这次成功是复测得来的——而这正是「不凭一次失败就判死」的全部证据。
     pub fn confirm_success(provider: &Provider, model: &str, latency_ms: u64) -> Self {
+        // 复测路径的 transport 留在 `None`：**这是已知缺口**，不是「没有传输」。
+        // 复测同样走适配器，只是它的响应在鉴权重试逻辑里没有传到这里 ——
+        // 要补它需要把响应一路带到这个函数，独立一笔。
         let mut record = Self::success(provider, model, latency_ms);
         record.reason = Some("确认复测：本次成功，此前那次鉴权失败判定为暂态".into());
         record
@@ -258,6 +281,7 @@ impl<'a> FailoverChain<'a> {
             match f(c.provider.clone(), c.model.upstream.clone()).await {
                 Ok(v) => {
                     let latency_ms = started.elapsed().as_millis() as u64;
+                    let _ = &v; // 响应类型是泛型，这里读不到它的字段
                     records.push(AttemptRecord::success(
                         &c.provider,
                         &c.model.upstream,
