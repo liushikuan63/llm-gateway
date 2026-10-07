@@ -470,6 +470,84 @@ pub struct AppConfig {
     /// B4 遥测导出。`otlp.endpoint` **默认为空** = 不导出任何东西。
     /// 绝不默认指向公网 collector —— 那等于把用户请求的元数据发给第三方。
     pub telemetry: crate::trace::TelemetryConfig,
+    /// 任务卡二 A8：Agent 型入口的落盘与执行口径。默认全部保守
+    /// （产物落在应用数据目录、`enabled=false`）。
+    pub agent: AgentConfig,
+}
+
+/// 任务卡二 A8：Agent 型入口的配置。
+///
+/// ## 【2026-10-07 用户裁决】产物根的基准目录
+///
+/// 三个候选（`app_data_dir` / 加配置项 / 用户文档目录）中，
+/// 用户选了**加配置项、默认 `app_data_dir`**：
+/// 默认与 `config.toml`、`gateway.db` 同处，
+/// 但允许用户把产物指到自己看得见的地方。
+///
+/// **已知代价**（写在这里免得以后当 bug 查）：配置项一改，
+/// **旧产物就找不到了** —— 历史审计里记的是当时的绝对路径。
+/// 所以这个值应当「设一次就不动」，而不是来回切。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// 总开关。**默认 false** —— Agent 型入口会让外部 CLI 在本地
+    /// 读写文件，这种能力不该因为升级而被默认打开。
+    pub enabled: bool,
+    /// 产物根的**基准目录**。`None` ⇒ 用 [`app_data_dir`]。
+    ///
+    /// 实际产物根是 `<base>/runtimes/<runtime_id>/workspace`，
+    /// 由 `agent_upstream::workspace::default_workspace_root` 拼出来
+    /// （它对 `runtime_id` 做白名单消毒）。
+    ///
+    /// **存 `PathBuf` 而不是 `String`**：这个值只在 Rust 侧用，
+    /// 走一遍字符串再解析回来只会多一处「解析失败怎么办」。
+    pub workspace_root: Option<std::path::PathBuf>,
+    /// 单次 Agent 执行的超时（秒）。
+    ///
+    /// **默认 300**（与 `codex_agent::EXEC_TIMEOUT_MS` 同源）。
+    /// 依据是实测：`codex exec --json` 会**静默挂住**（90 秒零输出且不结束），
+    /// 所以这个值不是「给慢一点的请求留余量」，而是**必然会用到的上限**。
+    pub exec_timeout_secs: u64,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            workspace_root: None,
+            exec_timeout_secs: 300,
+        }
+    }
+}
+
+impl AgentConfig {
+    /// 解析出产物根的基准目录。
+    ///
+    /// ## 【必须报错，不许回落】`app_data_dir()` 现在会回落成 `"."`
+    ///
+    /// `config::app_data_dir()` 在 `dirs::data_local_dir()` 返回 `None` 时
+    /// 回落成 `PathBuf::from(".")`。对 `config.toml` 那还算合理
+    /// （至少能启动），但对**产物根**是危险的：
+    /// `"."` 是**进程的当前工作目录** —— agent 的产物会落在
+    /// 用户启动网关的那个目录里，很可能是他的项目目录。
+    ///
+    /// 所以这里**不回落到任何地方**：拿不到基准目录就报错，
+    /// 让调用方给出可读的失败。**宁可跑不起来，也不悄悄写到别处。**
+    pub fn resolve_base(&self) -> Result<std::path::PathBuf, String> {
+        if let Some(explicit) = &self.workspace_root {
+            // 用户显式设了就用它 —— 即便它指向不可写的位置，
+            // 那也是用户的选择，报错时能指到他设的那个值。
+            return Ok(explicit.clone());
+        }
+        // `app_data_dir()` 的返回值这里**不用**：它在拿不到时给 `"."`。
+        // 直接问 `dirs`，拿不到就报错。
+        match dirs::data_local_dir() {
+            Some(dir) => Ok(dir.join("llm-gateway")),
+            None => Err("拿不到本机应用数据目录，无法确定 Agent 产物根。\
+                 请在配置里显式设置 agent.workspace_root"
+                .to_string()),
+        }
+    }
 }
 
 /// 上游鉴权失败的处理档位。
@@ -647,6 +725,8 @@ impl Default for AppConfig {
             budget: crate::budget::BudgetConfig::default(),
             audit: crate::audit::AuditConfig::default(),
             telemetry: crate::trace::TelemetryConfig::default(),
+            // A8：默认 `enabled=false` + 产物根走应用数据目录。
+            agent: AgentConfig::default(),
         }
     }
 }
@@ -951,4 +1031,79 @@ fn display_name_of(path: &std::path::Path) -> String {
 
 pub fn db_path() -> PathBuf {
     app_data_dir().join("gateway.db")
+}
+
+#[cfg(test)]
+mod agent_config_tests {
+    use super::*;
+
+    #[test]
+    fn 默认_agent_是关的且产物根未指定() {
+        let c = AgentConfig::default();
+        assert!(
+            !c.enabled,
+            "Agent 型入口会让外部 CLI 在本地读写文件，\
+             这种能力不该因为升级而被默认打开"
+        );
+        assert_eq!(c.workspace_root, None);
+        assert_eq!(c.exec_timeout_secs, 300, "超时默认值要对得上实测依据");
+    }
+
+    #[test]
+    fn 显式设了产物根就用它() {
+        let c = AgentConfig {
+            workspace_root: Some(std::path::PathBuf::from("D:/agent-workspaces")),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.resolve_base().unwrap(),
+            std::path::PathBuf::from("D:/agent-workspaces"),
+            "用户显式设的值必须原样生效"
+        );
+    }
+
+    /// **默认路径不许回落成 `.`** —— 这条是这个函数存在的理由。
+    #[test]
+    fn 默认产物根不是当前目录() {
+        let c = AgentConfig::default();
+        let base = c.resolve_base().expect("本机应当拿得到应用数据目录");
+        assert_ne!(
+            base,
+            std::path::PathBuf::from("."),
+            "`app_data_dir()` 在拿不到时会回落成 `.`，那是**进程的当前工作目录** ——\
+             产物会落在用户启动网关的那个目录里（很可能是他的项目目录）。\
+             `resolve_base` 必须报错，不许回落"
+        );
+        assert!(
+            base.is_absolute(),
+            "基准目录必须是绝对路径：{}",
+            base.display()
+        );
+        assert!(
+            base.ends_with("llm-gateway"),
+            "默认基准要与 config.toml / gateway.db 同处：{}",
+            base.display()
+        );
+    }
+
+    /// 配置段整体能序列化往返 —— `workspace_root` 是 `PathBuf`，
+    /// 它在 TOML 里的写法与 `String` 不同，值得钉一下。
+    #[test]
+    fn agent_配置段能往返() {
+        let c = AgentConfig {
+            enabled: true,
+            workspace_root: Some(std::path::PathBuf::from("D:/ws")),
+            exec_timeout_secs: 60,
+        };
+        let toml = toml::to_string(&c).expect("应当能序列化");
+        let back: AgentConfig = toml::from_str(&toml).expect("应当能反序列化");
+        assert_eq!(back, c, "往返不该丢信息（toml：{toml}）");
+    }
+
+    /// 老配置文件（没有 `[agent]` 段）必须仍能读 —— 不然升级即坏。
+    #[test]
+    fn 没有_agent_段的老配置仍能读() {
+        let cfg: AgentConfig = toml::from_str("").expect("空段应当能读");
+        assert_eq!(cfg, AgentConfig::default());
+    }
 }
