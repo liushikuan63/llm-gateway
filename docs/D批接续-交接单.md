@@ -93,18 +93,79 @@
 
 ### 仍未开工的前端（按交接单原顺序）
 
-1. **D5 的可解释界面 + Pareto 前沿**：`router/pareto.rs` 有 14 条测试，
-   但 `pareto_front` **仍没有生产调用者、没有 IPC、没有页面**。
-   卡片还要 `Capabilities.tsx` 里「每个候选摊开显示各维原始值与加权贡献」
-   与三条诚实性要求（来源徽标 / 无样本显示「数据不足」/ 冲突提示）——
-   其中「冲突提示」已经落地（见上），另两条未做。
-2. **A5 的前端只读徽标**：那一笔欠账比 §一.7 写的更靠前 ——
-   **`src/api.ts` 里连这四个 IPC 的绑定都没有**（全文只有 `listLocalRuntimes`，
-   那是本地模型运行时的，与 A5 的 `agent_runtimes` 无关）。
-   所以这一格至少是三件事：① `api.ts` 加绑定与类型；
-   ② `ProviderEditor` 显示 `runtime_id` 与 runtime 清单；
-   ③ `ui-smoke.cjs` 夹具 + 断言 + 截图。
-   **建议单独一拍做，不要和别的改动混在一起。**
+1. **D5 的可解释界面 + Pareto 前沿** —— **两半各自的状态见下面 §〇·三**。
+2. **A5 的前端只读徽标** —— **已做**，见 §〇·三。
+
+---
+
+## 〇·三、A5 与 D5 的落地（2026-10-07 21:18）
+
+### A5 前端：两笔做完（`dc36809`、`d886ccf`）
+
+- `ProviderView` 加 `runtime_id`（此前前端根本看不到这家走不走账号型上游）；
+- 供应商卡片上 `runtime_id` 非空才出现「账号型上游」徽标，写清
+  「请求经本机 CLI 发出，不走上面的地址」——同一张卡上的「API Key：已保存」
+  在账号型上游下是摆设；指向不存在的运行时时当场说「找不到这个运行时」；
+- Providers 页加折叠的运行时管理面板（列出 / 新建 / 删除），
+  四个 IPC 全都有消费者；删除被引用时**如实显示后端的拒绝理由**，不做级联删除。
+
+**踩到的两个坑（都值得记）**：
+1. 第一版截图里徽标被**展开的「更多」菜单**盖住，而断言读 `innerText` 照样全绿
+   —— 视觉验证白做。截图前必须先收起菜单。
+2. 那个菜单是**受控的** `<details open={...}>`，**Escape 与点空白都关不掉它**，
+   只有点 summary 才 toggle。**这是一个未修的可用性缺陷**（消费者的直觉是 Esc 关菜单）。
+
+### D5：Pareto 已做完（`31520ca`），打分解释做了一半（`8320a00`）
+
+**Pareto 前沿**（完整）：`Router::pareto_view` → `capability_pareto` IPC → 界面表格。
+三个维度**全部复用路由那一份口径**（`capability_base` / `usable_tps` /
+`reference_unit_price`）；币种不唯一时价格维度**整体退出**并在 `currency_note`
+里写明原因；被支配的候选写明**被谁支配**；缺数据显示「数据不足」而不是 0.00。
+判据：`cargo test --lib router::pareto` → 19 passed（原 14 + 新 5）；
+注违规自检两轮（缺失当 0 ⇒ 2 条红；去掉币种检查 ⇒ 1 条红）。
+
+**打分解释**（**只做了第一半**）：`score()` 已重构成 `explain().total` ——
+分解与总分是同一个函数的两种出口，不是两套算式。`ScoreFactor` 带
+`raw / weight / contribution / note()`（note 回答「为什么贡献是 1.0」：
+没有数据 / 权重为 0 / 已计入）。
+
+**未做的第二半**：`ScoreBreakdown.factors` 与 `note()` **还没有界面消费者**。
+接 IPC 与界面时要把 `rank_with_intent` 里的 `CostContext` 构造抽出来复用
+（否则前端拿到的是另一套口径）。**单独一笔做。**
+
+### 【实测结论】`route_golden` 抓不到连乘顺序的变化
+
+给 `explain()` 做注违规自检时，我把 `fit` 提到 `base` 连乘的**最前面**重跑，
+`tests/route_golden.rs` 的 8 条**仍然全绿**。也就是说：
+
+- 「连乘顺序保持原样」目前只是**保守做法**，不是被测试守住的约束；
+- 想真正钉住「逐位不变」，需要一条**直接对照 `total.to_bits()`** 的判据
+  （硬编码期望值 + 说明「改打分公式时必须同步更新它」）。**尚未加。**
+
+`explain()` 的文档注释已按这次实测改写，不再承诺现有金标准守不住的东西。
+
+### 顺带收敛的一处口径
+
+「当天第几分钟」原先在 `server.rs` 与 `router/mod.rs` 各算一遍。
+`31520ca` 起统一走 `server.rs` 的 `utc_minute_of_day()` ——
+两处各算一遍的话，跨分钟那一刻路由与前沿视图会用不同的时段价，
+而那种不一致不报错，只表现为「图上和实际选的不一样」。
+
+### 21:22 打包复验（A5 + D5 这批之后）
+
+| 判据 | 实测 |
+| --- | --- |
+| 编译 | `npm run tauri:build` **退出码 0** |
+| 产物时间 > 代码时间 | exe `21:22:19` > 最后改动 `21:11:53` ✓ |
+| 进程存活 | `Responding=True`，标题 `LLM Gateway` ✓ |
+| `GET /healthz` | **200** |
+| `GET /v1/models` 无 Key | **401** ✓ |
+
+Rust：`cargo test --jobs 1 -- --skip 真机_` → **970 passed / 0 failed / exit 0**；
+`cargo clippy --all-targets -- -D warnings` 与 `cargo fmt --check` → 退出码 0。
+前端：`npm run build` / `verify:ui` / `verify:plan` → 均退出码 0。
+`.ui-smoke-out/` 新增并人工确认过：`provider-runtime-badge.png`、
+`agent-runtimes.png`、`capability-pareto.png`。
 
 ### 本会话的一条实测教训：`live_functional` 并行会偶发红
 
