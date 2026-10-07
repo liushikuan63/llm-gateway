@@ -40,7 +40,8 @@ use crate::domain::{
 use crate::error::{GatewayError, Result};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::upstream::{PassthroughResponse, UpstreamClient, UpstreamEvent};
-use crate::router::failover::{classify, AtomicFlag, FailoverChain};
+use crate::router::cascade::{CascadeRunRequest, CascadeStop, ConfidenceReading};
+use crate::router::failover::{classify, AtomicFlag, AttemptOutcome, AttemptRecord, FailoverChain};
 
 /// 鉴权失败复测确认之后的处理：按策略把这家供应商自动停用。
 ///
@@ -3297,6 +3298,100 @@ fn schedule_compaction(state: Arc<GatewayState>, session_id: String) {
     });
 }
 
+/// 一次级联尝试的产物。
+///
+/// 【为什么不让 `send` 直接返回 `Err`】失败时那一跳的 `AttemptRecord`
+/// 仍然要进审计 —— 「上游拒了」恰恰是最需要看得见的一类记录。
+/// 让 `send` 返回 `Err` 的话，`run_cascade` 会把整轮结束掉，
+/// 而失败之前已经发生过的那几跳的记录也就一起没了。
+type CascadeAttemptPayload = Result<AttemptOutcome<crate::domain::ChatResponse>>;
+
+/// D4：级联发送闭包返回的 future。
+///
+/// **必须装箱**：闭包每次调用都要 clone 出一份独立的现场（`ranked` / `cfg` /
+/// `state`），而 Rust 的闭包不能返回 `impl Trait`。装箱的代价是一次堆分配，
+/// 相对一次 LLM 上游请求（秒级）可以忽略。
+type CascadeSendFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<CascadeAttemptPayload>> + Send>>;
+
+/// 级联各次尝试共用的逐跳明细收集器。
+///
+/// 【为什么需要它】每次尝试各有自己的 `Vec<AttemptRecord>`，而
+/// `CascadeRun` 只保留**最后**那次的值。不共享一个 sink 的话，
+/// 「第一跳发给了便宜的模型、被升级掉了」这件事会在审计里消失 ——
+/// 而那正是级联唯一需要向用户解释清楚的东西。
+type AttemptRecordSink = Arc<parking_lot::Mutex<Vec<AttemptRecord>>>;
+
+/// D4：级联置信度闭包返回的 future。装箱理由同上。
+type CascadeAskFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ConfidenceReading> + Send>>;
+
+/// D4：向 Jev 问一次「这个候选回答够不够好」。
+///
+/// 走的是**已有的** Jev 通道（`/v1/systemone`），不为此新起一个模型
+/// （卡片硬约束 2）。
+///
+/// ## `None` 与 `Some(0.0)` 是两件事
+///
+/// - `None` = **通道不可用**：服务没启动 / 超时 / 返回结构非法。
+///   三种情况一视同仁 —— 对「这个置信度可不可信」而言它们没有区别。
+///   调用方据此**不升级**（卡片硬约束 3）。
+/// - `Some(0.0)` = 通道好用，但它明确说这个回答不行 ——
+///   那正是该升级的情形。
+///
+/// 把两者合并成 `0.0` 会让「Jev 没起来」变成「每次都升级到最贵那档」，
+/// 那与实测量到的「edgeJev 会高置信度判错」叠加起来是双倍损失。
+async fn cascade_confidence(cfg: &AppConfig, question: &str, answer: &str) -> Option<f32> {
+    let jev = crate::intellect::JevClient::new(
+        &cfg.smart_routing.jev.base_url,
+        &cfg.smart_routing.jev.model,
+        cfg.smart_routing.jev.timeout_ms,
+        cfg.smart_routing.jev.max_state_chars,
+    )
+    .ok()?;
+    // state 是「问题 + 候选回答」。截断由 `truncate_state` 负责（保留尾部），
+    // 与分类那条通道同一个函数 —— 两处各写一套截断迟早不一致。
+    let state = format!("【用户的问题】\n{question}\n\n【候选回答】\n{answer}");
+    let body = serde_json::json!({
+        "model": jev.model_name(),
+        "state": { "prompt": jev.truncate_state(&state) },
+        "questions": {
+            "adequate": {
+                "type": "choice",
+                "instructions": "这个候选回答是否已经足以交付给用户，不需要换成更强的模型重答",
+                "criteria": {
+                    "adequate": "已经答到点上，内容完整，没有明显的事实或推理错误",
+                    "inadequate": "答偏了、明显不完整，或存在事实/推理错误"
+                }
+            }
+        }
+    });
+    let result = jev.decide(body).await.ok()?;
+    let answer = result.get("adequate")?;
+    Some(match answer.choice() {
+        // 选「够好」时取模型自报的确定程度：它自己对所选项都不确定时，
+        // 不该被当成「可以收手」。
+        Some("adequate") => answer.confidence(),
+        // 选了别的选项（含 inadequate）⇒ 明确「不够好」。
+        // 这里**不能**用 `answer.confidence()` —— 那会让「很确定地说不行」
+        // 拿到高置信度，语义正好反过来。
+        Some(_) => 0.0,
+        // 不是 choice（`noul` / `score`）时它的值本来就落在 0..=1。
+        None => answer.confidence(),
+    })
+}
+
+/// 级联要拿「用户这次问的是什么」去问 Jev，取最后一条 user 消息。
+/// 与 `intellect::ClassifyInput::last_user_text` **同口径**。
+fn last_user_text(req: &ChatRequest) -> String {
+    req.messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .map(|m| m.content_text())
+        .unwrap_or_default()
+}
+
 /// 非流式
 async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Response {
     let route = input.route_trace();
@@ -3311,7 +3406,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         response_session_id,
         session_id,
         client,
-        ranked,
+        mut ranked,
         cfg,
         exit,
         intent: _intent,
@@ -3321,14 +3416,40 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         refine,
     } = input;
     let started = Instant::now();
-    let flag = AtomicFlag::new();
     let max_attempts = if cfg.failover_enabled {
         cfg.max_fallback_attempts
     } else {
         1
     };
-    let chain = FailoverChain::new(&ranked, max_attempts, &flag);
-    let chain = chain.with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
+
+    // ===== D4：级联档的执行层 =====
+    //
+    // 这是 `RoutingStrategy::Cascade` 唯一的生产消费点。判定用
+    // [`Router::effective_strategy`] 而不是在本地重写一遍降级口径 ——
+    // 两处各判一次的话，表现会是「界面上设了 cascade、实际却没级联」，
+    // 而那种错误不报错，只是行为不对。
+    //
+    // **只在非流式路径上**（这里就是）：流式的换家在 `stream_dispatch` 里
+    // 由「首个字节之后不换家」那条铁律挡着，级联压根不参与。
+    let (strategy, _) = state.router.effective_strategy(&ranked, &cfg);
+    let cascade_on = matches!(strategy, RoutingStrategy::Cascade) && cfg.cascade.enabled();
+    // 级联档的**执行顺序**是「便宜优先」，与 `Weights` 排序刻意分开
+    // （级联档的权重与 Balanced 逐位相同，见 tests/cascade.rs）。
+    //
+    // 【模式隔离】重排只发生在真的走级联时 —— 其余七档的候选顺序
+    // 必须逐位不变。判断因此放在重排**之前**。
+    //
+    // `order_by_cost` 返回 false = 币种不可比或一个价格都没有，
+    // 此时保持原顺序：那不算错误，只是「便宜优先」这个前提本轮不成立。
+    let cascade_ordered = if cascade_on {
+        crate::router::order_by_cost(
+            &mut ranked,
+            estimate_message_tokens(&req.messages) as i64,
+            utc_minute_of_day(),
+        )
+    } else {
+        false
+    };
 
     // 缓存键的 provider/model 用**本轮路由的首选**（ranked[0]）。
     //
@@ -3418,63 +3539,154 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     };
 
     let upstream = state.upstream.clone();
-    let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
     let req_arc = Arc::new(req.clone());
 
     let health = state.health.clone();
     let router = state.router.clone();
+    // 级联各跳的逐跳明细共用这一个收集器：不共享的话，
+    // 「第一跳发给了便宜的模型、被升级掉了」这件事在审计里会消失。
+    let records_sink: AttemptRecordSink = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
-    let mut attempt_records = Vec::new();
-    let outcome = chain
-        .run_with_auth_policy(
-            &mut attempt_records,
-            |provider, model| {
-                let up = upstream.clone();
-                let r = req_arc.clone();
-                let defaults = state.cfg_snapshot().ollama_options;
-                let adapters = state.adapters.clone();
-                async move {
-                    // ===== 任务卡二 A5：**唯一分派点** =====
-                    //
-                    // 这是全仓唯一一处「按 Provider 的上游形态选路径」的地方。
-                    //
-                    // 【模式隔离】`runtime_id` 为 `None`（默认，也是绝大多数
-                    // Provider 的现状）时，这个 `if let` **落空后直接落到
-                    // 原有那一行**，中间不经过任何新代码 —— 所以「老 Provider
-                    // 的响应体逐字节不变」是**结构性保证**，
-                    // 而不是「小心写出来的」。
-                    //
-                    // 放在**链的闭包里**而不是函数顶部：`ranked` 是一批候选，
-                    // 「要发给谁」是链逐候选决定的。放在顶部就只能对
-                    // `ranked[0]` 生效，那会**丢掉失败转移** ——
-                    // 而那种缺陷只在首选真失败时才暴露。
-                    // 放在这里还意味着账号型与 API 型 Provider 混在一批候选里
-                    // 也能各自走对路。
-                    if let Some(runtime_id) = provider.runtime_id.as_deref() {
-                        return crate::agent_upstream::call_agent(
-                            &adapters,
-                            runtime_id,
-                            &model,
-                            &r.messages,
-                            timeout.as_millis() as u64,
+    // ===== D4：全仓唯一的发送路径 =====
+    //
+    // 级联**关着**时 `run_cascade` 立刻短路成「发一次」（连置信度都不读），
+    // 所以非级联路径也走这里：发送与「要不要升级」只有一份实现，
+    // 不会出现「生产路径与用例跑的不是同一段代码」那种假验证。
+    let cascade_run = {
+        let question = last_user_text(&req);
+        crate::router::cascade::run_cascade(
+            &cfg.cascade,
+            CascadeRunRequest {
+                candidates: ranked.len(),
+                streaming: false,
+            },
+            |start: usize| -> CascadeSendFuture {
+                // 每次尝试 clone 出一份独立现场：闭包不能返回借用外层的 future
+                // （`Pin<Box<dyn Future + Send>>` 默认是 `'static`）。
+                let state = Arc::clone(&state);
+                let ranked = ranked.clone();
+                let cfg = cfg.clone();
+                let upstream = upstream.clone();
+                let req_arc = Arc::clone(&req_arc);
+                let health = Arc::clone(&health);
+                let router = Arc::clone(&router);
+                let sink = Arc::clone(&records_sink);
+                Box::pin(async move {
+                    // `AtomicFlag` 只被流式路径 `set`，而这里是**非流式**入口；
+                    // 每次尝试各起一个，等价于原来共享一个（它永远是 0）。
+                    let flag = AtomicFlag::new();
+                    let chain = FailoverChain::new(&ranked[start..], max_attempts, &flag);
+                    let chain = chain
+                        .with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
+                    let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
+                    let mut records = Vec::new();
+                    let outcome = chain
+                        .run_with_auth_policy(
+                            &mut records,
+                            |provider, model| {
+                                let up = upstream.clone();
+                                let r = Arc::clone(&req_arc);
+                                let defaults = state.cfg_snapshot().ollama_options;
+                                let adapters = state.adapters.clone();
+                                async move {
+                                    // ===== 任务卡二 A5：**唯一分派点** =====
+                                    //
+                                    // 这是全仓唯一一处「按 Provider 的上游形态选路径」的地方。
+                                    //
+                                    // 【模式隔离】`runtime_id` 为 `None`（默认，也是绝大多数
+                                    // Provider 的现状）时，这个 `if let` **落空后直接落到
+                                    // 原有那一行**，中间不经过任何新代码 —— 所以「老 Provider
+                                    // 的响应体逐字节不变」是**结构性保证**，
+                                    // 而不是「小心写出来的」。
+                                    //
+                                    // 放在**链的闭包里**而不是函数顶部：`ranked` 是一批候选，
+                                    // 「要发给谁」是链逐候选决定的。放在顶部就只能对
+                                    // `ranked[0]` 生效，那会**丢掉失败转移** ——
+                                    // 而那种缺陷只在首选真失败时才暴露。
+                                    // 放在这里还意味着账号型与 API 型 Provider 混在一批候选里
+                                    // 也能各自走对路。
+                                    if let Some(runtime_id) = provider.runtime_id.as_deref() {
+                                        return crate::agent_upstream::call_agent(
+                                            &adapters,
+                                            runtime_id,
+                                            &model,
+                                            &r.messages,
+                                            timeout.as_millis() as u64,
+                                        )
+                                        .await;
+                                    }
+                                    up.call(&provider, &r, &model, timeout, &defaults).await
+                                }
+                            },
+                            |provider, model, err| {
+                                // 429 额外打满本地额度窗口，避免连续撞墙
+                                if let GatewayError::Upstream { status: 429, .. } = err {
+                                    if let Some(m) =
+                                        provider.models.iter().find(|m| m.upstream == model)
+                                    {
+                                        router.mark_rate_limited(provider, m);
+                                    }
+                                }
+                                health.record_failure(&provider.id, model, err);
+                            },
+                            auth_confirm_handler(state.clone(), cfg.clone()),
                         )
                         .await;
-                    }
-                    up.call(&provider, &r, &model, timeout, &defaults).await
-                }
+                    // 链要 `&mut Vec`，所以明细先落在本地，链跑完再并进共享 sink
+                    // ——共享锁不能跨 await 持有。
+                    sink.lock().append(&mut records);
+                    Ok::<_, GatewayError>(outcome)
+                })
             },
-            |provider, model, err| {
-                // 429 额外打满本地额度窗口，避免连续撞墙
-                if let GatewayError::Upstream { status: 429, .. } = err {
-                    if let Some(m) = provider.models.iter().find(|m| m.upstream == model) {
-                        router.mark_rate_limited(provider, m);
+            |payload: &CascadeAttemptPayload| -> CascadeAskFuture {
+                // 失败的那一跳不问 Jev：没有回答可评估。
+                // 返回「通道不可用」而不是 `Some(0.0)` —— 后者会触发升级，
+                // 而这里根本没有可升级的东西（错误由外层如实报出）。
+                let Ok(outcome) = payload.as_ref() else {
+                    return Box::pin(async { ConfidenceReading::unavailable() });
+                };
+                let cfg = cfg.clone();
+                let question = question.clone();
+                let content = outcome.value.content.clone();
+                Box::pin(async move {
+                    match cascade_confidence(&cfg, &question, &content).await {
+                        Some(value) => ConfidenceReading::available(value),
+                        None => ConfidenceReading::unavailable(),
                     }
-                }
-                health.record_failure(&provider.id, model, err);
+                })
             },
-            auth_confirm_handler(state.clone(), cfg.clone()),
         )
-        .await;
+        .await
+    };
+
+    // 各次尝试的逐跳明细都在这个 sink 里（级联升级过的前几跳也在）。
+    let mut attempt_records: Vec<AttemptRecord> = std::mem::take(&mut *records_sink.lock());
+    let mut cascade_stop: Option<CascadeStop> = None;
+    let mut cascade_attempts = 0usize;
+    let outcome: Result<AttemptOutcome<crate::domain::ChatResponse>> = match cascade_run {
+        Ok(run) => {
+            cascade_stop = Some(run.stop);
+            cascade_attempts = run.attempts;
+            run.value
+        }
+        // `run_cascade` 只在 `send` 自己返回 `Err` 时失败，而这里的 `send`
+        // 把结果包在 payload 里（失败也要保住那一跳的审计记录），
+        // 所以这条是防御分支 —— 真走到的话按「没有可用候选」处理。
+        Err(error) => Err(error),
+    };
+
+    // 「为什么这次没升级」是级联唯一会被问到的问题，而它没有别的落点：
+    // `requests` 表那几列已冻结（加列那笔账连着失败两次），
+    // 逐跳明细则由 `attempts_json` 如实承载。所以停因先进日志。
+    if let Some(stop) = cascade_stop {
+        tracing::info!(
+            attempts = cascade_attempts,
+            escalations = cascade_attempts.saturating_sub(1),
+            stop = crate::router::cascade::stop_label(stop),
+            cheap_first = cascade_ordered,
+            "级联路由执行完毕"
+        );
+    }
 
     match outcome {
         Ok(o) => {

@@ -452,6 +452,13 @@ pub struct AppConfig {
     pub smart_routing: SmartRoutingConfig,
     /// D3 成本与实测效率进入路由。默认全关。
     pub cost_routing: CostRoutingConfig,
+    /// D4 级联路由（FrugalGPT）：先发最便宜的合格候选，置信度不够再升级，
+    /// 最多升 `max_escalations` 次。
+    ///
+    /// **默认关闭**（`max_escalations = 0`）。关着时 `dispatch` 连置信度
+    /// 通道都不读，路径与改动前逐位等价（CLAUDE.md 铁律 2）。
+    /// 打开级联是用户的显式动作 —— 它会让一次请求变成一串真实账单。
+    pub cascade: crate::router::cascade::CascadePolicy,
     /// 网关内置联网搜索（不含密钥）
     pub search: SearchConfig,
     /// 注入给 Ollama 上游的专属旋钮。客户端协议表达不了，必须网关侧给。
@@ -734,6 +741,7 @@ impl Default for AppConfig {
             local_models: LocalModelConfig::default(),
             smart_routing: SmartRoutingConfig::default(),
             cost_routing: CostRoutingConfig::default(),
+            cascade: crate::router::cascade::CascadePolicy::default(),
             search: SearchConfig::default(),
             ollama_options: OllamaOptionsConfig::default(),
             auth_failure: AuthFailureConfig::default(),

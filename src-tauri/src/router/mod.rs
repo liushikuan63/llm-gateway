@@ -160,10 +160,62 @@ fn reference_unit_price(
 
 /// 单个候选的参考成本。与 [`comparable_cost_range`] 取的**必须是同一个字段**，
 /// 否则区间与取值不同源 —— 那会让最便宜的那个也拿不到满分。
-/// 单个候选的参考成本。与 [`comparable_cost_range`] 取的**必须是同一个字段**，
-/// 否则区间与取值不同源 —— 那会让最便宜的那个也拿不到满分。
 fn candidate_cost(c: &Candidate, prompt_tokens: i64, minute_of_day: u16) -> Option<f32> {
     reference_unit_price(c.model.price.as_ref()?, prompt_tokens, minute_of_day)
+}
+
+/// D4：级联档的**执行顺序** —— 便宜优先。
+///
+/// ## 为什么不用 `Weights` 排
+///
+/// 级联档的权重与 `Balanced` **逐位相同**（那是刻意的，见 `tests/cascade.rs`）：
+/// 权重回答的是「谁更合适」，而「先发最便宜的」是**执行顺序**的事。
+/// 把两者混在一起改，级联档就会顺带改掉排序口径 ——
+/// 那正是模式隔离要禁止的「新模式泄漏进常规路径」。
+///
+/// ## 返回 `bool` 而不是静默排序
+///
+/// 排序的前提是**价格可比**。币种不唯一时（USD 与 CNY 混在一批）
+/// 数字之间没有全序 —— 1 CNY 与 1 USD 谁贵取决于汇率，不是常数。
+/// 与 B2 / D3 同口径：这种情况下**不排**并返回 `false`，由调用方决定
+/// 怎么记这件事，而不是假装排过了。
+///
+/// 没有价格（或价格非正）的候选排在最后，且**保持原有相对顺序**
+/// （`sort_by_cached_key` 是稳定排序）——
+/// 「不知道价格」不该被当成「最便宜」，那会让一个没填价的模型永远被最先调用。
+pub fn order_by_cost(candidates: &mut [Candidate], prompt_tokens: i64, minute_of_day: u16) -> bool {
+    // 先做一次整批的可比性检查。**必须整批**：逐候选各判一次的话，
+    // 排在后面的那个 USD 候选会被拿 CNY 的尺子量，而这种错误不报错，
+    // 只表现为「偶尔先发了个贵的」。
+    let mut currency: Option<crate::domain::Currency> = None;
+    for c in candidates.iter() {
+        let Some(price) = c.model.price.as_ref() else {
+            continue;
+        };
+        if reference_unit_price(price, prompt_tokens, minute_of_day).is_none() {
+            continue;
+        }
+        match currency {
+            None => currency = Some(price.currency),
+            Some(existing) if existing != price.currency => return false,
+            _ => {}
+        }
+    }
+    if currency.is_none() {
+        // 一个可比价格都没有 ⇒ 「便宜优先」无从谈起，保持原顺序。
+        return false;
+    }
+    candidates.sort_by_cached_key(|c| {
+        c.model
+            .price
+            .as_ref()
+            .and_then(|p| reference_unit_price(p, prompt_tokens, minute_of_day))
+            // 价格换算到 1e-6 的整数刻度再比：`f32` 不是 `Ord`，
+            // 而 `partial_cmp` 在 NaN 上返回 `None`（`unwrap_or(Equal)`
+            // 会让 NaN 的候选随机落位）。`as i64` 是饱和转换，不会 UB。
+            .map_or(i64::MAX, |v| (v * 1_000_000.0).round() as i64)
+    });
+    true
 }
 
 /// D3：某个候选的实测吞吐（tok/s），样本不足时返回 `None`。
@@ -321,6 +373,42 @@ impl Router {
         Ok(out)
     }
 
+    /// 本轮**实际生效**的排序策略。
+    ///
+    /// 与 [`Self::rank_with_intent`] 的判定**同源**：级联执行层也要据此
+    /// 决定「这一轮走不走级联」。两边各判一次的话，等哪天降级口径改了，
+    /// 表现会是「界面上设了 cascade、实际却没级联」—— 不报错，只是行为不对。
+    ///
+    /// 返回值的第二部分是「custom 规则是否真的生效」：它同样是
+    /// 「策略写了 Custom」与「规则表非空」两件事的合取，
+    /// 单看策略会把「Custom 但没规则」误当成走了规则。
+    pub fn effective_strategy(
+        &self,
+        candidates: &[Candidate],
+        cfg: &AppConfig,
+    ) -> (RoutingStrategy, bool) {
+        // 虚拟策略名（客户端点名 `smart` / `fastest`）优先于全局配置。
+        let configured = candidates
+            .iter()
+            .find_map(|candidate| candidate.virtual_strategy)
+            .unwrap_or(cfg.routing_strategy);
+        let custom_rules_active =
+            matches!(configured, RoutingStrategy::Custom) && !self.custom_rules.read().is_empty();
+        // Custom 只表示「按显式规则路由」，没有规则时不能悄悄改用另一套权重，
+        // 退化为稳定的 Balanced 排序，仍保留健康和回退链路。
+        // Smart 同理：总开关关着时退化为 Balanced，绝不留下「只换权重不分类」的
+        // 半吊子状态。两条共用同一个降级口径，所以合并在一个分支里 ——
+        // 拆开写会有两个分支返回同一个值（clippy identical_blocks 会报）。
+        let strategy = if (matches!(configured, RoutingStrategy::Custom) && !custom_rules_active)
+            || (matches!(configured, RoutingStrategy::Smart) && !cfg.smart_routing.enabled)
+        {
+            RoutingStrategy::Balanced
+        } else {
+            configured
+        };
+        (strategy, custom_rules_active)
+    }
+
     /// 候选链排序
     ///
     /// **不带 prompt token 数**：本入口的调用方（`/v1/models` 预览、
@@ -388,15 +476,15 @@ impl Router {
 
         // 3) 确定本轮策略并在 custom 模式下应用前缀规则。规则位于健康/额度
         // 过滤之后，因而永远不能把不健康、冷却或已耗尽额度的候选重新带回链路。
-        let configured_strategy = candidates
-            .iter()
-            .find_map(|candidate| candidate.virtual_strategy)
-            .unwrap_or(cfg.routing_strategy);
-        let custom_rules = matches!(configured_strategy, RoutingStrategy::Custom)
-            .then(|| self.custom_rules.read().clone())
-            .unwrap_or_default();
-        let custom_rules_active =
-            matches!(configured_strategy, RoutingStrategy::Custom) && !custom_rules.is_empty();
+        //
+        // D4：策略判定抽到 [`Self::effective_strategy`]，
+        // 与「要不要走级联执行层」共用同一份判断。
+        let (strategy, custom_rules_active) = self.effective_strategy(&candidates, cfg);
+        let custom_rules = if custom_rules_active {
+            self.custom_rules.read().clone()
+        } else {
+            Vec::new()
+        };
         if custom_rules_active {
             candidates = apply_custom_rules(candidates, &custom_rules);
         }
@@ -404,18 +492,8 @@ impl Router {
         // 权重，退化为稳定的 Balanced 排序，仍保留健康和回退链路。
         // Smart 同理：总开关关着时退化为 Balanced，绝不留下「只换权重不分类」的
         // 半吊子状态。两条共用同一个降级口径。
-        let strategy =
-            // 两个「总开关关着就退化为 Balanced」的条件合并成一个分支。
-            // 拆开写会有两个分支返回同一个值（clippy identical_blocks 会报），
-            // 而且读起来容易让人以为两条降级路径有区别 —— 其实没有。
-            if (matches!(configured_strategy, RoutingStrategy::Custom) && !custom_rules_active)
-                || (matches!(configured_strategy, RoutingStrategy::Smart)
-                    && !cfg.smart_routing.enabled)
-            {
-                RoutingStrategy::Balanced
-            } else {
-                configured_strategy
-            };
+        //
+        // 那两条降级已经在 `effective_strategy` 里做过，这里直接用结果。
 
         // 4) 先按现有健康、额度、能力、延迟权重打分。显式 Boost 作为额外
         // 排序层级：同一层级仍完全沿用原有分数，避免规则吞掉正常的权重排序。

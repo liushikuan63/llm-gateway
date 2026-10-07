@@ -390,8 +390,16 @@ async fn 升级次数达到上限后_不再升级() {
     // 卡片点名的计数型断言：mock 上游调用次数 == N+1。
     let (out, sent, _) = 跑一轮(开启(2), false, 10, vec![Some(0.0); 8]).await;
 
-    assert_eq!(sent, vec![0, 1, 2], "N=2 时必须恰好发 3 次，不是 2 次也不是 4 次");
-    assert_eq!(sent.len(), 3, "N+1 口径：上限是「升级 N 次」而不是「发 N 次」");
+    assert_eq!(
+        sent,
+        vec![0, 1, 2],
+        "N=2 时必须恰好发 3 次，不是 2 次也不是 4 次"
+    );
+    assert_eq!(
+        sent.len(),
+        3,
+        "N+1 口径：上限是「升级 N 次」而不是「发 N 次」"
+    );
     assert_eq!(out.stop, CascadeStop::MaxEscalations);
     assert_eq!(out.readings.len(), 3, "每发一次读一次");
     assert_eq!(out.value, "回答来自第 2 档");
@@ -492,4 +500,356 @@ async fn 发送失败时直接上抛_不吞错也不重试() {
         "发送失败由失败转移链内部处理（它已经逐个候选试过），\
          级联这一层不该再换档重试 —— 那会把 N 次尝试变成 N×候选数"
     );
+}
+
+// ============ ② 级联的端到端判据：接线是不是真的通电 ============
+//
+// `run_cascade` 的用例能证明**循环**对，但证明不了 `normal_dispatch`
+// 真的在跑这个循环 —— 而「生产路径与用例跑的不是同一段代码」正是
+// 这个项目已经踩过的假验证。所以这一组走真实 HTTP：
+// mock 上游 + mock 决策端点 + 真网关。
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::http::StatusCode;
+use axum::routing::post;
+use axum::{Json, Router};
+use llm_gateway_lib::config::{AppConfig, RoutingStrategy};
+use llm_gateway_lib::db::{self, repo};
+use llm_gateway_lib::domain::{Currency, Dialect, ModelPrice, ModelRef, ModelType, Provider};
+use llm_gateway_lib::proxy::server::{serve, GatewayState};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+
+/// 一个只回固定内容的 OpenAI 兼容上游，并数自己被调用了几次。
+///
+/// base_url 形状对齐真实供应商（`http://host/v1`，网关自己拼
+/// `/chat/completions`）—— 夹具少一层 `/v1` 会让「路径拼对没有」
+/// 这件事永远测不出来。
+async fn 起上游(内容: &'static str) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": 内容 },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+                }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定随机端口");
+    let address = listener.local_addr().expect("读取本地地址");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}/v1"), hits, task)
+}
+
+/// 一个只回固定判定的决策端点，并数自己被调用了几次。
+///
+/// **响应形状照抄真实 edgeJev**（见 `tests/intellect.rs` 的
+/// `systemone_响应解析出_choice_与置信度` 里那份真实 body）：
+/// 夹具形状与真实不一致时，「解析器对不对」这件事就永远测不出来。
+///
+/// 用 `fallback` 而不是精确路由：解析器只认 `{base_url}/v1/systemone`
+/// 这个约定，而这里要测的不是路径拼接。
+async fn 起决策端点(
+    选择: &'static str,
+    置信度: f64,
+) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let app = Router::new().fallback(post(move || {
+        let counter = Arc::clone(&counter);
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "model": "rl-agent",
+                "answers": {
+                    "adequate": {
+                        "type": "choice",
+                        "choice": 选择,
+                        "probabilities": { "adequate": 0.5, "inadequate": 0.5 },
+                        "confidence": 置信度
+                    }
+                },
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            }))
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定随机端口");
+    let address = listener.local_addr().expect("读取本地地址");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), hits, task)
+}
+
+/// 单价与能力分都可配的供应商。
+///
+/// **两个参数必须能给出相反的排序结论**，否则「便宜优先」这条接线测不出来：
+/// `Weights` 看能力分（贵的强），`order_by_cost` 看价格（便宜的前）。
+/// 夹具若让两者结论一致，掐断 `order_by_cost` 也照样全绿 —— 这个坑真踩过。
+fn 供应商(id: &str, base_url: String, 单价: f64, 能力分: i32) -> Provider {
+    let now = chrono::Utc::now();
+    Provider {
+        id: id.into(),
+        name: id.into(),
+        dialect: Dialect::OpenAI,
+        base_url,
+        // 真实云供应商必然带 Key；不带会被「401 不回落」那条规则当成免 Key 后端
+        api_key_enc: llm_gateway_lib::crypto::encrypt("cascade-test-key").expect("加密"),
+        enabled: true,
+        priority: 0,
+        models: vec![ModelRef {
+            enabled: true,
+            alias: "integration-model".into(),
+            upstream: "integration-model".into(),
+            context_window: 16_384,
+            supports_tools: true,
+            supports_vision: false,
+            supports_audio: false,
+            supports_video: false,
+            supports_thinking: false,
+            supports_stream: true,
+            model_type: ModelType::Chat,
+            upstream_path: None,
+            price: Some(ModelPrice {
+                prompt: 单价,
+                completion: 单价,
+                cache_read: None,
+                cache_creation: None,
+                currency: Currency::Usd,
+                tiers: Vec::new(),
+                rules: Vec::new(),
+                source: Default::default(),
+            }),
+            overrides: None,
+            local: None,
+            capabilities: None,
+        }],
+        rpm_limit: 0,
+        intelligence: 能力分,
+        note: None,
+        runtime_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+async fn 未占用端口() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+async fn 等网关起来(base_url: &str) {
+    let client = reqwest::Client::new();
+    for _ in 0..80 {
+        if client
+            .get(format!("{base_url}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status() == StatusCode::OK)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("网关没能在预期时间内起来");
+}
+
+async fn 起网关(
+    供应商们: Vec<Provider>,
+    tune: impl FnOnce(&mut AppConfig),
+) -> (db::Db, AppConfig, JoinHandle<()>, String) {
+    let db = db::Db::connect_in_memory().await.unwrap();
+    for provider in 供应商们 {
+        repo::upsert_provider(db.pool(), &provider).await.unwrap();
+    }
+    let mut config = AppConfig {
+        port: 未占用端口().await,
+        unified_key: "cascade-e2e-key".into(),
+        ..Default::default()
+    };
+    tune(&mut config);
+    let gateway = Arc::new(GatewayState::new(db.clone(), config.clone()));
+    gateway.reload_providers().await.unwrap();
+    let task = tokio::spawn(async move {
+        let _ = serve(gateway).await;
+    });
+    let base_url = format!("http://{}:{}", config.bind, config.port);
+    等网关起来(&base_url).await;
+    (db, config, task, base_url)
+}
+
+async fn 发一句(base_url: &str, key: &str) -> (StatusCode, serde_json::Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({
+            "model": "integration-model",
+            "messages": [{ "role": "user", "content": "帮我看看这个限流器怎么设计" }]
+        }))
+        .send()
+        .await
+        .expect("请求应当发得出去");
+    let status = response.status();
+    let body = response.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+/// **卡片点名的计数型判据**：低置信度 ⇒ 上游被调用 **N+1** 次。
+///
+/// N = `max_escalations` = 1 ⇒ 两次：先便宜那档，再升到贵的那档。
+/// 只断言「最后答案对」是不够的 —— 那只发一次也能对。
+#[tokio::test]
+async fn 级联在低置信度时真的向两个上游各发一次() {
+    let (便宜地址, 便宜命中, _t1) = 起上游("便宜模型的回答").await;
+    let (贵地址, 贵命中, _t2) = 起上游("强模型的回答").await;
+    let (决策地址, 决策命中, _t3) = 起决策端点("inadequate", 0.9).await;
+
+    // 故意把贵的排在前面：这样「便宜优先」真的是**执行层排出来的**，
+    // 而不是靠供应商注册顺序碰巧对上的。
+    let (_db, config, _task, base_url) = 起网关(
+        vec![
+            供应商("strong", 贵地址, 10.0, 90),
+            供应商("cheap", 便宜地址, 0.1, 10),
+        ],
+        |cfg| {
+            cfg.routing_strategy = RoutingStrategy::Cascade;
+            cfg.cascade = CascadePolicy {
+                max_escalations: 1,
+                min_confidence: 0.6,
+            };
+            cfg.smart_routing.jev.base_url = 决策地址.clone();
+            cfg.smart_routing.jev.timeout_ms = 3_000;
+        },
+    )
+    .await;
+
+    let (status, body) = 发一句(&base_url, &config.unified_key).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        便宜命中.load(Ordering::SeqCst),
+        1,
+        "第一跳必须发给**最便宜**那档 —— 每次都发给第一家就是「便宜优先」没生效"
+    );
+    assert_eq!(
+        贵命中.load(Ordering::SeqCst),
+        1,
+        "置信度不够时必须升级到下一档并**真的再发一次**\
+         （N=1 ⇒ 上游总调用次数 N+1=2）"
+    );
+    assert_eq!(
+        决策命中.load(Ordering::SeqCst),
+        2,
+        "N=1 ⇒ 两次尝试 ⇒ 决策端点被问两次（每发一次问一次）"
+    );
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "强模型的回答",
+        "给用户的必须是**升级后**那次的回答 —— 返回便宜那档等于白升一级"
+    );
+}
+
+/// 反例组：够自信时**只发一次**，且停在第 0 档上。
+#[tokio::test]
+async fn 级联在够自信时只发一次且不惊动第二家() {
+    let (便宜地址, 便宜命中, _t1) = 起上游("便宜模型的回答").await;
+    let (贵地址, 贵命中, _t2) = 起上游("强模型的回答").await;
+    let (决策地址, _t3, _t3h) = 起决策端点("adequate", 0.9).await;
+
+    let (_db, config, _task, base_url) = 起网关(
+        vec![
+            供应商("strong", 贵地址, 10.0, 90),
+            供应商("cheap", 便宜地址, 0.1, 10),
+        ],
+        |cfg| {
+            cfg.routing_strategy = RoutingStrategy::Cascade;
+            cfg.cascade = CascadePolicy {
+                max_escalations: 2,
+                min_confidence: 0.6,
+            };
+            cfg.smart_routing.jev.base_url = 决策地址.clone();
+            cfg.smart_routing.jev.timeout_ms = 3_000;
+        },
+    )
+    .await;
+
+    let (status, body) = 发一句(&base_url, &config.unified_key).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(便宜命中.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        贵命中.load(Ordering::SeqCst),
+        0,
+        "置信度 0.9 ≥ 0.6 时必须收手 —— 升级一次就是多花一次真钱"
+    );
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "便宜模型的回答",
+        "够自信时给用户的必须是**最便宜那档**的回答：这条同时钉住了\
+         「便宜优先确实生效」（按能力分排的话先发的会是强模型那家）"
+    );
+}
+
+/// 反例组（铁律 2 模式隔离）：总开关关着时，路径与没有这个功能时一样 ——
+/// **连一次决策端点都不该打**。
+#[tokio::test]
+async fn 级联关着时不读决策端点也不升级() {
+    let (便宜地址, 便宜命中, _t1) = 起上游("便宜模型的回答").await;
+    let (贵地址, 贵命中, _t2) = 起上游("强模型的回答").await;
+    let (决策地址, 决策命中, _t3) = 起决策端点("inadequate", 0.9).await;
+
+    let (_db, config, _task, base_url) = 起网关(
+        vec![
+            供应商("strong", 贵地址, 10.0, 90),
+            供应商("cheap", 便宜地址, 0.1, 10),
+        ],
+        |cfg| {
+            // 策略设成 cascade、端点也配好了，**只有开关关着** ——
+            // 这正是「配好了但没开」的真实情形。
+            cfg.routing_strategy = RoutingStrategy::Cascade;
+            cfg.cascade = CascadePolicy::default();
+            cfg.smart_routing.jev.base_url = 决策地址.clone();
+            cfg.smart_routing.jev.timeout_ms = 3_000;
+        },
+    )
+    .await;
+
+    let (status, body) = 发一句(&base_url, &config.unified_key).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 关着时不重排候选（模式隔离）⇒ 发给谁由 `Weights` 决定，
+    // 而那不是本用例要钉的东西。这里只钉「只发了一次」。
+    assert_eq!(
+        决策命中.load(Ordering::SeqCst),
+        0,
+        "关着时连一次决策端点都不该打 —— 读一次是真实调用（超时预算 + 本机推理）"
+    );
+    let 总命中 = 便宜命中.load(Ordering::SeqCst) + 贵命中.load(Ordering::SeqCst);
+    assert_eq!(总命中, 1, "关着时只能发一次：既不该重排、也不该升级");
+    // 关着时**不重排**，所以发给谁由 `Weights` 决定：能力分 90 那家排在
+    // 能力分 10 那家前面。断言成「强模型的回答」而不是「命中那家」，
+    // 是为了让「关着也顺手按价格重排了」这种泄漏**必然变红**。
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "强模型的回答",
+        "关着时若命中的是便宜那家，说明「便宜优先」泄漏进了非级联路径"
+    );
+    assert_eq!(便宜命中.load(Ordering::SeqCst), 0);
 }
