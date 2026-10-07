@@ -6,6 +6,153 @@ use llm_gateway_lib::{
     domain::{Dialect, ModelRef, Provider},
 };
 
+// ------------------- D4 ③：交互信号采集（只采集不训练） -------------------
+
+/// 一份最小的审计记录。字段多但都是直白值 —— 这里要验的是两列新采集，
+/// 不是审计本身。
+fn 日志<'a>(
+    requested: &'a str,
+    session: Option<&'a str>,
+    routed: Option<&'a str>,
+) -> repo::RequestLog<'a> {
+    repo::RequestLog {
+        session_id: session,
+        client: None,
+        requested_model: requested,
+        routed_provider: Some("p"),
+        routed_model: routed,
+        status: Some(200),
+        latency_ms: 10,
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        fallback_attempts: 0,
+        error: None,
+        cost: None,
+        currency: None,
+        rate_label: None,
+        estimated_prompt_tokens: None,
+        attempts_json: None,
+        route: repo::RouteTrace::default(),
+        access_key_id: None,
+        refined_prompt: None,
+        trace_id: "t-1",
+    }
+}
+
+async fn 取一列(db: &Db, column: &str) -> i64 {
+    // 用白名单拼列名：调用方是测试自己，不是外部输入。
+    let sql = format!("SELECT {column} FROM requests ORDER BY rowid DESC LIMIT 1");
+    sqlx::query_scalar(&sql).fetch_one(db.pool()).await.unwrap()
+}
+
+/// 点名具体模型 ⇒ 采集为 1；**虚拟名一律为 0**。
+///
+/// 后半段是重点：把 `smart` / `fastest` 记成「用户点名」会让整列数据失真 ——
+/// 而它不报错，只是后续课题拿到一批错的偏好信号。
+#[tokio::test]
+async fn 点名模型被采集而虚拟名不算() {
+    let db = Db::connect_in_memory().await.unwrap();
+    for (index, (requested, expected)) in [
+        ("gpt-4o", 1i64),
+        ("auto", 0),
+        ("smart", 0),
+        ("fastest", 0),
+        ("smartest", 0),
+        ("balanced", 0),
+        ("cascade", 0),
+        ("", 0),
+        ("   ", 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        repo::log_request_at(
+            db.pool(),
+            1_700_000_000 + index as i64,
+            日志(requested, Some("s1"), Some("m1")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            取一列(&db, "user_pinned_model").await,
+            expected,
+            "requested_model = {requested:?} 的采集值不对"
+        );
+    }
+}
+
+/// 同一会话内换模型会**累计**；第一次没有「上一次」可比，所以是 0。
+#[tokio::test]
+async fn 同一会话换模型会累计() {
+    let db = Db::connect_in_memory().await.unwrap();
+    let mut seen = Vec::new();
+    for (index, model) in ["m1", "m2", "m3"].iter().enumerate() {
+        repo::log_request_at(
+            db.pool(),
+            1_700_000_000 + index as i64,
+            日志("auto", Some("s1"), Some(model)),
+        )
+        .await
+        .unwrap();
+        seen.push(取一列(&db, "session_model_switches").await);
+    }
+    assert_eq!(
+        seen,
+        vec![0, 1, 2],
+        "三次不同模型应当依次记成 0/1/2 —— 第一次没有「上一次」可比"
+    );
+}
+
+/// 反例组：一直用同一个模型，计数不该涨。
+///
+/// 少了这条，把「每次都 +1」写成实现的也能通过上面那条。
+#[tokio::test]
+async fn 同一会话用同一个模型不累计() {
+    let db = Db::connect_in_memory().await.unwrap();
+    let mut seen = Vec::new();
+    for index in 0..3 {
+        repo::log_request_at(
+            db.pool(),
+            1_700_000_000 + index,
+            日志("auto", Some("s1"), Some("m1")),
+        )
+        .await
+        .unwrap();
+        seen.push(取一列(&db, "session_model_switches").await);
+    }
+    assert_eq!(seen, vec![0, 0, 0], "模型没换就不该涨");
+}
+
+/// 两个会话各记各的 —— 计数是**会话级**的，不是全局的。
+#[tokio::test]
+async fn 换模型计数按会话隔离() {
+    let db = Db::connect_in_memory().await.unwrap();
+    repo::log_request_at(
+        db.pool(),
+        1_700_000_000,
+        日志("auto", Some("a"), Some("m1")),
+    )
+    .await
+    .unwrap();
+    repo::log_request_at(
+        db.pool(),
+        1_700_000_001,
+        日志("auto", Some("b"), Some("m9")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        取一列(&db, "session_model_switches").await,
+        0,
+        "另一个会话的第一次请求，不该继承前一列的计数"
+    );
+    // 没有会话 id 的请求（本机直连那类）也不该把别人的计数接过来。
+    repo::log_request_at(db.pool(), 1_700_000_002, 日志("auto", None, Some("m1")))
+        .await
+        .unwrap();
+    assert_eq!(取一列(&db, "session_model_switches").await, 0);
+}
+
 fn temporary_database_path() -> PathBuf {
     std::env::temp_dir().join(format!(
         "llm-gateway-db-{}-{}.sqlite",

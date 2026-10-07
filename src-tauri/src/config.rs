@@ -397,6 +397,32 @@ impl Default for SearchConfig {
     }
 }
 
+/// 请求是否**点名**了具体模型。`auto` / `smart` / `fastest` 这类虚拟名不算点名。
+///
+/// ## 为什么放在 config 而不是分类器里
+///
+/// 两个消费者：分类器（决定「跳过分类、直接用用户点的那家」）与
+/// D4 ③ 的采集（`requests.user_pinned_model`）。它们分属 intellect 与 db 两层，
+/// 而**虚拟模型名的清单本来就在这里**（`RoutingStrategy` 的七个档位名 +
+/// `auto`）—— 放在这里两边都能用，也只有在加一档策略时才会想到要改它。
+///
+/// 两处各写一份 `matches!` 的话，加一个虚拟名必然漏掉一处 ——
+/// 而漏掉的表现是「那个虚拟名被记成了用户点名」，不报错，只是数据脏了。
+pub fn is_explicit_model_name(requested: &str) -> bool {
+    !matches!(
+        requested.trim(),
+        "" | "auto"
+            | "priority"
+            | "balanced"
+            | "smartest"
+            | "fastest"
+            | "reliable"
+            | "custom"
+            | "smart"
+            | "cascade"
+    )
+}
+
 /// 应用级配置（落盘为 config.toml，可被「项目快照」整体打包/还原）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

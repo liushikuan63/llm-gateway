@@ -326,6 +326,26 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     // B4 traceId 贯穿。**本地永远要有** —— 即使 OTLP 导出关着，
     // traceId 也必须落库并在审计页可见，否则「导不出」会退化成「查不到」。
     ensure_column(pool, "requests", "trace_id", "TEXT").await?;
+    // D4 ③：交互信号采集（**只采集不训练**）。
+    //
+    // 两类弱信号：用户显式点名模型（说明上次没选对）、同一会话内换过几次模型
+    // （说明前面的结果不满足）。事实源 I.1 指出 RouteLLM 的强信号来自 LMSYS 的
+    // 人类偏好对 —— 本地拿不到，这两类是能拿到的那部分。
+    //
+    // `DEFAULT 0` 让**历史行**自动落到「没有信号」：这些列不存在的时候，
+    // 我们确实一次都没观测到。给它补一个猜测值才是真的撒谎。
+    ensure_column(pool, "requests", "user_pinned_model", "INTEGER DEFAULT 0").await?;
+    ensure_column(
+        pool,
+        "requests",
+        "session_model_switches",
+        "INTEGER DEFAULT 0",
+    )
+    .await?;
+    // 换模型计数每次都要读「同会话最近一条」，没有索引时那是全表扫。
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_req_session ON requests(session_id, ts)")
+        .execute(pool)
+        .await?;
     // 索引：审计页要「按 traceId 串联一次请求的全部尝试」，
     // 没有索引时那是全表扫。`CREATE INDEX IF NOT EXISTS` 是幂等的，
     // 对已有库重复执行安全。

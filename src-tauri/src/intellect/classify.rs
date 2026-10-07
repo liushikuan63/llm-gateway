@@ -77,10 +77,7 @@ impl ClassifyInput<'_> {
 
     /// 请求是否点名了具体模型。`auto` / `smart` / `fastest` 这些虚拟名不算点名。
     pub fn names_explicit_model(&self) -> bool {
-        !matches!(
-            self.requested_model.trim(),
-            "" | "auto" | "smart" | "fastest" | "smartest" | "reliable" | "balanced"
-        )
+        crate::config::is_explicit_model_name(self.requested_model)
     }
 }
 

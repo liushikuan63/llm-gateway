@@ -1368,14 +1368,28 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
 /// 那既慢又不稳（CLAUDE.md 第 11 条的同款教训：时间夹具不能靠等）。
 /// 生产路径仍然走 [`log_request`]。
 pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> Result<()> {
+    // D4 ③：这次请求有没有**点名**具体模型（`auto` / `smart` 这类虚拟名不算）。
+    //
+    // 在这里算而不是让 9 个调用点各传一个布尔：那个值完全由
+    // `requested_model` 决定，而它本来就在 `log` 里 ——
+    // 让每处各判一遍等于把一个纯函数复制九份，还没有任何好处。
+    let user_pinned_model = crate::config::is_explicit_model_name(log.requested_model);
     sqlx::query(
         r#"INSERT INTO requests
              (ts, session_id, client, requested_model, routed_provider, routed_model, status,
               latency_ms, prompt_tokens, completion_tokens, fallback_attempts, error,
               cost, currency, rate_label, estimated_prompt_tokens, attempts_json,
               route_intent, route_classifier, route_search, route_search_hits,
-              route_refined, route_refine_note, access_key_id, refined_prompt, trace_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+              route_refined, route_refine_note, access_key_id, refined_prompt, trace_id,
+              user_pinned_model, session_model_switches)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+             COALESCE((SELECT CASE WHEN routed_model IS ?
+                                   THEN session_model_switches
+                                   ELSE session_model_switches + 1 END
+                         FROM requests
+                        WHERE session_id = ?
+                        ORDER BY ts DESC, rowid DESC
+                        LIMIT 1), 0))"#,
     )
     .bind(ts)
     .bind(log.session_id)
@@ -1409,6 +1423,21 @@ pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> 
     // `refined_prompt` 是第 25 列、`trace_id` 是第 26 列。
     .bind(log.refined_prompt)
     .bind(log.trace_id)
+    // D4 ③ 的最后两位：**绑定顺序必须与列顺序一致**。
+    // 第 27 列 `user_pinned_model` 由调用方给，第 28 列 `session_model_switches`
+    // 在下面现算 —— 它要读「同会话最近一条」，而那是本函数之内才有的上下文。
+    .bind(user_pinned_model as i64)
+    // D4 ③：同一会话内**累计**换过几次模型，**在 INSERT 里一次算完**。
+    //
+    // 【为什么不先 SELECT 再 INSERT】审计写入在异步路径上，调用方
+    // （包括 `tests/budget_gate.rs` 那几条）在请求返回后立刻查计数。
+    // 多一次 round-trip 会让写入慢一拍，于是「查的时候还没写完」——
+    // 症状是一堆与本次改动毫无关系的断言变红。实测踩到过。
+    //
+    // 语义：`IS` 而不是 `=` —— 两边都是 NULL（第一次请求、或没取到模型名）
+    // 也要算「没换」；用 `=` 的话 NULL 永不相等，每一行都会被记成换过。
+    .bind(log.routed_model)
+    .bind(log.session_id)
     .execute(pool)
     .await?;
 
