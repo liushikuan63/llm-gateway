@@ -49,9 +49,15 @@
 1. **③ 交互信号采集**（卡片要求：用户点名模型 / 同 session 换 3 次以上模型，
    把计数采到 `requests` 表新列，**只采集不训练**）。**要加列**，而加列那笔账
    连续失败过两次，动手前先把「11 处 `RequestLog` 字面量 + INSERT 占位符」
-   那条路径想清楚（经验写在 §七、§八）。
-2. **前端：级联策略的配置界面**。卡片验收写 `npm run verify:ui`
-   「判据：生成了级联策略的配置截图」。现在只能手改 `config.toml`。
+   那条路径想清楚（经验写在 §七、§八）。**本会话没动它。**
+2. **前端：级联策略的配置界面** —— **已做**（`f2b8ee2`）。
+   `Providers.tsx` 的策略下拉补齐到 8 档（原先缺 `smart` 与 `cascade`，用户根本选不到），
+   新增 `CascadeStrip`，**只在 cascade 档渲染**。判据：
+   `npm run verify:ui` 退出码 0 且 `.ui-smoke-out/cascade-strip.png`（元素特写）
+   与 `cascade-settings-enabled.png` 是新生成的；`npm run build` 与 `verify:plan` 均 0。
+   **踩到的坑**：第一版截图用 `fullPage: true`，而页面滚动在**内部容器**上 ——
+   截图里根本没有级联区，而断言全绿。要验这类"在页面底部"的区块，
+   必须 `scrollIntoViewIfNeeded()` + 元素特写，不能只靠 fullPage。
 3. **级联的审计可见性**：`requests` 表没有承载「升级了几次 / 为什么没升级」的列。
    现在只有 `tracing` 日志（`stop_label` 的中文原因）与 `attempts_json`
    （两次尝试的逐跳明细都在里面）。要做成**界面可见**就需要加列 —— 与第 1 条同类。
@@ -60,6 +66,45 @@
 
 `router/mod.rs` 的 `candidate_cost` 上原本有**重复两遍的 doc 注释**
 （复制粘贴残留），`a051b7f` 里顺手删掉了重复那份，无行为改动。
+
+---
+
+## 〇·二、D 批其余前端的进展（2026-10-07 20:20）
+
+### D2 的冲突界面：**已完成**（`72cb12e`）
+
+交接单 §一.2 说「后端已把每一维各来源说过什么准备好，但 `src/pages/` 下没有 UI」。
+现在有了：`src/pages/Capabilities.tsx` + 导航项「能力与取舍」。
+
+- 冲突判定＝「不止一个来源，**且它们说的不全一样**」。
+  两个来源给出同一个值是互相印证，不是冲突 —— 界面上有反向断言钉着。
+- 胜出者按信任度标「生效」；各来源的值全列出来（卡片要的就是这条）。
+- 读失败时明确报错且不留半张表：空表看起来像「没有冲突」，
+  而那与「读失败」是完全相反的结论。
+- **只读页**：写入路径仍在 `ProviderEditor`。一个既能看冲突又能就地改值的页面
+  会让人分不清「我刚改的是哪个来源」，而来源正是这个功能唯一的解释对象。
+
+判据：`npm run verify:ui` 退出码 0 且 `.ui-smoke-out/capability-conflicts.png`
+新生成（图上确认：冲突卡列出「手工 0.90 生效」与「社区 0.40」，一致项收进折叠区）。
+
+**已知可改进点（不是缺陷，是范围）**：一个模型若既有冲突维度又有非冲突维度，
+卡片目前只列冲突维度，非冲突的那些要展开「各来源一致」区才看得到
+（而它在冲突卡里那个模型下并不出现）。卡片要求只覆盖冲突，故本笔未扩大。
+
+### 仍未开工的前端（按交接单原顺序）
+
+1. **D5 的可解释界面 + Pareto 前沿**：`router/pareto.rs` 有 14 条测试，
+   但 `pareto_front` **仍没有生产调用者、没有 IPC、没有页面**。
+   卡片还要 `Capabilities.tsx` 里「每个候选摊开显示各维原始值与加权贡献」
+   与三条诚实性要求（来源徽标 / 无样本显示「数据不足」/ 冲突提示）——
+   其中「冲突提示」已经落地（见上），另两条未做。
+2. **A5 的前端只读徽标**：那一笔欠账比 §一.7 写的更靠前 ——
+   **`src/api.ts` 里连这四个 IPC 的绑定都没有**（全文只有 `listLocalRuntimes`，
+   那是本地模型运行时的，与 A5 的 `agent_runtimes` 无关）。
+   所以这一格至少是三件事：① `api.ts` 加绑定与类型；
+   ② `ProviderEditor` 显示 `runtime_id` 与 runtime 清单；
+   ③ `ui-smoke.cjs` 夹具 + 断言 + 截图。
+   **建议单独一拍做，不要和别的改动混在一起。**
 
 ### 本会话的一条实测教训：`live_functional` 并行会偶发红
 
@@ -408,6 +453,33 @@ Start-Process src-tauri\target\release\llm-gateway.exe
 
 **仍未做**：安装包本身的安装/卸载流程（会改本机注册表与安装目录，
 属红线动作）。验的是 `target/release/llm-gateway.exe` 这个产物本体。
+
+### 2026-10-07 20:21 复验（D4 执行层接线 + 级联界面 + D2 冲突界面之后）
+
+| 判据 | 实测 |
+| --- | --- |
+| 编译 | `npm run tauri:build` **退出码 0** |
+| 产物时间 > 代码时间 | exe `20:21:04` > 最后改动 `20:14:48` ✓ |
+| 进程存活 | `Responding=True`，标题 `LLM Gateway` ✓ |
+| 监听 | `127.0.0.1:15721` |
+| `GET /healthz` | **200**，内容 `ok` |
+| `GET /v1/models` 无 Key | **401** ✓ |
+| 不存在路径 | **401**（同因：鉴权中间件在路由之前） |
+
+安装包：`nsis/…setup.exe` 3.99 MB、`msi/…msi` 6.21 MB。
+验证后已 `Stop-Process` 清理，不留常驻进程。
+
+**Rust 侧同批复验**：`cargo test --jobs 1 -- --skip 真机_` →
+**961 passed / 0 failed / exit 0**（基线 956 + 本会话新增 9 条循环用例与 3 条端到端）；
+`cargo clippy --all-targets -- -D warnings` → **退出码 0**；
+`live_functional` 单线程 → **7 passed / 0 failed**（并行偶发红见 §〇 末条）。
+
+**前端**：`npm run build` 退出码 0、`npm run verify:ui` 退出码 0、
+`npm run verify:plan` 退出码 0（4 份文档全绿）。
+`.ui-smoke-out/` 下新增 `cascade-strip.png`、`cascade-settings-enabled.png`、
+`capability-conflicts.png`，三张都在图上人工确认过。
+
+**仍未做**：安装包本身的安装/卸载流程（会改本机注册表与安装目录，属红线动作）。
 
 ---
 
