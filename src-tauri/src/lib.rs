@@ -113,12 +113,30 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
         return;
     }
 
+    // B8：把描述文件变成适配器。**总开关关着时一个目录都不扫**
+    // （模式隔离——扫本身就会去读用户指定的路径，关着的功能不该碰文件系统）。
+    // 加载失败只记日志、不影响启动：最坏是这个插件用不了，
+    // 而那比「网关因为一个描述文件起不来」轻得多。
+    let mut adapters = crate::agent_upstream::AdapterRegistry::with_builtins();
+    {
+        let outcome =
+            crate::agent_upstream::loader::load_plugins(&cfg.agent.plugin_dirs, cfg.agent.enabled);
+        for why in &outcome.skipped {
+            tracing::warn!("外部插件未加载：{why}");
+        }
+        let skipped = outcome.skipped.len();
+        let (loaded, _) = outcome.register_into(&mut adapters);
+        if cfg.agent.enabled {
+            tracing::info!("外部插件：加载 {loaded} 个、跳过 {skipped} 个");
+        }
+    }
+
     app.manage(AppState {
         db,
         config: Arc::new(parking_lot::RwLock::new(cfg)),
         gateway: gateway.clone(),
-        // A5：现在只有假适配器；A6/A7 会在这里加真适配器。
-        adapters: Arc::new(crate::agent_upstream::AdapterRegistry::with_builtins()),
+        // A5：内置假适配器 + A6/A7 的真适配器 + B8 的外部插件（上面刚加载）。
+        adapters: Arc::new(adapters),
     });
 
     let gw = gateway.clone();

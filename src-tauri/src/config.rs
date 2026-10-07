@@ -553,6 +553,15 @@ pub struct AgentConfig {
     /// 加一个「默认就限并发」的能力会让升级变成
     /// 「我的批处理脚本突然开始 429」。
     pub max_concurrency: usize,
+    /// B8：外部适配器的描述文件目录**白名单**。
+    ///
+    /// 空 = 一个都不加载（默认）。只有列在这里的目录**下面**的描述文件
+    /// 才会被加载 —— `validate_manifest` 会做 `canonicalize` 后比对前缀，
+    /// 所以符号链接绕不过去。
+    ///
+    /// **默认空而不是某个默认目录**：这个功能的语义是「用户主动把某个
+    /// 目录交给网关去读」，不该由我们替他挑一个位置。
+    pub plugin_dirs: Vec<std::path::PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -565,6 +574,8 @@ impl Default for AgentConfig {
             // 「我的脚本跑了几天突然开始 429」。
             quota: crate::agent_upstream::AgentQuota::default(),
             max_concurrency: 0,
+            // 默认一个目录都不给：见字段文档 —— 这个能力要用户主动交出目录。
+            plugin_dirs: Vec::new(),
         }
     }
 }
@@ -1149,6 +1160,12 @@ mod agent_config_tests {
                 daily_limit: 100,
             },
             max_concurrency: 3,
+            // 往返用例要覆盖这个字段：它是 B8 的白名单目录，
+            // 漏了它「往返」就只证明了别的字段能存。
+            plugin_dirs: vec![
+                std::path::PathBuf::from("D:/plugins-a"),
+                std::path::PathBuf::from("D:/plugins-b"),
+            ],
         };
         let toml = toml::to_string(&c).expect("应当能序列化");
         let back: AgentConfig = toml::from_str(&toml).expect("应当能反序列化");

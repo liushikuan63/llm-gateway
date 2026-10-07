@@ -869,13 +869,22 @@ async fn 流式完成后健康统计记下吞吐() {
     let body = response.text().await.unwrap();
     assert!(body.contains("[DONE]"), "流要正常跑完：{body}");
 
-    // 收到 [DONE] 之后统计必须**已经**记好 —— 与上下文落库同一个口径：
-    // 不靠 sleep 等后台任务，否则「等久一点就绿」会把真问题盖住。
-    let after = gateway.health.get("stream-mock", "integration-model");
+    // 收到 [DONE] 之后统计应当已经记好 —— 但**客户端读到 [DONE] 与服务端
+    // 执行那行记账之间没有同步关系**：实测这条断言偶发拿到 0，而单独跑又是绿的。
+    // 所以轮询等待，但**必须有上限**：等不到就是真没记，
+    // 不能靠「把 sleep 调长」掩盖 —— 那样这条用例就不再能失败了。
+    let mut after = gateway.health.get("stream-mock", "integration-model");
+    for _ in 0..50 {
+        if after.tps_samples > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        after = gateway.health.get("stream-mock", "integration-model");
+    }
     assert_eq!(
         after.tps_samples, 1,
-        "流式成功路径必须记吞吐样本；为 0 说明那行 record_success_with_throughput \
-         没生效或被删了（这正是本条要守的东西）"
+        "流式成功路径必须记吞吐样本（等了 1 秒仍为 0）。为 0 说明那行 \
+         record_success_with_throughput 没生效或被删了 —— 这正是本条要守的东西"
     );
     assert!(
         after.avg_tps > 0.0,

@@ -382,6 +382,8 @@ mod tests {
                 // 配额测试另有用例（`quota.rs`），这里不限。
                 quota: crate::agent_upstream::AgentQuota::default(),
                 max_concurrency: 0,
+                // 这批用例不碰外部插件（各自目录都不给）。
+                plugin_dirs: Vec::new(),
             },
             base,
         )
