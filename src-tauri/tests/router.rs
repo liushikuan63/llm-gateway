@@ -463,6 +463,74 @@ fn 解释视图列出不参与的候选并给出原因() {
         .any(|f| f.name == "capability"));
 }
 
+/// D5：**逐位**不变的守卫。
+///
+/// 【为什么需要它】给 `explain()` 做注违规自检时发现：把 `fit` 提到连乘
+/// 最前面，`tests/route_golden.rs` 的 8 条**仍然全绿** —— 现有的排序级金标准
+/// 抓不到浮点连乘顺序的变化。而「老策略的排序逐位不变」是铁律 2 的核心，
+/// 所以补一条直接对照 `total.to_bits()` 的判据。
+///
+/// 【常数红了怎么办】那正是它存在的意义：停下来确认「这次改动真的没有改变
+/// 既有输入的得分」。确认无误会后同步更新常数，并在提交信息里写明原因。
+/// **不要**把它放宽成范围比较 —— 那样它就退化成一条永远绿的装饰。
+///
+/// 【输入为什么这么写】要让**七个因子的原始值全都不是 1.0**。
+///
+/// 这不是讲究，是判据能不能失败的前提：`1.0.powf(任何权重)` 恒等于 1，
+/// 所以只要 health 或 latency 的原始值是满分，那一项就对权重与连乘顺序
+/// **完全不敏感**。实测踩过两次：
+/// ① 用 `Balanced` 权重（intent / cost / efficiency 全是 0）⇒ 抓不到；
+/// ② 换成全非零权重，但健康数据是「新建、无延迟样本」⇒
+///    `health_score` 与 `latency_score` 都返回 1.0，**照样抓不到**。
+/// 现在给一个成功 + 一个失败（成功率 0.5）与一个非零延迟。
+/// 【它抓**不到**什么 —— 实测过两次，别高估它】
+///
+/// 把 `base` 的连乘顺序换掉（把 `fit` 提到最前面），这条**仍然绿**。
+/// 浮点乘法虽不满足结合律，但在具体数值下换序经常给出**同样的 bits**。
+/// 所以它守的是**公式语义**（丢了一个因子、改了指数、改了常数 ——
+/// 这三种都实测会红），**不是求值顺序**。
+///
+/// 想守住顺序只能穷举换序，成本与收益不成比例；现实做法是让顺序
+/// **固定在代码结构里**，并承认没有测试能证明它。
+#[test]
+fn 打分结果逐位不变() {
+    let candidate = 分解候选();
+    let weights = Weights {
+        health: 0.25,
+        headroom: 0.15,
+        capability: 0.3,
+        latency: 0.1,
+        intent: 0.2,
+        cost: 0.2,
+        efficiency: 0.2,
+    };
+    // 先记一次成功（带非零延迟），再记一次失败 ⇒ 成功率 0.5、有延迟样本。
+    let health = HealthRegistry::new();
+    health.record_success("smart", "mock-model", 800);
+    health.record_failure(
+        "smart",
+        "mock-model",
+        &llm_gateway_lib::error::GatewayError::ModelNotFound("故意失败一次".into()),
+    );
+    let mut input = 分解输入(0.37, Some(health.get("smart", "mock-model")));
+    input.intent = Some(llm_gateway_lib::intellect::TaskClass::Simple);
+    input.domain = llm_gateway_lib::intellect::TaskDomain::Coding;
+    input.cost_bias = true;
+    input.cost_range = Some((1.0, 100.0));
+    input.candidate_cost = Some(37.0);
+    input.tps_range = Some((10.0, 200.0));
+    input.candidate_tps = Some(53.0);
+
+    let total = explain(&candidate, &input, &weights).total;
+    assert_eq!(
+        total.to_bits(),
+        0x3e9c4ff4,
+        "打分结果逐位变了。实际 bits = {:#010x}（{total}）。\
+         若这是有意的公式改动，同步更新这个常数并说明原因。",
+        total.to_bits()
+    );
+}
+
 #[test]
 fn model_type_prevents_cross_endpoint_routing() {
     let (router, _, _) = router();
