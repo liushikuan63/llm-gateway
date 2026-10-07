@@ -213,6 +213,10 @@ impl StdioSession {
     /// Windows 上 `Child::kill` 只杀直接子进程，孙进程会留下来占着端口、
     /// 继续写文件。`taskkill /T /F` 才走整棵树。
     pub async fn kill_tree(&mut self) {
+        // 实现移到 `crate::proc_util`：A6/A7 的账号型上游也要杀树，
+        // 抄第二份的结果是两处各自演化，而其中一处会忘记孙进程。
+        return crate::proc_util::kill_tree(&mut self.child).await;
+        #[allow(unreachable_code)]
         #[cfg(windows)]
         {
             if let Some(pid) = self.child.id() {

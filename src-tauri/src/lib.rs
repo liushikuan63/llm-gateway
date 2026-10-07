@@ -3,6 +3,7 @@ pub mod autostart;
 pub mod boot;
 // 任务卡二 A5：账号型上游（Codex / Qoder / Claude Code…）。
 pub mod agent_upstream;
+// 子进程工具：A6/A7 与 C1（MCP）共用同一份「杀进程树」实现。
 pub mod budget;
 pub mod bundle;
 pub mod cache;
@@ -25,6 +26,7 @@ pub mod pet_window;
 pub mod petdex;
 pub mod pricing;
 pub mod pricing_refresh;
+pub mod proc_util;
 pub mod protocol;
 pub mod provider_quota;
 pub mod proxy;
