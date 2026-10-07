@@ -183,6 +183,133 @@ fn 默认台账位置在应用数据目录() {
     );
 }
 
+// ==================== 真子进程：协议接在真进程上 ====================
+
+use llm_gateway_lib::agent_upstream::plugin_process::ProcessTransport;
+
+/// 写一个**真的会按协议应答**的参考插件（node 脚本）。
+///
+/// 用 node 而不是造一个 exe：本机有 node（前端就在用它），
+/// 启动比 PowerShell 快得多，而它 `console.log` 默认走 stdout ——
+/// 正好能模拟「插件往协议流里混日志」这个真实情形。
+fn 写参考插件脚本(dir: &std::path::Path, 啰嗦: bool, 装死: bool) -> std::path::PathBuf {
+    let path = dir.join(if 装死 {
+        "dead-plugin.js"
+    } else {
+        "ref-plugin.js"
+    });
+    let 日志行 = if 啰嗦 {
+        "process.stdout.write('[ref] 收到一条请求\\n');"
+    } else {
+        ""
+    };
+    let 主体 = if 装死 {
+        // 只挂着、什么都不回 —— 这正是 A6 实测到的 `codex exec` 行为。
+        "setInterval(() => {}, 1000);"
+    } else {
+        r#"let result;
+  if (req.type === 'probe') result = { ready: true };
+  else if (req.type === 'list_models') result = { models: ['ref-small', 'ref-large'] };
+  else if (req.type === 'complete') result = { text: '参考插件收到：' + (req.prompt || '') };
+  else { process.stdout.write(JSON.stringify({ request_id: req.request_id, error: '未知类型' }) + '\n'); return; }
+  process.stdout.write(JSON.stringify({ request_id: req.request_id, result }) + '\n');"#
+    };
+    let script = format!(
+        r#"const readline = require('readline');
+const rl = readline.createInterface({{ input: process.stdin }});
+rl.on('line', (line) => {{
+  let req;
+  try {{ req = JSON.parse(line); }} catch {{ return; }}
+  {日志行}
+  {主体}
+}});
+"#
+    );
+    std::fs::write(&path, script).expect("写参考插件脚本");
+    path
+}
+
+fn 临时目录(名字: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("llm-gateway-proc-{}-{名字}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("建临时目录");
+    dir
+}
+
+fn 真插件适配器(dir: &std::path::Path, 啰嗦: bool, 装死: bool) -> ExternalAdapter {
+    let script = 写参考插件脚本(dir, 啰嗦, 装死);
+    let transport = ProcessTransport::new("node", vec![script.to_string_lossy().into_owned()]);
+    let manifest = parse_manifest(&描述文件("ref")).unwrap();
+    ExternalAdapter::new(&manifest, std::sync::Arc::new(transport))
+}
+
+/// **卡片判据 1 的真进程版本**：协议接在真子进程上，三个请求都要通。
+#[tokio::test]
+async fn 真进程能跑通三个请求() {
+    let dir = 临时目录("ok");
+    let adapter = 真插件适配器(&dir, false, false);
+    // 超时给足：node 启动 + 首次解释要几百毫秒。
+    assert!(adapter.probe(15_000).await.expect("probe 应当成功"));
+    assert_eq!(
+        adapter.list_models(15_000).await.expect("list_models"),
+        vec!["ref-small".to_string(), "ref-large".to_string()]
+    );
+    let reply = adapter
+        .send(AgentRequest {
+            model: "ref-small".into(),
+            prompt: "真进程你好".into(),
+            timeout_ms: 15_000,
+        })
+        .await
+        .expect("complete 应当成功");
+    assert!(reply.text.contains("真进程你好"), "{}", reply.text);
+    assert_eq!(reply.transport, "external");
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// 插件往 stdout 打日志时，真进程路径也要能配对。
+#[tokio::test]
+async fn 真进程啰嗦时照样跑通() {
+    let dir = 临时目录("noisy");
+    let adapter = 真插件适配器(&dir, true, false);
+    assert!(adapter
+        .probe(15_000)
+        .await
+        .expect("啰嗦插件的 probe 也要成功"));
+    let reply = adapter
+        .send(AgentRequest {
+            model: "ref-small".into(),
+            prompt: "啰嗦".into(),
+            timeout_ms: 15_000,
+        })
+        .await
+        .unwrap();
+    assert!(reply.text.contains("啰嗦"));
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// **插件装死 ⇒ 超时并杀掉它**，而不是把请求挂住。
+///
+/// 这条是 A6 实测教训的落地：`codex exec --json` 会静默挂住 90 秒零输出。
+/// 没有超时的适配器会把每个请求都挂死在那。
+#[tokio::test]
+async fn 插件装死时超时并终止它() {
+    let dir = 临时目录("dead");
+    let adapter = 真插件适配器(&dir, false, true);
+    let started = std::time::Instant::now();
+    let err = adapter.probe(1_500).await.expect_err("装死的插件必须超时");
+    assert!(err.contains("没有回应"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "超时必须有上限，实际等了 {:?}",
+        started.elapsed()
+    );
+    // 再发一次：进程已被杀掉，应当重新起一个（而不是往死管道里写）。
+    // 它仍然是装死的，所以还会超时 —— 关键是**不 hang**。
+    assert!(adapter.probe(1_500).await.is_err());
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// 一个能用的最小描述文件。
 fn 描述文件(id: &str) -> String {
     serde_json::json!({
