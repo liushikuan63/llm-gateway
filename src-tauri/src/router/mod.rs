@@ -523,10 +523,12 @@ impl Router {
             prompt_tokens: prompt_tokens as i64,
             minute_of_day,
             health: self.health.clone(),
-            // 长 prompt 那一支**还没接**：`rank_with_intent` 的签名里
-            // 没有 prompt token 数，要加参数得改 server.rs 的 4 个调用点。
-            // 这里传 0 ⇒ 只有 `Simple` 类请求会拿到成本偏置，
-            // 而那正是卡片点名的第一场景。长 prompt 场景记为未接。
+            // 【已接】长 prompt 型代价用调用方传来的真实估算值
+            // （`ffb2528` 接的；此前这里传 0，注释也停在那个状态上，
+            // 2026-10-07 复验时一并订正）。
+            // `prompt_tokens` 是**请求级**的估算，由 `server.rs` 用
+            // `estimate_message_tokens(&req.messages)` 算好后传进来 ——
+            // 在这里现算拿不到 `req`，每个候选各算一遍也是浪费。
             cost_bias: score::cost_bias_applies(
                 intent,
                 prompt_tokens,

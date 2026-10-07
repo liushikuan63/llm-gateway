@@ -7,6 +7,71 @@
 
 ---
 
+## 〇、续做记录（2026-10-07 20:06，接手会话）
+
+### 复验：§二 的「第一步」已经还清了（那两段描述已过期）
+
+- **流式路径记吞吐有测试守着**：`proxy/health.rs` 的
+  `record_success_with_throughput` 把「成功率」与「吞吐」绑成一个函数，
+  `tests/agent_upstream.rs` 有两条用例直接调它（`流式成功路径的记账包含吞吐`、
+  `没有完成_token_时不记吞吐样本`）。删掉里面 `record_tps` 那一行会红。
+  **§一.1 与 §二 第一步说的「没有用例守着 / 只需在流式成功路径上调它」都不成立。**
+- **长 prompt 那一支也已经接了**（`ffb2528`）：`rank_with_intent` 有
+  `prompt_tokens` 参数，`server.rs` 传的是 `estimate_message_tokens(&req.messages)`，
+  `cost_bias_applies(intent, prompt_tokens, …)` 用的是真值。
+  原先那段「还没接」的注释是**残留的过期注释**，本次已订正。
+- 开工前基线实测：`cargo test --jobs 1` → **956 passed / 0 failed / exit 0**。
+
+### D4 ②：执行层已落地（两笔）
+
+| 提交 | 内容 |
+| --- | --- |
+| `cd5abb0` | `run_cascade` 循环本体（不依赖 IO 的形状，可注入 send / confidence）+ 9 条循环用例 |
+| `a051b7f` | 接线：`CascadePolicy` 进 `AppConfig`、`Router::effective_strategy`、`order_by_cost`（便宜优先）、`normal_dispatch` 走唯一发送路径 + 3 条端到端用例 |
+
+**交接单漏报的一格**：`CascadePolicy` 此前**根本没进 `AppConfig`** ——
+连配置来源都没有，所以级联压根打不开（不只是「没有执行层」这么简单）。
+`a051b7f` 补上了，字段名 `cascade`，默认 `max_escalations = 0`。
+
+**判据实测**（`cargo test --test cascade` → 26 passed / 0 failed）：
+- 低置信度 ⇒ 便宜那家 1 次、贵那家 1 次（N=1 ⇒ N+1=2）、决策端点 2 次、返回升级后那次的回答；
+- 够自信 ⇒ 只发 1 次，返回便宜那家；
+- 关着 ⇒ 决策端点 0 次、只发 1 次、命中能力分高那家（「便宜优先」没泄漏）。
+
+注违规自检三轮：掐断排序 ⇒ 2 条红；掐断级联接线 ⇒ 1 条红；关着不读 Jev ⇒ 1 条红。
+
+**夹具踩的坑（值得记）**：最初两个候选的 `Weights` 顺序**恰好也是便宜在前**，
+于是掐断 `order_by_cost` 照样全绿 —— **夹具区分不出「排序生效」与「碰巧对」**。
+现在给两个候选不同的 `intelligence`（90 vs 10），让两组排序结论相反。
+
+### D4 仍未做（三条）
+
+1. **③ 交互信号采集**（卡片要求：用户点名模型 / 同 session 换 3 次以上模型，
+   把计数采到 `requests` 表新列，**只采集不训练**）。**要加列**，而加列那笔账
+   连续失败过两次，动手前先把「11 处 `RequestLog` 字面量 + INSERT 占位符」
+   那条路径想清楚（经验写在 §七、§八）。
+2. **前端：级联策略的配置界面**。卡片验收写 `npm run verify:ui`
+   「判据：生成了级联策略的配置截图」。现在只能手改 `config.toml`。
+3. **级联的审计可见性**：`requests` 表没有承载「升级了几次 / 为什么没升级」的列。
+   现在只有 `tracing` 日志（`stop_label` 的中文原因）与 `attempts_json`
+   （两次尝试的逐跳明细都在里面）。要做成**界面可见**就需要加列 —— 与第 1 条同类。
+
+### 一条顺带修掉的重复
+
+`router/mod.rs` 的 `candidate_cost` 上原本有**重复两遍的 doc 注释**
+（复制粘贴残留），`a051b7f` 里顺手删掉了重复那份，无行为改动。
+
+### 本会话的一条实测教训：`live_functional` 并行会偶发红
+
+`cargo test --jobs 1` 里 `--jobs 1` 只限**编译**并行，**测试仍在并行跑**。
+三条真机用例同时打本机 Ollama 的 27B 时，会出现
+`上游服务 Ollama-local/qwen3.8:27b_q4_K_M 返回 HTTP 500`。
+按 `CLAUDE.md` 的口径单线程重跑 ⇒ **7 passed / 0 failed / exit 0**。
+**结论：全量验收要用 `cargo test --jobs 1 -- --skip 真机_` 跑常规部分，
+真机部分单独 `cargo test --test live_functional -- --test-threads=1` 跑。**
+
+---
+
 ## 一、当前状态（一眼看懂）
 
 **分支** `main`，与 `origin` 同步。任务卡一 A/B/C 三批完成；
@@ -18,7 +83,7 @@ D 批 5 张卡里 **D1 完成、D2 差界面、D3 完成、D4 差级联执行层
 **打包 + 真启动已验证**（`npm run tauri:build` 退出码 0，exe 真跑，
 `/healthz` 200、`/gw/agent/run` 401 非 404）。
 
-> **本文件的时效判据**：最后更新 2026-10-07 18:50。
+> **本文件的时效判据**：最后更新 2026-10-07 20:10（见 §〇 的续做记录）。
 > **本文件之外还有两个必读源**：卡片的判据在 `docs/VibeCoding任务卡-*.md`；
 > 行为基准在 `src-tauri/tests/`（不是任何文档）。
 
