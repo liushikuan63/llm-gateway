@@ -401,3 +401,50 @@ codex exec --json --skip-git-repo-check --ephemeral "say hi"
   `--help` 拿到了。要跑的话建议你本人跑。
 - **`--json` 的事件流形状**：因为挂住而没拿到。**不要凭猜写解析器** ——
   项目已经踩过「mock 形状与真实不一致」的坑。等登录后抓一次真实输出再写。
+
+---
+
+## 七、A6 / A7 现状（2026-10-07，L3 均已落地）
+
+| 卡 | 已落地 | 未做 |
+| --- | --- | --- |
+| A6 Codex | L3（`codex exec --json`）+ 参数构造 + 宽容解析器 + 超时/杀树/cwd 隔离 | 判据 1（需登录）、L1 `exec-server`、真机从未跑通 |
+| A7 Qoder | L3（`qoder -p … -o stream-json --tools=`）+ 协议版本守卫 + 真实形状解析 | 判据 1（需登录）、判据 3（隔离负向实验）、判据 4（额度）、L1 |
+
+### 已抓到的真实形状（A7，本机 qoder 1.1.65）
+
+```
+{"type":"system","subtype":"init","protocol_version":"1.5.0","tools":[],…}
+{"type":"assistant","message":{"content":[{"type":"text","text":"…"}]},"error":"authentication_failed"}
+{"type":"result","subtype":"success","is_error":true,"result":"…"}
+```
+
+- **最终回复在 `result.result`**
+- 未登录：`assistant.error = "authentication_failed"`
+- **`subtype: "success"` 不代表成功**，必须看 `is_error`
+
+### 两条安全关键的事实（实测，不是推演）
+
+1. **`qoder` 不加 `--tools` 时默认带 31 个工具**
+   （`Agent` `Bash` `Edit` `Write` `WebFetch` `Workflow`…）。
+   裁决之二要求默认无工具 ⇒ 参数里**必须始终带 `--tools=`**（带等号的空值；
+   `--tools ""` 在 PowerShell 下空串会被丢掉，CLI 报
+   `option '--tools <tools...>' argument missing`）。
+2. **`codex exec --json` 会静默挂住**（90 秒零输出且不结束）⇒
+   超时是必然触发的分支；而 `codex` 是包装器脚本，必须**杀进程树**
+   （见 `src-tauri/src/proc_util.rs`，它有真起孙进程的用例守着）。
+
+### A7 判据 4 的来源（本轮探查）
+
+**`qoder usage` 是真实命令，但登录门控** —— 未登录直接输出
+`Not logged in 路 Please run /login`。所以判据 4（额度可读）
+的前置与判据 1 是同一条：**需要你本人 `qoder login`**。
+
+### 一处我引入的欠账，必须记下来
+
+`AgentReply.transport`（`"L3"` / `"fake"`）**目前没有消费者** ——
+卡片 A6 判据 1 要求审计行记录它是 L1 还是 L3，而 `requests` 表里
+还没有对应列。按铁律 9「不留只写不读的字段」，这是一笔**待还的账**。
+
+要还它需要：`requests` 表加 `runtime_kind` 与 `transport` 两列 +
+审计写入点带上它们。**独立一笔**，不要和别的改动混在一起。
