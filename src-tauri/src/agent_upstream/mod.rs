@@ -20,12 +20,14 @@ pub mod adapter;
 pub mod codex;
 pub mod fake;
 pub mod qoder;
+pub mod run;
 pub mod workspace;
 
 pub use adapter::{AgentAdapter, AgentReply, AgentRequest};
 pub use codex::CodexAdapter;
 pub use fake::FakeAdapter;
 pub use qoder::QoderAdapter;
+pub use run::{run_agent, AgentRunOutcome};
 pub use workspace::WorkspaceRoot;
 
 use std::collections::BTreeMap;
