@@ -40,9 +40,15 @@ pub async fn kill_tree(child: &mut Child) {
     let _ = child.kill().await;
 }
 
-/// 杀进程树（同步尽力而为），供 `Drop` 路径用。
+/// 杀进程树（同步，等 `taskkill` 真的跑完），供 `Drop` 与启动清扫用。
 ///
 /// `Drop` 里不能 `.await`，所以单独一个同步版本。
+///
+/// 【为什么是 `output()` 而不是 `spawn()`】`spawn()` 只是把 `taskkill`
+/// 拉起来就返回，**根本不等它做完** —— 调用方拿到「函数返回了」却不知道
+/// 进程到底死没死，紧接着的检查会看到它还活着。
+/// 实测踩到：B8 的孤儿清理用例里 `killed` 计数是对的（说明走到了杀的分支），
+/// 但进程仍在运行。阻塞几十毫秒换一个确定的结论，值。
 pub fn kill_tree_blocking(pid: u32) {
     #[cfg(windows)]
     {
@@ -51,7 +57,7 @@ pub fn kill_tree_blocking(pid: u32) {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .output();
     }
     #[cfg(not(windows))]
     {

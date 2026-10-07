@@ -14,6 +14,175 @@ use llm_gateway_lib::agent_upstream::plugin::{
 };
 use llm_gateway_lib::agent_upstream::{AgentAdapter, AgentRequest};
 
+// ==================== B8 判据 4：孤儿进程清理 ====================
+
+use std::process::Command;
+
+use llm_gateway_lib::agent_upstream::plugin_process::{
+    encode, exe_basename, ledger_path, parse, sweep, write_ledger, PluginProcess,
+};
+
+/// 台账的编解码往返。
+#[test]
+fn 台账编解码往返且坏行跳过() {
+    let entries = vec![
+        PluginProcess {
+            pid: 1234,
+            exe: "ref-plugin.exe".into(),
+        },
+        PluginProcess {
+            pid: 5678,
+            exe: "有 空格 的名字.exe".into(),
+        },
+    ];
+    assert_eq!(parse(&encode(&entries)), entries);
+
+    // 坏行：缺分隔符 / pid 不是数字 / exe 为空 —— 都要跳过而不是整体失败。
+    // 台账是崩溃现场留下的文件，为一个坏行放弃整份台账 = 放弃清理。
+    let raw = "1234\tok.exe\n没有制表符\nabc\tx.exe\n99\t\n\ttt.exe\n";
+    assert_eq!(
+        parse(raw),
+        vec![PluginProcess {
+            pid: 1234,
+            exe: "ok.exe".into()
+        }],
+        "只应留下唯一那一行合法的"
+    );
+}
+
+/// exe 归一成 basename：两种分隔符都要认。
+#[test]
+fn exe_归一成_basename() {
+    assert_eq!(exe_basename(r"C:\tools\ref-plugin.exe"), "ref-plugin.exe");
+    assert_eq!(exe_basename("/usr/local/bin/ref"), "ref");
+    assert_eq!(exe_basename("ref.exe"), "ref.exe");
+}
+
+/// 台账文件不存在时清扫返回 0，不报错（第一次启动的正常情形）。
+#[test]
+fn 台账不存在时清扫返回零() {
+    let path = std::env::temp_dir().join(format!(
+        "llm-gateway-ledger-missing-{}-{}.txt",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(sweep(&path).unwrap(), 0);
+}
+
+/// 进程还在时：台账里的条目要**核对进程名**，匹配才杀。
+///
+/// 这里用一个真实的长跑进程（`cmd` 跑 `ping`）—— 判据 4 说的是真进程，
+/// 用 mock 验不出任何东西。
+#[test]
+fn 启动清扫杀掉台账里还活着的进程() {
+    let path = std::env::temp_dir().join(format!(
+        "llm-gateway-ledger-{}-{}.txt",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let mut child = Command::new("cmd")
+        .args(["/c", "ping -n 30 127.0.0.1 > nul"])
+        .spawn()
+        .expect("起一个长跑进程");
+    let pid = child.id();
+    // 台账里记的 exe 名必须与 tasklist 报的一致（cmd.exe），否则清扫会走
+    // 「名字不匹配 ⇒ 不动它」那条分支，测试就测不到杀。
+    write_ledger(
+        &path,
+        &[PluginProcess {
+            pid,
+            exe: "cmd.exe".into(),
+        }],
+    )
+    .unwrap();
+
+    let killed = sweep(&path).expect("清扫应当成功");
+    assert_eq!(killed, 1, "台账里那一条应当被认出并杀掉");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        child.try_wait().map(|s| s.is_some()).unwrap_or(true),
+        "清扫之后那个进程必须已经结束"
+    );
+    assert!(!path.exists(), "清扫之后台账必须被清掉");
+    let _ = child.kill();
+}
+
+/// **误杀防护**：pid 存在但**进程名不匹配**时不动它。
+///
+/// 这条是判据 4 的反面：不做名字核对的话，pid 复用会让网关在启动时
+/// 杀掉一个毫不相干的进程 —— 那比留下孤儿严重得多。
+#[test]
+fn 进程名不匹配时不误杀() {
+    let path = std::env::temp_dir().join(format!(
+        "llm-gateway-ledger-nomatch-{}-{}.txt",
+        std::process::id(),
+        line!()
+    ));
+    let mut child = Command::new("cmd")
+        .args(["/c", "ping -n 30 127.0.0.1 > nul"])
+        .spawn()
+        .expect("起一个长跑进程");
+    let pid = child.id();
+    write_ledger(
+        &path,
+        &[PluginProcess {
+            pid,
+            exe: "绝对不是一个真实的进程名.exe".into(),
+        }],
+    )
+    .unwrap();
+
+    let killed = sweep(&path).unwrap();
+    assert_eq!(killed, 0, "名字不匹配就不该动手");
+    assert!(
+        child.try_wait().map(|s| s.is_none()).unwrap_or(false),
+        "不匹配的进程不该被杀掉"
+    );
+    assert!(
+        !path.exists(),
+        "台账仍要清掉（结论已经有了：那不是我们的进程）"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// 已经死掉的 pid 不该被当成「杀不掉」而留在台账里。
+#[test]
+fn 已死的进程不算清理失败() {
+    let path = std::env::temp_dir().join(format!(
+        "llm-gateway-ledger-dead-{}-{}.txt",
+        std::process::id(),
+        line!()
+    ));
+    let mut child = Command::new("cmd").args(["/c", "exit 0"]).spawn().unwrap();
+    let pid = child.id();
+    let _ = child.wait();
+    write_ledger(
+        &path,
+        &[PluginProcess {
+            pid,
+            exe: "cmd.exe".into(),
+        }],
+    )
+    .unwrap();
+    assert_eq!(sweep(&path).unwrap(), 0, "它已经死了，没什么可杀的");
+    assert!(!path.exists(), "台账仍要被清掉，否则它会一直留着");
+}
+
+/// 默认台账位置就在应用数据目录下（与 config.toml / gateway.db 同处）。
+#[test]
+fn 默认台账位置在应用数据目录() {
+    let path = ledger_path();
+    assert!(path.ends_with("plugin-processes.txt"), "{path:?}");
+    assert_eq!(
+        path.parent(),
+        Some(llm_gateway_lib::config::app_data_dir().as_path())
+    );
+}
+
 /// 一个能用的最小描述文件。
 fn 描述文件(id: &str) -> String {
     serde_json::json!({

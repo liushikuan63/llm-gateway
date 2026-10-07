@@ -20,6 +20,7 @@ pub mod adapter;
 pub mod codex;
 pub mod fake;
 pub mod plugin;
+pub mod plugin_process;
 pub mod qoder;
 pub mod quota;
 pub mod run;
