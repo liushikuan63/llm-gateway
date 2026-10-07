@@ -19,6 +19,7 @@
 pub mod adapter;
 pub mod codex;
 pub mod fake;
+pub mod plugin;
 pub mod qoder;
 pub mod quota;
 pub mod run;
