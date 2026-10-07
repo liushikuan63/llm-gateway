@@ -192,6 +192,22 @@ pub async fn call_agent(
                 }
             }
         })?;
+    // 【临时落点，不是终态】卡片 A6 判据 1 要求审计行记录
+    // `runtime_kind` 与**实际**走的 `transport`（L1/L3），而 `requests`
+    // 表还没有这两列 —— 那笔账要动 11 处 `RequestLog` 字面量，独立一笔。
+    //
+    // 在那之前，这里先用日志把它记下来：`AgentReply.transport` 是
+    // **适配器如实回报**的值（假适配器报 "fake"、本适配器报 "L3"），
+    // 有它在日志里就**不是「只写不读」**（铁律 9），需要时也能从
+    // 运行日志追出「这一次到底走了哪条路」。
+    //
+    // 还账后这一行应当**删掉**（审计列才是权威），别让它变成两份真相。
+    tracing::info!(
+        runtime_kind = runtime_id,
+        agent_transport = %reply.transport,
+        model = model,
+        "账号型上游返回"
+    );
     Ok(reply.into_chat_response(model))
 }
 
