@@ -46,6 +46,60 @@ pub fn ledger_path() -> PathBuf {
     crate::config::app_data_dir().join("plugin-processes.txt")
 }
 
+/// **某个插件**的台账路径。
+///
+/// 一个插件一个文件，不共享一份：共享台账要读-改-写，而多个插件可能同时起 ——
+/// 那点锁的复杂度不值得，而且共享文件被写坏时**所有**插件的清理一起失效。
+pub fn ledger_path_for(plugin_id: &str) -> PathBuf {
+    crate::config::app_data_dir().join(format!("plugin-processes-{}.txt", sanitize_id(plugin_id)))
+}
+
+/// 把插件 id 消毒成安全的文件名片段。
+///
+/// id 来自**用户可以随手改的**描述文件。直接拿它拼路径会开出目录穿越
+/// （`../../evil` 能写到应用数据目录之外），而那种写入是**静默的**。
+/// 白名单：只留 ASCII 字母数字与 `-` `_`，其余一律换成 `_`，并截断到 64 字符。
+pub fn sanitize_id(id: &str) -> String {
+    let cleaned: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "unnamed".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 扫掉**所有**插件的台账。网关启动时调一次。
+///
+/// 前缀匹配同时覆盖旧的单文件台账（`plugin-processes.txt`）——
+/// 升级上来的机器上可能还留着它。
+pub fn sweep_all() -> Result<usize, String> {
+    let dir = crate::config::app_data_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // 目录还不存在（全新环境）不是错误。
+        Err(_) => return Ok(0),
+    };
+    let mut killed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("plugin-processes") || !name.ends_with(".txt") {
+            continue;
+        }
+        killed += sweep(&entry.path())?;
+    }
+    Ok(killed)
+}
+
 /// 把 exe 归一成 basename：`C:\tools\ref.exe` → `ref.exe`。
 ///
 /// 同时吃掉 Windows 与 Unix 两种分隔符 —— 描述文件里写哪种都可能，
@@ -172,6 +226,8 @@ pub fn write_ledger(path: &Path, entries: &[PluginProcess]) -> Result<(), String
 /// `codex exec` 正是这个行为）。超时后不杀的话，下一个请求会接着往一个
 /// 已经乱掉的 stdin 里写，错误会以「协议解析失败」的形式出现在很远的地方。
 pub struct ProcessTransport {
+    /// 台账按它分文件 —— 见 [`ledger_path_for`]。
+    plugin_id: String,
     exe: String,
     args: Vec<String>,
     inner: tokio::sync::Mutex<Option<Running>>,
@@ -186,12 +242,34 @@ struct Running {
 impl ProcessTransport {
     /// `exe` 与 `args` 应当**已经过 `validate_manifest` 的注入校验** ——
     /// 这里不重复校验（重复会掩盖「谁该负责」），也不会替调用方补。
-    pub fn new(exe: impl Into<String>, args: Vec<String>) -> Self {
+    ///
+    /// `plugin_id` 只用于**台账分文件**（网关崩溃后靠它找回自己拉起的进程），
+    /// 所以它会被 [`sanitize_id`] 消毒后才拼进路径。
+    pub fn new(plugin_id: impl Into<String>, exe: impl Into<String>, args: Vec<String>) -> Self {
         Self {
+            plugin_id: plugin_id.into(),
             exe: exe.into(),
             args,
             inner: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// 记下当前这个进程（网关崩溃后靠它来清理）。
+    ///
+    /// **失败不阻断**：台账是兜底手段，写不进去也只是「下次启动清不掉」，
+    /// 不该因此让插件起不来。
+    fn note_ledger(&self, pid: u32) {
+        let entry = PluginProcess {
+            pid,
+            exe: exe_basename(&self.exe),
+        };
+        if let Err(error) = write_ledger(&ledger_path_for(&self.plugin_id), &[entry]) {
+            tracing::warn!("插件进程台账写入失败（不影响本次运行）：{error}");
+        }
+    }
+
+    fn clear_ledger(&self) {
+        let _ = std::fs::remove_file(ledger_path_for(&self.plugin_id));
     }
 
     fn spawn(&self) -> Result<Running, String> {
@@ -206,6 +284,9 @@ impl ProcessTransport {
             .map_err(|e| format!("起插件进程失败（{}）：{e}", self.exe))?;
         let stdin = child.stdin.take().ok_or("拿不到插件的 stdin")?;
         let stdout = child.stdout.take().ok_or("拿不到插件的 stdout")?;
+        if let Some(pid) = child.id() {
+            self.note_ledger(pid);
+        }
         Ok(Running {
             child,
             stdin,
@@ -213,12 +294,13 @@ impl ProcessTransport {
         })
     }
 
-    /// 结束当前进程（杀树）并清空槽位。
+    /// 结束当前进程（杀树）并清空槽位与台账。
     async fn kill(&self, slot: &mut Option<Running>) {
         if let Some(mut running) = slot.take() {
             crate::proc_util::kill_tree(&mut running.child).await;
             let _ = running.child.wait().await;
         }
+        self.clear_ledger();
     }
 }
 
@@ -233,6 +315,10 @@ impl Drop for ProcessTransport {
                     crate::proc_util::kill_tree_blocking(pid);
                 }
             }
+            // 自己收的尾，台账要跟着清 —— 否则下次启动会去清理一个
+            // 早就不存在的 pid（无害，但会让「台账里有东西」这件事失去意义）。
+            drop(slot);
+            self.clear_ledger();
         }
     }
 }

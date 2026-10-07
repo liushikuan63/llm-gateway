@@ -183,6 +183,70 @@ fn 默认台账位置在应用数据目录() {
     );
 }
 
+/// 台账**按插件分文件**，且 id 会被消毒。
+///
+/// 消毒不是洁癖：id 来自用户可以随手改的描述文件，直接拼进路径会开出
+/// 目录穿越（`../../evil` 能写到应用数据目录之外），而那种写入是**静默的**。
+#[test]
+fn 台账按插件分文件且_id_被消毒() {
+    use llm_gateway_lib::agent_upstream::plugin_process::{ledger_path_for, sanitize_id};
+
+    let a = ledger_path_for("codex-work");
+    let b = ledger_path_for("qoder-home");
+    assert_ne!(a, b, "不同插件必须落在不同台账文件上");
+    assert_eq!(a.parent(), b.parent(), "但都在同一个目录里");
+
+    // 目录穿越：消毒后不能含任何路径分隔符
+    for evil in ["../../evil", "..\\..\\evil", "a/b", "C:\\Windows\\x"] {
+        let cleaned = sanitize_id(evil);
+        assert!(
+            !cleaned.contains('/') && !cleaned.contains('\\') && !cleaned.contains(':'),
+            "{evil:?} 消毒后仍含路径分隔符：{cleaned:?}"
+        );
+        let path = ledger_path_for(evil);
+        assert_eq!(
+            path.parent(),
+            Some(llm_gateway_lib::config::app_data_dir().as_path()),
+            "{evil:?} 把台账写到了应用数据目录之外：{path:?}"
+        );
+    }
+    // 空 id 也要有落点
+    assert!(!sanitize_id("").is_empty());
+    // 超长 id 要截断，否则文件名会超系统上限
+    assert!(sanitize_id(&"x".repeat(500)).len() <= 64);
+}
+
+/// 真进程与台账是**联动的**：起了就记、收尾就清。
+///
+/// 这条是「网关崩溃后还能清理」的前提 —— 台账写了才会被清扫看到；
+/// 而自己收尾时不清理，则下次启动会去清理一个早就不存在的 pid。
+#[tokio::test]
+async fn 真进程起落与台账联动() {
+    use llm_gateway_lib::agent_upstream::plugin_process::ledger_path_for;
+
+    let dir = 临时目录("ledger");
+    let script = 写参考插件脚本(&dir, false, false);
+    let manifest = parse_manifest(&描述文件("ref")).unwrap();
+    let ledger = ledger_path_for("ref-integration");
+    let _ = fs::remove_file(&ledger);
+
+    let adapter = ExternalAdapter::new(
+        &manifest,
+        std::sync::Arc::new(ProcessTransport::new(
+            "ref-integration",
+            "node",
+            vec![script.to_string_lossy().into_owned()],
+        )),
+    );
+    assert!(adapter.probe(15_000).await.expect("probe 应当成功"));
+    let raw = fs::read_to_string(&ledger).expect("起了进程就该有台账");
+    assert!(raw.contains("node"), "台账要记下 exe：{raw}");
+
+    drop(adapter);
+    assert!(!ledger.exists(), "自己收的尾，台账必须跟着清");
+    let _ = fs::remove_dir_all(dir);
+}
+
 // ==================== 真子进程：协议接在真进程上 ====================
 
 use llm_gateway_lib::agent_upstream::plugin_process::ProcessTransport;
@@ -238,7 +302,8 @@ fn 临时目录(名字: &str) -> PathBuf {
 
 fn 真插件适配器(dir: &std::path::Path, 啰嗦: bool, 装死: bool) -> ExternalAdapter {
     let script = 写参考插件脚本(dir, 啰嗦, 装死);
-    let transport = ProcessTransport::new("node", vec![script.to_string_lossy().into_owned()]);
+    let transport =
+        ProcessTransport::new("ref", "node", vec![script.to_string_lossy().into_owned()]);
     let manifest = parse_manifest(&描述文件("ref")).unwrap();
     ExternalAdapter::new(&manifest, std::sync::Arc::new(transport))
 }
