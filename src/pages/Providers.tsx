@@ -206,6 +206,30 @@ export default function ProvidersPage() {
   useEffect(() => { void load(); return () => { loadVersion.current++; }; }, []);
 
   /**
+   * 「更多」菜单的两种关闭手势：**Escape** 与**点空白**。
+   *
+   * 它是受控的 `<details open={...}>`，原生行为全被 React 接管 ——
+   * Escape 与点外部都不会关它，只有再点一次 summary 才 toggle。
+   * 而用户对下拉菜单的预期就是「按 Esc 就没了」；`ui-smoke` 里
+   * 那条断言当初是**绕过**这个缺陷写的（循环点 summary），
+   * 现在是正面钉住它。
+   *
+   * 点 summary 时事件**不冒泡到 document**（见下面的 `stopPropagation`）——
+   * 否则「打开」会立刻被 document 的 click 监听关掉，菜单根本打不开。
+   */
+  useEffect(() => {
+    if (openMenu === null) return;
+    const close = () => setOpenMenu(null);
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    document.addEventListener("click", close);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("click", close);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [openMenu]);
+
+  /**
    * 任务卡二 A5：把 `runtime_id` 翻成人话。
    *
    * **找不到就明说找不到** —— 只显示 id 会让用户以为配好了，
@@ -379,7 +403,7 @@ export default function ProvidersPage() {
           <div className="provider-model-preview"><div><span>可用映射</span><strong>{p.models.length}</strong></div><div className="provider-model-tags">{p.models.slice(0, 4).map(m => <span className="tag" key={m.alias} title={`${m.upstream} · ${formatContext(m.context_window)} tokens`}>{m.alias}</span>)}{p.models.length > 4 && <span className="tag">+{p.models.length - 4}</span>}{!p.models.length && <span className="muted">未配置模型映射</span>}</div></div>
           <div className="provider-meta"><span>{p.rpm_limit ? `${p.rpm_limit} RPM` : "RPM 不限"}</span><span>优先级 {p.priority}</span>{testResult?.id === p.id && <span className="test-latency">实测 {testResult.latency} ms</span>}</div>
           <footer><div className="row"><button className="ghost" disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), note: p.note ?? "" })}>配置</button><button className="ghost" disabled={busy !== null} onClick={() => void test(p)}>{busy === p.id ? "处理中…" : "测试连接"}</button><button className="ghost" disabled={busy !== null || !p.enabled || p.is_active} onClick={() => void run(p.id, () => api.setActive(p.id), `${p.name} 已设为主用`)}>{p.is_active ? "已主用" : "设为主用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void toggleEnabled(p)}>{p.enabled ? "停用" : "启用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void duplicate(p)} title="复制配置并落库，API Key 留空需自行填写">复制</button></div>
-          <details className="provider-more" open={openMenu === p.id}><summary aria-label={`${p.name} 更多操作`} onClick={event => { event.preventDefault(); setOpenMenu(current => current === p.id ? null : p.id); }}>•••</summary><div className="provider-more-menu">
+          <details className="provider-more" open={openMenu === p.id}><summary aria-label={`${p.name} 更多操作`} onClick={event => { event.preventDefault(); event.stopPropagation(); setOpenMenu(current => current === p.id ? null : p.id); }}>•••</summary><div className="provider-more-menu">
             <button disabled={busy !== null} onClick={() => { setOpenMenu(null); setQuotaProvider(p); }}>查询额度 / 有效期</button>
             <button disabled={busy !== null} onClick={() => { setOpenMenu(null); void run(p.id, () => api.upsertProvider(providerInput(p, { enabled: !p.enabled })), p.enabled ? `已停用 ${p.name}` : `已启用 ${p.name}`); }}>{p.enabled ? "停用供应商" : "启用供应商"}</button>
             <button disabled={busy !== null} onClick={() => { setOpenMenu(null); void duplicate(p); }}>复制配置并新建</button>

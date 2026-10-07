@@ -836,18 +836,30 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     /* ------------------------------------------------------------------ */
     // 夹具里两家配了 runtime_id：一张指向存在的运行时、一张指向不存在的。
     //
-    // 截图前必须收起「更多」菜单：它展开时会**盖住徽标文字**，
-    // 而断言读的是 innerText —— 那种情况下断言全绿、图上看不见，
-    // 视觉验证就白做了（这一次真的踩到了）。
+    // 截图前先收起「更多」菜单：它展开时会**盖住徽标文字**，而断言读的是
+    // innerText —— 那种情况下断言全绿、图上看不见，视觉验证就白做了。
     //
-    // 【为什么要循环点】这个菜单是**受控的** `<details open={...}>`，
-    // Escape 与点空白都不会关它，只有点 summary 才 toggle。
-    // 顺带记一笔：「Escape 关不掉菜单」本身是个可用性缺陷（已写进交接单）。
-    while (await page.locator(".provider-more[open] > summary").count() > 0) {
-      await page.locator(".provider-more[open] > summary").first().click();
-      await page.waitForTimeout(120);
-    }
-    assert.equal(await page.locator(".provider-more[open]").count(), 0, "截图前菜单必须已收起");
+    // 这里**正面钉住两种关闭手势**：Escape 与点空白。此前两者都是坏的
+    // （受控的 `<details open>` 谁都不关），测试只能循环点 summary 绕过 ——
+    // 那等于把缺陷当成了测试的前提。先自己开一个，不依赖前面测试的残留状态。
+    const openMenus = () => page.locator(".provider-more[open]").count();
+    await page.locator(".provider-more > summary").first().click();
+    await page.waitForFunction(
+      () => document.querySelectorAll(".provider-more[open]").length === 1, null, { timeout: 3000 },
+    );
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(
+      () => document.querySelectorAll(".provider-more[open]").length === 0, null, { timeout: 3000 },
+    );
+    await page.locator(".provider-more > summary").first().click();
+    await page.waitForFunction(
+      () => document.querySelectorAll(".provider-more[open]").length === 1, null, { timeout: 3000 },
+    );
+    await page.locator("body").click({ position: { x: 5, y: 5 } });
+    await page.waitForFunction(
+      () => document.querySelectorAll(".provider-more[open]").length === 0, null, { timeout: 3000 },
+    );
+    assert.equal(await openMenus(), 0, "截图前菜单必须已收起");
     const runtimeBadges = page.locator(".provider-card .provider-runtime");
     assert.equal(
       await runtimeBadges.count(), 2,
