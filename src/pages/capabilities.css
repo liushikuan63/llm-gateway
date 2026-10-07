@@ -1,0 +1,32 @@
+/* D2：多来源能力账本的冲突视图。样式只服务这一个页面。 */
+
+.capabilities-page { display: flex; flex-direction: column; gap: 16px; }
+
+.capability-error { padding: 14px 18px; border: 1px solid var(--danger); border-radius: 11px; color: var(--danger); font-size: 13px; }
+
+.capability-empty { padding: 24px 26px; border: 1px dashed var(--border); border-radius: 11px; }
+.capability-empty strong { display: block; font-size: 15px; margin-bottom: 10px; }
+.capability-empty p { font-size: 13px; color: var(--muted); line-height: 1.8; margin: 0 0 8px; }
+
+.capability-summary { font-size: 13px; color: var(--muted); }
+
+.capability-card { padding: 18px 20px; }
+.capability-card header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+.capability-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+.capability-badge.conflict { color: var(--danger); border-color: var(--danger); }
+
+.capability-row { display: flex; align-items: flex-start; gap: 18px; padding: 10px 0; border-top: 1px solid var(--border); }
+.capability-dimension { min-width: 72px; font-size: 13px; }
+.capability-values { display: flex; flex-wrap: wrap; gap: 10px; list-style: none; margin: 0; padding: 0; }
+.capability-values li { display: flex; align-items: center; gap: 7px; padding: 5px 11px; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }
+/* 胜出者必须一眼看得出来 —— 只列值而不说谁生效，用户还是要自己猜。 */
+.capability-values li.winner { border-color: var(--accent); }
+.capability-source { color: var(--muted); }
+.capability-value { font-variant-numeric: tabular-nums; font-weight: 600; }
+.capability-winner-tag { font-size: 10px; color: var(--accent); }
+
+.capability-hint { font-size: 12px; color: var(--muted); line-height: 1.7; margin: 12px 0 0; }
+
+.capability-agreeing { font-size: 13px; }
+.capability-agreeing summary { cursor: pointer; color: var(--muted); }
+.capability-agreeing ul { margin: 12px 0 0; padding-left: 18px; line-height: 1.9; color: var(--muted); }

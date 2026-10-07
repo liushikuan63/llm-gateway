@@ -66,6 +66,22 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       ],
     },
   };
+  // D2 能力账本：三种情形各一条 —— 真冲突、多来源但一致、只有单一来源。
+  // 「一致」那条是必须的：把「两个来源说了同一个值」也标成冲突，
+  // 会让用户去处理一个根本不存在的问题。
+  window.__fixtureCapabilities = {
+    "openrouter/openrouter/free": {
+      values: {
+        coding: { manual: { value: 0.9, source: "manual" }, community: { value: 0.4, source: "community" } },
+        reasoning: { manual: { value: 0.7, source: "manual" } },
+      },
+    },
+    "anthropic/claude-sonnet": {
+      values: {
+        reasoning: { manual: { value: 0.8, source: "manual" }, catalog: { value: 0.8, source: "catalog" } },
+      },
+    },
+  };
   window.__fixtureSearchKey = { masked: "tvly-****-abc", configured: true };
   // 搜索设置快照。`get_search_settings` 与 `update_search_settings` 共用它，
   // 这样"保存后重新打开页面设置仍是新值"这条断言才不是自说自话。
@@ -275,6 +291,10 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     switch (cmd) {
       case "list_providers": if (providerFailure) throw new Error("模拟供应商读取失败"); return structuredClone(window.__fixtureProviders);
       case "get_config": if (configFailure) throw new Error("模拟配置读取失败"); return structuredClone(window.__fixtureConfig);
+      // D2：能力账本导出。**夹具必须给出与后端 `CapabilitySet` 相同的形状**
+      // （`values[维度][来源] = { value, source }`）—— 形状不对时页面会静默
+      // 显示「数据不足」，那与「真的没有数据」看起来一模一样。
+      case "export_capabilities": return JSON.stringify(window.__fixtureCapabilities ?? {});
       case "discover_provider_models":
         if (args.input.base_url.includes("broken")) throw new Error("上游返回 HTTP 401，请检查密钥权限");
         return { base_url: "https://example.test/v1", warnings: [], models: [
@@ -934,6 +954,44 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     // 手工定价的模型仍显示手工标记，说明未被刷新覆盖。
     assert((await page.locator(".provider-card").filter({ hasText: "多模态服务" }).innerText()).includes("vision-model"));
     await page.screenshot({ path: path.join(output, "pricing-refresh-desktop.png"), fullPage: true });
+
+    /* ------------------------------------------------------------------ */
+    /* D2 能力冲突（多来源账本）                                            */
+    /* ------------------------------------------------------------------ */
+    await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "能力与取舍", exact: true }).click();
+    await page.locator(".capability-summary").waitFor({ timeout: 5000 });
+    const capSummary = await page.locator(".capability-summary").innerText();
+    assert(/2 个模型有能力数据/.test(capSummary), `汇总要给出模型总数：${capSummary}`);
+    assert(/1 个存在冲突/.test(capSummary), `汇总要给出冲突数：${capSummary}`);
+    assert(/1 个各来源一致/.test(capSummary), `汇总要给出「一致」的个数：${capSummary}`);
+
+    const conflictCards = page.locator(".capability-card");
+    assert.equal(await conflictCards.count(), 1, "夹具里只有一个真冲突（coding 0.9 vs 0.4）");
+    const conflictText = await conflictCards.first().innerText();
+    assert(conflictText.includes("openrouter/openrouter/free"), conflictText);
+    assert(conflictText.includes("有冲突"), `必须标出「有冲突」：${conflictText}`);
+    // 卡片要求的正是这一条：**把各来源的值都列出来**。
+    // 只给胜出者的话，用户看到「我填的没生效」时没有任何线索。
+    assert(
+      conflictText.includes("0.90") && conflictText.includes("0.40"),
+      `各来源的值都要列出来：${conflictText}`,
+    );
+    assert(
+      conflictText.includes("手工") && conflictText.includes("社区"),
+      `来源徽标都要有：${conflictText}`,
+    );
+    assert(conflictText.includes("生效"), `必须标出哪个来源生效：${conflictText}`);
+    // 反向断言：两个来源给出**同一个值**不是冲突。
+    // 少了这一条，把「互相印证」也标成冲突的实现照样全绿。
+    assert(!conflictText.includes("claude-sonnet"), "一致的模型不该出现在冲突卡里");
+    const agreeing = page.locator(".capability-agreeing");
+    assert.equal(await agreeing.count(), 1, "一致的模型要收进折叠区，而不是消失");
+    // 必须**展开**再读：折叠的 `<details>` 里 `innerText` 拿不到内容
+    // （它只返回渲染出来的文本），断言会以「没列出」的形式假红。
+    await agreeing.locator("summary").click();
+    await page.waitForTimeout(150);
+    assert((await agreeing.innerText()).includes("claude-sonnet"), "展开后要列出它");
+    await page.screenshot({ path: path.join(output, "capability-conflicts.png"), fullPage: true });
 
     /* ------------------------------------------------------------------ */
     /* 本地模型与智能模式                                                  */
