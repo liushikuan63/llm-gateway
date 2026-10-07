@@ -385,6 +385,36 @@ summary 的 onClick 补 `stopPropagation`（否则「打开」会立刻被 docum
 
 ---
 
+## 〇·十、收尾复验：打包 + 真启动（2026-10-08 00:38）
+
+**打包**：`npm run tauri:build` 退出码 0，两个产物都产出：
+`LLM Gateway_0.2.0_x64-setup.exe`（4.2 MB）/ `LLM Gateway_0.2.0_x64_en-US.msi`（6.5 MB）。
+`llm-gateway.exe` 时间戳 **00:38:04** 晚于最后一次代码修改 **00:22:53** ✓
+
+**真启动**（跑的就是刚打出来的那个 exe）：
+
+| 请求 | 结果 |
+| --- | --- |
+| `GET /healthz` | **200** |
+| `GET /v1/models`（不带 key） | **401** |
+| `GET /definitely-not-a-route` | **401**（鉴权先行：未认证就不区分路径，这是对的） |
+| 清理后残留进程 | 无 |
+
+### 这次踩到的两个坑（都是**测量方式**的错，不是产物坏了）
+
+1. **假红**：`npm run tauri:build 2>&1 | Select-Object -Last 3` 之后读 `$LASTEXITCODE`，
+   取到的是**管道最后一环**的退出码而不是 npm 的 ⇒ 明明成功却报 exit 1，
+   而且 `*>` 重定向把 `tauri` 写在 stderr 的进度全吞了，日志只剩 4 行空壳。
+   正确姿势：`Start-Process -Wait -PassThru -RedirectStandardOutput X -RedirectStandardError Y`，
+   两个流分开落盘，再看 `$p.ExitCode`。
+2. **端口**：交接单里先前记的是 `8317`，**实际是 `15721`**（日志里 `LLM Gateway 已启动 http://127.0.0.1:15721`）。
+   探错端口得到的是「无法连接到远程服务器」，看起来像「exe 起不来」——
+   而日志显示它 `backend ready in 16 ms`，一直在正常服务。
+   **判据**：探不到端口时先读 `%LOCALAPPDATA%\llm-gateway\logs\gateway.log`，
+   别先怀疑产物。
+
+---
+
 ## 〇·八、级联的审计可见性（D4 遗留账，已还）
 
 **问题**：级联的「发了几次、为什么没升级」此前只有 `tracing` 日志里有 ——
