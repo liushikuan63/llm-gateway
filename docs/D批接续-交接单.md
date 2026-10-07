@@ -337,3 +337,67 @@ Start-Process src-tauri\target\release\llm-gateway.exe
 
 **仍未做**：安装包本身的安装/卸载流程（会改本机注册表与安装目录，
 属红线动作）。验的是 `target/release/llm-gateway.exe` 这个产物本体。
+
+---
+
+## 六、A6 的实测底数（2026-10-07，卡片要求的第一步）
+
+卡片写「**第一步（不可跳过）**：`codex doctor`、`codex login --help`
+读登录方式」。下面是实测结果 —— **读命令面不需要登录，已经做完了**。
+
+### 本机装了
+
+- `codex` → `C:\Users\Admin\AppData\Roaming\npm\codex.ps1`（`~/.codex` 存在）
+- `qoder` → `C:\Users\Admin\.qoder\entry\qoder.cmd`（A7 也能开工）
+
+### `codex` 的命令面证实了卡片的方案
+
+`codex --help` 里有：`exec`（非交互，L3 用）、**`exec-server`**
+（`[EXPERIMENTAL] Run the standalone exec-server service`，L1 用）、
+`login`、`doctor`。卡片说的 L1/L3 两条路**都真实存在**。
+
+`codex exec` 的关键参数（实测 `--help`）：
+
+| 参数 | 用途 |
+| --- | --- |
+| `--json` | **存在** —— L3 取事件流就靠它 |
+| `-m/--model` | 指定模型 |
+| `--skip-git-repo-check` | cwd 不是 git 仓库时要加 |
+| `--ephemeral` | 不落会话记录 |
+| `-i/--image` | 附图片 |
+| `--output-schema <FILE>` | 结构化输出 |
+| **`--dangerously-bypass-approvals-and-sandbox`** | **适配器绝不能用** —— 名字已经说明了；本项目铁律要求子进程 cwd 隔离，绕沙箱是反向的 |
+
+### 【实测硬事实】`codex exec` 会**挂着不出声**
+
+```
+codex exec --json --skip-git-repo-check --ephemeral "say hi"
+```
+在临时目录里跑（`cwd` 指向 `%TEMP%\codexprobe-*`，不碰仓库）
+**90 秒后仍未结束，且 stdout / stderr 一个字都没有**。
+
+这不是「还没登录所以报错」—— 报错会立刻返回。它是**静默挂住**。
+
+**对 A6 的三个直接含义**：
+
+1. **超时不是理论要求，是实测的默认行为。** 铁律「超时杀进程树」
+   是这条路径上**必然会触发**的分支，不是防御性代码。
+   没有超时的适配器会把这个请求永远挂住。
+2. **必须杀进程树，不是杀进程。** `codex.cmd` 是个包装器
+   （本机是 `.ps1` + `.cmd`），杀父进程会留下真正的 node 子进程。
+3. **「零输出」本身要当作一种可诊断的状态。** 用户的界面不能显示
+   「正在等待上游…」转到天荒地老 —— 要在超时后给出
+   「codex 在 N 秒内没有任何输出」，并说明可能原因
+   （未登录 / 需要交互输入 / 网络不通）。
+
+### 还没做的（需要你本人）
+
+- **登录**：卡片明写「登录必须由用户本人完成（本轮不代登录、
+  **不读 `~/.codex/auth.json`**）」。所以：
+  **A6 的判据 1（登录后 200 + `runtime_kind='codex'`）我做不了**，
+  要你先跑一次 `codex login`。
+- **`codex doctor`**：没跑。它可能修改本地状态（诊断工具常会写日志 /
+  重建缓存），而它并非适配器实现所必需 —— 命令面已经从
+  `--help` 拿到了。要跑的话建议你本人跑。
+- **`--json` 的事件流形状**：因为挂住而没拿到。**不要凭猜写解析器** ——
+  项目已经踩过「mock 形状与真实不一致」的坑。等登录后抓一次真实输出再写。
