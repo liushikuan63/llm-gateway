@@ -28,7 +28,7 @@ pub use adapter::{AgentAdapter, AgentReply, AgentRequest};
 pub use codex::CodexAdapter;
 pub use fake::FakeAdapter;
 pub use qoder::QoderAdapter;
-pub use quota::{AgentQuota, QuotaBook, QuotaRejection};
+pub use quota::{AgentQuota, ConcurrencyGate, ConcurrencyRejection, QuotaBook, QuotaRejection};
 pub use run::{run_agent, run_agent_request, AgentRunOutcome};
 pub use workspace::WorkspaceRoot;
 

@@ -381,6 +381,7 @@ mod tests {
                 exec_timeout_secs: 5,
                 // 配额测试另有用例（`quota.rs`），这里不限。
                 quota: crate::agent_upstream::AgentQuota::default(),
+                max_concurrency: 0,
             },
             base,
         )

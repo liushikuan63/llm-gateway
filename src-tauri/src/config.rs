@@ -514,6 +514,12 @@ pub struct AgentConfig {
     ///
     /// 两个值都为 0 = 不限（与项目里 `rpm_limit` 等既有口径一致）。
     pub quota: crate::agent_upstream::AgentQuota,
+    /// B5 判据 4：**并发**执行上限。**0 = 不限**（默认）。
+    ///
+    /// 为什么默认不限：Agent 型执行会起外部进程、写文件。
+    /// 加一个「默认就限并发」的能力会让升级变成
+    /// 「我的批处理脚本突然开始 429」。
+    pub max_concurrency: usize,
 }
 
 impl Default for AgentConfig {
@@ -525,6 +531,7 @@ impl Default for AgentConfig {
             // 默认不限 —— 加一个「默认就限额」的能力会让升级变成
             // 「我的脚本跑了几天突然开始 429」。
             quota: crate::agent_upstream::AgentQuota::default(),
+            max_concurrency: 0,
         }
     }
 }
@@ -1107,6 +1114,7 @@ mod agent_config_tests {
                 rpm: 10,
                 daily_limit: 100,
             },
+            max_concurrency: 3,
         };
         let toml = toml::to_string(&c).expect("应当能序列化");
         let back: AgentConfig = toml::from_str(&toml).expect("应当能反序列化");

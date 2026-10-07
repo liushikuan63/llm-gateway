@@ -143,6 +143,12 @@ pub struct GatewayState {
     /// 而且**判定与记账必须在同一个临界区**里 —— 分成两次加锁的话，
     /// 两个并发请求可能都判过、都记账，于是上限被突破一次。
     pub agent_quota: Arc<parking_lot::Mutex<crate::agent_upstream::QuotaBook>>,
+    /// 任务卡二 B5 判据 4：**并发**闸门。
+    ///
+    /// 与 `agent_quota` 分开两把锁：它们的临界区互不相关，
+    /// 合用一把会让「并发判定」被「配额记账」阻塞 —— 而并发闸门的
+    /// 全部意义就是「立刻给出是与否」。
+    pub agent_concurrency: Arc<parking_lot::Mutex<crate::agent_upstream::ConcurrencyGate>>,
 }
 
 impl GatewayState {
@@ -178,6 +184,9 @@ impl GatewayState {
             adapters: Arc::new(crate::agent_upstream::AdapterRegistry::with_builtins()),
             agent_quota: Arc::new(parking_lot::Mutex::new(
                 crate::agent_upstream::QuotaBook::new(),
+            )),
+            agent_concurrency: Arc::new(parking_lot::Mutex::new(
+                crate::agent_upstream::ConcurrencyGate::new(),
             )),
         }
     }
@@ -723,6 +732,25 @@ async fn gw_agent_run(
             .into_response();
     }
 
+    // ===== B5 判据 4：并发闸门。**不排队** —— 满了立刻拒 =====
+    //
+    // 顺序：配额 → 并发 → 执行。两道闸门都在**跑之前** ——
+    // 超限的那次一旦跑起来就已经在用户机器上写了文件、花了额度。
+    //
+    // 用**独立的一把锁**（不与 `agent_quota` 合用）：并发闸门的全部意义
+    // 就是「立刻给出是与否」，被配额记账阻塞就失去了意义。
+    let limit = cfg.agent.max_concurrency;
+    if let Err(rejection) = state.agent_concurrency.lock().try_enter(limit) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": rejection.message(),
+                "source": "gateway_concurrency",
+            })),
+        )
+            .into_response();
+    }
+
     let outcome = crate::agent_upstream::run_agent_request(
         &cfg.agent,
         &state.adapters,
@@ -731,6 +759,11 @@ async fn gw_agent_run(
         &req.prompt,
     )
     .await;
+    // **必须与上面的 `try_enter` 配对。** 漏掉这一句的后果是
+    // 槽位永久占住 —— 跑过 N 次之后再也进不来（N = 上限）。
+    // 它紧跟 `.await` 之后、在任何 `return` 之前，就是为了让「配对」
+    // 这件事在代码里是**看得见的**。
+    state.agent_concurrency.lock().leave();
     let latency_ms = started.elapsed().as_millis() as u64;
 
     // ===== 审计：`route_intent = "agent"` + 产物清单（卡片 A8 要求）=====
