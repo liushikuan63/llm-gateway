@@ -548,7 +548,9 @@ fn health_score(h: Option<&ProviderHealth>) -> f32 {
 /// 而不是固定的 4。这是 `Option` 设计的直接推论 ——
 /// 若把 `None` 当 0 参与乘积，一个只标了 `coding` 的模型会因为
 /// 另外三个「不知道」而被判成 0 分，那正是 D1 要消灭的错。
-fn capability_base(m: &ModelRef) -> Option<f32> {
+/// `pub(super)`：D5 的 Pareto 视图（`router/mod.rs`）要复用同一份质量口径 ——
+/// 在那边重写一遍几何平均，就又多了一处会漂移的实现。
+pub(super) fn capability_base(m: &ModelRef) -> Option<f32> {
     capability_base_of(m.capabilities.as_ref()?)
 }
 

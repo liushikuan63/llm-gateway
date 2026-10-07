@@ -751,6 +751,35 @@ export interface AuditExportResult {
   columns_doc: string | null;
 }
 
+// ---------- D5 可解释性与 Pareto 前沿 ----------
+
+/**
+ * 前沿视图里的一个点。三维**原值**都摊开 —— 只回前沿成员的话，
+ * 用户既不知道它们凭什么上榜，也分不清没上榜的是「更差」还是「没数据」。
+ */
+export interface ParetoPointView {
+  /** `provider_id/alias`。 */
+  id: string;
+  label: string;
+  /** 质量：模型级能力维度的几何平均。`null` = 没有能力数据。 */
+  quality: number | null;
+  /** 速度：实测 tok/s。`null` = 样本不足（不是「最慢」）。 */
+  speed: number | null;
+  /** 单价（每百万 token）。`null` = 没有价格或币种不可比。 */
+  unit_price: number | null;
+  currency: string | null;
+}
+
+export interface ParetoView {
+  points: ParetoPointView[];
+  /** 非支配解，按输入顺序。 */
+  front: string[];
+  /** 被支配的候选 → 支配它的那些 id。 */
+  dominated_by: Record<string, string[]>;
+  /** 币种不唯一、价格维度整体退出时的原因。 */
+  currency_note: string | null;
+}
+
 // ---------- 任务卡二 A5：账号型上游运行时 ----------
 
 /**
@@ -1015,6 +1044,15 @@ export const api = {
    * 界面可以直接把它当文本给用户复制或写文件。
    */
   exportCapabilities: () => invoke<string>("export_capabilities"),
+
+  /**
+   * D5：质量 × 速度 × 价格的三维前沿。
+   *
+   * **三个维度都在后端算**（与路由同一份口径）。界面不重算任何一维 ——
+   * 重算等于把口径复制一份，改了一处另一处悄悄漂移，
+   * 表现是「前沿图上看到的和实际路由选的不一样」。
+   */
+  capabilityPareto: () => invoke<ParetoView>("capability_pareto"),
 
   /**
    * 导入能力账本。

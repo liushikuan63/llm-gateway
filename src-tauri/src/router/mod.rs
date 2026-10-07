@@ -409,6 +409,99 @@ impl Router {
         (strategy, custom_rules_active)
     }
 
+    /// D5：质量 × 速度 × 价格的三维前沿视图。
+    ///
+    /// ## 三个维度都取自**与路由同一份口径**
+    ///
+    /// - 质量：模型级能力维度的几何平均（`capability_base`）；
+    /// - 速度：实测 tok/s，**样本数不足的不参与**（`usable_tps`，与 D3 同门槛）；
+    /// - 价格：`reference_unit_price`（与定价模块同源，分档价与峰谷价都生效）。
+    ///
+    /// 在界面里重算一遍这三个值等于把口径复制一份：改了一处另一处悄悄漂移，
+    /// 而那种漂移的表现是「前沿图上看到的和实际路由选的不一样」。
+    ///
+    /// ## 币种不唯一时价格维度**整体**退出
+    ///
+    /// 与 B2 / D3 同口径：USD 与 CNY 的数字不可比。这时把全部候选的价格
+    /// 置为 `None`（**不是**只留其中一种币种的子集），并在 `currency_note`
+    /// 里写明原因 —— 否则用户看到所有点都没价格，会以为是自己没填。
+    ///
+    /// 缺数据的维度在 [`crate::router::pareto::dominance`] 里**不构成支配依据**，
+    /// 所以「数据不足」不会被当成「最差」：那正是卡片反向用例要钉的东西。
+    pub fn pareto_view(
+        &self,
+        providers: &[Provider],
+        cfg: &AppConfig,
+        minute_of_day: u16,
+    ) -> crate::router::pareto::ParetoView {
+        let enabled: Vec<(&Provider, &ModelRef)> = providers
+            .iter()
+            .filter(|p| p.enabled)
+            .flat_map(|p| p.models.iter().filter(|m| m.enabled).map(move |m| (p, m)))
+            .collect();
+
+        // 币种检查必须**整批**做：逐个判的话，排在后面的 USD 候选会被
+        // 拿 CNY 的尺子量，而那种错误不报错，只表现为「价格维度看着不对」。
+        let mut currency: Option<crate::domain::Currency> = None;
+        let mut mixed = false;
+        for (_, m) in &enabled {
+            let Some(price) = m.price.as_ref() else {
+                continue;
+            };
+            if reference_unit_price(price, 0, minute_of_day).is_none() {
+                continue;
+            }
+            match currency {
+                None => currency = Some(price.currency),
+                Some(existing) if existing != price.currency => mixed = true,
+                _ => {}
+            }
+        }
+
+        let points: Vec<crate::router::pareto::ParetoPointView> = enabled
+            .iter()
+            .map(|(p, m)| {
+                // 参考单价用 `prompt_tokens = 0`（最低档）＋当前分钟：
+                // 峰谷价生效，分档价取基础档。与路由的成本维度同一函数。
+                let price = m.price.as_ref().and_then(|pr| {
+                    reference_unit_price(pr, 0, minute_of_day).map(|v| (v, pr.currency))
+                });
+                crate::router::pareto::ParetoPointView {
+                    id: format!("{}/{}", p.id, m.alias),
+                    label: format!("{} · {}", p.name, m.alias),
+                    quality: score::capability_base(m),
+                    speed: usable_tps(
+                        &self.health.get(&p.id, &m.upstream),
+                        cfg.cost_routing.min_efficiency_samples,
+                    ),
+                    unit_price: if mixed { None } else { price.map(|(v, _)| v) },
+                    currency: price.map(|(_, c)| c.code().to_string()),
+                }
+            })
+            .collect();
+
+        let raw: Vec<crate::router::pareto::ParetoPoint> = points
+            .iter()
+            .map(|pt| {
+                crate::router::pareto::ParetoPoint::from_price(
+                    &pt.id,
+                    pt.quality,
+                    pt.speed,
+                    pt.unit_price,
+                )
+            })
+            .collect();
+        let front = crate::router::pareto::pareto_front(&raw);
+        crate::router::pareto::ParetoView {
+            front: front.front.clone(),
+            dominated_by: front.dominated_by.clone(),
+            currency_note: mixed.then(|| {
+                "候选里同时存在多种币种，价格不可比，因此这一维整体不参与支配判定".to_string()
+            }),
+            points,
+        }
+    }
+
     /// 候选链排序
     ///
     /// **不带 prompt token 数**：本入口的调用方（`/v1/models` 预览、
@@ -505,10 +598,10 @@ impl Router {
         // D3：成本/效率的**相对区间必须整批算一次**。
         // 每个候选各算一遍会得出「成本用了含免费模型的区间、效率用了不含的」
         // 这类不一致，而那种不一致不报错，只表现为排序偶尔不对。
-        // D3：峰谷时段倍率要「当天第几分钟」。用时间戳现算而不是引 `Timelike`：
-        // 本文件其余地方都没有 time feature 的依赖，为一个整数引入 trait 不值。
-        let minute_of_day =
-            ((chrono::Utc::now().timestamp().div_euclid(60)).rem_euclid(1440)) as u16;
+        // D3：峰谷时段倍率要「当天第几分钟」。**与 `server.rs` 同一份实现** ——
+        // 两处各算一遍的话，D5 的前沿视图与实际路由会在跨分钟的那一刻用不同的
+        // 时段价，而那种不一致不报错，只表现为「图上和实际选的不一样」。
+        let minute_of_day = crate::proxy::server::utc_minute_of_day();
         let cost = CostContext {
             range: comparable_cost_range(&candidates, prompt_tokens as i64, minute_of_day),
             // D3：实测吞吐区间。**样本数不足的候选整条跳过**

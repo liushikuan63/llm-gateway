@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, CapabilitySet } from "../api";
+import { api, CapabilitySet, ParetoView } from "../api";
 import { errorText } from "./providerPresets";
 import "./capabilities.css";
 
@@ -61,6 +61,7 @@ function rowsOf(set: CapabilitySet | undefined): DimensionRow[] {
 
 export default function CapabilitiesPage() {
   const [ledger, setLedger] = useState<Record<string, CapabilitySet> | null>(null);
+  const [pareto, setPareto] = useState<ParetoView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -68,13 +69,15 @@ export default function CapabilitiesPage() {
     setBusy(true);
     setError(null);
     try {
-      const raw = await api.exportCapabilities();
+      const [raw, view] = await Promise.all([api.exportCapabilities(), api.capabilityPareto()]);
       setLedger(JSON.parse(raw) as Record<string, CapabilitySet>);
+      setPareto(view);
     } catch (cause) {
       // 读不到就明确报出来，并且**不留半张表** —— 空表看起来像「没有冲突」，
       // 而那与「读失败」是完全相反的结论。
       setError(errorText(cause));
       setLedger({});
+      setPareto(null);
     } finally {
       setBusy(false);
     }
@@ -100,6 +103,56 @@ export default function CapabilitiesPage() {
       </header>
 
       {error && <div className="capability-error" role="alert">读取能力账本失败：{error}</div>}
+
+      {/* D5：三维前沿。缺数据的维度显示「数据不足」而不是 0 或空白 ——
+          0 会被读成「这一维得了 0 分」，而事实是「我们没有这一维的数据」。 */}
+      {pareto && (
+        <section className="pareto-section">
+          <h3>质量 × 速度 × 价格</h3>
+          <p className="capability-hint">
+            三个维度互不相让时，没有哪个候选「最好」—— 只有「不被任何人全面胜过」。
+            下面把每个候选的三个原始值都摊开：<strong>前沿</strong>上的候选没人能全面胜过它，
+            被支配的会写明是被谁支配。
+          </p>
+          {pareto.currency_note && <p className="pareto-note" role="note">{pareto.currency_note}</p>}
+          {pareto.points.length === 0 ? (
+            <p className="capability-hint">还没有启用中的模型可供比较。</p>
+          ) : (
+            <>
+              <table className="pareto-table">
+                <thead>
+                  <tr><th>候选</th><th>质量</th><th>速度</th><th>价格</th><th>结论</th></tr>
+                </thead>
+                <tbody>
+                  {pareto.points.map((pt) => {
+                    const onFront = pareto.front.includes(pt.id);
+                    const dominators = pareto.dominated_by[pt.id] ?? [];
+                    const labelOf = (id: string) => pareto.points.find((p) => p.id === id)?.label ?? id;
+                    return (
+                      <tr key={pt.id} className={onFront ? "on-front" : "dominated"}>
+                        <td>{pt.label}</td>
+                        <td>{pt.quality === null ? <span className="missing">数据不足</span> : pt.quality.toFixed(2)}</td>
+                        <td>{pt.speed === null ? <span className="missing">数据不足</span> : `${pt.speed.toFixed(1)} tok/s`}</td>
+                        <td>{pt.unit_price === null ? <span className="missing">无价格</span> : `${pt.unit_price} ${pt.currency ?? ""}`}</td>
+                        <td>
+                          {onFront
+                            ? <span className="tag front-tag">前沿</span>
+                            : <span className="tag dominated-tag">被 {dominators.map(labelOf).join("、")} 支配</span>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <p className="capability-hint">
+                速度按实测 tok/s，<strong>样本不足的显示「数据不足」而不是 0</strong> ——
+                0 在约定里表示「没有样本」，把它当成最慢会让刚接入的模型立刻被判成被支配。
+                价格取的是参考单价（分档价与峰谷价都会生效）。
+              </p>
+            </>
+          )}
+        </section>
+      )}
 
       {ledger !== null && withData.length === 0 && !error && (
         <div className="capability-empty">

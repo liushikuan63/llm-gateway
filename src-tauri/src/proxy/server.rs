@@ -4652,7 +4652,7 @@ fn fallback_count(upstream_attempts: usize) -> i64 {
 }
 
 /// UTC 当日分钟数，用于匹配时段价规则。
-fn utc_minute_of_day() -> u16 {
+pub fn utc_minute_of_day() -> u16 {
     use chrono::Timelike;
     let now = chrono::Utc::now();
     (now.hour() * 60 + now.minute()) as u16

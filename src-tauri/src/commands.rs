@@ -1419,6 +1419,30 @@ pub async fn export_requests(
     })
 }
 
+/* ------------------- D5 可解释性与 Pareto 前沿 ------------------- */
+
+/// D5：质量 × 速度 × 价格的三维前沿视图。
+///
+/// 三个维度的取值口径**全部在 `Router::pareto_view` 里**（与路由同源），
+/// 这里只负责取配置与供应商列表。界面**不重算**任何一维 ——
+/// 重算等于把口径复制一份，改了一处另一处就悄悄漂移。
+///
+/// 时段用 `server.rs` 的那一份实现（峰谷价要生效，就必须与真实计费同一分钟）。
+#[tauri::command]
+pub async fn capability_pareto(
+    state: State<'_, AppState>,
+) -> Result<crate::router::pareto::ParetoView, String> {
+    let cfg = state.gateway.cfg_snapshot();
+    let providers = repo::list_providers(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(state.gateway.router.pareto_view(
+        &providers,
+        &cfg,
+        crate::proxy::server::utc_minute_of_day(),
+    ))
+}
+
 /* ------------------- 任务卡二 A5：账号型上游运行时 ------------------- */
 
 /// 列出全部运行时。

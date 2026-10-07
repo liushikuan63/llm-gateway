@@ -107,6 +107,39 @@ impl ParetoFront {
     }
 }
 
+/// 前沿视图里的**一个点**：三维原值都摊开，缺哪一维也明说。
+///
+/// 【为什么原值也要回给界面】只回前沿成员的话，用户看到的是一串名字，
+/// 既不知道它们凭什么上榜，也不知道没上榜的是「更差」还是「没数据」。
+/// 卡片对这件事的要求写在「被支配的候选要标出来并说明被谁支配」那一条里。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParetoPointView {
+    /// `provider_id/alias`。
+    pub id: String,
+    /// 给人看的名字（供应商名 + 模型别名）。
+    pub label: String,
+    /// 质量：模型级能力维度的几何平均。`None` = 没有能力数据。
+    pub quality: Option<f32>,
+    /// 速度：实测 tok/s。`None` = 样本不足（不是「最慢」）。
+    pub speed: Option<f32>,
+    /// 单价（每百万 token，与定价模块同源）。`None` = 没有价格或币种不可比。
+    pub unit_price: Option<f32>,
+    pub currency: Option<String>,
+}
+
+/// 前端要的完整视图：三维原值 + 前沿 + 支配关系。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ParetoView {
+    pub points: Vec<ParetoPointView>,
+    pub front: Vec<String>,
+    pub dominated_by: BTreeMap<String, Vec<String>>,
+    /// 币种不唯一、因而**价格维度整体不参与**时写明原因。
+    ///
+    /// 不说的话，用户看到所有点都没有价格，会以为是自己没填价 ——
+    /// 而真实原因可能只是「这批候选里有 USD 也有 CNY，两者不可比」。
+    pub currency_note: Option<String>,
+}
+
 /// 判定 A 是否支配 B。
 ///
 /// - 每一维：**两边都有值**时才比较；有一边缺失 ⇒ 这一维**不构成支配依据**
@@ -185,6 +218,9 @@ pub fn pareto_front(points: &[ParetoPoint]) -> ParetoFront {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::router::Router;
 
     fn p(id: &str, q: Option<f32>, s: Option<f32>, c: Option<f32>) -> ParetoPoint {
         ParetoPoint {
@@ -368,5 +404,206 @@ mod tests {
         assert!(front.front.is_empty());
         assert!(front.dominated_by.is_empty());
         assert!(front.dominators("不存在").is_empty());
+    }
+
+    // ============ D5：前沿视图的三维取值口径（`Router::pareto_view`）============
+    //
+    // 上面那些钉的是**支配判定**本身；这一组钉的是**喂给它的三个数从哪来**。
+    // 两者都会错，而错法不同：前者会算出错的前沿，后者会让前沿建立在
+    // 「缺失被当成 0」之上 —— 那正是卡片反向用例要挡的东西。
+
+    fn 路由器() -> Router {
+        Router::new(
+            Arc::new(crate::router::ratelimit::RateLimiter::new()),
+            Arc::new(crate::proxy::health::HealthRegistry::new()),
+        )
+    }
+
+    fn 模型(
+        alias: &str,
+        单价: Option<f64>,
+        币种: crate::domain::Currency,
+        质量: Option<(f32, f32)>,
+    ) -> crate::domain::ModelRef {
+        crate::domain::ModelRef {
+            enabled: true,
+            alias: alias.into(),
+            upstream: alias.into(),
+            context_window: 32_768,
+            supports_tools: true,
+            supports_vision: false,
+            supports_audio: false,
+            supports_video: false,
+            supports_thinking: false,
+            supports_stream: true,
+            model_type: crate::domain::ModelType::Chat,
+            upstream_path: None,
+            price: 单价.map(|p| crate::domain::ModelPrice {
+                prompt: p,
+                completion: p,
+                cache_read: None,
+                cache_creation: None,
+                currency: 币种,
+                tiers: Vec::new(),
+                rules: Vec::new(),
+                source: Default::default(),
+            }),
+            overrides: None,
+            local: None,
+            capabilities: 质量.map(|(coding, reasoning)| crate::domain::ModelCapabilities {
+                coding: Some(coding),
+                reasoning: Some(reasoning),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn 供应商(id: &str, models: Vec<crate::domain::ModelRef>) -> crate::domain::Provider {
+        let now = chrono::Utc::now();
+        crate::domain::Provider {
+            id: id.into(),
+            name: id.into(),
+            dialect: crate::domain::Dialect::OpenAI,
+            base_url: "https://example.test/v1".into(),
+            api_key_enc: String::new(),
+            enabled: true,
+            priority: 0,
+            models,
+            rpm_limit: 0,
+            intelligence: 50,
+            note: None,
+            runtime_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn 视图(providers: Vec<crate::domain::Provider>) -> ParetoView {
+        路由器().pareto_view(&providers, &crate::config::AppConfig::default(), 600)
+    }
+
+    #[test]
+    fn 币种混用时价格维度整体退出并写明原因() {
+        let view = 视图(vec![
+            供应商(
+                "a",
+                vec![模型(
+                    "m",
+                    Some(1.0),
+                    crate::domain::Currency::Usd,
+                    Some((0.9, 0.9)),
+                )],
+            ),
+            供应商(
+                "b",
+                vec![模型(
+                    "m",
+                    Some(7.0),
+                    crate::domain::Currency::Cny,
+                    Some((0.9, 0.9)),
+                )],
+            ),
+        ]);
+        assert!(
+            view.points.iter().all(|p| p.unit_price.is_none()),
+            "币种不可比时价格维度必须**整体**退出，而不是只留其中一种币种的子集 —— \
+             只留一部分会让「币种不同」这个事实消失"
+        );
+        assert!(
+            view.currency_note.is_some(),
+            "必须写明原因，否则用户看到所有点都没价格，会以为是自己没填"
+        );
+        // 币种仍然如实回给界面（好让说明里能写出是哪两种）
+        assert_eq!(view.points[0].currency.as_deref(), Some("usd"));
+    }
+
+    #[test]
+    fn 币种统一时价格保留() {
+        let view = 视图(vec![
+            供应商(
+                "a",
+                vec![模型(
+                    "m",
+                    Some(1.0),
+                    crate::domain::Currency::Usd,
+                    Some((0.9, 0.9)),
+                )],
+            ),
+            供应商(
+                "b",
+                vec![模型(
+                    "m",
+                    Some(20.0),
+                    crate::domain::Currency::Usd,
+                    Some((0.5, 0.5)),
+                )],
+            ),
+        ]);
+        assert_eq!(view.points[0].unit_price, Some(1.0));
+        assert_eq!(view.points[1].unit_price, Some(20.0));
+        assert!(view.currency_note.is_none(), "币种统一时不该有多余的说明");
+        // 便宜且强的那家支配又贵又弱的那家
+        assert!(view.front.contains(&"a/m".to_string()));
+        assert!(!view.front.contains(&"b/m".to_string()));
+        assert_eq!(view.dominated_by.get("b/m").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn 没有能力数据时质量是_none_而不是零() {
+        let view = 视图(vec![供应商(
+            "a",
+            vec![模型("m", Some(1.0), crate::domain::Currency::Usd, None)],
+        )]);
+        assert_eq!(
+            view.points[0].quality, None,
+            "只有模态布尔、没有质量维度时质量必须是 None —— \
+             当成 0 会让它被判成「被所有候选支配」"
+        );
+    }
+
+    #[test]
+    fn 样本不足时速度是_none_() {
+        // 健康表里一次成功记录都没有 ⇒ 没有实测吞吐。
+        let view = 视图(vec![供应商(
+            "a",
+            vec![模型(
+                "m",
+                Some(1.0),
+                crate::domain::Currency::Usd,
+                Some((0.9, 0.9)),
+            )],
+        )]);
+        assert_eq!(
+            view.points[0].speed, None,
+            "没有样本时速度必须是 None（不是 0）—— 0 在约定里表示「无样本」，\
+             而当成最慢会让一个刚接入的模型被立刻判成被支配"
+        );
+    }
+
+    #[test]
+    fn 数据不足的候选不算被支配_仍在前沿() {
+        // 卡片反向用例在视图层的对应：三维**全缺**的候选不该被判成
+        // 「被某个三维齐全的候选支配」。缺数据既不是更好也不是更差。
+        let view = 视图(vec![
+            供应商(
+                "strong",
+                vec![模型(
+                    "m",
+                    Some(1.0),
+                    crate::domain::Currency::Usd,
+                    Some((0.99, 0.99)),
+                )],
+            ),
+            供应商(
+                "blank",
+                vec![模型("m", None, crate::domain::Currency::Usd, None)],
+            ),
+        ]);
+        assert!(
+            view.front.contains(&"blank/m".to_string()),
+            "三维全缺是「数据不足」，不是「被支配」—— 把它踢出前沿等于拿缺失数据下了结论。实际前沿：{:?}",
+            view.front
+        );
+        assert!(!view.dominated_by.contains_key("blank/m"));
     }
 }

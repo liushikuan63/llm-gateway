@@ -91,6 +91,20 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     { id: "codex-work", kind: "codex", label: "Codex（工作）", options: null, enabled: true,
       created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-01T00:00:00Z" },
   ];
+  // D5 前沿视图：四条覆盖三种情形 —— 两个互不支配的前沿点、
+  // 一个**三维全缺**的点（数据不足，不是被支配）、一个被完全支配的点。
+  // 第三条尤其不能省：少了它，「把 null 当 0」的实现照样全绿。
+  window.__fixturePareto = {
+    points: [
+      { id: "openrouter/openrouter/free", label: "OpenRouter · openrouter/free", quality: 0.8, speed: 120, unit_price: 1.5, currency: "usd" },
+      { id: "anthropic/claude-sonnet", label: "Anthropic · claude-sonnet", quality: 0.95, speed: 40, unit_price: 12, currency: "usd" },
+      { id: "ollama/qwen-local", label: "本地 Ollama · qwen-local", quality: null, speed: null, unit_price: null, currency: null },
+      { id: "multimodal/vision-model", label: "多模态服务 · vision-model", quality: 0.5, speed: 30, unit_price: 20, currency: "usd" },
+    ],
+    front: ["openrouter/openrouter/free", "anthropic/claude-sonnet", "ollama/qwen-local"],
+    dominated_by: { "multimodal/vision-model": ["anthropic/claude-sonnet"] },
+    currency_note: null,
+  };
   window.__fixtureSearchKey = { masked: "tvly-****-abc", configured: true };  // 搜索设置快照。`get_search_settings` 与 `update_search_settings` 共用它，
   // 这样"保存后重新打开页面设置仍是新值"这条断言才不是自说自话。
   const searchSettings = () => {
@@ -303,6 +317,10 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       // （`values[维度][来源] = { value, source }`）—— 形状不对时页面会静默
       // 显示「数据不足」，那与「真的没有数据」看起来一模一样。
       case "export_capabilities": return JSON.stringify(window.__fixtureCapabilities ?? {});
+      // D5：三维前沿。三个维度都在后端算，夹具给的是**已经算好的视图** ——
+      // 形状必须与 `ParetoView` 一致，否则页面会静默渲染成空表。
+      case "capability_pareto":
+        return structuredClone(window.__fixturePareto ?? { points: [], front: [], dominated_by: {}, currency_note: null });
       // A5：运行时清单与适配器表。徽标要靠前者把 runtime_id 翻成人话；
       // 漏了这个 case 会让整页 `Promise.all` 失败 —— 那是白屏，不是「没有徽标」。
       case "list_agent_runtimes": return structuredClone(window.__fixtureAgentRuntimes ?? []);
@@ -1111,6 +1129,37 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await page.waitForTimeout(150);
     assert((await agreeing.innerText()).includes("claude-sonnet"), "展开后要列出它");
     await page.screenshot({ path: path.join(output, "capability-conflicts.png"), fullPage: true });
+
+    /* ------------------------------------------------------------------ */
+    /* D5 Pareto 前沿                                                      */
+    /* ------------------------------------------------------------------ */
+    const paretoTable = page.locator(".pareto-table");
+    await paretoTable.waitFor({ timeout: 5000 });
+    const paretoText = await paretoTable.innerText();
+    // 三个原始值都要摊开：只给前沿成员的话，用户不知道它们凭什么上榜。
+    assert(paretoText.includes("0.80"), `质量原值要显示：${paretoText}`);
+    assert(paretoText.includes("120.0 tok/s"), `速度原值要显示：${paretoText}`);
+    assert(paretoText.includes("1.5 usd"), `价格原值要显示：${paretoText}`);
+    // 被支配的必须写明**被谁**支配 —— 只画前沿会让用户以为没上榜的是数据缺失。
+    assert(
+      paretoText.includes("被 Anthropic · claude-sonnet 支配"),
+      `被支配的候选要写明被谁支配：${paretoText}`,
+    );
+    assert.equal(await paretoTable.locator("tr.dominated").count(), 1, "夹具里只有一个被支配的候选");
+    assert.equal(await paretoTable.locator("tr.on-front").count(), 3, "前沿上应有 3 个");
+    // 诚实性：三维全缺的候选必须显示「数据不足」，而不是 0.00 或空白。
+    const blankRow = paretoTable.locator("tr").filter({ hasText: "qwen-local" });
+    const blankText = await blankRow.innerText();
+    assert(
+      (blankText.match(/数据不足/g) ?? []).length >= 2,
+      `缺数据的维度必须显示「数据不足」：${blankText}`,
+    );
+    assert(!blankText.includes("0.00"), `数据不足不等于 0 分：${blankText}`);
+    assert.equal(
+      await blankRow.evaluate((el) => el.classList.contains("on-front")), true,
+      "数据不足的候选不能被判成被支配 —— 缺数据既不是更好也不是更差",
+    );
+    await page.screenshot({ path: path.join(output, "capability-pareto.png"), fullPage: true });
 
     /* ------------------------------------------------------------------ */
     /* 本地模型与智能模式                                                  */

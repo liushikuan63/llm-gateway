@@ -30,3 +30,17 @@
 .capability-agreeing { font-size: 13px; }
 .capability-agreeing summary { cursor: pointer; color: var(--muted); }
 .capability-agreeing ul { margin: 12px 0 0; padding-left: 18px; line-height: 1.9; color: var(--muted); }
+
+/* D5：三维前沿。 */
+.pareto-section { display: flex; flex-direction: column; gap: 10px; }
+.pareto-section h3 { font-size: 15px; margin: 0; }
+.pareto-note { font-size: 12px; color: var(--danger); margin: 0; }
+.pareto-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.pareto-table th, .pareto-table td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.pareto-table th { color: var(--muted); font-weight: 500; }
+/* 前沿与非前沿必须一眼分得开 —— 只靠「有没有 tag」用户要逐行找。 */
+.pareto-table tr.on-front { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.pareto-table tr.dominated { color: var(--muted); }
+.missing { color: var(--muted); font-style: italic; }
+.front-tag { color: var(--accent); border-color: var(--accent); }
+.dominated-tag { color: var(--muted); }
