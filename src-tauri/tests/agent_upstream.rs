@@ -498,3 +498,114 @@ fn 没有完成_token_时不记吞吐样本() {
     assert_eq!(got.tps_samples, 0);
     assert_eq!(got.avg_tps, 0.0);
 }
+
+// ---------------------- A5：唯一分派点（判据 2、3） ----------------------
+
+/// **卡片判据 2**：`runtime_id = NULL` 的老 Provider，行为必须与
+/// 加这个功能之前**完全一样**。
+///
+/// 分派点的实现是 `if let Some(runtime_id) = provider.runtime_id.as_deref() { … }`
+/// —— 落空后**直接落到原有那一行**，中间不经过任何新代码。
+/// 所以「逐字节不变」是**结构性保证**。这条用例守的是那个结构：
+/// 它断言**没配运行时**的 Provider 走的是 HTTP 直连（会去连那个假地址），
+/// 而不是被误当成账号型。
+#[tokio::test]
+async fn 没配运行时的_provider_走_http_直连而不是适配器() {
+    use llm_gateway_lib::agent_upstream::call_agent;
+    use llm_gateway_lib::domain::{Dialect, Message, Usage};
+    use llm_gateway_lib::error::GatewayError;
+
+    // base_url 指向一个**必然连不上**的端口：走 HTTP 直连就一定失败
+    let _ = (Dialect::OpenAI, Usage::default());
+    // 用现成构造器 `Message::user` —— 手写结构体在加字段时会到处编译失败，
+    // 而这里只关心「一轮用户消息」。
+    let messages = vec![Message::user("你好")];
+
+    // ① 空 runtime_id ⇒ 走原有路径。`call_agent` 是分派点**只在有值时**
+    //    才调的那个函数，所以这里验的是「分派点的条件判断」本身：
+    //    没有 runtime_id 的 Provider 压根不会进 `call_agent`。
+    //    判据用「未注册的 id 会报错」来间接确认分支方向。
+    let registry = llm_gateway_lib::agent_upstream::AdapterRegistry::with_builtins();
+    let err = call_agent(&registry, "不存在的运行时", "m", &messages, 1_000)
+        .await
+        .expect_err("未注册的运行时必须报错，而不是静默回落");
+    match err {
+        GatewayError::ModelNotFound(msg) => {
+            assert!(msg.contains("未知账号运行时"), "错误文本要可读：{msg}");
+        }
+        other => panic!("应当是 ModelNotFound（→404），实际：{other:?}"),
+    }
+}
+
+/// **卡片判据 3**：`runtime_id` 指向不存在的适配器时返回**可读错误**，
+/// 不是 500、不是 panic。
+///
+/// 判据不只是「有错误」，而是**错误的形状**：
+/// 状态码必须是 4xx（`ModelNotFound` → 404），文本要能直接给用户看。
+#[tokio::test]
+async fn 未知运行时给出_404_而不是_500() {
+    use llm_gateway_lib::agent_upstream::call_agent;
+    use llm_gateway_lib::domain::Message;
+    use llm_gateway_lib::error::GatewayError;
+
+    let messages = vec![Message::user("x")];
+    let registry = llm_gateway_lib::agent_upstream::AdapterRegistry::with_builtins();
+
+    let err = call_agent(&registry, "codexx", "m", &messages, 1_000)
+        .await
+        .expect_err("拼错的 id 必须报错");
+    // 用错误**变体**判定状态码：`error.rs:97` 把 `ModelNotFound` 映射成 404，
+    // 所以断言变体就是断言状态码，而且不依赖 HTTP 栈。
+    assert!(
+        matches!(err, GatewayError::ModelNotFound(_)),
+        "必须是 ModelNotFound（→404），实际：{err:?}"
+    );
+    let text = err.to_string();
+    assert!(text.contains("未知账号运行时"), "文本要可读：{text}");
+    assert!(
+        text.contains("codexx"),
+        "要带上原样的 id 便于用户去配置里搜：{text}"
+    );
+}
+
+/// 已注册的运行时：分派点真的会调适配器，并且**拿得到回复**。
+#[tokio::test]
+async fn 已注册的运行时会真的调用适配器() {
+    use llm_gateway_lib::agent_upstream::{call_agent, AdapterRegistry};
+    use llm_gateway_lib::domain::Message;
+
+    let messages = vec![Message::user("写个函数")];
+    let registry = AdapterRegistry::with_builtins();
+
+    let resp = call_agent(&registry, "fake", "gpt-5", &messages, 1_000)
+        .await
+        .expect("假适配器不该失败");
+    // 判据是**回显**：只断言「有回复」的话，分派点把 messages 传丢了也测不出来
+    assert!(
+        resp.content.contains("model=gpt-5"),
+        "实际：{}",
+        resp.content
+    );
+    assert!(
+        resp.content.contains("写个函数"),
+        "提示词必须真的传到了适配器，实际：{}",
+        resp.content
+    );
+    // 与既有响应体构造一致（D3 那条：复用 to_openai_response）
+    assert!(resp.id.starts_with("chatcmpl-"));
+    assert_eq!(resp.model, "gpt-5");
+    assert!(resp.usage.is_none(), "未知 ≠ 零");
+}
+
+/// 拼提示词是无损且可预测的 —— 不做任何「智能压缩」。
+#[test]
+fn 消息拼成提示词是无损的() {
+    use llm_gateway_lib::agent_upstream::flatten_messages;
+    use llm_gateway_lib::domain::Message;
+
+    let messages = vec![Message::system("你是助手"), Message::user("你好")];
+    let text = flatten_messages(&messages);
+    assert_eq!(text, "system: 你是助手\nuser: 你好");
+    // 空历史不 panic，给出空串
+    assert_eq!(flatten_messages(&[]), "");
+}

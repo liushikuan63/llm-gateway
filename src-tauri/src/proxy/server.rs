@@ -130,6 +130,12 @@ pub struct GatewayState {
     pub cache: Arc<crate::cache::ResponseCache>,
     /// 只有实际 listener 位于回环地址时才会激活远程反代认证逻辑。
     listener_is_loopback: AtomicBool,
+    /// 任务卡二 A5：账号型上游的适配器注册表。
+    ///
+    /// 放在 `GatewayState` 而不是只在 `AppState` 上：**分派点在代理这一侧**，
+    /// 它拿到的只有 `GatewayState`。注册表是无状态只读的，`Arc` 共享，
+    /// 两个 state 各持一份 `Arc` 即可。
+    pub adapters: Arc<crate::agent_upstream::AdapterRegistry>,
 }
 
 impl GatewayState {
@@ -159,6 +165,10 @@ impl GatewayState {
             remote_access_keys: Arc::new(parking_lot::RwLock::new(Vec::new())),
             compaction_lock: tokio::sync::Mutex::new(()),
             listener_is_loopback: AtomicBool::new(false),
+            // A5：现在只有假适配器。`AppState` 那份由 lib.rs 各自构造 ——
+            // 两处各建一份是**可以的**（适配器无状态），
+            // 合成一个全局单例反而要多引入一层共享。
+            adapters: Arc::new(crate::agent_upstream::AdapterRegistry::with_builtins()),
         }
     }
 
@@ -3224,7 +3234,36 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 let up = upstream.clone();
                 let r = req_arc.clone();
                 let defaults = state.cfg_snapshot().ollama_options;
-                async move { up.call(&provider, &r, &model, timeout, &defaults).await }
+                let adapters = state.adapters.clone();
+                async move {
+                    // ===== 任务卡二 A5：**唯一分派点** =====
+                    //
+                    // 这是全仓唯一一处「按 Provider 的上游形态选路径」的地方。
+                    //
+                    // 【模式隔离】`runtime_id` 为 `None`（默认，也是绝大多数
+                    // Provider 的现状）时，这个 `if let` **落空后直接落到
+                    // 原有那一行**，中间不经过任何新代码 —— 所以「老 Provider
+                    // 的响应体逐字节不变」是**结构性保证**，
+                    // 而不是「小心写出来的」。
+                    //
+                    // 放在**链的闭包里**而不是函数顶部：`ranked` 是一批候选，
+                    // 「要发给谁」是链逐候选决定的。放在顶部就只能对
+                    // `ranked[0]` 生效，那会**丢掉失败转移** ——
+                    // 而那种缺陷只在首选真失败时才暴露。
+                    // 放在这里还意味着账号型与 API 型 Provider 混在一批候选里
+                    // 也能各自走对路。
+                    if let Some(runtime_id) = provider.runtime_id.as_deref() {
+                        return crate::agent_upstream::call_agent(
+                            &adapters,
+                            runtime_id,
+                            &model,
+                            &r.messages,
+                            timeout.as_millis() as u64,
+                        )
+                        .await;
+                    }
+                    up.call(&provider, &r, &model, timeout, &defaults).await
+                }
             },
             |provider, model, err| {
                 // 429 额外打满本地额度窗口，避免连续撞墙

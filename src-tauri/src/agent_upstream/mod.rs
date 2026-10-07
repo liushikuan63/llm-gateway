@@ -95,6 +95,96 @@ impl AdapterRegistry {
     }
 }
 
+
+// ==================== A5：唯一分派点用的两个入口 ====================
+
+/// `Role` 的协议写法。领域枚举没有提供这个 —— 它不该关心协议拼写，
+/// 而**这里需要**（提示词是给账号型 CLI 看的纯文本）。
+fn role_label(role: &crate::domain::Role) -> &'static str {
+    use crate::domain::Role;
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+/// 把消息历史拼成一段提示词。
+///
+/// 账号型上游收的是**一轮对话**（`codex exec "…"` 那类），不是消息数组 ——
+/// 各家的消息格式都不一样，逐家实现一遍不如在分派点做一次归一。
+///
+/// **不做任何「智能压缩」**：拼接必须是无损的、可预测的。
+/// 智能裁剪属于上下文管理，那是网关侧的会话职责（见 `context` 模块），
+/// 在这里再做一次会让「发出去的到底是什么」变得说不清。
+pub fn flatten_messages(messages: &[crate::domain::Message]) -> String {
+    messages
+        .iter()
+        .map(|m| format!("{}: {}", role_label(&m.role), m.content_text()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 走账号型上游发一轮。**这是「唯一分派点」调用的那个函数。**
+///
+/// ## 三种失败各有各的状态码（卡片判据 3）
+///
+/// - `runtime_id` 解析不出来 ⇒ `ModelNotFound` ⇒ **404**
+///   （错误文本是「未知账号运行时：xxx」）
+/// - 适配器自己报错（未登录、命令不存在…）⇒ `CapabilityUnavailable` ⇒ **400**
+///   —— 用户能改的东西，给 4xx；让他知道「这不是服务器的锅」
+/// - 超时 ⇒ `Timeout` ⇒ 504
+///
+/// **一律不是 500** —— 500 意味着「服务端有 bug」，而这三件事
+/// 全是配置或环境问题，给 500 会把用户引向错误的排查方向。
+pub async fn call_agent(
+    registry: &AdapterRegistry,
+    runtime_id: &str,
+    model: &str,
+    messages: &[crate::domain::Message],
+    timeout_ms: u64,
+) -> Result<crate::domain::ChatResponse, crate::error::GatewayError> {
+    let adapter = registry
+        .resolve(Some(runtime_id))
+        .map_err(crate::error::GatewayError::ModelNotFound)?;
+    // `resolve(Some(非空))` 成功时一定是 `Some`；`None` 只在空串时出现，
+    // 而空串在上面已经被 `resolve` 挡成 `Ok(None)` 了 —— 这里再挡一次
+    // 是为了不写 `unwrap`（那会在将来有人改 `resolve` 时变成一个 panic）。
+    let Some(adapter) = adapter else {
+        return Err(crate::error::GatewayError::ModelNotFound(format!(
+            "未知账号运行时：{runtime_id}"
+        )));
+    };
+    let prompt = flatten_messages(messages);
+    let reply = adapter
+        .send(AgentRequest {
+            model: model.to_string(),
+            prompt,
+            timeout_ms,
+        })
+        .await
+        .map_err(|e| {
+            // 「超时」要单独归类：它是**唯一**一个「重试可能有用」的失败，
+            // 而其余（未登录、命令不存在）重试一万次也一样。
+            if e.contains("超时") {
+                crate::error::GatewayError::Timeout(e)
+            } else {
+                // 用 `Upstream` 而不是 `CapabilityUnavailable`：
+                // 后者的消息是「请为相应模型勾选对应能力后重试」，
+                // 用在「适配器起不来」上会把用户引向完全无关的地方。
+                // `Upstream { status: 400 }` 走 `from_u16` ⇒ 400 ⇒ 4xx。
+                crate::error::GatewayError::Upstream {
+                    provider: runtime_id.to_string(),
+                    model: model.to_string(),
+                    status: 400,
+                    body: e,
+                }
+            }
+        })?;
+    Ok(reply.into_chat_response(model))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
