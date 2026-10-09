@@ -197,6 +197,7 @@ pub fn to_model_ref(info: &LocalModelInfo) -> ModelRef {
         overrides: None,
         local: Some(info.meta.clone()),
         enabled: true,
+        capabilities: None,
     }
 }
 
