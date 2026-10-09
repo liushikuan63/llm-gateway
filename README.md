@@ -95,7 +95,7 @@ npm run tauri:dev
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-win.ps1
 ```
 
-脚本会在缺少依赖时安装前端依赖，随后校验 Tauri 的 Windows 交付配置、图标和 MSI 升级标识，再构建前端、Rust 二进制、NSIS 与 MSI 安装包，并输出本次安装包的 SHA-256。Tauri 配置启用 `useLocalToolsDir: true`，Windows 打包工具使用 `src-tauri/target/.tauri` 下的本地工具目录。也可以单独执行：
+脚本会在缺少依赖时安装前端依赖，随后校验 Tauri 的 Windows 交付配置、图标和 MSI 升级标识，再构建前端、Rust 二进制、NSIS 与 MSI 安装包，并输出本次安装包的 SHA-256。Tauri 配置启用 `useLocalToolsDir: true`，Windows 打包工具在首次打包时创建本地缓存目录 `<src-tauri/target/.tauri>`（尖括号表示生成物，源码检出时尚不存在）。也可以单独执行：
 
 ```powershell
 npm run verify:release
