@@ -88,7 +88,7 @@ mod tests {
 
     const READY_TIMEOUT: Duration = Duration::from_secs(15);
     const POLL_INTERVAL: Duration = Duration::from_millis(100);
-    // CI 上 PowerShell 启动可能超过旧测试的 600ms + 10 * 100ms 等待窗口。
+    // 显式覆盖旧测试的 600ms + 10 * 100ms 等待窗口。
     const GRANDCHILD_START_DELAY: Duration = Duration::from_secs(2);
 
     /// 起一个会活很久的子进程，杀掉它，确认它真的没了。
@@ -125,13 +125,18 @@ mod tests {
     /// 这是本模块存在的全部理由 —— `Child::kill` 杀不掉它。
     #[tokio::test]
     async fn 杀树能带走孙进程() {
+        #[cfg(windows)]
+        if let Some(path) = std::env::var_os("LLMGW_PROC_UTIL_HELPER_PID_FILE") {
+            run_grandchild_spawner(PathBuf::from(path)).await;
+            return;
+        }
         let started = tokio::time::Instant::now();
         let mut child = spawn_grandchild_spawner().await;
         let _ = child.child.id().expect("应当拿得到 pid");
         let grandchild = read_grandchild_pid(&mut child).await;
         // 【不许「跳过」】项目规则：`eprintln!` + `return` 会被 cargo 记成 ok，
-        // 而「跳过」与「通过」必须可区分。本机 `powershell` 必然可用，
-        // 所以拿不到孙进程 pid 就是**失败**，不是环境不支持。
+        // 而「跳过」与「通过」必须可区分。夹具必须写出实际存活的 PID，
+        // 拿不到就是**失败**，不是环境不支持。
         let grandchild = grandchild.expect("拿不到存活的孙进程 pid，不能记成通过");
         assert!(
             started.elapsed() >= GRANDCHILD_START_DELAY,
@@ -165,6 +170,11 @@ mod tests {
 
         fn pid_file(&self) -> PathBuf {
             self.0.join("grandchild.pid")
+        }
+
+        #[cfg(windows)]
+        fn helper_log(&self) -> PathBuf {
+            self.0.join("helper.log")
         }
     }
 
@@ -253,25 +263,26 @@ mod tests {
         let pid_file = directory.pid_file();
         #[cfg(windows)]
         let child = {
-            // `start /b` 起一个脱离的 sleeper，然后写它的 pid 需要额外手段；
-            // 这里用 powershell 起子进程并落 pid，形状与真实包装器一致
-            // （`codex.cmd` → node 也是同样的一层）。
-            let script = format!(
-                "$ErrorActionPreference = 'Stop'; Start-Sleep -Milliseconds {}; $p = $null; \
-                 try {{ $p = Start-Process -FilePath 'cmd.exe' \
-                 -ArgumentList '/C','ping -n 60 127.0.0.1 > NUL' -PassThru -WindowStyle Hidden; \
-                 Set-Content -LiteralPath $env:LLMGW_PROC_UTIL_PID_FILE -Value $p.Id -Encoding ASCII; \
-                 Start-Sleep -Seconds 60 }} catch {{ \
-                 if ($null -ne $p) {{ & taskkill.exe /T /F /PID $p.Id > $null 2>&1 }}; throw }}",
-                GRANDCHILD_START_DELAY.as_millis()
-            );
-            tokio::process::Command::new("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                .env("LLMGW_PROC_UTIL_PID_FILE", &pid_file)
+            // 原 PowerShell/Start-Process 夹具在 CI 上可能卡在写 PID 之前。
+            // 直接用当前 Rust 测试 EXE 作包装器，只在这个子进程设置 helper
+            // 环境变量，精准运行同名用例的专用分支；仍实际起 cmd → ping。
+            let log = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.helper_log())
+                .expect("创建私有 helper 日志");
+            tokio::process::Command::new(std::env::current_exe().expect("当前测试 EXE"))
+                .args([
+                    "--exact",
+                    "proc_util::tests::杀树能带走孙进程",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("LLMGW_PROC_UTIL_HELPER_PID_FILE", &pid_file)
                 .creation_flags(0x08000000) // CREATE_NO_WINDOW
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::from(log))
                 .kill_on_drop(true)
                 .spawn()
                 .expect("起 grandchild spawner")
@@ -299,6 +310,42 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    async fn run_grandchild_spawner(pid_file: PathBuf) {
+        use std::io::Write;
+
+        eprintln!("helper started; delaying grandchild");
+        tokio::time::sleep(GRANDCHILD_START_DELAY).await;
+        let child = spawn_sleeper().await;
+        let pid = child.child.id().expect("helper 的实际子进程 PID");
+        eprintln!("grandchild spawned: {pid}");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(pid_file)
+            .expect("创建自有孙进程 PID 文件");
+        writeln!(file, "{pid}").expect("写入自有孙进程 PID");
+        file.flush().expect("刷新自有孙进程 PID");
+        drop(file);
+        eprintln!("grandchild PID ready");
+        // 父包装器保持存活，孙进程不能靠正常退出让 kill_tree 断言通过。
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(child);
+    }
+
+    fn readiness_error(process: &TestProcess, message: String) -> String {
+        #[cfg(windows)]
+        if let Some(log) = process
+            .directory
+            .as_ref()
+            .and_then(|directory| std::fs::read_to_string(directory.helper_log()).ok())
+        {
+            return format!("{message}; helper: {log}");
+        }
+        let _ = process;
+        message
+    }
+
     async fn read_grandchild_pid(process: &mut TestProcess) -> Result<u32, String> {
         let path = process
             .directory
@@ -308,7 +355,12 @@ mod tests {
         let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
         loop {
             match process.child.try_wait() {
-                Ok(Some(status)) => return Err(format!("父进程在就绪前退出：{status}")),
+                Ok(Some(status)) => {
+                    return Err(readiness_error(
+                        process,
+                        format!("父进程在就绪前退出：{status}"),
+                    ));
+                }
                 Err(error) => return Err(format!("无法读取自有父进程状态：{error}")),
                 Ok(None) => {}
             }
@@ -325,7 +377,10 @@ mod tests {
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err("等待自有孙进程 PID 和存活状态超过 15 秒".into());
+                return Err(readiness_error(
+                    process,
+                    "等待自有孙进程 PID 和存活状态超过 15 秒".into(),
+                ));
             }
             tokio::time::sleep(POLL_INTERVAL.min(deadline - now)).await;
         }
