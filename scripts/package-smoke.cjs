@@ -119,6 +119,90 @@ async function portOpen(port) {
     await page.screenshot({ path: path.join(output, "installed-diagnostics.png"), fullPage: true });
     record("real-readonly-diagnostics-no-model-call");
 
+    await page.getByRole("button", { name: "账号权益", exact: true }).click();
+    await page.getByTestId("benefits-page").waitFor();
+    assert(config.benefits && config.benefits.enabled === false && config.benefits.auto_claim === false);
+    const defaultBenefits = await ipc("benefits_overview");
+    assert.equal(defaultBenefits.enabled, false);
+    assert.deepEqual(await ipc("benefit_runs"), []);
+    await page.screenshot({ path: path.join(output, "installed-benefits.png"), fullPage: true });
+    record("benefits-real-ui-ipc-default-disabled-no-external-reward-traffic");
+
+    const localToken = "acceptance-local-benefit-token";
+    const account = { id: "local-benefit-account", platform: "qoder", label: "验收国际账号", enabled: true };
+    const configured = { ...config, benefits: { ...config.benefits, accounts: [account, { ...account, id: "local-cn-account", platform: "qoder_cn", label: "验收国内账号" }] } };
+    await ipc("update_config", { cfg: configured });
+    await assert.rejects(ipc("set_benefit_token", { accountId: account.id, token: "invalid\r\nheader" }));
+    await ipc("set_benefit_token", { accountId: account.id, token: localToken });
+    const savedBenefits = await ipc("benefits_overview");
+    assert.equal(savedBenefits.accounts.length, 2);
+    assert.equal(savedBenefits.accounts.find(row => row.account_id === account.id).has_token, true);
+    assert.equal(savedBenefits.accounts.find(row => row.platform === "qoder_cn").has_token, false);
+    assert(!JSON.stringify(savedBenefits).includes(localToken));
+    assert(!fs.readFileSync(path.join(data, "config.toml"), "utf8").includes(localToken));
+    for (const file of ["gateway.db", "gateway.db-wal", "gateway.db-shm"]) {
+      const location = path.join(data, file);
+      if (fs.existsSync(location)) assert(!fs.readFileSync(location).includes(Buffer.from(localToken)), "benefit token persisted as plaintext");
+    }
+    await assert.rejects(ipc("claim_benefit_now", { accountId: account.id }));
+    assert.deepEqual(await ipc("benefit_runs"), []);
+    await ipc("clear_benefit_token", { accountId: account.id });
+    assert.equal((await ipc("benefits_overview")).accounts.find(row => row.account_id === account.id).has_token, false);
+    await ipc("update_config", { cfg: config });
+    record("benefits-real-token-encryption-crlf-validation-clear-and-disabled-claim-guard");
+
+    const benefitEndpoint = `http://127.0.0.1:${config.port}/gw/benefits`;
+    const authHeader = { Authorization: `Bearer ${config.unified_key}` };
+    assert.equal((await fetch(benefitEndpoint)).status, 401);
+    assert.equal((await fetch(benefitEndpoint, { headers: { ...authHeader, "X-Forwarded-For": "203.0.113.1", "X-Forwarded-Proto": "https" } })).status, 404);
+    const authorized = await fetch(benefitEndpoint, { headers: authHeader });
+    assert.equal(authorized.status, 200);
+    assert.equal((await authorized.json()).enabled, false);
+    record("benefits-real-management-http-auth-and-forwarded-client-rejection");
+
+    const now = new Date().toISOString();
+    const runtime = { id: "acceptance-custom-runtime", kind: "fake", label: "验收运行时", enabled: true,
+      options: { model_aliases: { "vendor-model": "first-alias" } }, created_at: now, updated_at: now };
+    await ipc("save_agent_runtime", { runtime });
+    const providerId = await ipc("upsert_provider", { input: {
+      id: null, name: "安装包账号调用验收", dialect: "openai", base_url: "http://127.0.0.1:1/v1",
+      api_key: "", enabled: true, priority: 1, rpm_limit: 0, intelligence: 50, note: null,
+      models: [{ enabled: true, alias: "acceptance-model", upstream: "vendor-model", context_window: 16384,
+        supports_tools: false, supports_vision: false, supports_audio: false, supports_video: false,
+        supports_thinking: false, supports_stream: false, model_type: "chat", upstream_path: null,
+        price: null, overrides: null, local: null, capabilities: null }],
+    } });
+    await ipc("set_provider_runtime", { providerId, runtimeId: runtime.id });
+    assert.equal((await ipc("list_providers")).find(row => row.id === providerId).runtime_id, runtime.id);
+    await ipc("update_config", { cfg: { ...config, cache: { ...config.cache, enabled: true } } });
+    const chat = () => fetch(`http://127.0.0.1:${config.port}/v1/chat/completions`, {
+      method: "POST", headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "acceptance-model", messages: [{ role: "user", content: "local-runtime-check" }] }),
+    });
+    const firstChat = await chat();
+    assert.equal(firstChat.status, 200);
+    assert((await firstChat.json()).choices[0].message.content.includes("first-alias"));
+    const cachedChat = await chat();
+    assert.equal(cachedChat.status, 200);
+    assert.equal(cachedChat.headers.get("x-cache"), "HIT");
+    await cachedChat.arrayBuffer();
+    await ipc("save_agent_runtime", { runtime: { ...runtime, options: { model_aliases: { "vendor-model": "second-alias" } } } });
+    const changedChat = await chat();
+    assert.equal(changedChat.status, 200);
+    assert.equal(changedChat.headers.get("x-cache"), "MISS");
+    assert((await changedChat.json()).choices[0].message.content.includes("second-alias"));
+    await ipc("save_agent_runtime", { runtime: { ...runtime, enabled: false } });
+    const disabledChat = await chat();
+    assert(disabledChat.status >= 400 && disabledChat.status < 500);
+    await disabledChat.arrayBuffer();
+    await assert.rejects(ipc("set_provider_runtime", { providerId, runtimeId: runtime.id }));
+    await ipc("set_provider_runtime", { providerId, runtimeId: null });
+    assert.equal((await ipc("list_providers")).find(row => row.id === providerId).runtime_id, null);
+    await ipc("delete_provider", { id: providerId });
+    await ipc("delete_agent_runtime", { id: runtime.id });
+    await ipc("update_config", { cfg: config });
+    record("real-provider-bind-custom-runtime-chat-alias-hot-change-cache-invalidation-disable-and-unbind");
+
     await page.getByRole("button", { name: "VPN 与代理", exact: true }).click();
     await page.getByTestId("vpn-page").waitFor();
     assert.equal((await ipc("vpn_status")).running, false);

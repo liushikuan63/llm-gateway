@@ -51,6 +51,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     // 页面会白屏而测试全绿（CLAUDE.md 铁律 10 点名的正是这个坑）。
     cascade: { max_escalations: 0, min_confidence: 0.6 },
     cache: { enabled: false, capacity: 200, ttl_secs: 0 },
+    benefits: { enabled: false, auto_claim: false, auto_claim_after_hour: 10, accounts: [] },
     smart_routing: {
       enabled: true, classifier: "jev",
       jev: { base_url: "http://127.0.0.1:8009/v1/systemone", model: "rl-agent", timeout_ms: 1200, max_state_chars: 4000,
@@ -74,6 +75,30 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     settings: { kernel_path: "", mixed_port: 17890, controller_port: 17909 },
     running: false, kernel_ready: false, profile_ready: false, pid: null, version: null,
     proxy_url: "http://127.0.0.1:17890", mode: "rule", error: null,
+  };
+  window.__fixtureBenefitTokens = {};
+  window.__fixtureBenefitRuns = [];
+  window.__fixtureBenefitClaimed = {};
+  window.__fixtureBenefitQueries = 0;
+  const benefitOverview = () => {
+    const config = window.__fixtureConfig.benefits;
+    return { enabled: config.enabled, auto_claim: config.auto_claim, auto_claim_after_hour: config.auto_claim_after_hour,
+      checked_at: "2026-10-10T03:00:00Z", accounts: config.accounts.map(account => {
+        const hasToken = Boolean(window.__fixtureBenefitTokens[`${account.platform}:${account.id}`]);
+        const query = config.enabled && account.enabled && hasToken;
+        if (query) window.__fixtureBenefitQueries++;
+        const error = query && window.__fixtureBenefitAccountError ? "平台凭据被拒，请更新 Token。" : null;
+        const claimed = Boolean(window.__fixtureBenefitClaimed[`${account.platform}:${account.id}`]);
+        return { account_id: account.id, platform: account.platform, label: account.label, enabled: account.enabled,
+          has_token: hasToken, token_masked: hasToken ? "********" : null, error,
+          capabilities: { query: true, manual_claim: true, auto_claim: true, scope: "活动赠送权益" },
+          last_run: window.__fixtureBenefitRuns.find(run => run.account_id === account.id) ?? null,
+          status: !query || error ? null : { platform: account.platform, claimable: !claimed, source: "Qoder 活动接口", warnings: ["活动状态以逐条结果为准。"], checked_at: "2026-10-10T03:00:00Z", campaigns: [
+            { campaign_id: "permanent", campaign_key: "permanent-gift", claim_status: "CLAIMED", action_type: "CLAIM_BENEFIT", amount: null, kind: null, valid_days: null, start_at: null, end_at: null },
+            { campaign_id: "daily", campaign_key: "daily-20261010", claim_status: claimed ? "CLAIMED" : "CLAIMABLE", action_type: "CLAIM_BENEFIT", amount: 100, kind: "CREDITS", valid_days: 30, start_at: 1791597600, end_at: 1791683940 },
+          ] },
+        };
+      }) };
   };
   window.__fixtureManagedKernelPath = "C:/fixture/managed/mihomo.exe";
   window.__fixtureVpnKernelInstalled = false;
@@ -403,6 +428,43 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         if (window.__fixtureProviderHold) await new Promise(resolve => (window.__fixtureProviderPending ??= []).push(resolve));
         return structuredClone(window.__fixtureProviders);
       case "get_config": if (configFailure) throw new Error("模拟配置读取失败"); return structuredClone(window.__fixtureConfig);
+      case "benefits_overview": {
+        const plan = window.__fixtureBenefitPlans?.shift() ?? {};
+        const result = plan.overview ?? benefitOverview();
+        if (window.__fixtureBenefitHold) await new Promise(resolve => (window.__fixtureBenefitPending ??= []).push(resolve));
+        if (plan.delayMs) await new Promise(resolve => setTimeout(resolve, plan.delayMs));
+        if (window.__fixtureBenefitFailure || plan.error) throw new Error("模拟权益读取失败");
+        return structuredClone(result);
+      }
+      case "benefit_runs":
+        if (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 200) throw new Error("非法历史条数");
+        return structuredClone(window.__fixtureBenefitRuns.filter(run => !args.accountId || run.account_id === args.accountId).slice(0, args.limit));
+      case "set_benefit_token": {
+        const account = window.__fixtureConfig.benefits.accounts.find(account => account.id === args.accountId);
+        if (!account || !args.token.trim()) throw new Error("账号或 Token 无效");
+        window.__fixtureBenefitTokens[`${account.platform}:${account.id}`] = true;
+        // Only metadata is retained by the mock. Plaintext tokens never enter a response, config or browser storage.
+        window.__fixtureBenefitTokenWrite = { accountId: args.accountId, length: args.token.length };
+        return null;
+      }
+      case "clear_benefit_token": {
+        const account = window.__fixtureConfig.benefits.accounts.find(account => account.id === args.accountId);
+        if (!account) throw new Error("账号不存在");
+        delete window.__fixtureBenefitTokens[`${account.platform}:${account.id}`];
+        return null;
+      }
+      case "claim_benefit_now": {
+        const config = window.__fixtureConfig.benefits;
+        const account = config.accounts.find(account => account.id === args.accountId);
+        if (!config.enabled || !account?.enabled || !window.__fixtureBenefitTokens[`${account.platform}:${account.id}`]) throw new Error("权益账号不可领取");
+        const mode = window.__fixtureBenefitClaimMode ?? (window.__fixtureBenefitClaimed[`${account.platform}:${account.id}`] ? "replayed" : "granted");
+        const id = window.__fixtureBenefitRuns.length + 1;
+        const messages = { granted: "平台本次实际发放了 100 CREDITS。", replayed: "平台判定重复领取，没有再次发放。", no_claimable: "平台没有可领取的活动。", error: "平台暂不可用，本窗口未了结，可重试。", skipped: "已跳过该账号。" };
+        const run = { id, account_id: account.id, platform: account.platform, window_key: `${account.platform}:2026-10-10:daily-20261010`, campaign_key: "daily-20261010", verdict: mode, amount: ["granted", "replayed"].includes(mode) ? 100 : null, message: messages[mode], manual: true, created_at: "2026-10-10T03:01:00Z" };
+        window.__fixtureBenefitRuns.unshift(run);
+        if (["granted", "replayed"].includes(mode)) window.__fixtureBenefitClaimed[`${account.platform}:${account.id}`] = true;
+        return { run, outcome: !["granted", "replayed"].includes(mode) ? null : { platform: account.platform, campaign_id: "daily", campaign_key: "daily-20261010", status: "CLAIMED", replayed: mode === "replayed", granted: mode === "granted", amount: 100, kind: "CREDITS", claimed_at: "2026-10-10T03:01:00Z", expires_at: "2026-11-09T03:01:00Z", message: messages[mode] } };
+      }
       case "vpn_status": return structuredClone(window.__fixtureVpnStatus);
       case "vpn_kernel_info":
         if (window.__fixtureVpnKernelInfoFailure) throw new Error("模拟官方内核信息读取失败");
@@ -523,13 +585,22 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       // A5：运行时清单与适配器表。徽标要靠前者把 runtime_id 翻成人话；
       // 漏了这个 case 会让整页 `Promise.all` 失败 —— 那是白屏，不是「没有徽标」。
       case "list_agent_runtimes": return structuredClone(window.__fixtureAgentRuntimes ?? []);
-      case "list_agent_adapters": return [["fake", "假适配器（不需要登录）"], ["codex", "Codex CLI"], ["qoder", "Qoder CLI"]];
+      case "list_agent_adapters": return [["fake", "假适配器（不需要登录）"], ["codex", "Codex CLI"], ["qoder", "Qoder CLI"], ["qoder-cn", "Qoder 中国版 CLI"], ["claude-code", "Claude Code"], ["opencode", "OpenCode"]];
       // A5：运行时的两个写操作。删除被引用时**模拟后端的拒绝** ——
       // 那条可读错误（「还有 N 个供应商在用它」）正是这一格最该被看见的行为：
       // 它把「删了会留下指向空气的 runtime_id」这个后果挡在了操作当时。
       case "save_agent_runtime": {
+        if (Object.keys(args.runtime.options ?? {}).some(key => !["executable", "exe", "model_aliases"].includes(key))) throw new Error("不支持的运行时 options 字段");
         const rest = (window.__fixtureAgentRuntimes ?? []).filter(r => r.id !== args.runtime.id);
         window.__fixtureAgentRuntimes = [...rest, args.runtime];
+        return null;
+      }
+      case "set_provider_runtime": {
+        const provider = window.__fixtureProviders.find(provider => provider.id === args.providerId);
+        if (!provider) throw new Error("供应商不存在");
+        if (args.runtimeId !== null && !window.__fixtureAgentRuntimes.some(runtime => runtime.id === args.runtimeId && runtime.enabled)) throw new Error("运行时不存在或已停用");
+        provider.runtime_id = args.runtimeId;
+        window.__fixtureRuntimeBinding = { providerId: args.providerId, runtimeId: args.runtimeId };
         return null;
       }
       case "delete_agent_runtime":
@@ -1313,6 +1384,213 @@ async function verifyVpnKernel(browser, errors) {
   await context.close();
 }
 
+async function verifyBenefits(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  const consoleErrors = [];
+  page.on("pageerror", error => errors.push(`benefits: ${error.message}`));
+  page.on("console", message => { if (message.type() === "error") consoleErrors.push(message.text()); });
+  page.on("dialog", dialog => dialog.accept());
+  await page.goto(baseUrl);
+  await page.getByRole("heading", { name: "OpenRouter", exact: true }).waitFor();
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  const settled = () => page.waitForFunction(() => {
+    const button = document.querySelector('[data-testid="benefits-page"] .page-heading button');
+    return Boolean(document.querySelector('[data-testid="benefits-settings"]')) && button && !button.disabled;
+  });
+  await page.evaluate(() => { window.__fixtureBenefitFailure = true; });
+  await nav.getByRole("button", { name: "账号权益", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "读取账号权益失败" }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "添加账号", exact: true }).isEnabled(), false);
+  await page.screenshot({ path: path.join(output, "benefits-load-error.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureBenefitFailure = false; });
+  await page.getByRole("button", { name: "刷新权益", exact: true }).click();
+  await settled();
+  assert.equal(await page.getByRole("checkbox", { name: "启用账号权益", exact: true }).isChecked(), false);
+  assert.equal(await page.getByRole("checkbox", { name: "每日自动领取", exact: true }).isChecked(), false);
+  assert.equal(await page.evaluate(() => window.__fixtureBenefitQueries), 0, "默认关闭时不向平台查询");
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.includes("claim_benefit_now")), false, "进入页面不自动领取");
+  assert((await page.getByTestId("benefit-capabilities").innerText()).includes("自动签到能力未知"));
+  await page.getByRole("button", { name: "Qoder 官方活动说明", exact: true }).click();
+  await page.waitForFunction(() => Boolean(window.__fixtureOpenedOfficialUrl));
+  assert.equal(await page.evaluate(() => window.__fixtureOpenedOfficialUrl), "https://docs.qoder.com/events/100credits");
+  await page.screenshot({ path: path.join(output, "benefits-default-off.png"), fullPage: true });
+  const addAccount = async (id, label, platform) => {
+    await page.getByRole("button", { name: "添加账号", exact: true }).click();
+    await page.getByLabel("账号 ID", { exact: true }).fill(id);
+    await page.getByLabel("显示名", { exact: true }).fill(label);
+    await page.getByLabel("平台", { exact: true }).selectOption(platform);
+    await page.getByRole("button", { name: "保存账号", exact: true }).click();
+    await page.getByRole("dialog").waitFor({ state: "hidden" });
+    await settled();
+  };
+  await addAccount("qoder-test", "国际活动账号", "qoder");
+  await addAccount("qoder-cn-test", "中国活动账号", "qoder_cn");
+  const international = page.getByTestId("benefit-account-qoder-test");
+  const chinese = page.getByTestId("benefit-account-qoder-cn-test");
+  assert.equal(await international.getByRole("button", { name: "手动领取", exact: true }).isEnabled(), false);
+  assert.equal(await page.evaluate(() => window.__fixtureBenefitQueries), 0);
+  await page.screenshot({ path: path.join(output, "benefits-missing-token.png"), fullPage: true });
+  await international.getByRole("button", { name: "设置 Token", exact: true }).click();
+  await page.getByLabel("权益 Token", { exact: true }).fill("fixture-benefit-private-value");
+  assert.equal(await page.getByLabel("权益 Token", { exact: true }).getAttribute("type"), "password");
+  await page.getByRole("button", { name: "保存 Token", exact: true }).click();
+  await settled();
+  assert((await international.innerText()).includes("Token 已保存"));
+  assert.equal(await page.evaluate(() => window.__fixtureBenefitQueries), 0, "保存Token不会绕过关闭态发平台请求");
+  assert(!(await page.getByTestId("benefits-page").innerText()).includes("fixture-benefit-private-value"));
+  assert(await page.evaluate(() => !JSON.stringify(window.__fixtureConfig).includes("fixture-benefit-private-value") && !JSON.stringify(localStorage).includes("fixture-benefit-private-value")), "Token不进config或storage");
+  await page.getByRole("checkbox", { name: "启用账号权益", exact: true }).check();
+  await settled();
+  assert.equal(await page.getByRole("checkbox", { name: "每日自动领取", exact: true }).isChecked(), false);
+  assert.equal(await international.getByRole("button", { name: "手动领取", exact: true }).isEnabled(), true);
+  assert.equal(await chinese.getByRole("button", { name: "手动领取", exact: true }).isEnabled(), false, "各平台Token不共用");
+  await international.locator("details > summary").nth(0).click();
+  assert((await international.innerText()).includes("数量未知"), "未知数量不显示0");
+  await international.locator("details > summary").nth(1).click();
+  assert((await international.innerText()).includes("30 天"));
+  await page.screenshot({ path: path.join(output, "benefits-campaign-details.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureBenefitAccountError = true; });
+  await page.getByRole("button", { name: "刷新权益", exact: true }).click();
+  await settled();
+  assert((await international.innerText()).includes("平台凭据被拒"));
+  assert.equal(await international.getByRole("button", { name: "手动领取", exact: true }).isEnabled(), false);
+  await page.screenshot({ path: path.join(output, "benefits-account-error.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureBenefitAccountError = false; window.__fixtureBenefitClaimMode = "error"; });
+  await page.getByRole("button", { name: "刷新权益", exact: true }).click();
+  await settled();
+  await international.getByRole("button", { name: "手动领取", exact: true }).click();
+  await settled();
+  assert((await page.getByTestId("benefit-claim-result").innerText()).includes("领取失败"));
+  assert.equal(await international.getByRole("button", { name: "手动领取", exact: true }).isEnabled(), true, "失败不封窗，可重试");
+  await page.screenshot({ path: path.join(output, "benefits-claim-error.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureBenefitClaimMode = "granted"; });
+  await international.getByRole("button", { name: "手动领取", exact: true }).click();
+  await settled();
+  assert((await page.getByTestId("benefit-claim-result").innerText()).includes("实际发放"));
+  assert((await page.getByTestId("benefit-claim-result").innerText()).includes("100 CREDITS"));
+  assert.equal(await international.getByRole("button", { name: "手动领取", exact: true }).isEnabled(), false);
+  await page.screenshot({ path: path.join(output, "benefits-granted.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureBenefitClaimed["qoder:qoder-test"] = false; window.__fixtureBenefitClaimMode = "replayed"; });
+  await page.getByRole("button", { name: "刷新权益", exact: true }).click();
+  await settled();
+  assert((await page.getByRole("status").filter({ hasText: "国际活动账号：实际发放" }).innerText()).includes("实际发放"), "刷新保留领取反馈");
+  await international.getByRole("button", { name: "手动领取", exact: true }).click();
+  await settled();
+  assert((await page.getByTestId("benefit-claim-result").innerText()).includes("重复领取，未再次发放"));
+  assert(!(await page.getByTestId("benefit-claim-result").innerText()).includes("实际发放"));
+  assert((await page.getByTestId("benefit-history").innerText()).includes("领取失败"));
+  await page.screenshot({ path: path.join(output, "benefits-replayed-history.png"), fullPage: true });
+  await page.getByRole("checkbox", { name: "每日自动领取", exact: true }).check();
+  await settled();
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.benefits.auto_claim), true);
+  const beforeInvalidHour = await page.evaluate(() => window.__fixtureConfigUpdates.length);
+  await page.getByLabel("本地时间不早于", { exact: true }).fill("24");
+  await page.getByRole("button", { name: "保存领取时间", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.__fixtureConfigUpdates.length), beforeInvalidHour);
+  await page.getByLabel("本地时间不早于", { exact: true }).fill("11");
+  await page.getByRole("button", { name: "保存领取时间", exact: true }).click();
+  await settled();
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.benefits.auto_claim_after_hour), 11);
+  await page.screenshot({ path: path.join(output, "benefits-auto-settings.png"), fullPage: true });
+  await page.getByRole("checkbox", { name: "每日自动领取", exact: true }).uncheck();
+  await settled();
+  await international.getByRole("button", { name: "编辑账号", exact: true }).click();
+  await page.getByLabel("平台", { exact: true }).selectOption("qoder_cn");
+  await page.getByRole("button", { name: "保存账号", exact: true }).click();
+  await settled();
+  assert((await international.innerText()).includes("缺少 Token"), "切换平台不能误复用国际版Token");
+  await international.getByRole("button", { name: "编辑账号", exact: true }).click();
+  await page.getByLabel("平台", { exact: true }).selectOption("qoder");
+  await page.getByRole("button", { name: "保存账号", exact: true }).click();
+  await settled();
+  await international.getByRole("button", { name: "清除 Token", exact: true }).click();
+  await settled();
+  assert((await international.innerText()).includes("缺少 Token"));
+  assert((await page.getByTestId("benefit-history").innerText()).includes("实际发放"), "清除Token保留历史");
+  await page.screenshot({ path: path.join(output, "benefits-token-cleared.png"), fullPage: true });
+  await page.getByRole("checkbox", { name: "启用账号权益", exact: true }).uncheck();
+  await settled();
+  const queriesWhenOff = await page.evaluate(() => window.__fixtureBenefitQueries);
+  await page.getByRole("button", { name: "刷新权益", exact: true }).click();
+  await settled();
+  assert.equal(await page.evaluate(() => window.__fixtureBenefitQueries), queriesWhenOff);
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureBenefitPlans = [{ delayMs: 350, overview: { enabled: false, auto_claim: false, auto_claim_after_hour: 10, checked_at: "2026-10-10T01:00:00Z", accounts: [] } }, {}]; });
+  await nav.getByRole("button", { name: "账号权益", exact: true }).click();
+  await international.waitFor();
+  await page.waitForTimeout(450);
+  assert.equal(await international.count(), 1, "StrictMode晚到旧权益结果不覆盖新账号列表");
+  await page.evaluate(() => { window.__fixtureBenefitHold = true; window.__fixtureBenefitPending = []; window.__fixtureBenefitPlans = [{ error: true }]; });
+  await page.getByRole("button", { name: "刷新权益", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureBenefitPending.length === 1);
+  assert.equal(await page.getByTestId("benefits-page").locator(".page-heading button").first().isEnabled(), false, "同一权益读取保持单飞");
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureBenefitHold = false; });
+  await nav.getByRole("button", { name: "账号权益", exact: true }).click();
+  await settled();
+  await page.evaluate(() => { window.__fixtureBenefitPending.splice(0).forEach(resolve => resolve()); });
+  await page.waitForTimeout(50);
+  assert.equal(await page.getByRole("alert").count(), 0, "卸载后的权益失败不污染新页面");
+  await page.screenshot({ path: path.join(output, "benefits-async-guard.png"), fullPage: true });
+  for (const width of [900, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `账号权益页面不能横向溢出: ${width}`);
+    await page.screenshot({ path: path.join(output, `benefits-${width}.png`), fullPage: true });
+  }
+  await page.setViewportSize({ width: 1180, height: 900 });
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.locator(".agent-runtimes > summary").click();
+  const runtimeKinds = await page.getByLabel("运行时类型", { exact: true }).locator("option").evaluateAll(nodes => nodes.map(node => node.value));
+  for (const kind of ["qoder-cn", "claude-code", "opencode"]) assert(runtimeKinds.includes(kind));
+  assert(!runtimeKinds.includes("trae"), "Trae无内置账号型上游支持");
+  await page.getByLabel("运行时 id", { exact: true }).fill("claude-personal");
+  await page.getByLabel("运行时显示名", { exact: true }).fill("Claude 个人订阅");
+  await page.getByLabel("运行时类型", { exact: true }).selectOption("claude-code");
+  await page.getByLabel("运行时可执行文件", { exact: true }).fill("C:/fixture/claude.exe");
+  await page.getByLabel("运行时模型别名", { exact: true }).fill('{"my-claude":"sonnet"}');
+  await page.getByRole("button", { name: "新建运行时", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureAgentRuntimes.some(runtime => runtime.id === "claude-personal"));
+  const runtimeRow = page.locator(".agent-runtime-list li").filter({ hasText: "claude-personal" });
+  await runtimeRow.getByRole("button", { name: "编辑", exact: true }).click();
+  assert.equal(await page.getByLabel("运行时可执行文件", { exact: true }).inputValue(), "C:/fixture/claude.exe");
+  assert.equal(await page.getByLabel("运行时 id", { exact: true }).isEnabled(), false);
+  await page.screenshot({ path: path.join(output, "account-runtime-options.png"), fullPage: true });
+  await page.getByLabel("运行时模型别名", { exact: true }).fill('{"my-claude":0}');
+  await page.getByRole("button", { name: "保存运行时", exact: true }).click();
+  assert((await page.getByRole("alert").innerText()).includes("非空字符串"));
+  await page.getByLabel("运行时模型别名", { exact: true }).fill('{"my-claude":"opus"}');
+  await page.getByRole("button", { name: "保存运行时", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureAgentRuntimes.find(runtime => runtime.id === "claude-personal").options.model_aliases["my-claude"] === "opus");
+  const providerCard = page.locator(".provider-card").filter({ has: page.getByRole("heading", { name: "OpenRouter", exact: true }) });
+  const originalProvider = await page.evaluate(() => structuredClone(window.__fixtureProviders.find(provider => provider.id === "openrouter")));
+  await providerCard.locator(".provider-more > summary").click();
+  await providerCard.getByRole("button", { name: "选择 HTTP / 账号型上游", exact: true }).click();
+  await page.getByLabel("上游来源", { exact: true }).selectOption("claude-personal");
+  await page.getByRole("button", { name: "保存上游绑定", exact: true }).click();
+  await page.getByRole("dialog", { name: "选择供应商上游", exact: true }).waitFor({ state: "hidden" });
+  assert((await providerCard.innerText()).includes("Claude 个人订阅 · claude-code"));
+  const boundProvider = await page.evaluate(() => structuredClone(window.__fixtureProviders.find(provider => provider.id === "openrouter")));
+  assert.deepEqual({ ...boundProvider, runtime_id: undefined }, { ...originalProvider, runtime_id: undefined }, "绑定上游不能改Key/模型/定价");
+  await providerCard.screenshot({ path: path.join(output, "account-runtime-bound.png") });
+  await providerCard.locator(".provider-more > summary").click();
+  await providerCard.getByRole("button", { name: "选择 HTTP / 账号型上游", exact: true }).click();
+  await page.getByLabel("上游来源", { exact: true }).selectOption("");
+  await page.getByRole("button", { name: "保存上游绑定", exact: true }).click();
+  await page.getByRole("dialog", { name: "选择供应商上游", exact: true }).waitFor({ state: "hidden" });
+  assert.equal(await providerCard.locator(".provider-runtime").count(), 0);
+  assert.equal(await page.evaluate(() => window.__fixtureRuntimeBinding.runtimeId), null);
+  await providerCard.screenshot({ path: path.join(output, "account-runtime-unbound.png") });
+  for (const width of [900, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `账号型运行时不能横向溢出: ${width}`);
+    await page.locator(".agent-runtimes").screenshot({ path: path.join(output, `account-runtime-${width}.png`) });
+  }
+  assert.deepEqual(consoleErrors, [], "账号权益和运行时页面不能出现控制台错误");
+  await context.close();
+}
+
 async function verifyDiagnostics(browser, errors) {
   const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
   await context.addInitScript(fixture);
@@ -1466,6 +1744,7 @@ async function verifyDiagnostics(browser, errors) {
     await verifyVpnPage(browser, errors);
     await verifyVpnKernel(browser, errors);
     await verifyDiagnostics(browser, errors);
+    await verifyBenefits(browser, errors);
 
     // 「接口协议」下拉必须列出全部五种方言。少一种的症状是**静默的**：
     // 新建的供应商压根没法选那个协议，而测试全绿、界面也不报错。
@@ -1692,7 +1971,7 @@ async function verifyDiagnostics(browser, errors) {
 
     // 新建：kind 下拉必须给出适配器表里的全部选项（只给 label 配不出 id）。
     const kindOptions = await runtimesPanel.getByLabel("运行时类型").locator("option").allInnerTexts();
-    assert.equal(kindOptions.length, 3, `适配器下拉应有 3 项，实际 ${kindOptions.join("|")}`);
+    assert.equal(kindOptions.length, 6, `适配器下拉应有 6 项，实际 ${kindOptions.join("|")}`);
     assert(kindOptions.some(text => text.includes("codex")), `选项要同时给出 id 与人话：${kindOptions.join("|")}`);
 
     await runtimesPanel.getByLabel("运行时 id").fill("qoder-home");
@@ -3088,6 +3367,6 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await preview.goto(baseUrl);
     await preview.getByRole("heading", { name: "浏览器预览已隔离", exact: true }).waitFor();
     assert.equal(await preview.locator(".provider-card").count(), 0);
-    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, first-use guidance, persisted skip/completion, manual search, offline HTML, themes, startup splash, pet HUD/actions, async page races, polling feedback, exact cache settings, VPN controls, official kernel install/rollback, redacted local diagnostics, responsive layouts and preview isolation; screenshots=${output}`);
+    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, first-use guidance, persisted skip/completion, manual search, offline HTML, themes, startup splash, pet HUD/actions, async page races, polling feedback, exact cache settings, VPN controls, official kernel install/rollback, redacted local diagnostics, account benefits/claim results/tokens/history, account runtime options/binding, responsive layouts and preview isolation; screenshots=${output}`);
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

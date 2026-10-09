@@ -1,6 +1,6 @@
 [package]
 name = "llm-gateway"
-version = "0.2.0"
+version = "0.2.1"
 description = "本地优先的统一 LLM 网关：多 Provider 聚合、协议转换、上下文持久化、失败降级"
 authors = ["you"]
 edition = "2021"

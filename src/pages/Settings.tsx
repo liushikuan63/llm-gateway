@@ -947,7 +947,7 @@ ${keyInfo.ollama_endpoint}`}
         <div className="sub">
           管理本机安装的 AI 编码 CLI：检测路径与版本，未安装的也能直接下载安装，并支持一键更新。覆盖 Claude Code、Codex、Gemini CLI、Qoder CLI（国际/国内版）、
           OpenCode、OpenClaw、Pi、DeepSeek Harness、WorkBuddy、Cline、Amp、Auggie、Continue CLI、Crush、Factory Droid、iFlow CLI、
-          Grok Build、Cursor CLI、TRAE CLI、Hermes Agent。
+          Grok Build、Cursor CLI、TraeCode CLI 2.0、Hermes Agent。
           「检测本机 CLI」只读取 PATH 与常见安装目录、不联网；「检测并检查更新」会查询 npm 最新版本（官方脚本类工具除外，脚本始终安装最新版）。
           安装命令全部来自内置常量，执行前会展示确切命令；npm 类通过 npm 全局安装，脚本类执行官方 PowerShell 安装脚本。
         </div>
@@ -1095,6 +1095,7 @@ ${keyInfo.ollama_endpoint}`}
 
       <div className="card">
         <strong>CLI 工具接管</strong>
+        <div className="msg" role="status">客户端接管是让 CLI 使用本网关；供应商中的账号型运行时则让 CLI 作为上游。Qoder 中国版、Claude Code、OpenCode 的账号型适配器请在供应商页配置并自行登录。活动查询与领取位于「账号权益」，使用独立 Token；安装了某个 CLI 不代表已支持它的签到或调用。</div>
         <div className="sub">
           已有配置会先创建同目录的唯一备份并逐字节校验，备份失败不会改写原文件。OpenCode 与 Crush 使用各自的官方自定义 Provider 配置；Gemini CLI 暂不支持接管。写入后请重新启动对应 CLI。
         </div>

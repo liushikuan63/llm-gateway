@@ -32,3 +32,4 @@ Thumbs.db
 # 前端冒烟测试的截图产物（每次 verify:ui 重生成，4.9 MB）。
 # 不入库：它是**验证证据**而非交付物 —— 证据看 CI 输出或本地 .ui-smoke-out/。
 .ui-smoke-out/
+.ui-smoke-out-*/

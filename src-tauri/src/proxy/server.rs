@@ -149,6 +149,8 @@ pub struct GatewayState {
     /// 它拿到的只有 `GatewayState`。注册表是无状态只读的，`Arc` 共享，
     /// 两个 state 各持一份 `Arc` 即可。
     pub adapters: Arc<crate::agent_upstream::AdapterRegistry>,
+    /// 手动和自动奖励领取共享同一服务与持久幂等账本。
+    pub benefits: Arc<crate::benefits::BenefitsCenter>,
     /// 任务卡二 B5 判据 5：**网关侧**的配额账本。
     ///
     /// 用 `parking_lot::Mutex` 而不是 `RwLock`：这个锁只在
@@ -177,6 +179,7 @@ impl GatewayState {
         let cache = Arc::new(crate::cache::ResponseCache::new(cfg.cache.clone()));
         let upstream = Arc::new(UpstreamClient::new());
         upstream.set_proxy(cfg.http_proxy.as_deref());
+        let benefits = Arc::new(crate::benefits::BenefitsCenter::new(db.pool().clone()));
 
         Self {
             db,
@@ -186,6 +189,7 @@ impl GatewayState {
             client_limiter: Arc::new(RateLimiter::new()),
             router,
             upstream,
+            benefits,
             ctx,
             cache,
             providers: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -341,6 +345,19 @@ impl GatewayState {
             } else {
                 last_pricing_refresh = None;
             }
+            // 清理和定价刷新可能耗时；尚未开始的领取必须采用最新开关和代理。
+            let benefits_cfg = self.cfg_snapshot();
+            if let Err(error) = self
+                .benefits
+                .auto_tick(
+                    &benefits_cfg.benefits,
+                    benefits_cfg.http_proxy.as_deref(),
+                    chrono::Local::now(),
+                )
+                .await
+            {
+                tracing::warn!("账号权益自动领取失败: {error}");
+            }
         }
     }
 }
@@ -414,6 +431,8 @@ pub async fn serve(state: Arc<GatewayState>) -> Result<()> {
         // 任务卡二 A8：Agent 型入口。**与 LLM 透传分开**（裁决之一）——
         // 它让外部 CLI 在本地干活并产出文件，不是一个「聊天补全」接口。
         .route("/gw/agent/run", post(gw_agent_run))
+        .route("/gw/benefits", get(gw_benefits))
+        .route("/gw/benefits/claim", post(gw_benefits_claim))
         // axum 0.7 推荐顺序：先 layer，最后 with_state
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
         // 非信任客户端的超大请求体会同时挤占内存和上游配额，按方案书限制为 8 MiB。
@@ -731,6 +750,48 @@ async fn gw_stats(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     }
 }
 
+/// /gw 管理路由沿用统一 Key 鉴权和反代/外部客户端拒绝策略。
+async fn gw_benefits(State(state): State<Arc<GatewayState>>) -> Response {
+    let cfg = state.cfg_snapshot();
+    match state
+        .benefits
+        .overview(&cfg.benefits, cfg.http_proxy.as_deref())
+        .await
+    {
+        Ok(overview) => Json(overview).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":error})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BenefitClaimRequest {
+    account_id: String,
+}
+
+async fn gw_benefits_claim(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<BenefitClaimRequest>,
+) -> Response {
+    let cfg = state.cfg_snapshot();
+    match state
+        .benefits
+        .claim_now(&cfg.benefits, cfg.http_proxy.as_deref(), &req.account_id)
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":error})),
+        )
+            .into_response(),
+    }
+}
+
 /// 任务卡二 A8：Agent 型入口。
 ///
 /// 请求体：`{ "runtime": "<runtime_id>", "model": "...", "prompt": "..." }`
@@ -811,7 +872,8 @@ async fn gw_agent_run(
             .into_response();
     }
 
-    let outcome = crate::agent_upstream::run_agent_request(
+    let outcome = crate::agent_upstream::run_agent_request_with_runtime(
+        state.db.pool(),
         &cfg.agent,
         &state.adapters,
         &req.runtime,
@@ -3801,6 +3863,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                                 let r = Arc::clone(&req_arc);
                                 let defaults = state.cfg_snapshot().ollama_options;
                                 let adapters = state.adapters.clone();
+                                let runtime_pool = state.db.pool().clone();
                                 async move {
                                     // ===== 任务卡二 A5：**唯一分派点** =====
                                     //
@@ -3819,7 +3882,8 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                                     // 放在这里还意味着账号型与 API 型 Provider 混在一批候选里
                                     // 也能各自走对路。
                                     if let Some(runtime_id) = provider.runtime_id.as_deref() {
-                                        return crate::agent_upstream::call_agent(
+                                        return crate::agent_upstream::call_agent_with_runtime(
+                                            &runtime_pool,
                                             &adapters,
                                             runtime_id,
                                             &model,

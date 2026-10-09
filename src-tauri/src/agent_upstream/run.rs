@@ -165,6 +165,31 @@ pub async fn run_agent_request(
     run_agent(adapter.as_ref(), model, prompt, timeout_ms, &workspace).await
 }
 
+/// Database-aware production entry; the disabled global gate runs before DB or disk I/O.
+pub async fn run_agent_request_with_runtime(
+    pool: &sqlx::SqlitePool,
+    config: &crate::config::AgentConfig,
+    registry: &super::AdapterRegistry,
+    runtime_id: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<AgentRunOutcome, String> {
+    if !config.enabled {
+        return Err("Agent 型入口未启用；请在配置里打开 agent.enabled".into());
+    }
+    let runtime = super::resolve_runtime(pool, registry, runtime_id).await?;
+    let workspace = super::workspace::default_workspace_root(&config.resolve_base()?, &runtime.id)?;
+    let timeout_ms = config.exec_timeout_secs.saturating_mul(1000).max(1);
+    run_agent(
+        runtime.adapter.as_ref(),
+        model,
+        prompt,
+        timeout_ms,
+        &workspace,
+    )
+    .await
+}
+
 /// 列出产物根下的所有文件：**相对路径 → 修改时间戳**。
 ///
 /// 用「修改时间」而不是「文件大小」判断改动：agent 完全可能

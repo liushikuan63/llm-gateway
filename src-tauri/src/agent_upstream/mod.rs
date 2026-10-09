@@ -19,12 +19,14 @@
 pub mod adapter;
 pub mod codex;
 pub mod fake;
+pub mod headless;
 pub mod loader;
 pub mod plugin;
 pub mod plugin_process;
 pub mod qoder;
 pub mod quota;
 pub mod run;
+pub mod runtime;
 pub mod workspace;
 
 pub use adapter::{AgentAdapter, AgentReply, AgentRequest};
@@ -32,7 +34,8 @@ pub use codex::CodexAdapter;
 pub use fake::FakeAdapter;
 pub use qoder::QoderAdapter;
 pub use quota::{AgentQuota, ConcurrencyGate, ConcurrencyRejection, QuotaBook, QuotaRejection};
-pub use run::{run_agent, run_agent_request, AgentRunOutcome};
+pub use run::{run_agent, run_agent_request, run_agent_request_with_runtime, AgentRunOutcome};
+pub use runtime::{resolve_runtime, ResolvedRuntime};
 pub use workspace::WorkspaceRoot;
 
 use std::collections::BTreeMap;
@@ -69,6 +72,13 @@ impl AdapterRegistry {
         // A7：Qoder。**它的存在就是 A5 抽象的验收** —— 加它只做了三件事：
         // 实现 trait、注册一行、写 qoder.rs。**没有改动 A5 的任何抽象。**
         registry.register(Arc::new(QoderAdapter::default()));
+        for kind in [
+            headless::ClientKind::QoderCn,
+            headless::ClientKind::ClaudeCode,
+            headless::ClientKind::OpenCode,
+        ] {
+            registry.register(Arc::new(headless::HeadlessAdapter::new(kind, None)));
+        }
         registry
     }
 
@@ -175,6 +185,39 @@ pub async fn call_agent(
             "未知账号运行时：{runtime_id}"
         )));
     };
+    send_chat(adapter.as_ref(), runtime_id, model, messages, timeout_ms).await
+}
+
+/// Production entry: database runtime id -> enabled/kind/options -> actual adapter.
+pub async fn call_agent_with_runtime(
+    pool: &sqlx::SqlitePool,
+    registry: &AdapterRegistry,
+    runtime_id: &str,
+    model: &str,
+    messages: &[crate::domain::Message],
+    timeout_ms: u64,
+) -> Result<crate::domain::ChatResponse, crate::error::GatewayError> {
+    let runtime = resolve_runtime(pool, registry, runtime_id)
+        .await
+        .map_err(crate::error::GatewayError::ModelNotFound)?;
+    tracing::info!(runtime_id = %runtime.id, runtime_kind = %runtime.kind, "账号型上游分派");
+    send_chat(
+        runtime.adapter.as_ref(),
+        &runtime.id,
+        model,
+        messages,
+        timeout_ms,
+    )
+    .await
+}
+
+async fn send_chat(
+    adapter: &dyn AgentAdapter,
+    runtime_id: &str,
+    model: &str,
+    messages: &[crate::domain::Message],
+    timeout_ms: u64,
+) -> Result<crate::domain::ChatResponse, crate::error::GatewayError> {
     let prompt = flatten_messages(messages);
     let reply = adapter
         .send(AgentRequest {
@@ -212,7 +255,7 @@ pub async fn call_agent(
     //
     // 还账后这一行应当**删掉**（审计列才是权威），别让它变成两份真相。
     tracing::info!(
-        runtime_kind = runtime_id,
+        runtime_id = runtime_id,
         agent_transport = %reply.transport,
         model = model,
         "账号型上游返回"
@@ -240,7 +283,24 @@ pub async fn run_json_cli(
     timeout_ms: u64,
     label: &str,
 ) -> Result<String, String> {
+    run_json_cli_with_input(program, args, timeout_ms, label, &[], None).await
+}
+
+pub async fn run_json_cli_with_input(
+    program: &str,
+    args: &[String],
+    timeout_ms: u64,
+    label: &str,
+    environment: &[(String, String)],
+    input: Option<&str>,
+) -> Result<String, String> {
     use std::process::Stdio;
+
+    pub const STDOUT_LIMIT: usize = 8 * 1024 * 1024;
+    pub const STDERR_LIMIT: usize = 64 * 1024;
+    if input.is_some_and(|input| input.len() > STDOUT_LIMIT) {
+        return Err(format!("{label} 输入超过 8 MiB 限制"));
+    }
 
     let workdir = crate::mcp::stdio::isolated_workdir(&format!("agent-{label}"));
     // 目录建不出来就报错而不是退回当前目录 —— 「悄悄跑在用户的项目目录里」
@@ -252,80 +312,124 @@ pub async fn run_json_cli(
         )
     })?;
 
-    let mut child = tokio::process::Command::new(program)
+    let mut command = tokio::process::Command::new(program);
+    command
         .args(args)
+        .envs(environment.iter().map(|(key, value)| (key, value)))
         .current_dir(&workdir)
-        .stdin(Stdio::null()) // 交互式 CLI 读到 stdin 会等输入 —— 直接关掉
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            // 「命令不存在」是最常见的失败，给一句能照做的提示
-            format!("启动 {label} 失败（{program}）：{e}。请确认它已安装并在 PATH 里")
-        })?;
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let child = command.spawn().map_err(|e| {
+        // 「命令不存在」是最常见的失败，给一句能照做的提示
+        format!("启动 {label} 失败（{program}）：{e}。请确认它已安装并在 PATH 里")
+    })?;
+    // Dropping a request also terminates the owned tree, before Child's own drop.
+    struct OwnedCli(tokio::process::Child);
+    impl Drop for OwnedCli {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0.id() {
+                crate::proc_util::kill_tree_blocking(pid);
+            }
+        }
+    }
+    let mut owned = OwnedCli(child);
+    let child = &mut owned.0;
 
     // 【为什么不用 `wait_with_output`】它**取走** `child`（`self` 按值），
     // 于是超时分支里再也没有 `child` 可杀 —— 而 `kill_on_drop(true)` 会先
     // 杀掉直接子进程，之后 `taskkill /T` **就找不到孙进程了**
     // （树是从父进程往上走的）。所以必须：先取走两根管道、并发读，
     // 让 `child` 一直活到超时分支里。
-    use tokio::io::AsyncReadExt;
-    let mut out_pipe = child.stdout.take().ok_or("拿不到 stdout 管道")?;
-    let mut err_pipe = child.stderr.take().ok_or("拿不到 stderr 管道")?;
-    // 并发读，避免「输出塞满管道缓冲 → 子进程阻塞 → 永远等不到超时结束」
-    let out_task = tokio::spawn(async move {
-        let mut s = String::new();
-        let _ = out_pipe.read_to_string(&mut s).await;
-        s
-    });
-    let err_task = tokio::spawn(async move {
-        let mut s = String::new();
-        let _ = err_pipe.read_to_string(&mut s).await;
-        s
-    });
-
-    let status = match tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        child.wait(),
-    )
-    .await
-    {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
-            crate::proc_util::kill_tree(&mut child).await;
-            return Err(format!("{label} 进程异常：{e}"));
+    let out_pipe = child.stdout.take().ok_or("拿不到 stdout 管道")?;
+    let err_pipe = child.stderr.take().ok_or("拿不到 stderr 管道")?;
+    let input_pipe = child.stdin.take();
+    async fn capture(
+        pipe: impl tokio::io::AsyncRead + Unpin,
+        limit: usize,
+    ) -> Result<Vec<u8>, String> {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        pipe.take((limit + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| "读取 CLI 输出失败".to_string())?;
+        if bytes.len() > limit {
+            return Err("CLI 输出超过大小限制".into());
+        }
+        Ok(bytes)
+    }
+    // No detached reader tasks: timeout, limits and cancellation drop every pipe future.
+    let outcome =
+        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms.max(1)), async {
+            let write = async {
+                if let Some(input) = input {
+                    use tokio::io::AsyncWriteExt;
+                    let mut pipe = input_pipe.ok_or("拿不到 stdin 管道")?;
+                    pipe.write_all(input.as_bytes())
+                        .await
+                        .map_err(|_| "写入 CLI 输入失败")?;
+                    pipe.shutdown().await.map_err(|_| "关闭 CLI 输入失败")?;
+                }
+                Ok::<(), String>(())
+            };
+            let wait = async { child.wait().await.map_err(|_| "CLI 进程异常".to_string()) };
+            let (_, status, stdout, stderr) = tokio::try_join!(
+                write,
+                wait,
+                capture(out_pipe, STDOUT_LIMIT),
+                capture(err_pipe, STDERR_LIMIT)
+            )?;
+            Ok::<_, String>((status, stdout, stderr))
+        })
+        .await;
+    let (status, stdout, stderr) = match outcome {
+        Ok(Ok(result)) => result,
+        Ok(Err(message)) => {
+            crate::proc_util::kill_tree(child).await;
+            let _ = child.wait().await;
+            return Err(format!("{label}：{message}"));
         }
         Err(_) => {
             // 超时：**杀树**，不是杀进程。此刻 `child` 还活着，
             // 树是完整的，`taskkill /T` 才走得通。
-            crate::proc_util::kill_tree(&mut child).await;
+            crate::proc_util::kill_tree(child).await;
+            let _ = child.wait().await;
             let secs = timeout_ms / 1000;
             return Err(format!(
-                "{label} 在 {secs} 秒内没有结束，已终止。\
+                "{label} 超时，在 {secs} 秒内没有结束，已终止。\
                  常见原因：未登录（试 `{label} login`）、需要交互输入、或网络不通"
             ));
         }
     };
-    let stdout = out_task.await.unwrap_or_default();
-    let stderr = err_task.await.unwrap_or_default();
-
     if !status.success() {
-        let stderr = stderr.as_str();
-        // 失败时把 stderr 的**前几行**带上 —— 那里面通常就是原因
-        // （未登录、配置错、模型名不对），比一个退出码有用得多。
-        let hint: String = stderr.lines().take(3).collect::<Vec<_>>().join(" / ");
+        // Third-party stderr can contain credentials or a complete prompt. Classify,
+        // never echo it into IPC, gateway errors or logs.
+        let stderr = String::from_utf8_lossy(&stderr).to_ascii_lowercase();
+        let hint = if stderr.contains("authentication")
+            || stderr.contains("not logged")
+            || stderr.contains("unauthorized")
+        {
+            "未登录或凭据无效，请先在官方 CLI 登录"
+        } else if stderr.contains("unknown option") || stderr.contains("unrecognized") {
+            "CLI 版本不支持所需参数，请升级官方 CLI"
+        } else {
+            "请检查 CLI 登录、模型、配额和网络状态"
+        };
         return Err(format!(
             "{label} 退出码 {}：{}",
             status.code().unwrap_or(-1),
-            if hint.trim().is_empty() {
-                "（stderr 为空）".to_string()
-            } else {
-                hint
-            }
+            hint
         ));
     }
-    Ok(stdout)
+    String::from_utf8(stdout).map_err(|_| format!("{label} 输出不是有效的 UTF-8"))
 }
 
 #[cfg(test)]

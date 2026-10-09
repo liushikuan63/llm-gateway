@@ -1,5 +1,46 @@
 # VibeCoding 任务卡 · 账号型上游包装（0.7.0 / 0.8.0 / 0.9.0）
 
+## 2026-10-10 实施现状与本轮计划
+
+本节覆盖当前实施范围，下文的 2026-10-05 现场证据、最初抽象与「未开始」回填表保留为历史。当前仓库已有 `AgentRuntime`、Codex/Qoder 适配器、供应商运行时管理、独立 Agent 入口、隔离与调用配额；本轮是在这些实现上增加经官方核验的客户端能力，不从旧骨架重新开始。
+
+本批补充原优化与 VPN 工作；N2 路由预演、N3 并发预算预占、N4 协议契约矩阵及 V3 系统代理/TUN/权限服务仍按[运行时一致性与 VPN 集成任务卡](VibeCoding任务卡-运行时一致性与VPN集成.md)推进，不能将本批客户端接入写成这些后续方向已经完成。
+
+| 客户端 / 能力 | 当前与本轮处理 | 页面必须如实说明 |
+| --- | --- | --- |
+| Codex、Qoder | 复用既有账号型适配器与动态运行时列表 | 登录由用户本人完成；账号型调用经本机 CLI，不使用供应商 HTTP Key |
+| Qoder CN、Claude Code、OpenCode | 本轮新增 `qoder-cn`、`claude-code`、`opencode` 官方无头适配器 | 以实际注册的适配器显示可选项；需兼容版本、用户自行登录与模型权限 |
+| Trae / WorkBuddy | 官方接口、凭据与无工具隔离能力分别核验 | 未证实的调用或自动签到显示未适配/未知；不暗示通过普通 Token 即可通用 |
+| Qoder / Qoder CN 活动权益 | 独立「账号权益」页面按已核验活动 API 实施 | 本机 CLI 登录态和活动 Token 两套凭据，不混用；领取不是模型调用验证 |
+| 第三方逆向插件、提醒与后续能力 | 保留原后续方向 | 本轮不内置签名、设备指纹、验证码绕过或客户端凭据读取 |
+
+实施顺序：核验并固定官方 CLI 参数与实际返回结构；为支持的客户端新增适配器与禁工具、未登录、超时和模式隔离对照；前端按真实 kind/DTO 对齐运行时选项及能力说明；更新手册，最后做类型检查与浏览器新增交互、390/900 布局验收。当前实现路径见下文，完成状态以本轮源码及测试回填，不用历史调查当作当前调用已通过。
+
+验收要区分客户端接管（网关作为模型服务）、账号型上游（CLI 作为上游）、活动领取（平台权益 API）三个方向。未绑定账号型运行时的供应商保持 HTTP 路径；新增运行时和绑定均须用户显式操作，不自动安装或登录，不读取第三方凭据文件；Trae 的自动签到仍未适配，不作为本轮承诺。
+
+当前实现位置为 `src-tauri/src/agent_upstream/headless.rs`、`src-tauri/src/agent_upstream/runtime.rs` 和原适配器模块。数据库 runtime 的自定义 ID、kind、enabled、options 现有消费者：`options.executable`（兼容 `exe`）选择 CLI，`model_aliases` 映射模型名；拒绝额外 `args`/`env`。数据库记录优先，已停用记录不能绕过为同名内置运行时。仅无数据库记录时保留旧内置 ID 兼容路径。
+
+前端在供应商页支持运行时新建/编辑、可选路径与模型别名；供应商更多菜单新增「选择 HTTP / 账号型上游」，专用 `set_provider_runtime` 仅更新绑定并刷新后续路由，不改 Key、模型或定价。设置页说明接管与上游的方向差异，手册 0.2.1 为 23 章。新运行时的创建与绑定均由用户显式操作；Gemini CLI 本轮不新增账号型适配器，安装入口不等于接管或上游已适配。
+
+| 实现边界 | 官方依据与当前验收范围 |
+| --- | --- |
+| Qoder 中国版 | [官方 CLI 参数](https://docs.qoder.cn/cli/cli-reference)：无头输出、空工具、严格空 MCP（UUID 临时配置文件绝对路径，调用结束清理）、空设置来源、禁 hooks；本机缺新 CLI，未用真实账号调用 |
+| Claude Code | [官方 CLI 参数](https://code.claude.com/docs/en/cli-reference)：print JSON、空工具、严格 MCP、safe-mode；旧版缺参数时拒绝，不降级开工具；认证及管理策略仍由官方 CLI 处理 |
+| OpenCode | [官方 CLI](https://opencode.ai/docs/cli/)、[权限](https://opencode.ai/docs/permissions/) 与 [官方 debug config 实现](https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/src/cli/cmd/debug/config.ts)：先用与 run 相同的子进程环境执行配置预检，确认唯一 primary Agent 全 deny、share 禁用；显式插件或未关闭的 MCP 会被拒绝，预检通过后才发送提示词；不传 auto/share/attach，不承诺 OS 沙箱或 CLI 进程零副作用 |
+| TraeCode CLI 2.0 | [官方 ACP](https://docs.trae.cn/cli_agent-client-protocol) 已有文档，但缺本轮可靠的完整禁工具证据；只更新官方安装入口，不注册内置上游，也不声称自动签到 |
+
+新三款真实登录、模型调用及订阅额度未实测；离线协议/进程夹具与浏览器 IPC 回归只能证明本地行为和合同。历史 A6/A7 里的 L1→L3 设想并非本轮全部实现，当前调用路线以源码与审计为准，不写成已支持自动协议降级。
+
+OpenCode 预检使用官方 `opencode debug config` 的已解析、脱敏 JSON；网关不展示或记录这份配置。唯一 Agent 缺失、停用、非 primary、权限未全拒绝、share 未关闭、显式插件存在或 MCP 未显式关闭，均在 `run` 前报错，不向该 CLI 发送模型提示词。预检上限为 10 秒且不能超过请求总时限，后续 run 使用总时限的剩余时间；两段不分别获得完整超时。该门禁面向当前官方配置契约，旧版不支持预检时拒绝，不降级到默认工具 Agent。CLI 自身的配置解析、初始化与会话落盘仍不属于 OS 沙箱保护，不能将不发送提示词泛化成整个 CLI 零副作用。
+
+既有 `AttemptRecord.runtime_kind` 字段历史上实际保存账号 runtime_id，自定义 ID 不等于适配器 kind；本轮保持该审计合同，新增分派日志分别记录已解析的 id/kind且不记录 options、凭据或提示词。把审计 ID 与 kind 拆开属于后续改进，不宣称本轮已经完成。
+
+前端回归：`npx tsc --noEmit`、`npm run verify:manual`（23 章）、`npm run verify:plan`（7 份文档）退出码 0；完整 `verify:ui` 退出码 0，新目录 `.ui-smoke-out-20261010/` 共 115 张截图，保留旧 97 张场景并新增 18 张，覆盖路径/模型别名、绑定/解绑、390/900 布局，控制台错误为空。生产构建与真实安装包验证由同轮验证记录独立回填。
+
+最终全量门禁及 0.2.1 两包验收已通过：NSIS 实装后、MSI 提取后分别执行 12 项真实检查，覆盖本批运行时接线与原 VPN 流程；具体数量、校验值及未实测边界见[本批验证记录](验证记录.md)，不将受控 fake 调用写成所有客户端真实模型调用通过。
+
+---
+
 > 目标：让**任意账号型 AI 编程工具的订阅额度**，以本地 OpenAI 兼容接口提供给
 > Claude Code / Codex CLI / DSH / 本网关自身等任意 OpenAI 客户端。
 > 已确认走通的样板：**Codex**、**Qoder**；待核验：**Claude Code**、**TraeCode**、**WorkBuddy**；

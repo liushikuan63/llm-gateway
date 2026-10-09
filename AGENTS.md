@@ -13,6 +13,8 @@
 | 硬约束、执行纪律、模式隔离红线 | [`CLAUDE.md`](CLAUDE.md) |
 | 当前批次要做什么 | [`docs/VibeCoding任务卡-后续完善方案.md`](docs/VibeCoding任务卡-后续完善方案.md) |
 | 运行时优化与内置 VPN 增量任务 | [`docs/VibeCoding任务卡-运行时一致性与VPN集成.md`](docs/VibeCoding任务卡-运行时一致性与VPN集成.md) |
+| 账号权益、活动与奖励领取 | [`docs/VibeCoding任务卡-账号权益与签到.md`](docs/VibeCoding任务卡-账号权益与签到.md) |
+| 客户端接入能力与运行时配置 | [`docs/VibeCoding任务卡-账号型上游包装.md`](docs/VibeCoding任务卡-账号型上游包装.md) |
 | 现状陈述的证据（`路径:行号`）与落地台账 | [`docs/_FACTS-后续完善方案.md`](docs/_FACTS-后续完善方案.md) |
 | 整体架构 | [`docs/统一LLM网关设计方案.md`](docs/统一LLM网关设计方案.md) |
 | 智能路由 / 本地模型 / 搜索 | [`docs/智能路由与本地模型设计方案.md`](docs/智能路由与本地模型设计方案.md) |

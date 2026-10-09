@@ -49,6 +49,16 @@
 | 不知道本机 CLI 装没装、是不是旧版 | 检测 21 个主流 AI 编码 CLI，比对 npm 最新版本，展示确切命令后再一键安装或更新，并可用最小请求做端到端自检 |
 | 想随时知道 AI 工具在干什么 | 桌宠置顶小窗按宠物包动画呈现工作 / 空闲 / 出错状态；展开信息面板可查看带 AI 软件前缀的当前任务，并定位窗口、打开项目或确认后结束对应软件，宠物可通过官方 Petdex CLI 安装 |
 
+## 客户端账号与活动权益
+
+账号型上游支持 Codex、Qoder、Qoder CN、Claude Code 和 OpenCode，由用户在本机 CLI 完成登录。在供应商页新建或编辑账号运行时，可设置独立 id、客户端类型、可执行文件和模型别名映射；实际聊天与 Agent 入口都会按数据库配置解析，停用后立即拒绝执行。客户端安装、模型调用和奖励领取分别验收，检测到 CLI 并不意味着账号已登录或模型请求已通过。
+
+“账号权益”页支持 Qoder 国际版与国内版的活动查询、手动领取、自动领取和本地执行记录。总开关及自动领取默认关闭；自动领取仅在应用运行时每 5 分钟检查，并受开始小时和平台返回的实际活动窗口限制。用户手工填写活动 token，经 IPC 进入加密 secret 存储，界面只显示是否已保存；本工具不读取第三方客户端凭据文件。凭据过期时需重新填写。
+
+领取依据逐条活动状态，`replayed=true` 只显示已领，不计为新增奖励。同账号的并发操作合并，成功与已领记录按活动 ID 和实际起止时间持久判重；写请求失败不盲目重发，下一次先查平台状态。活动奖励数量与账号剩余余额不同：本版展示活动和领取结果，未接入总余额查询，不用 0 代替未知。Trae / WorkBuddy 的积分和自动签到接口尚未适配；Trae 的安装入口已更新到官方 CLI 2.0。
+
+新增客户端采用文本调用并限制模型工具，兼容版本若不接受所需参数会明确失败。OpenCode 在发送提示词前用官方只读配置命令核验独立文本 Agent、全禁工具与禁共享，遇到显式插件或启用的 MCP 时拒绝调用；预检仍由 CLI 自身解析/初始化配置，不提供系统沙箱。具体参数、官方来源和后续任务见 [客户端 VibeCoding 任务卡](docs/VibeCoding任务卡-账号型上游包装.md)与[权益 VibeCoding 任务卡](docs/VibeCoding任务卡-账号权益与签到.md)。本批离线测试和真实安装包流程覆盖接线与状态管理，实际账号发放结果需要用户本人凭据另验。
+
 ## 缓存与 VPN 代理
 
 设置中的精确缓存默认关闭，容量默认 200 条；可设置有效期秒数，0 为不过期。配置更新会清空缓存并拒绝旧在途响应回填，容量与有效期热生效。只缓存符合条件的非流式纯文本；流式、多模态、工具调用和搜索注入等保留绕过。
@@ -96,8 +106,8 @@ npm run tauri:build
 
 | 平台 | 路径 |
 | --- | --- |
-| Windows NSIS | `src-tauri/target/release/bundle/nsis/LLM Gateway_0.2.0_x64-setup.exe` |
-| Windows MSI | `src-tauri/target/release/bundle/msi/LLM Gateway_0.2.0_x64_en-US.msi` |
+| Windows NSIS | `src-tauri/target/release/bundle/nsis/LLM Gateway_0.2.1_x64-setup.exe` |
+| Windows MSI | `src-tauri/target/release/bundle/msi/LLM Gateway_0.2.1_x64_en-US.msi` |
 
 安装包使用 WebView2 `downloadBootstrapper` 模式；目标机器未安装 WebView2 时，安装过程需要联网下载运行时。当前未配置代码签名，首次运行 Windows 可能弹 SmartScreen，选「更多信息 → 仍然运行」。
 

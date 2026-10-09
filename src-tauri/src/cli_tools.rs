@@ -244,12 +244,12 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         id: "trae_cli",
-        label: "TRAE CLI",
+        label: "TraeCode CLI 2.0",
         source: InstallSource::PowerShellScript {
-            command: "irm https://trae.cn/trae-cli/install.ps1 | iex",
+            command: "irm https://trae.cn/trae-cli/install_v2.ps1 | iex",
         },
         binaries: &["traecli"],
-        docs_url: "https://docs.trae.cn/cli_get-started-with-trae-cli",
+        docs_url: "https://docs.trae.cn/cli_get-started-with-trae-code-cli-2",
     },
     ToolSpec {
         id: "hermes",

@@ -506,6 +506,9 @@ pub struct AppConfig {
     /// 任务卡二 A8：Agent 型入口的落盘与执行口径。默认全部保守
     /// （产物落在应用数据目录、`enabled=false`）。
     pub agent: AgentConfig,
+    /// 账号权益中心。默认关闭，活动查询和领取必须由用户显式启用。
+    /// 令牌仅进入加密 secret 存储，不写入配置或项目快照。
+    pub benefits: crate::benefit_config::BenefitsConfig,
 }
 
 /// 任务卡二 A8：Agent 型入口的配置。
@@ -788,6 +791,7 @@ impl Default for AppConfig {
             telemetry: crate::trace::TelemetryConfig::default(),
             // A8：默认 `enabled=false` + 产物根走应用数据目录。
             agent: AgentConfig::default(),
+            benefits: crate::benefit_config::BenefitsConfig::default(),
         }
     }
 }
@@ -987,6 +991,7 @@ impl AppConfig {
             anyhow::bail!("选择 SearXNG 后端时必须填写实例地址");
         }
         self.auth_failure.validate()?;
+        self.benefits.validate()?;
         Ok(())
     }
 

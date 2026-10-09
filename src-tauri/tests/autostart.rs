@@ -289,21 +289,18 @@ async fn 没拉起过时停止返回_false() {
 /* --------------------------- 真实 edgeJev 的配置 --------------------------- */
 
 #[test]
+#[ignore = "requires local edgeJev installation; set LLMGW_EDGEJEV_ROOT and run explicitly"]
 fn 本机_edgejev_的路径约定与命令构造一致() {
     // **不要把路径写死。** 这条测试的判据是「preflight 接受一个真实存在的布局」，
     // 而本机布局会变：初版是 `.venv-runtime\Scripts\edgejev.exe`，后来搬到了 E 盘
     // 并改成 `start_jev.py` 启动（2026-10-05）。写死路径的测试在换机/搬目录后
     // 会以「可执行文件不存在」失败，看起来像代码坏了，其实是环境变了。
     //
-    // 现在按「先找到再断言」：本机实际用的是哪一种就测哪一种。
-    let roots = [
-        r"E:\Users\Admin\Documents\deepseek-harness\default-workspace\jev",
-        r"C:\Users\Admin\Documents\deepseek-harness\default-workspace\jev",
-    ];
-    let root = roots
-        .iter()
-        .find(|r| std::path::Path::new(r).is_dir())
-        .unwrap_or_else(|| panic!("edgeJev 根目录不存在，试过：{roots:?}"));
+    // 托管 CI 没有本机模型/解释器。真实布局必须由验收者显式提供；
+    // 普通预检及参数用例仍默认执行，不用成功返回来伪装环境缺失。
+    let root =
+        std::env::var("LLMGW_EDGEJEV_ROOT").expect("真实布局验收需要设置 LLMGW_EDGEJEV_ROOT");
+    assert!(std::path::Path::new(&root).is_dir(), "edgeJev 根目录不存在");
     let model_dir = format!(r"{root}\jev-int8");
     assert!(
         std::path::Path::new(&model_dir).is_dir(),

@@ -1,5 +1,35 @@
 # VibeCoding 任务卡 · 账号权益、签到与领奖
 
+## 2026-10-10 实施现状与本轮计划
+
+本节是本轮实施入口；下文 2026-10-05/06 的调查、撤回记录与接口证据保留为历史，不代表当前代码状态。开工检查工作区干净；此前已有供应商额度查询与账号型运行时管理，但没有独立账号权益中心。本轮按 §九已核验的 Qoder 国际版/中国版契约实施，不重新读取第三方凭据或代登录。
+
+原 N2/N3/N4/V3 优化方向继续保留在[运行时一致性与 VPN 集成任务卡](VibeCoding任务卡-运行时一致性与VPN集成.md)，本批账号权益是补充；总余额适配、到期提醒和更多平台权益须分别核验，不能以活动条数或领取历史代替完成声明。
+
+当前源码已接入独立「账号权益」页面、账号配置、活动详情、手动/可选自动领取、加密 Token 与领取记录。配置定义在 `src-tauri/src/benefit_config.rs`，纯解析与应用编排合并在 `src-tauri/src/benefits.rs`，沿用 `db/repo.rs` 和 `db/migrations.rs`；没有另建历史规格中的 `benefit_center.rs`。IPC 为 `benefits_overview`、`claim_benefit_now`、`set_benefit_token`、`clear_benefit_token`、`benefit_runs`；账号与开关走既有 `update_config`。返回 `has_token` 与固定掩码，不返回 Token 原文，密钥按平台和账号分别存储。
+
+| 能力 | 本轮范围 | 其他平台边界 |
+| --- | --- | --- |
+| 活动列表、逐条领取状态、积分数量与有效期 | Qoder / Qoder CN；未知金额或时间显示未知 | Trae 等平台仅列能力差异，不假装已适配 |
+| 手动领取、发放与重复领取结果、执行历史 | 用户显式触发；以后端逐条 campaign 状态为准 | 不把登录、模型调用或桌面提醒当成签到成功 |
+| 每日自动领取 | 总开关与自动领取均默认关闭，用户显式开启后复用手动路径 | 未核验平台不提供可操作的自动领取开关 |
+| Token 管理 | 用户自行输入，仅 Tauri IPC 提交；返回只带凭据状态，保存后清空输入 | 不读客户端凭据文件，不在页面、配置、日志或导出中回显 Token |
+| 账号型模型调用 | 在供应商运行时管理中独立配置 | 与本页领取凭据和赠送积分分开，不保证调用可用或额度互通 |
+
+账号型 OpenCode 调用还须通过独立的配置预检：在同一子进程环境先执行官方 `opencode debug config`，确认唯一 primary Agent 全 deny、share 禁用；显式插件或未关闭的 MCP 会导致拒绝，未通过时不执行 run、不发送模型提示词。预检最多 10 秒并与 run 共用请求总时限。这项门禁不验证活动 Token 或积分，也不等于 OS 沙箱；CLI 自身解析、初始化与会话落盘仍有独立边界。详见另一任务卡的当前 OpenCode 能力矩阵。
+
+实施顺序：先落实后端 DTO/IPC 与禁用不发请求、幂等/错误不封窗测试，再接入「账号权益」导航和页面；随后对齐客户端运行时能力说明，更新单一手册源 `src/content/user-manual.json`，最后运行类型检查与真实浏览器 IPC 夹具回归。手册已更新为 0.2.1、23 章；最终命令结果回填验证记录。
+
+页面验收必须覆盖默认关闭、缺少 Token、加载失败/重试、活动详情、金额未知、`granted` 与 `replayed` 分离、手动失败可重试、自动设置保存、历史记录、导航退出后的迟到结果保护，以及 390/900 像素布局与控制台错误。浏览器 mock 不代表已真实领取；本轮实测领取另列证据，不用历史截图替代。
+
+本轮没有使用真实平台 Token 调用活动 API，因此没有新的真实余额、实际发放或生产接口漂移验收结论。页面只展示活动权益，不承诺账户总余额；自动领取仅在应用运行时执行。托盘或到期主动提醒仍属后续方向，不能将页面内历史记录写成主动提醒已完成。
+
+前端回归：类型检查与手册/任务卡验证退出码 0；完整浏览器 `verify:ui` 退出码 0，截图独立写入 `.ui-smoke-out-20261010/`（115 张，旧 97 场景全部保留）。新增断言覆盖默认不查询/不领取、每平台 Token 隔离与不回显、活动详情/未知值、失败后重试、发放与重复领取、自动开关/小时校验、历史、严格模式乱序及卸载后的迟到响应；390/900 布局已目视，控制台错误为空。此处“发放”是保真 IPC 夹具分支，不代表真实平台发放验收。
+
+最终全量门禁和 0.2.1 包端验收已通过；NSIS 实装后与 MSI 提取后分别验证权益页、默认关闭、Token 加密/清除、管理 HTTP 鉴权等真实接线。两组各 12 项包含原 VPN 流程，具体证据见[本批验证记录](验证记录.md)；合成 Token 未发平台，不作为实际奖励到账结论。
+
+---
+
 > 需求：把「每日签到 / 活动赠送积分」这类平台权益，直接在网关里看到并领取，
 > 而不是每天自己在七八个平台之间手动点一遍。
 
@@ -28,7 +58,7 @@
 |---|---|
 | 网关已有平台适配层：`QuotaAdapter { Openrouter, Deepseek, Newapi, Sub2api }`，按 host 注册，未知中转站按 `NewApi → Sub2Api` 顺序尝试，**无适配时明确给出「该服务尚无已适配的额度查询接口」警告而不是假装有数据** | `src-tauri/src/provider_quota.rs:14-20, 112-126` |
 | 已知端点：`openrouter /key`、`deepseek /user/balance`、`NewAPI /api/usage/token`、`Sub2API /v1/usage` | 同上 `:176-185` |
-| 网关**没有任何定时器**；只有 `server.rs:230` 一个 300 秒的维护 tick | `src-tauri/src/proxy/server.rs:230` |
+| 2026-10-05 历史现状：网关没有独立权益调度器；当时使用 `src-tauri/src/proxy/server.rs` 的维护 tick（旧估计行号 230，非当前引用） | `src-tauri/src/proxy/server.rs` |
 | Qoder「每日 100 Credits」规则原文：窗口每天 10:00（UTC+8）开启、次日前夕关闭；**每窗口限领一次，必须手动领、错过不补、不结转**；**仅限在 Qoder 桌面端领取**；有效期 30 天、先到期先扣；个人用户适用、Teams/Enterprise 不适用 | <https://docs.qoder.com/events/100credits.md>（2026-10-05 取） |
 | Qoder 的额度可以**官方读取**：CLI `/usage` 面板（Plan / Plan Expiration Date / Plan Credits Used / Add-on Credits Used），Agent SDK 另有 `getUsageInfo()` | <https://docs.qoder.com/cli/usage.md>；`/usage` **需要已登录或已设 Access Token** |
 | 本机已配置的 8 家平台：commandcode、openrouter、zai-coding-cn、sensenova、maas-api、geeknow、shitapi、agentrouter（+ 本地 Ollama） | 2026-10-05 探测结果，见 `2026-10-05-导入DSH供应商与模型.md` |
@@ -207,7 +237,7 @@ agentrouter 是 L2' 的典型：**端点有，但凭据是账号密码**——�
 |---|---|
 | 平台适配 | 与 `provider_quota.rs` 同文件同风格的 `ClaimAdapter`，共用 host → 适配器 的注册表；没有就返回「该平台暂无已适配的领取接口」 |
 | 执行记录 | 新表 `claim_runs`（`provider_id / window_key / verdict / amount / message / ts`）；`window_key` 用「平台 + 本地日期」保证一天一次可判重 |
-| 调度 | 挂在 `server.rs:230` 已有的 300 秒 tick 上：到点且本地判定「窗口开启且今日未领」才跑。**不引入新的定时器子系统** |
+| 调度 | 历史设计：挂在 `src-tauri/src/proxy/server.rs` 已有维护 tick 上（旧估计行号 230）：到点且本地判定「窗口开启且今日未领」才跑。**不引入新的定时器子系统** |
 | 手动入口 | Tauri 命令 `claim_now(provider_id)` + 供应商卡片上的按钮 |
 | 界面 | 供应商卡片增一块「权益」：余额、赠送额度、最近到期、今日状态（可领 / 已领 / 不适用）、最近一次领取结果 |
 | 与 R1 联动 | 供应商因鉴权失败被自动停用、或额度为 0 时，在卡片上直接提示「该平台有可领权益 / 订阅到期」 |

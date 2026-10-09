@@ -55,6 +55,8 @@ pub fn exec_args(model: &str, prompt: &str) -> Vec<String> {
         args.push("-m".to_string());
         args.push(model.to_string());
     }
+    // A prompt beginning with '-' is data, never an additional CLI permission flag.
+    args.push("--".to_string());
     args.push(prompt.to_string());
     args
 }
@@ -247,6 +249,21 @@ mod tests {
     }
 
     #[test]
+    fn 前导开关提示词始终位于参数分隔符后() {
+        for prompt in [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--model=unexpected",
+            "review",
+        ] {
+            let args = exec_args("gpt-5", prompt);
+            assert_eq!(args.last().unwrap(), prompt);
+            assert_eq!(args[args.len() - 2], "--");
+            assert_eq!(args.iter().filter(|arg| *arg == "--").count(), 1);
+            assert_eq!(args[args.len() - 4..args.len() - 2], ["-m", "gpt-5"]);
+        }
+    }
+
+    #[test]
     fn 解析取最后一条助手消息() {
         // 事件流形态按候选路径的关键字段构造 —— 形状未确认，
         // 但**取最后一条**这个语义是确定的（前面的都是过程）。
@@ -363,24 +380,34 @@ mod run_json_cli_tests {
         );
     }
 
-    /// 非零退出：错误里要带 stderr 的**前几行** —— 那里面通常就是原因。
+    /// 非零退出保留分类和退出码，但不能回显第三方 stderr 中的凭据或提示词。
     #[tokio::test]
-    async fn 非零退出时把_stderr_带进错误() {
+    async fn 非零退出时分类_stderr_且不回显原文() {
         #[cfg(windows)]
         let (program, args) = (
             "cmd".to_string(),
-            vec!["/C".to_string(), "echo 未登录 >&2 & exit /b 3".to_string()],
+            vec![
+                "/C".to_string(),
+                "echo authentication failed fixture-secret >&2 & exit /b 3".to_string(),
+            ],
         );
         #[cfg(not(windows))]
         let (program, args) = (
             "sh".to_string(),
-            vec!["-c".to_string(), "echo 未登录 >&2; exit 3".to_string()],
+            vec![
+                "-c".to_string(),
+                "echo authentication failed fixture-secret >&2; exit 3".to_string(),
+            ],
         );
 
         let err = run_json_cli(&program, &args, 30_000, "mock-fail")
             .await
             .expect_err("非零退出必须报错");
-        assert!(err.contains("未登录"), "stderr 内容要出现在错误里：{err}");
+        assert!(err.contains("未登录"), "错误保留登录分类：{err}");
+        assert!(
+            !err.contains("fixture-secret"),
+            "stderr 原文不得进入错误：{err}"
+        );
         assert!(err.contains("退出码"), "要带上退出码：{err}");
     }
 

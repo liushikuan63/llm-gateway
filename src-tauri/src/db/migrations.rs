@@ -195,6 +195,25 @@ CREATE TABLE IF NOT EXISTS agent_runtimes (
 "#,
     ),
     (
+        "benefit_runs",
+        r#"
+CREATE TABLE IF NOT EXISTS benefit_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id   TEXT NOT NULL,
+    platform     TEXT NOT NULL,
+    window_key   TEXT NOT NULL,
+    campaign_key TEXT,
+    verdict      TEXT NOT NULL,
+    amount       REAL,
+    message      TEXT,
+    manual       INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_benefit_runs_account ON benefit_runs(account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_benefit_runs_window ON benefit_runs(account_id, window_key, verdict);
+"#,
+    ),
+    (
         "meta",
         r#"
 CREATE TABLE IF NOT EXISTS meta (

@@ -453,6 +453,25 @@ V1 仍由用户选择本地内核文件。**尚未交付**内核预置/自动安
 
 N2 请求形状预演、N3 并发预算预占、N4 跨实现契约矩阵、V3 系统代理/TUN/权限服务继续列在 [增量任务卡](VibeCoding任务卡-运行时一致性与VPN集成.md)。真实外部节点/订阅、系统网络接管和收费上游仍未作为本轮离线验收内容。此时报告是多个瞬时快照，不能承诺跨配置/VPN/DB 原子一致。
 
+## O. 2026-10-10 账号权益与客户端接入补漏
+
+本批是在 R1–R4/V1/V2/N1 及原 A–D 方向上的补充，任务细则沿用 [账号型上游任务卡](VibeCoding任务卡-账号型上游包装.md)与[账号权益任务卡](VibeCoding任务卡-账号权益与签到.md)。应用版本更新为 0.2.1，未增加依赖或更改路由权重。新增 `benefit_runs` 表为增量迁移，历史 Provider、请求审计与加密 secret 保留。
+
+| 补漏 | 当前源码依据与行为 |
+| --- | --- |
+| 真实运行时解析 | `src-tauri/src/agent_upstream/runtime.rs` 先查数据库，以 id 找 kind/enabled/executable/model_aliases；有行时不回退同名内置客户端。单条执行读取拒绝损坏 options，列表仍可展示待修配置。普通聊天与独立 Agent 入口都使用该解析器，旧内置 id 仅在没有数据库行时兼容。 |
+| 页面到生产调用 | `src/pages/Providers.tsx` 和 `src-tauri/src/commands.rs` 增加显式供应商绑定/解绑。修改仅影响 runtime_id/更新时间，不改 Key、模型和定价。运行时保存清除响应缓存；HTTP 与 IPC 共用实际加载插件的注册表。 |
+| 更多客户端 | `src-tauri/src/agent_upstream/headless.rs` 新增 Qoder CN、Claude Code、OpenCode，连同原 Codex/Qoder 共 5 个真实类型（另有 fake 夹具）。新客户端限制模型工具；OpenCode 在发送提示词前预检已解析配置，拒绝默认 Agent 回退、显式插件和启用的 MCP。旧 Codex 权限继承不属于新增无工具保证，所有 CLI 都不提供操作系统沙箱。 |
+| 活动权益与奖励 | `src-tauri/src/benefits.rs` 与 `src-tauri/src/benefit_config.rs` 支持 Qoder 国际/国内固定主机活动协议。总开关/自动领取默认关；只读列表不领取；手动与后台 300 秒检查共用 singleflight、真实活动窗口和持久记录。实际发放与 replayed 分开，重放不计新增 amount；错误不封窗，后续先 GET 确认，不盲重 POST。 |
+| 凭据边界 | `commands.rs` 的 Token 写入只有 IPC。secret 按平台和账号分别加密，返回 has_token 与固定掩码，不读第三方凭据文件。HTTP 管理路由复用统一 Key 和外部/反代客户端拒绝；固定 HTTPS host、禁重定向、有限超时和 512 KiB 响应上限。 |
+| 当前验证状态 | 最终全量 `scripts/ci-local.ps1 -Step all` 退出码 0：61 份 Rust suite 输出，1115 passed / 0 failed / 18 ignored；421 条定向测试是全量的子集，不重复累计。显式本机 edgeJev 布局验收另有 1 passed。浏览器 115 张截图通过，23 章手册、7 份任务文档校验通过；0.2.1 两包构建、NSIS 实装后及 MSI 提取后各 12 项真实 WebView2/IPC 验收退出码 0。NSIS 卸载与原用户 5 文件摘要保护通过；不将 MSI 提取写成整机安装。 |
+
+活动数量和领取记录不等于账户总余额。本批没有手动真实 Token，未验证平台生产协议漂移或新奖励到账，也未验证三个新增客户端的本人登录模型调用。Trae/WorkBuddy 的权益接口保持未适配；Trae 安装入口仅更新到官方 CLI 2.0，不算上游或签到接通。活动接口是历史两次实际取证形成的协议，官方活动说明只用于核验现行规则，不将历史取证写成公开稳定的官方 API 合约。
+
+仍需独立推进：总余额适配、到期/托盘提醒、Trae/WorkBuddy 官方协议与本人权限验收，以及原 N2/N3/N4/V3。历史审计 `runtime_kind` 列仍存运行时 id，当前分派日志已区分 runtime_id 与适配器 kind，审计契约迁移继续保留在任务卡。
+
+持久交付位于 `D:/Java/GitHub/llm-auto/artifacts/LLM-Gateway-0.2.1-20261010`，包大小、SHA-256、真实验收结果与边界见[验证记录](验证记录.md)。独立证据在 `%TEMP%/llmgw-accounts-acceptance-20261010/`；不覆盖上一批 0.2.0 文件，不将私有测试数据库或密钥复制进交付目录。
+
 ## F. 本文的过期条件
 
 出现下列任一情况，本文即失效，必须重新盘点而不是直接沿用：

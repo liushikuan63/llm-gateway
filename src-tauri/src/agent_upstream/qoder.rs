@@ -49,13 +49,21 @@ pub const QODER_PROTOCOL_VERSION: &str = "1.5.0";
 pub fn stream_args(prompt: &str) -> Vec<String> {
     vec![
         "-p".to_string(),
-        prompt.to_string(),
         "-o".to_string(),
         "stream-json".to_string(),
         // 必须是 `--tools=`（带等号的空值）而不是两个参数 `--tools ""`——
         // 后者在 PowerShell 与部分 shell 下空串会被丢掉，
         // CLI 报 `option '--tools <tools...>' argument missing`（实测踩到）。
         "--tools=".to_string(),
+        "--strict-mcp-config".to_string(),
+        "--mcp-config".to_string(),
+        "{\"mcpServers\":{}}".to_string(),
+        "--setting-sources=".to_string(),
+        "--settings".to_string(),
+        "{\"disableAllHooks\":true}".to_string(),
+        "--no-session-persistence".to_string(),
+        "--".to_string(),
+        prompt.to_string(),
     ]
 }
 
@@ -173,7 +181,14 @@ impl AgentAdapter for QoderAdapter {
     }
 
     async fn send(&self, request: AgentRequest) -> Result<AgentReply, String> {
-        let args = stream_args(&request.prompt);
+        let mut args = stream_args(&request.prompt);
+        if !request.model.trim().is_empty() {
+            let position = args.len() - 2;
+            args.splice(
+                position..position,
+                ["--model".into(), request.model.clone()],
+            );
+        }
         let stdout =
             super::run_json_cli(self.program(), &args, request.timeout_ms.max(1), "qoder").await?;
         let (version, text) = parse_events(&stdout)?;
@@ -213,12 +228,40 @@ mod tests {
     /// 然后断言回显内容。回显是子进程视角的证据，不是我的构造。
     #[tokio::test]
     async fn 实际命令行里带的是无工具参数() {
-        // mock：把收到的每个参数用 `|` 连起来打到 stdout。
-        // Windows 用 cmd 的 `%*`；非 Windows 用 sh 的 `$@`。
+        // CREATE_NO_WINDOW 下 cmd/chcp 仍可能输出 OEM；使用明确 UTF-8 的脚本。
+        // 非 Windows 用 sh 的 `$@`。
         #[cfg(windows)]
-        let (program, _extra) = ("cmd".to_string(), ());
+        struct ProbeScript(std::path::PathBuf);
         #[cfg(windows)]
-        let mut argv = vec!["/C".to_string(), "echo %*".to_string()];
+        impl Drop for ProbeScript {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        #[cfg(windows)]
+        let probe = {
+            use std::io::Write;
+            let path =
+                std::env::temp_dir().join(format!("llmgw-qoder-argv-{}.ps1", uuid::Uuid::new_v4()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let guard = ProbeScript(path);
+            let written = file.write_all(b"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)\n$args|ForEach-Object{[Console]::Out.WriteLine($_)}\n");
+            drop(file);
+            written.unwrap();
+            guard
+        };
+        #[cfg(windows)]
+        let program = "powershell.exe".to_string();
+        #[cfg(windows)]
+        let mut argv = vec![
+            "-NoProfile".to_string(),
+            "-File".to_string(),
+            probe.0.to_str().unwrap().to_string(),
+        ];
         #[cfg(not(windows))]
         let (program, mut argv) = (
             "sh".to_string(),
@@ -275,7 +318,8 @@ mod tests {
         );
         assert!(args.contains(&"-o".to_string()));
         assert!(args.contains(&"stream-json".to_string()));
-        assert_eq!(args[1], "你好", "提示词要真的传进去");
+        assert_eq!(args.last().unwrap(), "你好", "提示词要真的传进去");
+        assert_eq!(args[args.len() - 2], "--", "提示词不能覆盖工具开关");
     }
 
     #[test]

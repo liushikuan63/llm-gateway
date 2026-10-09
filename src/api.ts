@@ -167,6 +167,89 @@ export interface AppConfig {
   cascade: CascadePolicy;
   search: SearchConfig;
   cache: CacheConfig;
+  benefits: BenefitsConfig;
+}
+
+export type BenefitPlatform = "qoder" | "qoder_cn";
+export interface BenefitAccount {
+  id: string;
+  platform: BenefitPlatform;
+  label: string;
+  enabled: boolean;
+}
+export interface BenefitsConfig {
+  enabled: boolean;
+  auto_claim: boolean;
+  auto_claim_after_hour: number;
+  accounts: BenefitAccount[];
+}
+export interface BenefitCampaign {
+  campaign_id: string;
+  campaign_key: string;
+  claim_status: "CLAIMABLE" | "CLAIMED" | "UNKNOWN";
+  action_type: string;
+  amount: number | null;
+  kind: string | null;
+  valid_days: number | null;
+  start_at: number | null;
+  end_at: number | null;
+}
+export interface BenefitStatus {
+  platform: string;
+  claimable: boolean;
+  campaigns: BenefitCampaign[];
+  source: string;
+  warnings: string[];
+  checked_at: string;
+}
+export type BenefitVerdict = "granted" | "replayed" | "no_claimable" | "skipped" | "error";
+export interface BenefitRunRecord {
+  id: number;
+  account_id: string;
+  platform: string;
+  window_key: string;
+  campaign_key: string | null;
+  verdict: BenefitVerdict;
+  amount: number | null;
+  message: string;
+  manual: boolean;
+  created_at: string;
+}
+export interface BenefitAccountView {
+  account_id: string;
+  platform: BenefitPlatform;
+  label: string;
+  enabled: boolean;
+  has_token: boolean;
+  token_masked: string | null;
+  status: BenefitStatus | null;
+  last_run: BenefitRunRecord | null;
+  error: string | null;
+  capabilities: { query: boolean; manual_claim: boolean; auto_claim: boolean; scope: string };
+}
+export interface BenefitOverview {
+  enabled: boolean;
+  auto_claim: boolean;
+  auto_claim_after_hour: number;
+  checked_at: string;
+  accounts: BenefitAccountView[];
+}
+export interface ClaimOutcome {
+  platform: string;
+  campaign_id: string;
+  campaign_key: string;
+  status: string;
+  replayed: boolean;
+  granted: boolean;
+  amount: number | null;
+  kind: string | null;
+  claimed_at: string | null;
+  expires_at: string | null;
+  message: string;
+}
+export interface BenefitClaimResult {
+  run: BenefitRunRecord;
+  outcome: ClaimOutcome | null;
 }
 
 export interface CacheConfig {
@@ -1212,6 +1295,13 @@ export const api = {
    */
   listAgentRuntimes: () => invoke<AgentRuntime[]>("list_agent_runtimes"),
 
+  benefitsOverview: () => invoke<BenefitOverview>("benefits_overview"),
+  claimBenefitNow: (accountId: string) => invoke<BenefitClaimResult>("claim_benefit_now", { accountId }),
+  setBenefitToken: (accountId: string, token: string) => invoke<void>("set_benefit_token", { accountId, token }),
+  clearBenefitToken: (accountId: string) => invoke<void>("clear_benefit_token", { accountId }),
+  benefitRuns: (accountId: string | null = null, limit = 50) =>
+    invoke<BenefitRunRecord[]>("benefit_runs", { accountId, limit }),
+
   /**
    * 已注册的适配器，`[id, label]`。
    *
@@ -1224,6 +1314,9 @@ export const api = {
     invoke<void>("save_agent_runtime", { runtime }),
 
   deleteAgentRuntime: (id: string) => invoke<void>("delete_agent_runtime", { id }),
+
+  setProviderRuntime: (providerId: string, runtimeId: string | null) =>
+    invoke<void>("set_provider_runtime", { providerId, runtimeId }),
 
   /**
    * 让用户选一个保存路径。取消时返回 `null`。

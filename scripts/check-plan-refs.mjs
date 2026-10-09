@@ -31,6 +31,8 @@ const DOCS = [
   'docs/_FACTS-后续完善方案.md',
   'docs/VibeCoding任务卡-后续完善方案.md',
   'docs/VibeCoding任务卡-运行时一致性与VPN集成.md',
+  'docs/VibeCoding任务卡-账号权益与签到.md',
+  'docs/VibeCoding任务卡-账号型上游包装.md',
   'CLAUDE.md',
   'README.md',
 ];

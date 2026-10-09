@@ -1956,7 +1956,7 @@ pub async fn list_agent_runtimes(pool: &SqlitePool) -> Result<Vec<AgentRuntime>>
     Ok(out)
 }
 
-/// 读一个运行时。不存在返回 `None`。
+/// 执行前严格读取运行时；坏 options 不得回落默认 CLI。列表保留可读降级。
 pub async fn get_agent_runtime(pool: &SqlitePool, id: &str) -> Result<Option<AgentRuntime>> {
     let row = sqlx::query(
         "SELECT id, kind, label, options_json, enabled, created_at, updated_at \
@@ -1966,7 +1966,30 @@ pub async fn get_agent_runtime(pool: &SqlitePool, id: &str) -> Result<Option<Age
     .fetch_optional(pool)
     .await?;
     match row {
-        Some(row) => Ok(Some(read_agent_runtime(&row)?)),
+        Some(row) => {
+            let options = match row.get::<Option<String>, _>("options_json") {
+                Some(raw) => {
+                    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+                        crate::error::GatewayError::Other(anyhow::anyhow!(
+                            "账号运行时 options_json 无效，请重新保存运行时配置"
+                        ))
+                    })?;
+                    if !parsed.is_object() {
+                        return Err(crate::error::GatewayError::Other(anyhow::anyhow!(
+                            "账号运行时 options_json 必须是对象"
+                        )));
+                    }
+                    Some(parsed)
+                }
+                None => None,
+            };
+            let mut runtime = read_agent_runtime(&row)?;
+            runtime.options = options;
+            runtime
+                .validate()
+                .map_err(|error| crate::error::GatewayError::Other(anyhow::anyhow!(error)))?;
+            Ok(Some(runtime))
+        }
         None => Ok(None),
     }
 }
@@ -2052,4 +2075,95 @@ pub async fn providers_using_runtime(pool: &SqlitePool, runtime_id: &str) -> Res
         .fetch_all(pool)
         .await?;
     Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+}
+
+/// Bind an existing enabled runtime row without changing any other provider/model settings.
+pub async fn set_provider_runtime(
+    pool: &SqlitePool,
+    provider_id: &str,
+    runtime_id: Option<&str>,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE providers SET runtime_id=?,updated_at=? WHERE id=? AND (? IS NULL OR EXISTS (SELECT 1 FROM agent_runtimes WHERE id=? AND enabled=1))",
+    )
+    .bind(runtime_id)
+    .bind(Utc::now())
+    .bind(provider_id)
+    .bind(runtime_id)
+    .bind(runtime_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/* ---------------------------- Campaign benefits ---------------------------- */
+
+pub async fn insert_benefit_run(
+    pool: &SqlitePool,
+    run: &crate::benefits::BenefitRunRecord,
+) -> Result<i64> {
+    let result = sqlx::query(
+        "INSERT INTO benefit_runs (account_id,platform,window_key,campaign_key,verdict,amount,message,manual,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&run.account_id)
+    .bind(&run.platform)
+    .bind(&run.window_key)
+    .bind(&run.campaign_key)
+    .bind(run.verdict.as_str())
+    .bind(run.amount)
+    .bind(&run.message)
+    .bind(run.manual)
+    .bind(&run.created_at)
+    .execute(pool)
+    .await?;
+    Ok(result.last_insert_rowid())
+}
+
+pub async fn benefit_window_settled(
+    pool: &SqlitePool,
+    account_id: &str,
+    window_key: &str,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM benefit_runs WHERE account_id=? AND window_key=? AND verdict IN ('granted','replayed')",
+    )
+    .bind(account_id)
+    .bind(window_key)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
+pub async fn list_benefit_runs(
+    pool: &SqlitePool,
+    account_id: Option<&str>,
+    limit: u32,
+) -> Result<Vec<crate::benefits::BenefitRunRecord>> {
+    use crate::benefits::{BenefitRunRecord, BenefitVerdict};
+    let rows = sqlx::query(
+        "SELECT id,account_id,platform,window_key,campaign_key,verdict,amount,message,manual,created_at FROM benefit_runs WHERE (? IS NULL OR account_id=?) ORDER BY id DESC LIMIT ?",
+    )
+    .bind(account_id)
+    .bind(account_id)
+    .bind(limit.min(200))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| BenefitRunRecord {
+            id: row.get("id"),
+            account_id: row.get("account_id"),
+            platform: row.get("platform"),
+            window_key: row.get("window_key"),
+            campaign_key: row.get("campaign_key"),
+            verdict: BenefitVerdict::parse(row.get::<String, _>("verdict").as_str())
+                .unwrap_or(BenefitVerdict::Error),
+            amount: row.get("amount"),
+            message: row
+                .get::<Option<String>, _>("message")
+                .unwrap_or_else(|| "执行记录未提供详情".into()),
+            manual: row.get::<i64, _>("manual") != 0,
+            created_at: row.get("created_at"),
+        })
+        .collect())
 }

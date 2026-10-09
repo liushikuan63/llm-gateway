@@ -18,7 +18,104 @@ use crate::model_catalog;
 use crate::proxy::server::GatewayState;
 use crate::AppState;
 
+/* ---------------------------- 账号权益与奖励 ---------------------------- */
+
+#[tauri::command]
+pub async fn benefits_overview(
+    state: State<'_, AppState>,
+) -> Result<crate::benefits::BenefitOverview, String> {
+    let cfg = state.config.read().clone();
+    state
+        .gateway
+        .benefits
+        .overview(&cfg.benefits, cfg.http_proxy.as_deref())
+        .await
+}
+
+#[tauri::command]
+pub async fn claim_benefit_now(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::benefits::BenefitClaimResult, String> {
+    let cfg = state.config.read().clone();
+    state
+        .gateway
+        .benefits
+        .claim_now(&cfg.benefits, cfg.http_proxy.as_deref(), &account_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn set_benefit_token(
+    state: State<'_, AppState>,
+    account_id: String,
+    token: String,
+) -> Result<(), String> {
+    let cfg = state.config.read().clone();
+    state
+        .gateway
+        .benefits
+        .set_token(&cfg.benefits, &account_id, &token)
+        .await
+}
+
+#[tauri::command]
+pub async fn clear_benefit_token(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<(), String> {
+    let cfg = state.config.read().clone();
+    state
+        .gateway
+        .benefits
+        .clear_token(&cfg.benefits, &account_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn benefit_runs(
+    state: State<'_, AppState>,
+    account_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<crate::benefits::BenefitRunRecord>, String> {
+    state
+        .gateway
+        .benefits
+        .runs(account_id.as_deref(), limit.unwrap_or(50).clamp(1, 200))
+        .await
+}
+
 /* ------------------------------- Provider ------------------------------- */
+
+/// 显式绑定或解除账号上游；普通供应商保存继续保留已有绑定。
+#[tauri::command]
+pub async fn set_provider_runtime(
+    state: State<'_, AppState>,
+    provider_id: String,
+    runtime_id: Option<String>,
+) -> Result<(), String> {
+    if let Some(id) = runtime_id.as_deref() {
+        let runtime = repo::get_agent_runtime(state.db.pool(), id)
+            .await
+            .map_err(|_| "无法读取账号运行时".to_string())?
+            .ok_or_else(|| "请先创建并启用要绑定的账号运行时".to_string())?;
+        if !runtime.enabled {
+            return Err("该账号运行时已停用，不能建立新绑定".into());
+        }
+        crate::agent_upstream::resolve_runtime(state.db.pool(), &state.adapters, id).await?;
+    }
+    if !repo::set_provider_runtime(state.db.pool(), &provider_id, runtime_id.as_deref())
+        .await
+        .map_err(|_| "无法更新供应商账号绑定".to_string())?
+    {
+        return Err("供应商不存在，或账号运行时已被删除/停用；请刷新后重试".into());
+    }
+    state
+        .gateway
+        .reload_providers()
+        .await
+        .map_err(|_| "绑定已保存，但刷新路由失败，请重试刷新".to_string())
+}
 
 /// 前端提交的 provider 表单。api_key 是明文，落库前加密。
 #[derive(Debug, Clone, Deserialize)]
@@ -1810,7 +1907,10 @@ pub async fn save_agent_runtime(
     }
     repo::upsert_agent_runtime(state.db.pool(), &runtime)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // 可执行文件、别名或启停变更后，旧账号响应不能继续命中缓存。
+    state.gateway.cache.invalidate_all();
+    Ok(())
 }
 
 /// 删除运行时。

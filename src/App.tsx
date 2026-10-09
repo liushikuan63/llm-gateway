@@ -13,6 +13,7 @@ import StatsPage from "./pages/Stats";
 import SettingsPage from "./pages/Settings";
 import VpnPage from "./pages/Vpn";
 import DiagnosticsPage from "./pages/Diagnostics";
+import BenefitsPage from "./pages/Benefits";
 import LocalModelsPage from "./pages/LocalModels";
 import CapabilitiesPage from "./pages/Capabilities";
 
@@ -22,6 +23,7 @@ const NAVIGATION = [
   { id: "capabilities", label: "能力与取舍", description: "各来源对同一模型能力的说法、冲突与可解释性。", icon: "activity" },
   { id: "sessions", label: "会话上下文", description: "查看持久化消息、摘要与路由续接信息。", icon: "sessions" },
   { id: "stats", label: "用量与审计", description: "核对请求量、降级过程与实际路由记录。", icon: "activity" },
+  { id: "benefits", label: "账号权益", description: "查看活动赠送权益、领取结果与执行记录。", icon: "activity" },
   { id: "vpn", label: "VPN 与代理", description: "管理本机内核、节点与网关代理出口。", icon: "shield" },
   { id: "diagnostics", label: "本地诊断", description: "本地检查网关状态并导出脱敏报告。", icon: "monitor" },
   { id: "settings", label: "设置", description: "配置监听边界、访问控制与网关行为。", icon: "settings" },
@@ -410,7 +412,8 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
               {tab === "sessions" && <SessionsPage />}
               {tab === "stats" && <StatsPage />}
               {tab === "vpn" && <VpnPage />}
-              {tab === "diagnostics" && <DiagnosticsPage />}
+          {tab === "diagnostics" && <DiagnosticsPage />}
+          {tab === "benefits" && <BenefitsPage />}
               {tab === "settings" && <SettingsPage />}
             </>
           )}

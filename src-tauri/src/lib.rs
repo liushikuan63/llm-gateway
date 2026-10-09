@@ -4,6 +4,8 @@ pub mod boot;
 // 任务卡二 A5：账号型上游（Codex / Qoder / Claude Code…）。
 pub mod agent_upstream;
 // 子进程工具：A6/A7 与 C1（MCP）共用同一份「杀进程树」实现。
+pub mod benefit_config;
+pub mod benefits;
 pub mod budget;
 pub mod bundle;
 pub mod cache;
@@ -110,14 +112,6 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
             return;
         }
     };
-    let gateway = Arc::new(GatewayState::new(db.clone(), cfg.clone()));
-    // 服务开始监听前完成首次加载，避免启动后的首个请求因缓存尚为空而 404。
-    if let Err(error) = gateway.reload_providers().await {
-        tracing::error!("load providers failed: {error}");
-        boot.mark_error(error.to_string());
-        return;
-    }
-
     // B8：把描述文件变成适配器。**总开关关着时一个目录都不扫**
     // （模式隔离——扫本身就会去读用户指定的路径，关着的功能不该碰文件系统）。
     // 加载失败只记日志、不影响启动：最坏是这个插件用不了，
@@ -136,6 +130,18 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
         }
     }
 
+    // IPC 和实际 HTTP 请求共用已加载的注册表，包括外部插件。
+    let adapters = Arc::new(adapters);
+    let mut gateway = GatewayState::new(db.clone(), cfg.clone());
+    gateway.adapters = adapters.clone();
+    let gateway = Arc::new(gateway);
+    // 服务开始监听前完成首次加载，避免启动后的首个请求因缓存尚为空而 404。
+    if let Err(error) = gateway.reload_providers().await {
+        tracing::error!("load providers failed: {error}");
+        boot.mark_error(error.to_string());
+        return;
+    }
+
     let vpn_root = config::app_data_dir().join("vpn");
     let vpn_manager = match app.path().resolve(
         "resources/mihomo/mihomo-windows-amd64-compatible-v1.19.32.zip",
@@ -149,7 +155,7 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
         config: Arc::new(parking_lot::RwLock::new(cfg)),
         gateway: gateway.clone(),
         // A5：内置假适配器 + A6/A7 的真适配器 + B8 的外部插件（上面刚加载）。
-        adapters: Arc::new(adapters),
+        adapters,
         vpn: Arc::new(vpn_manager),
     });
 
@@ -303,6 +309,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::benefits_overview,
+            commands::claim_benefit_now,
+            commands::set_benefit_token,
+            commands::clear_benefit_token,
+            commands::benefit_runs,
             commands::vpn_status,
             commands::vpn_kernel_info,
             commands::install_vpn_kernel,
@@ -322,6 +333,7 @@ pub fn run() {
             provider_quota::get_provider_quota,
             commands::discover_provider_models,
             commands::upsert_provider,
+            commands::set_provider_runtime,
             commands::delete_provider,
             commands::test_provider,
             commands::set_active_provider,
