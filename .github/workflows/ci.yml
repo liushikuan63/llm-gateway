@@ -49,7 +49,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
@@ -80,6 +80,7 @@ jobs:
         run: npm run build
 
       - name: npm run verify:manual
+        run: npm run verify:manual
 
       # scripts/*.cjs is not compiled by `npm run build` (only src/ is),
       # and verify:manual only inspects docs. Measured 2026-10-05: a broken
@@ -95,6 +96,7 @@ jobs:
       # step above). The guard that the comment calls "keep this step" was dead
       # the whole time. Do not add a second `run:` here.
       - name: scripts syntax
+        shell: bash
         run: |
           for f in scripts/*.cjs scripts/*.mjs scripts/*.js; do
             [ -e "$f" ] || continue
