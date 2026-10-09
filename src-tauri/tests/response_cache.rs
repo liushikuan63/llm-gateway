@@ -102,27 +102,35 @@ fn provider(id: &str, base_url: String, models: Vec<ModelRef>) -> Provider {
     }
 }
 
-async fn unused_loopback_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-async fn wait_for_gateway(base_url: &str) {
-    let client = reqwest::Client::new();
-    for _ in 0..200 {
-        if client
-            .get(format!("{base_url}/healthz"))
-            .send()
-            .await
-            .is_ok_and(|r| r.status() == reqwest::StatusCode::OK)
-        {
-            return;
+async fn wait_for_gateway(gateway: &GatewayState, task: &JoinHandle<()>) -> String {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(!task.is_finished(), "本测试网关在就绪前退出");
+        // 端口 0 由 serve 一次性绑定；只取本实例的真实地址，不能误等其他测试。
+        if let Some(listener) = gateway.listener_snapshot() {
+            let base_url = format!("http://{}", listener.bound_addr);
+            if tokio::time::timeout_at(deadline, client.get(format!("{base_url}/healthz")).send())
+                .await
+                .is_ok_and(|result| result.is_ok_and(|r| r.status() == reqwest::StatusCode::OK))
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "本测试网关超时才就绪"
+                );
+                return base_url;
+            }
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "本测试网关未在预期时间内就绪"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("网关没在预期时间内起来");
 }
 
 const KEY: &str = "lgw-cache-test-key";
@@ -171,7 +179,7 @@ async fn spawn_with_mock(
     .unwrap();
 
     let mut config = AppConfig {
-        port: unused_loopback_port().await,
+        port: 0,
         unified_key: KEY.into(),
         ..Default::default()
     };
@@ -183,11 +191,10 @@ async fn spawn_with_mock(
     let task = tokio::spawn({
         let gateway = gateway.clone();
         async move {
-            let _ = serve(gateway).await;
+            serve(gateway).await.expect("本测试网关服务失败");
         }
     });
-    let base_url = format!("http://{}:{}", config.bind, config.port);
-    wait_for_gateway(&base_url).await;
+    let base_url = wait_for_gateway(&gateway, &task).await;
 
     Harness {
         upstream: upstream_state,
@@ -496,7 +503,7 @@ async fn 流式请求返回_bypass_且不缓存() {
     .await
     .unwrap();
     let mut config = AppConfig {
-        port: unused_loopback_port().await,
+        port: 0,
         unified_key: KEY.into(),
         ..Default::default()
     };
@@ -506,11 +513,10 @@ async fn 流式请求返回_bypass_且不缓存() {
     let task = tokio::spawn({
         let gateway = gateway.clone();
         async move {
-            let _ = serve(gateway).await;
+            serve(gateway).await.expect("本测试网关服务失败");
         }
     });
-    let base_url = format!("http://{}:{}", config.bind, config.port);
-    wait_for_gateway(&base_url).await;
+    let base_url = wait_for_gateway(&gateway, &task).await;
 
     let resp = post_chat_extra(
         &base_url,
@@ -535,14 +541,44 @@ async fn 流式请求返回_bypass_且不缓存() {
     );
     // 不该出现 key：没查过表就没有键
     assert!(header(&resp, "x-cache-key").is_none());
-    drop(resp);
+    // 缓存用例验证完整成功的 SSE，不能把未读完的客户端取消混进对照请求。
+    let streamed = tokio::time::timeout(Duration::from_secs(5), resp.text())
+        .await
+        .expect("完整流式响应应在期限内结束")
+        .expect("完整读取流式响应");
+    assert!(streamed.contains("data: [DONE]"), "缺终止帧: {streamed}");
+    assert!(
+        streamed.contains("讲") && streamed.contains("故事"),
+        "缺回答增量: {streamed}"
+    );
+    assert!(!streamed.contains("\"error\""), "流式错误帧: {streamed}");
 
     // 反例组：同一个网关，非流式请求是能缓存的 ——
     // 证明「BYPASS」是流式这条路径特有的，不是缓存整体没工作
     let a = post_chat(&base_url, "plain-model", text_messages("讲个故事")).await;
-    assert_eq!(header(&a, "x-cache").as_deref(), Some("MISS"));
+    let a_status = a.status();
+    let a_cache = header(&a, "x-cache");
+    let a_body = a.text().await.expect("读取非流式首次响应");
+    assert_eq!(
+        a_status,
+        reqwest::StatusCode::OK,
+        "非流式首次响应: {a_body}"
+    );
+    assert_eq!(a_cache.as_deref(), Some("MISS"), "首次响应: {a_body}");
+    let a_json: serde_json::Value = serde_json::from_str(&a_body).expect("首次响应为 JSON");
+    assert_eq!(a_json["choices"][0]["message"]["content"], "非流式回答");
     let b = post_chat(&base_url, "plain-model", text_messages("讲个故事")).await;
-    assert_eq!(header(&b, "x-cache").as_deref(), Some("HIT"));
+    let b_status = b.status();
+    let b_cache = header(&b, "x-cache");
+    let b_body = b.text().await.expect("读取非流式缓存响应");
+    assert_eq!(
+        b_status,
+        reqwest::StatusCode::OK,
+        "非流式缓存响应: {b_body}"
+    );
+    assert_eq!(b_cache.as_deref(), Some("HIT"), "缓存响应: {b_body}");
+    let b_json: serde_json::Value = serde_json::from_str(&b_body).expect("缓存响应为 JSON");
+    assert_eq!(b_json["choices"][0]["message"]["content"], "非流式回答");
     // 上游被调用两次：流式一次 + 非流式首次一次
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     drop(task);
@@ -624,7 +660,7 @@ async fn 含_tool_calls_的响应不被缓存() {
     .await
     .unwrap();
     let mut config = AppConfig {
-        port: unused_loopback_port().await,
+        port: 0,
         unified_key: KEY.into(),
         ..Default::default()
     };
@@ -634,11 +670,10 @@ async fn 含_tool_calls_的响应不被缓存() {
     let task = tokio::spawn({
         let gateway = gateway.clone();
         async move {
-            let _ = serve(gateway).await;
+            serve(gateway).await.expect("本测试网关服务失败");
         }
     });
-    let base_url = format!("http://{}:{}", config.bind, config.port);
-    wait_for_gateway(&base_url).await;
+    let base_url = wait_for_gateway(&gateway, &task).await;
 
     let msgs = text_messages("帮我查天气");
     let first = post_chat(&base_url, "plain-model", msgs.clone()).await;
