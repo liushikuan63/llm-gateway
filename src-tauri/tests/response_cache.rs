@@ -670,13 +670,34 @@ async fn 含_tool_calls_的响应不被缓存() {
 /// 非空有两种取值：后端名（成功）或 `failed`（预取跑了但没拿到结果）。
 /// 两种都算「这个请求被搜索链路碰过」，都不该缓存。
 ///
-/// 这里刻意走 `failed` 那条：给一个连不上的搜索后端，预取必然失败。
-/// 好处是不用去对齐某个真实搜索后端的请求形状与返回结构
-/// （CLAUDE.md 第 9 条要求 mock 五项对齐，对齐错了测出来的是别的东西），
-/// 而断言的不变量完全一样。
+/// 这里刻意走 `failed` 那条：本机 SearXNG 夹具按真实 GET 路径与查询参数
+/// 返回 503，并统计实际调用。显式选择 SearXNG，不能只填实例 URL 后仍用
+/// 默认 DuckDuckGo，让测试结果取决于公网是否可达。
 #[tokio::test]
 async fn 触发过搜索预取的请求不被缓存() {
-    // 127.0.0.1:1 是保留端口，连不上 → 预取必然失败
+    let search_calls = Arc::new(AtomicUsize::new(0));
+    let search_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let search_addr = search_listener.local_addr().unwrap();
+    let search_counter = search_calls.clone();
+    let search = Router::new().route(
+        "/search",
+        axum::routing::get(
+            move |axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| {
+                let calls = search_counter.clone();
+                async move {
+                    assert_eq!(query.get("format").map(String::as_str), Some("json"));
+                    assert_eq!(query.get("q").map(String::as_str), Some("今天有什么新闻"));
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            },
+        ),
+    );
+    let search_task = tokio::spawn(async move {
+        axum::serve(search_listener, search).await.unwrap();
+    });
     let h = spawn(true, |cfg| {
         cfg.smart_routing.enabled = true;
         // 只开总开关不够：`smart_mode_active` 还要求「策略是 smart」或
@@ -684,8 +705,9 @@ async fn 触发过搜索预取的请求不被缓存() {
         // 第一版就是这样，断言拿到的是 `x-route-search: None`。
         cfg.routing_strategy = llm_gateway_lib::config::RoutingStrategy::Smart;
         cfg.search.enabled = true;
-        cfg.search.searxng_url = Some("http://127.0.0.1:1".into());
-        cfg.search.timeout_ms = 300;
+        cfg.search.backend = llm_gateway_lib::config::SearchBackendKind::SearXng;
+        cfg.search.searxng_url = Some(format!("http://{search_addr}"));
+        cfg.search.timeout_ms = 2_000;
     })
     .await;
     // 同时命中 WEB_KEYWORDS 里的「今天」与「新闻」两个词
@@ -700,6 +722,7 @@ async fn 触发过搜索预取的请求不被缓存() {
         Some("failed"),
         "搜索预取应当跑过并失败 —— 否则这条用例没测到目标场景"
     );
+    assert_eq!(search_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         header(&first, "x-cache").as_deref(),
         Some("BYPASS"),
@@ -722,6 +745,13 @@ async fn 触发过搜索预取的请求不被缓存() {
         2,
         "两次都必须真打上游"
     );
+    assert_eq!(
+        search_calls.load(Ordering::SeqCst),
+        2,
+        "两次都必须调用本机搜索夹具，不能依赖公网或跳过搜索"
+    );
+    search_task.abort();
+    let _ = search_task.await;
 }
 
 /// 配置变更后缓存被清空。
