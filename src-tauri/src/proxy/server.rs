@@ -108,6 +108,17 @@ use crate::router::Router as GatewayRouter;
 
 /* ------------------------------ 共享状态 ------------------------------ */
 
+/// Only the listener owned by this gateway can populate this local snapshot.
+#[derive(Debug, Clone)]
+pub struct ListenerSnapshot {
+    pub bound_addr: SocketAddr,
+    pub configured_bind: String,
+    pub configured_port: u16,
+    pub configured_allow_lan: bool,
+    pub remote_mode_enabled: bool,
+    pub remote_public_url: Option<String>,
+}
+
 pub struct GatewayState {
     pub db: db::Db,
     pub cfg: Arc<parking_lot::RwLock<AppConfig>>,
@@ -131,6 +142,7 @@ pub struct GatewayState {
     pub cache: Arc<crate::cache::ResponseCache>,
     /// 只有实际 listener 位于回环地址时才会激活远程反代认证逻辑。
     listener_is_loopback: AtomicBool,
+    listener_snapshot: parking_lot::RwLock<Option<ListenerSnapshot>>,
     /// 任务卡二 A5：账号型上游的适配器注册表。
     ///
     /// 放在 `GatewayState` 而不是只在 `AppState` 上：**分派点在代理这一侧**，
@@ -163,6 +175,8 @@ impl GatewayState {
         ));
         let ctx = ContextStore::new(db.clone());
         let cache = Arc::new(crate::cache::ResponseCache::new(cfg.cache.clone()));
+        let upstream = Arc::new(UpstreamClient::new());
+        upstream.set_proxy(cfg.http_proxy.as_deref());
 
         Self {
             db,
@@ -171,7 +185,7 @@ impl GatewayState {
             limiter,
             client_limiter: Arc::new(RateLimiter::new()),
             router,
-            upstream: Arc::new(UpstreamClient::new()),
+            upstream,
             ctx,
             cache,
             providers: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -179,6 +193,7 @@ impl GatewayState {
             remote_access_keys: Arc::new(parking_lot::RwLock::new(Vec::new())),
             compaction_lock: tokio::sync::Mutex::new(()),
             listener_is_loopback: AtomicBool::new(false),
+            listener_snapshot: parking_lot::RwLock::new(None),
             // A5：现在只有假适配器。`AppState` 那份由 lib.rs 各自构造 ——
             // 两处各建一份是**可以的**（适配器无状态），
             // 合成一个全局单例反而要多引入一层共享。
@@ -192,6 +207,10 @@ impl GatewayState {
         }
     }
 
+    pub fn listener_snapshot(&self) -> Option<ListenerSnapshot> {
+        self.listener_snapshot.read().clone()
+    }
+
     pub async fn reload_providers(&self) -> Result<()> {
         // 走 routable 变体：路由表里只放**已启用**的模型。
         //
@@ -202,6 +221,8 @@ impl GatewayState {
         // 撑不过一次保存。
         let list = repo::list_routable_providers(self.db.pool()).await?;
         let remote_keys = repo::list_remote_access_keys(self.db.pool()).await?;
+        // 发布路由与缓存失效时阻止配置/代次快照交叉读取。
+        let _cfg_guard = self.cfg.write();
         *self.providers.write() = list;
         *self.remote_access_keys.write() = remote_keys;
 
@@ -241,6 +262,25 @@ impl GatewayState {
 
     pub fn cfg_snapshot(&self) -> AppConfig {
         self.cfg.read().clone()
+    }
+
+    /// 配置热更新的共同入口；同步路由规则并清除旧响应缓存。
+    pub fn update_cfg(&self, cfg: AppConfig) {
+        let mut current = self.cfg.write();
+        self.router.set_custom_rules(cfg.custom_rules.clone());
+        self.upstream.set_proxy(cfg.http_proxy.as_deref());
+        self.cache.reconfigure(&cfg.cache);
+        *current = cfg;
+    }
+
+    fn cfg_snapshot_with_cache_generation(&self) -> (AppConfig, u64) {
+        let cfg = self.cfg.read();
+        let generation = if cfg.cache.enabled {
+            self.cache.generation()
+        } else {
+            0
+        };
+        (cfg.clone(), generation)
     }
 
     /// 在同一条串行链路中重新读取会话、判定阈值并执行压缩。每个等待者都在拿锁
@@ -384,10 +424,19 @@ pub async fn serve(state: Arc<GatewayState>) -> Result<()> {
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| GatewayError::Other(e.into()))?;
-    let is_loopback = listener
+    let bound_addr = listener
         .local_addr()
-        .map(|addr| addr.ip().is_loopback())
-        .unwrap_or(false);
+        .map_err(|e| GatewayError::Other(e.into()))?;
+    let is_loopback = bound_addr.ip().is_loopback();
+    *state.listener_snapshot.write() = Some(ListenerSnapshot {
+        bound_addr,
+        configured_bind: bind,
+        configured_port: port,
+        configured_allow_lan: cfg.allow_lan,
+        remote_mode_enabled: cfg.remote_mode.enabled,
+        remote_public_url: cfg.remote_mode.public_url.clone(),
+    });
+    let _lifetime = ListenerLifetime(state.clone());
     state
         .listener_is_loopback
         .store(is_loopback, Ordering::Release);
@@ -399,6 +448,16 @@ pub async fn serve(state: Arc<GatewayState>) -> Result<()> {
     .await
     .map_err(|e| GatewayError::Other(e.into()))?;
     Ok(())
+}
+
+/// Cancellation and listener shutdown both invalidate the diagnostic snapshot.
+struct ListenerLifetime(Arc<GatewayState>);
+
+impl Drop for ListenerLifetime {
+    fn drop(&mut self) {
+        *self.0.listener_snapshot.write() = None;
+        self.0.listener_is_loopback.store(false, Ordering::Release);
+    }
 }
 
 /// 已认证调用方的审计标识。它不含原始 Key，允许后续分发链路安全落库。
@@ -1136,6 +1195,10 @@ async fn passthrough_dispatch(
         _ => return error_response(&GatewayError::Protocol("非聊天请求缺少 model".into())),
     };
     let cfg = state.cfg_snapshot();
+    if let Some(response) = model_allowlist_gate(&state, &cfg, client.as_deref(), &requested_model)
+    {
+        return response;
+    }
     let providers = state.providers.read().clone();
     let candidates = match state
         .router
@@ -1378,6 +1441,9 @@ async fn dispatch_remote_compaction(
     client_stream: bool,
 ) -> Response {
     let cfg = state.cfg_snapshot();
+    if let Some(response) = model_allowlist_gate(&state, &cfg, client.as_deref(), &req.model) {
+        return response;
+    }
     let header_sid = headers
         .get("x-session-id")
         .and_then(|value| value.to_str().ok())
@@ -2068,6 +2134,7 @@ struct DispatchInput {
     /// 实测证据：修之前两次完全相同的请求拿到
     /// `a-4ec77332-…` 与 `a-e4826059-…` 两个 session，键必然不同。
     cache_session: String,
+    cache_generation: u64,
     /// B4 贯穿本次请求的 traceId。入口处定一次，之后所有落库与响应头都用它。
     trace_id: String,
 }
@@ -2198,14 +2265,21 @@ async fn run_routing_preflight(
             .unwrap_or(false);
         if needs_web {
             let key = load_search_key(state).await;
-            let outcome = crate::search::executor::prefetch(
-                crate::search::executor::shared_client(),
-                &cfg.search,
-                key.as_deref(),
-                &mut req.messages,
-                &effective_text,
-            )
-            .await;
+            let outcome = match crate::outbound::search_client(cfg.http_proxy.as_deref()) {
+                Ok(client) => {
+                    crate::search::executor::prefetch(
+                        &client,
+                        &cfg.search,
+                        key.as_deref(),
+                        &mut req.messages,
+                        &effective_text,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    crate::search::executor::SearchOutcome::failed(cfg.search.backend, error)
+                }
+            };
             if let Some(error) = outcome.error.as_deref() {
                 tracing::warn!("联网搜索未生效：{error}");
             }
@@ -2247,9 +2321,16 @@ async fn run_prompt_refine(
         crate::crypto::decrypt(&p.api_key_enc).ok()
     });
     target.api_key = key;
+    let client = match crate::outbound::search_client(cfg.http_proxy.as_deref()) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!("提示词改写代理配置不可用，保留原文：{error}");
+            return None;
+        }
+    };
     Some(
         crate::intellect::refine::refine(
-            crate::search::executor::shared_client(),
+            &client,
             &target,
             target.api_key.clone(),
             user_text,
@@ -2848,6 +2929,48 @@ impl ResponsesStreamState {
     }
 }
 
+/// 所有公开模型入口共用白名单闸门，并在解析模型名后、路由前执行。
+/// 预算开关关闭或本机统一 Key 继续沿用原路径；空白名单表示不限。
+fn model_allowlist_gate(
+    state: &GatewayState,
+    cfg: &AppConfig,
+    client: Option<&str>,
+    requested_model: &str,
+) -> Option<Response> {
+    if !cfg.budget.enabled {
+        return None;
+    }
+    let key_id = crate::budget::access_key_id_of(client)?;
+    let whitelist = state
+        .remote_access_keys
+        .read()
+        .iter()
+        .find(|key| key.id == key_id)
+        .map(|key| key.allowed_models.clone())
+        .unwrap_or_default();
+    if crate::budget::model_allowed(&whitelist, requested_model) {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "该访问 Key 不允许使用模型 {}（白名单：{}）",
+                        requested_model,
+                        whitelist.join(", "),
+                    ),
+                    "type": "model_not_allowed",
+                    "code": "model_not_allowed",
+                    "model": requested_model,
+                }
+            })),
+        )
+            .into_response(),
+    )
+}
+
 async fn dispatch(
     state: Arc<GatewayState>,
     mut req: ChatRequest,
@@ -2855,7 +2978,7 @@ async fn dispatch(
     client: Option<String>,
     exit: Exit,
 ) -> Response {
-    let cfg = state.cfg_snapshot();
+    let (cfg, cache_generation) = state.cfg_snapshot_with_cache_generation();
 
     // B4 traceId 在**入口处定一次**。之后所有落库、响应头、span 都用它。
     //
@@ -2873,35 +2996,8 @@ async fn dispatch(
     // 打分之前」，符合卡片的位置要求。
     //
     // 被拒的请求**不扣费、不进 requests 表** —— 与预算闸门同一口径。
-    if cfg.budget.enabled {
-        if let Some(key_id) = crate::budget::access_key_id_of(client.as_deref()) {
-            let whitelist = state
-                .remote_access_keys
-                .read()
-                .iter()
-                .find(|k| k.id == key_id)
-                .map(|k| k.allowed_models.clone())
-                .unwrap_or_default();
-            if !crate::budget::model_allowed(&whitelist, &req.model) {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": format!(
-                                "该访问 Key 不允许使用模型 {}（白名单：{}）",
-                                req.model,
-                                whitelist.join(", "),
-                            ),
-                            "type": "model_not_allowed",
-                            "code": "model_not_allowed",
-                            // 写明被拒的模型名，客户端才知道该换哪一个
-                            "model": req.model,
-                        }
-                    })),
-                )
-                    .into_response();
-            }
-        }
+    if let Some(response) = model_allowlist_gate(&state, &cfg, client.as_deref(), &req.model) {
+        return response;
     }
 
     // 1) 会话定位
@@ -3118,6 +3214,7 @@ async fn dispatch(
         search: preflight.search,
         refine: preflight.refine,
         cache_session: header_sid.clone().unwrap_or_default(),
+        cache_generation,
         // traceId 在**入口处定一次**：客户端给了合法值就透传（便于跨服务串联），
         // 否则生成新的。清洗在 `resolve_trace_id` 里做 —— 这个值会被写进
         // 响应头，不清洗就是 HTTP 头注入面。
@@ -3397,7 +3494,33 @@ fn last_user_text(req: &ChatRequest) -> String {
         .unwrap_or_default()
 }
 
-/// 非流式
+/// 普通成功和缓存重放均需在返回前提交问答及粘性路由，确保立即续接可读到历史。
+/// `exchange` 的 token 仅统计本轮上游消费；缓存命中必须传 0。
+async fn persist_completed_exchange(
+    state: &Arc<GatewayState>,
+    session_id: &str,
+    exchange: ExchangeWrite<'_>,
+) -> Result<()> {
+    let provider = exchange.routed_provider;
+    let model = exchange.routed_model;
+    state.ctx.append_exchange_with(session_id, exchange).await?;
+    if let (Some(provider), Some(model)) = (provider, model) {
+        if let Err(error) = repo::update_sticky(
+            state.db.pool(),
+            session_id,
+            provider,
+            model,
+            now_secs() + state.cfg_snapshot().sticky_ttl_secs,
+        )
+        .await
+        {
+            tracing::warn!("更新会话粘性路由失败: {error}");
+        }
+    }
+    Ok(())
+}
+
+/// 非流式请求执行与缓存。
 async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Response {
     let route = input.route_trace();
     // `tokio::spawn(async move { … })` 是**按值**捕获用到的变量，
@@ -3406,6 +3529,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let mut audit_route = route.clone();
     let DispatchInput {
         cache_session,
+        cache_generation,
         trace_id,
         req,
         new_messages,
@@ -3486,13 +3610,91 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 upstream_status: None,
                 response_has_tool_calls: false,
             };
-            match state.cache.lookup(&cache_cfg, &key_input) {
+            match state
+                .cache
+                .lookup_for_generation(&cache_cfg, &key_input, cache_generation)
+            {
                 crate::cache::Lookup::Hit(value) => {
                     // 存的是协议中立的 `ChatResponse`，命中时按本次 exit 重新编码 ——
                     // 这样 OpenAI / Anthropic / Responses 三个出口能共用一份缓存。
                     // 若直接存编码后的 body，同一个逻辑请求来自不同客户端就会串格式。
                     let cached: crate::domain::ChatResponse =
                         serde_json::from_value(value).unwrap_or_default();
+                    let assistant = Message {
+                        role: Role::Assistant,
+                        content: Content::Text(cached.content.clone()),
+                        tool_calls: cached.tool_calls.clone(),
+                        tool_call_id: None,
+                        name: None,
+                    };
+                    if let Err(error) = persist_completed_exchange(
+                        &state,
+                        &session_id,
+                        ExchangeWrite {
+                            incoming: &new_messages,
+                            assistant: &assistant,
+                            routed_provider: Some(pid),
+                            routed_model: Some(mid),
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                        },
+                    )
+                    .await
+                    {
+                        tracing::error!("缓存响应上下文持久化失败: {error}");
+                        return error_response(&error);
+                    }
+                    schedule_compaction(state.clone(), session_id.clone());
+
+                    // 缓存重放是独立请求，审计关联本次 trace；未调用上游，
+                    // 不能将缓存响应里的旧 usage 再计入花费或吞吐统计。
+                    let audit_state = state.clone();
+                    let audit_session_id = session_id.clone();
+                    let audit_client = client.clone();
+                    let audit_requested_model = req.model.clone();
+                    let audit_pid = pid.clone();
+                    let audit_mid = mid.clone();
+                    let audit_trace_id = trace_id.clone();
+                    let audit_route = route.clone();
+                    let audit_currency = ranked
+                        .first()
+                        .and_then(|candidate| candidate.model.price.as_ref())
+                        .map(|price| price.currency.code().to_owned());
+                    let audit_refined_prompt = crate::audit::refined_prompt_to_store(
+                        &cfg.audit,
+                        refine.as_ref().map(|result| result.prompt.as_str()),
+                    );
+                    let latency_ms = started.elapsed().as_millis() as i64;
+                    tokio::spawn(async move {
+                        let _ = repo::log_request(
+                            audit_state.db.pool(),
+                            repo::RequestLog {
+                                session_id: Some(&audit_session_id),
+                                client: audit_client.as_deref(),
+                                requested_model: &audit_requested_model,
+                                routed_provider: Some(&audit_pid),
+                                routed_model: Some(&audit_mid),
+                                status: Some(200),
+                                latency_ms,
+                                prompt_tokens: 0,
+                                completion_tokens: 0,
+                                fallback_attempts: 0,
+                                error: None,
+                                cost: Some(0.0),
+                                currency: audit_currency.as_deref(),
+                                rate_label: None,
+                                estimated_prompt_tokens: None,
+                                attempts_json: Some("[]"),
+                                route: audit_route,
+                                access_key_id: crate::budget::access_key_id_of(
+                                    audit_client.as_deref(),
+                                ),
+                                refined_prompt: audit_refined_prompt.as_deref(),
+                                trace_id: &audit_trace_id,
+                            },
+                        )
+                        .await;
+                    });
                     let body = encode_response(&cached, mid, exit);
                     let mut resp = Json(body).into_response();
                     apply_route_headers(&route, resp.headers_mut());
@@ -3508,6 +3710,8 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         ))),
                     );
                     h.insert("x-session-id", parse_header(&response_session_id));
+                    h.insert("x-routed-via", parse_header(&format!("{pid}/{mid}")));
+                    h.insert("x-fallback-attempts", parse_header("0"));
                     // B4：traceId **永远**回给客户端，即使 OTLP 导出关着。
                     // 否则「导不出」会退化成「查不到」——排查时手里一个可追的标识都没有。
                     h.insert("x-trace-id", parse_header(&trace_id));
@@ -3536,7 +3740,10 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     upstream_status: None,
                     response_has_tool_calls: false,
                 };
-                probe.bypass_reason_code().map(|r| r.code())
+                probe.bypass_reason_code().map(|r| r.code()).or_else(|| {
+                    (state.cache.generation() != cache_generation)
+                        .then_some(crate::cache::BypassReason::ConfigurationChanged.code())
+                })
             }
             None => None,
         }
@@ -3754,34 +3961,22 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 tool_call_id: None,
                 name: None,
             };
-            if let Err(error) = state
-                .ctx
-                .append_exchange_with(
-                    &session_id,
-                    ExchangeWrite {
-                        incoming: &new_messages,
-                        assistant: &assistant,
-                        routed_provider: Some(&pid),
-                        routed_model: Some(&mid),
-                        prompt_tokens: pt as i64,
-                        completion_tokens: ct as i64,
-                    },
-                )
-                .await
-            {
-                tracing::error!("响应成功但上下文持久化失败: {error}");
-                return error_response(&error);
-            }
-            if let Err(error) = repo::update_sticky(
-                state.db.pool(),
+            if let Err(error) = persist_completed_exchange(
+                &state,
                 &session_id,
-                &pid,
-                &mid,
-                now_secs() + state.cfg_snapshot().sticky_ttl_secs,
+                ExchangeWrite {
+                    incoming: &new_messages,
+                    assistant: &assistant,
+                    routed_provider: Some(&pid),
+                    routed_model: Some(&mid),
+                    prompt_tokens: pt as i64,
+                    completion_tokens: ct as i64,
+                },
             )
             .await
             {
-                tracing::warn!("更新会话粘性路由失败: {error}");
+                tracing::error!("响应成功但上下文持久化失败: {error}");
+                return error_response(&error);
             }
 
             // exchange 已持久化后再触发后台压缩。若下一请求先到达，它会通过请求
@@ -3902,20 +4097,33 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             // 若这次实际是失败转移到第二家拿到的答案，用它回填会让
             // 「provider_id=首选」这个键指向第二家的输出 —— 键与内容不符。
             // 宁可少缓存一次。
-            if let Some(key) = cache_miss_key.as_deref() {
+            if let Some(key) = cache_miss_key.as_ref() {
                 let routed_as_intended = intended_route
                     .as_ref()
                     .is_some_and(|(pid, mid)| *pid == o.provider_id && *mid == o.model);
                 let has_tool_calls = o.value.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
                 if routed_as_intended && !has_tool_calls {
-                    if let Ok(serialized) = serde_json::to_value(&o.value) {
-                        state.cache.store(key, serialized);
+                    let stored = serde_json::to_value(&o.value)
+                        .is_ok_and(|serialized| state.cache.store(key, serialized));
+                    if stored {
+                        h.insert(
+                            "x-cache",
+                            parse_header(crate::cache::CacheOutcome::Miss.code()),
+                        );
+                        h.insert(
+                            "x-cache-key",
+                            parse_header(&crate::cache::key_prefix(key.key())),
+                        );
+                    } else {
+                        h.insert(
+                            "x-cache",
+                            parse_header(crate::cache::CacheOutcome::Bypass.code()),
+                        );
+                        h.insert(
+                            "x-cache-reason",
+                            parse_header(crate::cache::BypassReason::ConfigurationChanged.code()),
+                        );
                     }
-                    h.insert(
-                        "x-cache",
-                        parse_header(crate::cache::CacheOutcome::Miss.code()),
-                    );
-                    h.insert("x-cache-key", parse_header(&crate::cache::key_prefix(key)));
                 } else if has_tool_calls {
                     // 响应带工具调用：从「本来要缓存」降级为绕过，并说明原因
                     h.insert(
@@ -3988,6 +4196,13 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     }
 }
 
+struct PreparedUpstreamStream {
+    stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<UpstreamEvent>> + Send>>,
+    first_event: UpstreamEvent,
+    initial_usage: Option<Usage>,
+    initial_finish_reason: Option<String>,
+}
+
 /// 流式。核心难点是「降级时机」：
 /// 一旦已经向客户端吐出第一个 delta，就不再换家 —— 否则用户会看到两截拼起来的回答。
 /// 因此只有在拿到首个 delta 之前的失败才允许切换。
@@ -3998,6 +4213,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let DispatchInput {
         // 流式一律 BYPASS，用不到缓存键里的会话 id。
         cache_session: _cache_session,
+        cache_generation: _cache_generation,
         trace_id,
         req,
         new_messages,
@@ -4027,113 +4243,93 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
     // 响应头一经发送就无法改写。先完成连接与首个有效事件的选择，才能让
     // X-Routed-Via / X-Fallback-Attempts 反映实际结果，同时仍能在未输出前降级。
-    let mut attempts = 0usize;
-    let mut last_error: Option<GatewayError> = None;
-    let mut selected = None;
-    let mut attempt_records: Vec<crate::router::failover::AttemptRecord> = Vec::new();
-
-    'select: for candidate in ranked.iter().take(max_attempts) {
-        attempts += 1;
-        let attempt_started = Instant::now();
-        let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
-        let mut upstream_stream = match state
-            .upstream
-            .call_stream(
-                &candidate.provider,
-                &req,
-                &candidate.model.upstream,
-                timeout,
-                &cfg.ollama_options,
-            )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                record_candidate_failure(&state, candidate, &error);
-                attempt_records.push(crate::router::failover::AttemptRecord::failure(
-                    &candidate.provider,
-                    &candidate.model.upstream,
-                    &error,
-                    attempt_started.elapsed().as_millis() as u64,
-                ));
-                let retryable = error.retryable();
-                last_error = Some(error);
-                if !retryable {
-                    break;
-                }
-                continue;
-            }
-        };
-
-        let mut initial_usage = None;
-        let mut initial_finish_reason = None;
-        loop {
-            match upstream_stream.next().await {
-                Some(Ok(UpstreamEvent::Ping)) => continue,
-                Some(Ok(UpstreamEvent::Usage(value))) => {
-                    merge_usage(&mut initial_usage, value);
-                    continue;
-                }
-                Some(Ok(UpstreamEvent::Finish { finish_reason })) => {
-                    if finish_reason.is_some() {
-                        initial_finish_reason = finish_reason;
+    let flag = AtomicFlag::new();
+    let chain = FailoverChain::new(&ranked, max_attempts, &flag)
+        .with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
+    let upstream = state.upstream.clone();
+    let request = Arc::new(req.clone());
+    let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
+    let defaults = cfg.ollama_options.clone();
+    let mut attempt_records = Vec::new();
+    // 一次尝试止于首个可输出事件。整条流不能放进降级闭包，否则首字节后
+    // 的故障也会重放请求。鉴权复测、免 Key 否决和停用均复用同一条链。
+    let selected = chain
+        .run_with_auth_policy(
+            &mut attempt_records,
+            move |provider, model| {
+                let upstream = upstream.clone();
+                let request = request.clone();
+                let defaults = defaults.clone();
+                async move {
+                    let mut stream = upstream
+                        .call_stream(&provider, &request, &model, timeout, &defaults)
+                        .await?;
+                    let mut initial_usage = None;
+                    let mut initial_finish_reason = None;
+                    loop {
+                        match stream.next().await {
+                            Some(Ok(UpstreamEvent::Ping)) => {}
+                            Some(Ok(UpstreamEvent::Usage(value))) => {
+                                merge_usage(&mut initial_usage, value)
+                            }
+                            Some(Ok(UpstreamEvent::Finish { finish_reason })) => {
+                                if finish_reason.is_some() {
+                                    initial_finish_reason = finish_reason;
+                                }
+                            }
+                            Some(Ok(first_event)) => {
+                                return Ok(PreparedUpstreamStream {
+                                    stream,
+                                    first_event,
+                                    initial_usage,
+                                    initial_finish_reason,
+                                })
+                            }
+                            Some(Err(error)) => return Err(error),
+                            None => {
+                                return Err(GatewayError::Upstream {
+                                    provider: provider.name.clone(),
+                                    model,
+                                    status: 502,
+                                    body: "上游在输出首个有效事件前结束".into(),
+                                })
+                            }
+                        }
                     }
-                    continue;
                 }
-                Some(Ok(event)) => {
-                    attempt_records.push(crate::router::failover::AttemptRecord::success(
-                        &candidate.provider,
-                        &candidate.model.upstream,
-                        attempt_started.elapsed().as_millis() as u64,
-                    ));
-                    selected = Some((
-                        candidate.clone(),
-                        upstream_stream,
-                        event,
-                        initial_usage,
-                        initial_finish_reason,
-                    ));
-                    break 'select;
+            },
+            |provider, model, error| {
+                if let Some(candidate) = ranked.iter().find(|candidate| {
+                    candidate.provider.id == provider.id && candidate.model.upstream == model
+                }) {
+                    record_candidate_failure(&state, candidate, error);
                 }
-                Some(Err(error)) => {
-                    record_candidate_failure(&state, candidate, &error);
-                    attempt_records.push(crate::router::failover::AttemptRecord::failure(
-                        &candidate.provider,
-                        &candidate.model.upstream,
-                        &error,
-                        attempt_started.elapsed().as_millis() as u64,
-                    ));
-                    let retryable = error.retryable();
-                    last_error = Some(error);
-                    if !retryable {
-                        break 'select;
-                    }
-                    break;
-                }
-                None => {
-                    let error = GatewayError::Protocol(format!(
-                        "上游 {}/{} 在输出首个事件前结束",
-                        candidate.provider.name, candidate.model.upstream
-                    ));
-                    record_candidate_failure(&state, candidate, &error);
-                    attempt_records.push(crate::router::failover::AttemptRecord::failure(
-                        &candidate.provider,
-                        &candidate.model.upstream,
-                        &error,
-                        attempt_started.elapsed().as_millis() as u64,
-                    ));
-                    last_error = Some(error);
-                    break;
-                }
-            }
-        }
-    }
-
+            },
+            auth_confirm_handler(state.clone(), cfg.clone()),
+        )
+        .await;
+    let attempts = attempt_records.len();
     let (candidate, mut upstream_stream, first_event, initial_usage, initial_finish_reason) =
         match selected {
-            Some(selected) => selected,
-            None => {
-                let error = last_error.unwrap_or(GatewayError::AllProvidersFailed { attempts });
+            Ok(outcome) => {
+                let candidate = ranked
+                    .iter()
+                    .find(|candidate| {
+                        candidate.provider.id == outcome.provider_id
+                            && candidate.model.upstream == outcome.model
+                    })
+                    .expect("降级链返回的供应商和模型来自同一份候选快照")
+                    .clone();
+                let prepared = outcome.value;
+                (
+                    candidate,
+                    prepared.stream,
+                    prepared.first_event,
+                    prepared.initial_usage,
+                    prepared.initial_finish_reason,
+                )
+            }
+            Err(error) => {
                 spawn_failed_stream_audit(
                     state,
                     FailedStreamAudit {

@@ -63,6 +63,20 @@ impl Default for BudgetConfig {
 /// 金额换算：1 货币单位 = 1_000_000 micros。
 pub const MICROS_PER_UNIT: i64 = 1_000_000;
 
+/// Match saved budgets to the same canonical currency codes used by model prices.
+/// Zero keeps the existing unlimited semantics; invalid limits must not become unlimited.
+pub fn normalize_budget_currency(limit_micros: i64, currency: &str) -> Result<String, String> {
+    if limit_micros < 0 {
+        return Err("月度预算不能为负数".into());
+    }
+    if limit_micros == 0 {
+        return Ok(String::new());
+    }
+    crate::domain::Currency::parse(currency)
+        .map(|currency| currency.code().to_owned())
+        .ok_or_else(|| "设置月度预算时，币种必须为 USD 或 CNY".into())
+}
+
 /// 把上游计费口径的浮点金额转成整数 micros。
 ///
 /// 用 `round` 而不是 `trunc`：`0.1 + 0.2` 算出来的 `0.30000000000000004`
@@ -101,7 +115,7 @@ pub fn check_budget(used_micros: i64, limit_micros: i64, currency: &str) -> Gate
 pub fn spent_in_currency(rows: &[(String, f64)], currency: &str) -> i64 {
     let mut total_units = 0.0f64;
     for (row_currency, cost) in rows {
-        if row_currency == currency {
+        if row_currency.trim().eq_ignore_ascii_case(currency.trim()) {
             total_units += cost;
         }
     }
@@ -291,6 +305,44 @@ mod tests {
             ("CNY".to_string(), 999.0),
         ];
         assert_eq!(spent_in_currency(&rows, "USD"), 3_750_000);
+    }
+
+    #[test]
+    fn 预算币种忽略大小写且不同币种仍分别累计() {
+        let rows = vec![
+            ("usd".to_string(), 1.5),
+            ("USD".to_string(), 2.25),
+            ("cny".to_string(), 10.0),
+            ("CNY".to_string(), 20.0),
+        ];
+        for currency in ["USD", "usd", " UsD "] {
+            assert_eq!(spent_in_currency(&rows, currency), 3_750_000);
+        }
+        for currency in ["CNY", "cny", " CnY "] {
+            assert_eq!(spent_in_currency(&rows, currency), 30_000_000);
+        }
+        assert_eq!(spent_in_currency(&rows, "JPY"), 0);
+    }
+
+    #[test]
+    fn 保存预算时规范币种并拒绝会让限额失效的输入() {
+        for (input, canonical) in [
+            ("USD", "usd"),
+            ("usd", "usd"),
+            (" CNY ", "cny"),
+            ("cny", "cny"),
+        ] {
+            assert_eq!(
+                normalize_budget_currency(1_000_000, input).unwrap(),
+                canonical
+            );
+        }
+        assert_eq!(normalize_budget_currency(0, "USD").unwrap(), "");
+        assert_eq!(normalize_budget_currency(0, "").unwrap(), "");
+        for currency in ["", " ", "JPY", "US D"] {
+            assert!(normalize_budget_currency(1_000_000, currency).is_err());
+        }
+        assert!(normalize_budget_currency(-1, "USD").is_err());
     }
 
     #[test]

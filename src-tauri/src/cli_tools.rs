@@ -495,14 +495,11 @@ pub fn install_tool_available(source: &InstallSource) -> bool {
 
 /// 查询 npm registry 的 latest 版本。匿名可访问，只读。
 pub async fn latest_version(package: &str, proxy: Option<&str>) -> Result<String, String> {
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .timeout(REGISTRY_TIMEOUT)
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none());
-    if let Some(proxy) = proxy.filter(|proxy| !proxy.trim().is_empty()) {
-        builder = builder
-            .proxy(reqwest::Proxy::all(proxy.trim()).map_err(|_| "HTTP 代理地址无效".to_string())?);
-    }
+    let builder = crate::outbound::apply_proxy(builder, proxy)?;
     let client = builder.build().map_err(|e| e.to_string())?;
     let url = format!("https://registry.npmjs.org/{package}/latest");
     let response = client

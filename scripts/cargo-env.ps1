@@ -88,5 +88,5 @@ $env:CARGO_TERM_COLOR  = 'never'
 # finds the CRT and kernel32.lib through the SDK paths added above.
 $env:CARGO_ENCODED_RUSTFLAGS = ''
 
-Set-Location 'D:\Java\GitHub\llm-auto\llm-gateway\src-tauri'
+Set-Location -LiteralPath (Join-Path $PSScriptRoot '..\src-tauri')
 Write-Host "cargo env ready: MSVC $vcVersion, SDK $sdkVer"

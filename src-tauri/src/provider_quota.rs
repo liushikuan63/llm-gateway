@@ -128,13 +128,11 @@ pub async fn query(
     if key.trim().is_empty() {
         return Err("请先在供应商配置中保存 API Key".into());
     }
-    let mut client = Client::builder()
+    let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(6))
         .timeout(Duration::from_secs(10));
-    if let Some(proxy) = proxy.filter(|p| !p.trim().is_empty()) {
-        client = client.proxy(reqwest::Proxy::all(proxy).map_err(|_| "代理配置无效")?);
-    }
+    let client = crate::outbound::apply_proxy(client, proxy)?;
     let client = client.build().map_err(|_| "无法初始化额度查询")?;
     tokio::time::timeout(Duration::from_secs(25), async {
         let mut failures = Vec::new();

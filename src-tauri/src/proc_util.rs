@@ -83,18 +83,27 @@ async fn taskkill(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    const READY_TIMEOUT: Duration = Duration::from_secs(15);
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+    // CI 上 PowerShell 启动可能超过旧测试的 600ms + 10 * 100ms 等待窗口。
+    const GRANDCHILD_START_DELAY: Duration = Duration::from_secs(2);
 
     /// 起一个会活很久的子进程，杀掉它，确认它真的没了。
     #[tokio::test]
     async fn 杀树之后子进程不再存活() {
         let mut child = spawn_sleeper().await;
-        let pid = child.id().expect("应当拿得到 pid");
-        kill_tree(&mut child).await;
-
-        // 给它一点时间退场，然后确认进程真的不在了
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let pid = child.child.id().expect("应当拿得到 pid");
         assert!(
-            !pid_alive(pid),
+            pid_alive(pid).expect("读取自有子进程存活状态"),
+            "前置：子进程应当活着"
+        );
+        kill_tree(&mut child.child).await;
+
+        assert!(
+            wait_until_gone(pid).await.expect("读取自有子进程退出状态"),
             "kill_tree 之后 pid {pid} 仍然存活 —— 树杀没生效"
         );
     }
@@ -103,44 +112,114 @@ mod tests {
     /// 没有这一条，上面那条可能只是因为「进程本来就起不来」而通过。
     #[tokio::test]
     async fn 对照组_不杀的时候进程还活着() {
-        let mut child = spawn_sleeper().await;
-        let pid = child.id().expect("应当拿得到 pid");
-        assert!(pid_alive(pid), "前置：子进程应当活着");
-        let _ = child.kill().await; // 清理
-        let _ = child.wait().await;
+        let child = spawn_sleeper().await;
+        let pid = child.child.id().expect("应当拿得到 pid");
+        assert!(
+            pid_alive(pid).expect("读取自有子进程存活状态"),
+            "前置：子进程应当活着"
+        );
+        // TestProcess 的 Drop 清理整棵自有树，断言失败也不会留下 ping。
     }
 
     /// 起一个**孙进程**：父进程再起一个 sleeper。
     /// 这是本模块存在的全部理由 —— `Child::kill` 杀不掉它。
     #[tokio::test]
     async fn 杀树能带走孙进程() {
+        let started = tokio::time::Instant::now();
         let mut child = spawn_grandchild_spawner().await;
-        let _ = child.id().expect("应当拿得到 pid");
-        // 等它把孙进程起来
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        let grandchild = read_grandchild_pid().await;
+        let _ = child.child.id().expect("应当拿得到 pid");
+        let grandchild = read_grandchild_pid(&mut child).await;
         // 【不许「跳过」】项目规则：`eprintln!` + `return` 会被 cargo 记成 ok，
         // 而「跳过」与「通过」必须可区分。本机 `powershell` 必然可用，
         // 所以拿不到孙进程 pid 就是**失败**，不是环境不支持。
-        let grandchild = grandchild.expect(
-            "拿不到孙进程 pid —— 拿不到就说明这条用例什么都没验，\
-             不能记成通过（本机 powershell 必然可用）",
-        );
-        assert!(pid_alive(grandchild), "前置：孙进程应当活着");
-
-        kill_tree(&mut child).await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let grandchild = grandchild.expect("拿不到存活的孙进程 pid，不能记成通过");
         assert!(
-            !pid_alive(grandchild),
+            started.elapsed() >= GRANDCHILD_START_DELAY,
+            "夹具必须实际经过超过旧 1.6s 等待窗口的启动延迟"
+        );
+        assert!(
+            pid_alive(grandchild).expect("读取自有孙进程存活状态"),
+            "前置：孙进程应当活着"
+        );
+
+        kill_tree(&mut child.child).await;
+        assert!(
+            wait_until_gone(grandchild)
+                .await
+                .expect("读取自有孙进程退出状态"),
             "kill_tree 之后孙进程 {grandchild} 仍然存活 —— 只杀了直接子进程"
         );
     }
 
     // ---------- 平台相关的小工具 ----------
 
-    async fn spawn_sleeper() -> Child {
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("llmgw-proc-util-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).expect("创建本测试专用目录");
+            Self(path)
+        }
+
+        fn pid_file(&self) -> PathBuf {
+            self.0.join("grandchild.pid")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 失败、超时和断言 panic 都清理自己启动的父树及已确认的孙进程。
+    struct TestProcess {
+        child: Child,
+        grandchild: Option<u32>,
+        directory: Option<TestDirectory>,
+    }
+
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                if let Some(pid) = self.child.id() {
+                    kill_tree_blocking(pid);
+                }
+                let _ = self.child.start_kill();
+            }
+            // 先停止父树，再读私有文件，父进程不能继续写入新的 PID。
+            let grandchild = self.grandchild.or_else(|| {
+                self.directory.as_ref().and_then(|directory| {
+                    std::fs::read_to_string(directory.pid_file())
+                        .ok()?
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 0)
+                })
+            });
+            // 检测失败时仍尝试清理已确认自有的 PID，Drop 不再触发二次 panic。
+            if let Some(pid) = grandchild.filter(|pid| pid_alive(*pid).unwrap_or(true)) {
+                #[cfg(windows)]
+                kill_tree_blocking(pid);
+                #[cfg(not(windows))]
+                {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .output();
+                }
+            }
+        }
+    }
+
+    async fn spawn_sleeper() -> TestProcess {
         #[cfg(windows)]
-        {
+        let child = {
             tokio::process::Command::new("cmd")
                 .args(["/C", "ping -n 60 127.0.0.1 > NUL"])
                 .stdin(Stdio::null())
@@ -149,9 +228,9 @@ mod tests {
                 .kill_on_drop(true)
                 .spawn()
                 .expect("起 sleeper")
-        }
+        };
         #[cfg(not(windows))]
-        {
+        let child = {
             tokio::process::Command::new("sleep")
                 .arg("60")
                 .stdin(Stdio::null())
@@ -160,79 +239,127 @@ mod tests {
                 .kill_on_drop(true)
                 .spawn()
                 .expect("起 sleeper")
+        };
+        TestProcess {
+            child,
+            grandchild: None,
+            directory: None,
         }
     }
 
     /// 起一个「再起一个 sleeper 并把它的 pid 写进文件」的父进程。
-    async fn spawn_grandchild_spawner() -> Child {
-        let pid_file = grandchild_pid_file();
-        let _ = std::fs::remove_file(&pid_file);
+    async fn spawn_grandchild_spawner() -> TestProcess {
+        let directory = TestDirectory::new();
+        let pid_file = directory.pid_file();
         #[cfg(windows)]
-        {
+        let child = {
             // `start /b` 起一个脱离的 sleeper，然后写它的 pid 需要额外手段；
             // 这里用 powershell 起子进程并落 pid，形状与真实包装器一致
             // （`codex.cmd` → node 也是同样的一层）。
             let script = format!(
-                "$p = Start-Process -FilePath 'cmd' -ArgumentList '/C','ping -n 60 127.0.0.1 > NUL' \
-                 -PassThru -WindowStyle Hidden; Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 60",
-                pid_file.display()
+                "$ErrorActionPreference = 'Stop'; Start-Sleep -Milliseconds {}; $p = $null; \
+                 try {{ $p = Start-Process -FilePath 'cmd.exe' \
+                 -ArgumentList '/C','ping -n 60 127.0.0.1 > NUL' -PassThru -WindowStyle Hidden; \
+                 Set-Content -LiteralPath $env:LLMGW_PROC_UTIL_PID_FILE -Value $p.Id -Encoding ASCII; \
+                 Start-Sleep -Seconds 60 }} catch {{ \
+                 if ($null -ne $p) {{ & taskkill.exe /T /F /PID $p.Id > $null 2>&1 }}; throw }}",
+                GRANDCHILD_START_DELAY.as_millis()
             );
             tokio::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", &script])
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .env("LLMGW_PROC_UTIL_PID_FILE", &pid_file)
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .kill_on_drop(true)
                 .spawn()
                 .expect("起 grandchild spawner")
-        }
+        };
         #[cfg(not(windows))]
-        {
-            let script = format!("sleep 60 & echo $! > {}; sleep 60", pid_file.display());
+        let child = {
+            let script = format!(
+                "sleep {}; sleep 60 & echo $! > \"$LLMGW_PROC_UTIL_PID_FILE\"; sleep 60",
+                GRANDCHILD_START_DELAY.as_secs()
+            );
             tokio::process::Command::new("sh")
                 .args(["-c", &script])
+                .env("LLMGW_PROC_UTIL_PID_FILE", &pid_file)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .kill_on_drop(true)
                 .spawn()
                 .expect("起 grandchild spawner")
+        };
+        TestProcess {
+            child,
+            grandchild: None,
+            directory: Some(directory),
         }
     }
 
-    fn grandchild_pid_file() -> std::path::PathBuf {
-        std::env::temp_dir().join("llmgw-proc-util-grandchild.pid")
-    }
-
-    async fn read_grandchild_pid() -> Option<u32> {
-        let path = grandchild_pid_file();
-        for _ in 0..10 {
+    async fn read_grandchild_pid(process: &mut TestProcess) -> Result<u32, String> {
+        let path = process
+            .directory
+            .as_ref()
+            .expect("孙进程夹具必须有独立目录")
+            .pid_file();
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            match process.child.try_wait() {
+                Ok(Some(status)) => return Err(format!("父进程在就绪前退出：{status}")),
+                Err(error) => return Err(format!("无法读取自有父进程状态：{error}")),
+                Ok(None) => {}
+            }
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(pid) = text.trim().parse::<u32>() {
-                    return Some(pid);
+                    if pid > 0 {
+                        process.grandchild = Some(pid);
+                        if pid_alive(pid)? {
+                            return Ok(pid);
+                        }
+                        return Err("孙进程在就绪前已退出".into());
+                    }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err("等待自有孙进程 PID 和存活状态超过 15 秒".into());
+            }
+            tokio::time::sleep(POLL_INTERVAL.min(deadline - now)).await;
         }
-        None
+    }
+
+    async fn wait_until_gone(pid: u32) -> Result<bool, String> {
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        while pid_alive(pid)? {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(POLL_INTERVAL.min(deadline - now)).await;
+        }
+        Ok(true)
     }
 
     #[cfg(windows)]
-    fn pid_alive(pid: u32) -> bool {
+    fn pid_alive(pid: u32) -> Result<bool, String> {
         // `tasklist /FI "PID eq N"` 会输出一行表头 + 命中行；
         // 用输出里是否含该 pid 判定。不做 `kill -0` 那种信号检查 ——
         // Windows 上没有对应的东西。
         let out = std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output();
-        match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
-            Err(_) => false,
+            .output()
+            .map_err(|error| format!("无法执行 tasklist：{error}"))?;
+        if !out.status.success() {
+            return Err(format!("tasklist 执行失败：{}", out.status));
         }
+        Ok(String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
     }
 
     #[cfg(not(windows))]
-    fn pid_alive(pid: u32) -> bool {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    fn pid_alive(pid: u32) -> Result<bool, String> {
+        Ok(std::path::Path::new(&format!("/proc/{pid}")).exists())
     }
 }

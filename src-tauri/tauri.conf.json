@@ -31,6 +31,7 @@
     "targets": ["nsis", "msi"],
     "useLocalToolsDir": true,
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
+    "resources": ["resources/mihomo/*"],
     "category": "DeveloperTool",
     "shortDescription": "统一 LLM 网关：多 Provider 聚合 / 协议转换 / 上下文持久化 / 失败降级",
     "longDescription": "把 DeepSeek、GLM、Kimi、通义、OpenRouter、Gemini 等任意 OpenAI / Anthropic 兼容端点收进一个本地网关，支持 exe 启动、统一 URL、上下文保存、自动降级切换。",

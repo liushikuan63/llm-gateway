@@ -166,6 +166,91 @@ export interface AppConfig {
   smart_routing: SmartRoutingConfig;
   cascade: CascadePolicy;
   search: SearchConfig;
+  cache: CacheConfig;
+}
+
+export interface CacheConfig {
+  enabled: boolean;
+  /** 精确响应缓存最大条目数。 */
+  capacity: number;
+  /** 有效期秒数；0 保留原有不过期行为。 */
+  ttl_secs: number;
+}
+
+export interface VpnSettings {
+  kernel_path: string;
+  mixed_port: number;
+  controller_port: number;
+}
+
+export interface VpnStatus {
+  settings: VpnSettings;
+  running: boolean;
+  kernel_ready: boolean;
+  profile_ready: boolean;
+  pid: number | null;
+  version: string | null;
+  proxy_url: string;
+  mode: string;
+  error: string | null;
+}
+
+export interface VpnProxy {
+  name: string;
+  kind: string;
+  now: string | null;
+  members: string[];
+}
+
+export interface VpnProfileInput {
+  path?: string | null;
+  url?: string | null;
+}
+
+export interface VpnKernelInfo {
+  supported: boolean;
+  version: string;
+  installed: boolean;
+  managed: boolean;
+  can_rollback: boolean;
+  license_url: string;
+  source_url: string;
+}
+
+export type DiagnosticStatus = "ok" | "warning" | "error" | "unknown";
+
+export interface DiagnosticCheck {
+  id: string;
+  status: DiagnosticStatus;
+  title: string;
+  detail: string;
+}
+
+export interface DiagnosticsSummary {
+  providers_total: number;
+  providers_enabled: number;
+  providers_disabled: number;
+  models_enabled: number;
+  cache_enabled: boolean;
+  cache_capacity: number;
+  cache_ttl_secs: number;
+  /** Physical entries, including expired entries awaiting normal cache access. */
+  cache_entries: number;
+  cache_hits: number;
+  cache_misses: number;
+  remote_keys_enabled: number;
+  budgeted_keys: number;
+  budget_currency_counts: { currency: string; count: number }[];
+  vpn_running: boolean | null;
+  proxy_mode: "none" | "managed_vpn" | "external" | "invalid";
+}
+
+export interface DiagnosticsReport {
+  schema_version: number;
+  generated_at: string;
+  overall: DiagnosticStatus;
+  checks: DiagnosticCheck[];
+  summary: DiagnosticsSummary;
 }
 
 export type LocalRuntimeKind = "ollama" | "open_ai_compatible";
@@ -1014,6 +1099,21 @@ export interface PetAsset {
 }
 
 export const api = {
+  vpnStatus: () => invoke<VpnStatus>("vpn_status"),
+  vpnKernelInfo: () => invoke<VpnKernelInfo>("vpn_kernel_info"),
+  installVpnKernel: () => invoke<VpnStatus>("install_vpn_kernel"),
+  rollbackVpnKernel: () => invoke<VpnStatus>("rollback_vpn_kernel"),
+  getGatewayDiagnostics: () => invoke<DiagnosticsReport>("get_gateway_diagnostics"),
+  exportGatewayDiagnostics: (dest: string) =>
+    invoke<void>("export_gateway_diagnostics", { dest }),
+  saveVpnSettings: (settings: VpnSettings) => invoke<VpnStatus>("save_vpn_settings", { settings }),
+  importVpnProfile: (input: VpnProfileInput) => invoke<VpnStatus>("import_vpn_profile", { input }),
+  startVpn: () => invoke<VpnStatus>("start_vpn"),
+  stopVpn: () => invoke<VpnStatus>("stop_vpn"),
+  listVpnProxies: () => invoke<VpnProxy[]>("list_vpn_proxies"),
+  selectVpnProxy: (group: string, name: string) => invoke<void>("select_vpn_proxy", { group, name }),
+  setVpnMode: (mode: string) => invoke<void>("set_vpn_mode", { mode }),
+  useVpnForGateway: (enabled: boolean) => invoke<ConfigUpdateResult>("use_vpn_for_gateway", { enabled }),
   listProviders: () => invoke<ProviderView[]>("list_providers"),
   upsertProvider: (input: ProviderInput) => invoke<string>("upsert_provider", { input }),
   deleteProvider: (id: string) => invoke<void>("delete_provider", { id }),

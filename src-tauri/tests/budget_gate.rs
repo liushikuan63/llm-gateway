@@ -9,12 +9,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use llm_gateway_lib::budget::MICROS_PER_UNIT;
 use llm_gateway_lib::config::AppConfig;
 use llm_gateway_lib::db::{self, repo};
-use llm_gateway_lib::domain::{Dialect, ModelRef, Provider, RemoteAccessKey};
+use llm_gateway_lib::domain::{
+    Currency, Dialect, ModelPrice, ModelRef, ModelType, Provider, RemoteAccessKey,
+};
 use llm_gateway_lib::proxy::server::{serve, GatewayState};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -57,7 +60,22 @@ fn provider(base_url: String) -> Provider {
         api_key_enc: String::new(),
         enabled: true,
         priority: 0,
-        models: vec![model("alpha"), model("beta")],
+        models: vec![
+            model("alpha"),
+            model("beta"),
+            ModelRef {
+                model_type: ModelType::Embedding,
+                ..model("embed-model")
+            },
+            ModelRef {
+                model_type: ModelType::Image,
+                ..model("image-model")
+            },
+            ModelRef {
+                model_type: ModelType::Speech,
+                ..model("speech-model")
+            },
+        ],
         rpm_limit: 0,
         intelligence: 80,
         note: None,
@@ -129,17 +147,32 @@ struct Harness {
 async fn spawn(keys: Vec<RemoteAccessKey>, mutate: impl FnOnce(&mut AppConfig)) -> Harness {
     let mock = Mock::default();
     let calls = mock.calls.clone();
-    let app = Router::new().fallback(post(move |Json(_b): Json<serde_json::Value>| {
+    let app = Router::new().fallback(post(move |uri: axum::extract::OriginalUri, Json(_b): Json<serde_json::Value>| {
         let calls = calls.clone();
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            if uri.path().ends_with("/audio/speech") {
+                return ([("content-type", "audio/mpeg")], b"mock-audio".to_vec()).into_response();
+            }
+            if uri.path().ends_with("/embeddings") {
+                return Json(serde_json::json!({
+                    "object": "list", "model": "embed-model",
+                    "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+                    "usage": {"prompt_tokens": 5, "total_tokens": 5}
+                })).into_response();
+            }
+            if uri.path().ends_with("/images/generations") {
+                return Json(serde_json::json!({
+                    "created": 1, "data": [{"b64_json": "bW9jay1pbWFnZQ=="}]
+                })).into_response();
+            }
             Json(serde_json::json!({
                 "id": "chatcmpl-budget",
                 "object": "chat.completion",
                 "model": "mock-model",
                 "choices": [{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
                 "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
-            }))
+            })).into_response()
         }
     }));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -629,5 +662,185 @@ async fn 真实请求把_access_key_id_写进_requests() {
         after,
         before + 1,
         "真实请求必须归属到这个 Key —— 否则预算统计永远是 0，闸门形同虚设"
+    );
+}
+
+fn auxiliary_requests() -> Vec<(&'static str, &'static str, serde_json::Value)> {
+    vec![
+        (
+            "/v1/embeddings",
+            "embed-model",
+            serde_json::json!({"model": "embed-model", "input": "hello"}),
+        ),
+        (
+            "/v1/images/generations",
+            "image-model",
+            serde_json::json!({"model": "image-model", "prompt": "a tree"}),
+        ),
+        (
+            "/v1/audio/speech",
+            "speech-model",
+            serde_json::json!({"model": "speech-model", "input": "hello", "voice": "alloy"}),
+        ),
+        (
+            "/v1/responses",
+            "beta",
+            serde_json::json!({
+                "model": "beta",
+                "input": [
+                    {"type": "message", "role": "user", "content": "summarize this task"},
+                    {"type": "compaction_trigger"}
+                ]
+            }),
+        ),
+    ]
+}
+
+async fn auxiliary_request(h: &Harness, path: &str, body: &serde_json::Value) -> reqwest::Response {
+    client()
+        .post(format!("{}{path}", h.base_url))
+        .header("x-forwarded-for", "198.51.100.7")
+        .header("x-forwarded-proto", "https")
+        .bearer_auth(KEY_SECRET)
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn 模型白名单覆盖非聊天及远程压缩入口() {
+    let h = spawn(
+        vec![access_key("rk-main", true, (0, "", vec!["alpha".into()]))],
+        |_| {},
+    )
+    .await;
+    let cases = auxiliary_requests();
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap();
+
+    for (path, model, body) in &cases {
+        let response = auxiliary_request(&h, path, body).await;
+        let (status, code, error) = error_code(response).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::FORBIDDEN,
+            "{path} 必须执行白名单"
+        );
+        assert_eq!(code, "model_not_allowed");
+        assert_eq!(error["error"]["model"], *model);
+    }
+    assert_eq!(
+        h.mock_calls.load(Ordering::SeqCst),
+        0,
+        "白名单拒绝不能调用上游"
+    );
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(after, before, "白名单拒绝不能写 requests");
+
+    h.gateway.remote_access_keys.write()[0].allowed_models =
+        cases.iter().map(|(_, model, _)| (*model).into()).collect();
+    for (path, _, body) in &cases {
+        let response = auxiliary_request(&h, path, body).await;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "白名单允许后 {path} 应可用"
+        );
+        response.bytes().await.unwrap();
+    }
+    assert_eq!(h.mock_calls.load(Ordering::SeqCst), cases.len());
+
+    h.gateway.remote_access_keys.write()[0].allowed_models = vec!["alpha".into()];
+    h.gateway.cfg.write().budget.enabled = false;
+    for (path, _, body) in &cases {
+        let response = auxiliary_request(&h, path, body).await;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "关闭闸门后 {path} 不应检查白名单"
+        );
+        response.bytes().await.unwrap();
+    }
+    assert_eq!(h.mock_calls.load(Ordering::SeqCst), 2 * cases.len());
+}
+
+#[tokio::test]
+async fn 非聊天及远程压缩入口白名单为空时不限() {
+    let h = spawn(vec![access_key("rk-main", true, (0, "", vec![]))], |_| {}).await;
+    let cases = auxiliary_requests();
+    for (path, _, body) in &cases {
+        let response = auxiliary_request(&h, path, body).await;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "空白名单应放行 {path}"
+        );
+        response.bytes().await.unwrap();
+    }
+    assert_eq!(h.mock_calls.load(Ordering::SeqCst), cases.len());
+}
+
+#[tokio::test]
+async fn 真实小写计费币种计入大写预算并阻止下一请求() {
+    let h = spawn(
+        vec![access_key(
+            "rk-main",
+            true,
+            (MICROS_PER_UNIT, "USD", vec![]),
+        )],
+        |_| {},
+    )
+    .await;
+    let mut priced = h.gateway.providers.read()[0].clone();
+    priced.models[0].price = Some(ModelPrice {
+        prompt: 1_000_000.0,
+        completion: 1_000_000.0,
+        cache_read: None,
+        cache_creation: None,
+        currency: Currency::Usd,
+        tiers: vec![],
+        rules: vec![],
+        source: Default::default(),
+    });
+    repo::upsert_provider(h.db.pool(), &priced).await.unwrap();
+    h.gateway.reload_providers().await.unwrap();
+
+    let response = chat_with(&h.base_url, KEY_SECRET, "alpha").await;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "尚无消费时必须放行"
+    );
+    response.bytes().await.unwrap();
+    // 成功审计异步写入，等待明确的数据库条件，避免把记账延迟误判为闸门失败。
+    let mut recorded = false;
+    for _ in 0..100 {
+        let rows = repo::sum_cost_by_currency_for_key(h.db.pool(), "rk-main", month_start())
+            .await
+            .unwrap();
+        if rows
+            .iter()
+            .any(|(currency, cost)| currency == "usd" && *cost > 1.0)
+        {
+            recorded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(recorded, "真实计价路径必须写入小写 usd 消费");
+    let response = chat_with(&h.base_url, KEY_SECRET, "alpha").await;
+    let (status, code, _) = error_code(response).await;
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(code, "budget_exceeded");
+    assert_eq!(
+        h.mock_calls.load(Ordering::SeqCst),
+        1,
+        "超预算后不能再调用上游"
     );
 }

@@ -322,3 +322,106 @@ async fn 流式已开始吐出字节时不得换家() {
         "流式已开始时不得复测或换家"
     );
 }
+
+#[tokio::test]
+async fn 确认复测占用总尝试预算且耗尽后不能再换家() {
+    let cands = [
+        candidate(provider("a", "m", true)),
+        candidate(provider("b", "m", true)),
+    ];
+    let flag = AtomicFlag::new();
+    let chain = FailoverChain::new(&cands, 2, &flag).with_auth_policy(AuthFailureMode::Skip, 1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut records = Vec::new();
+    let result = chain
+        .run_with_auth_policy(
+            &mut records,
+            |provider, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if provider.id == "a" {
+                        Err(refused(&provider.id))
+                    } else {
+                        Ok("unexpected")
+                    }
+                }
+            },
+            |_, _, _| {},
+            |_, _| {},
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| record.provider_id == "a"));
+}
+
+#[tokio::test]
+async fn 跳过免密钥候选不消耗实际尝试预算() {
+    let cands = [
+        candidate(provider("a", "m", true)),
+        candidate(provider("free", "m", false)),
+        candidate(provider("b", "m", true)),
+    ];
+    let flag = AtomicFlag::new();
+    let chain = FailoverChain::new(&cands, 2, &flag).with_auth_policy(AuthFailureMode::Skip, 0);
+    let mut records = Vec::new();
+    let result = chain
+        .run_with_auth_policy(
+            &mut records,
+            |provider, _| async move {
+                assert_ne!(provider.id, "free", "鉴权拒绝后不能调用免密钥候选");
+                if provider.id == "a" {
+                    Err(refused(&provider.id))
+                } else {
+                    Ok("recovered")
+                }
+            },
+            |_, _, _| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.provider_id, "b");
+    assert_eq!(result.attempts, 2);
+    assert_eq!(records.len(), 2);
+}
+
+#[tokio::test]
+async fn 首次鉴权拒绝后即使复测变成限流也不能落到免密钥候选() {
+    let cands = [
+        candidate(provider("a", "m", true)),
+        candidate(provider("free", "m", false)),
+        candidate(provider("b", "m", true)),
+    ];
+    let flag = AtomicFlag::new();
+    let chain = FailoverChain::new(&cands, 4, &flag).with_auth_policy(AuthFailureMode::Skip, 1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut records = Vec::new();
+    let result = chain
+        .run_with_auth_policy(
+            &mut records,
+            |provider, _| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_ne!(provider.id, "free");
+                    if provider.id == "a" {
+                        if n == 0 {
+                            Err(refused(&provider.id))
+                        } else {
+                            Err(throttled(&provider.id))
+                        }
+                    } else {
+                        Ok("recovered")
+                    }
+                }
+            },
+            |_, _, _| {},
+            |_, _| panic!("限流不能确认凭据永久失效"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.provider_id, "b");
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+    assert_eq!(records.len(), 3);
+}

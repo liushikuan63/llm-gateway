@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 struct MockState {
     calls: Arc<AtomicUsize>,
     responses: Arc<Mutex<Vec<serde_json::Value>>>,
+    pause_first: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 async fn mock_upstream(state: MockState) -> Router {
@@ -34,6 +35,12 @@ async fn mock_upstream(state: MockState) -> Router {
         async move {
             let n = state.calls.fetch_add(1, Ordering::SeqCst);
             state.responses.lock().unwrap().push(body.clone());
+            if n == 0 {
+                if let Some((started, release)) = &state.pause_first {
+                    started.notify_one();
+                    release.notified().await;
+                }
+            }
             // 每次返回的 id 都不同：这样「第二次拿到的是缓存还是新响应」
             // 可以从 body 里直接读出来，而不是靠计数推断。
             //
@@ -131,7 +138,14 @@ struct Harness {
 
 /// 起一套「mock 上游 + 真网关」。`cache_enabled` 与 `mutate` 控制缓存与场景。
 async fn spawn(cache_enabled: bool, mutate: impl FnOnce(&mut AppConfig)) -> Harness {
-    let upstream_state = MockState::default();
+    spawn_with_mock(cache_enabled, mutate, MockState::default()).await
+}
+
+async fn spawn_with_mock(
+    cache_enabled: bool,
+    mutate: impl FnOnce(&mut AppConfig),
+    upstream_state: MockState,
+) -> Harness {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = mock_upstream(upstream_state.clone()).await;
@@ -288,6 +302,99 @@ async fn 开启时相同请求第二次命中且上游只被调用一次() {
         second_body["choices"][0]["message"]["content"],
         "命中必须返回第一次的内容"
     );
+}
+
+#[tokio::test]
+async fn 缓存命中后立即续接保留完整会话且不重复消费() {
+    let h = spawn(true, |_| {}).await;
+    let first = post_chat(&h.base_url, "plain-model", text_messages("first question")).await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let first_sid = header(&first, "x-session-id").unwrap();
+    first.bytes().await.unwrap();
+
+    let hit = post_chat(&h.base_url, "plain-model", text_messages("first question")).await;
+    assert_eq!(hit.status(), reqwest::StatusCode::OK);
+    assert_eq!(header(&hit, "x-cache").as_deref(), Some("HIT"));
+    let hit_sid = header(&hit, "x-session-id").unwrap();
+    assert_ne!(hit_sid, first_sid, "匿名请求应分别获得独立会话");
+    assert_eq!(
+        header(&hit, "x-routed-via").as_deref(),
+        Some("mock/plain-model")
+    );
+    assert_eq!(header(&hit, "x-fallback-attempts").as_deref(), Some("0"));
+    hit.bytes().await.unwrap();
+    assert_eq!(h.upstream.calls.load(Ordering::SeqCst), 1);
+
+    let history = repo::recent_messages(h._db.pool(), &hit_sid, 10)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2, "HIT 返回前必须提交本轮问答");
+    assert_eq!(history[0].content, "first question");
+    assert_eq!(history[1].content, "answer-0");
+    let session = repo::get_or_create_session(h._db.pool(), &hit_sid)
+        .await
+        .unwrap();
+    assert_eq!(session.total_tokens, 0, "缓存重放不增加上游 token 消费");
+    assert_eq!(session.sticky_provider_id.as_deref(), Some("mock"));
+    assert_eq!(session.sticky_model.as_deref(), Some("plain-model"));
+
+    let next = client()
+        .post(format!("{}/v1/chat/completions", h.base_url))
+        .bearer_auth(KEY)
+        .header("x-session-id", &hit_sid)
+        .json(&serde_json::json!({"model": "plain-model", "messages": text_messages("follow up")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(next.status(), reqwest::StatusCode::OK);
+    next.bytes().await.unwrap();
+    assert_eq!(h.upstream.calls.load(Ordering::SeqCst), 2);
+    let requests = h.upstream.responses.lock().unwrap();
+    assert_eq!(
+        requests[1]["messages"],
+        serde_json::json!([
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "answer-0"},
+            {"role": "user", "content": "follow up"}
+        ]),
+        "续接必须携带命中时保存的完整问答"
+    );
+}
+
+#[tokio::test]
+async fn 缓存命中写入零消费审计并关联本次_trace() {
+    let h = spawn(true, |_| {}).await;
+    let warm = post_chat(&h.base_url, "plain-model", text_messages("audit question")).await;
+    assert_eq!(warm.status(), reqwest::StatusCode::OK);
+    warm.bytes().await.unwrap();
+    let trace_id = "abcdefabcdefabcdefabcdefabcdefab";
+    let hit = client().post(format!("{}/v1/chat/completions", h.base_url))
+        .bearer_auth(KEY)
+        .header("x-trace-id", trace_id)
+        .json(&serde_json::json!({"model": "plain-model", "messages": text_messages("audit question")}))
+        .send().await.unwrap();
+    assert_eq!(header(&hit, "x-cache").as_deref(), Some("HIT"));
+    assert_eq!(header(&hit, "x-trace-id").as_deref(), Some(trace_id));
+    let sid = header(&hit, "x-session-id").unwrap();
+    hit.bytes().await.unwrap();
+    let mut audit = None;
+    for _ in 0..100 {
+        audit = sqlx::query_as::<_, (String, String, String, i64, i64, f64, String)>(
+            "SELECT session_id, routed_provider, routed_model, prompt_tokens, completion_tokens, cost, attempts_json FROM requests WHERE trace_id = ?"
+        ).bind(trace_id).fetch_optional(h._db.pool()).await.unwrap();
+        if audit.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (stored_sid, provider, model, prompt, completion, cost, attempts) =
+        audit.expect("每次 HIT 必须存在可追踪的审计记录");
+    assert_eq!(stored_sid, sid);
+    assert_eq!(provider, "mock");
+    assert_eq!(model, "plain-model");
+    assert_eq!((prompt, completion, cost), (0, 0, 0.0));
+    assert_eq!(attempts, "[]", "缓存命中没有新增上游尝试");
+    assert_eq!(h.upstream.calls.load(Ordering::SeqCst), 1);
 }
 
 /// 反例：同样两次请求，缓存**关闭**时上游必须被调用两次。
@@ -756,4 +863,158 @@ async fn 含图片的请求返回_bypass() {
     // 反例：同一模型、纯文本请求是可缓存的
     let a = post_chat(&h.base_url, "vision-model", text_messages("纯文本")).await;
     assert_eq!(header(&a, "x-cache").as_deref(), Some("MISS"));
+}
+
+#[tokio::test]
+async fn 重载期间旧请求完成后不能回填已失效缓存() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let h = spawn_with_mock(
+        true,
+        |_| {},
+        MockState {
+            pause_first: Some((started.clone(), release.clone())),
+            ..Default::default()
+        },
+    )
+    .await;
+    let base = h.base_url.clone();
+    let pending = tokio::spawn(async move {
+        post_chat(&base, "plain-model", text_messages("in flight question")).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    h.gateway.reload_providers().await.unwrap();
+    release.notify_one();
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        h.gateway.cache.stats().entries,
+        0,
+        "重载后不能留下在途旧请求的响应"
+    );
+
+    let fresh = post_chat(
+        &h.base_url,
+        "plain-model",
+        text_messages("in flight question"),
+    )
+    .await;
+    assert_eq!(header(&fresh, "x-cache").as_deref(), Some("MISS"));
+    fresh.bytes().await.unwrap();
+    let hit = post_chat(
+        &h.base_url,
+        "plain-model",
+        text_messages("in flight question"),
+    )
+    .await;
+    assert_eq!(header(&hit, "x-cache").as_deref(), Some("HIT"));
+    assert_eq!(h.upstream.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn 热更新容量立即限制新缓存而无需重启() {
+    let h = spawn(true, |_| {}).await;
+    let mut cfg = h.gateway.cfg_snapshot();
+    cfg.cache.capacity = 1;
+    h.gateway.update_cfg(cfg);
+    for text in ["capacity a", "capacity b"] {
+        let response = post_chat(&h.base_url, "plain-model", text_messages(text)).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.bytes().await.unwrap();
+    }
+    assert_eq!(h.gateway.cache.stats().entries, 1, "新容量必须立即生效");
+    let latest = post_chat(&h.base_url, "plain-model", text_messages("capacity b")).await;
+    assert_eq!(header(&latest, "x-cache").as_deref(), Some("HIT"));
+    latest.bytes().await.unwrap();
+    let evicted = post_chat(&h.base_url, "plain-model", text_messages("capacity a")).await;
+    assert_eq!(header(&evicted, "x-cache").as_deref(), Some("MISS"));
+    assert_eq!(h.upstream.calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn 热更新_ttl_到期后重新调用上游() {
+    let h = spawn(true, |_| {}).await;
+    let mut cfg = h.gateway.cfg_snapshot();
+    cfg.cache = serde_json::from_value(serde_json::json!({
+        "enabled": true, "capacity": 200, "ttl_secs": 1
+    }))
+    .unwrap();
+    h.gateway.update_cfg(cfg);
+    let first = post_chat(&h.base_url, "plain-model", text_messages("ttl question")).await;
+    assert_eq!(header(&first, "x-cache").as_deref(), Some("MISS"));
+    first.bytes().await.unwrap();
+    let second = post_chat(&h.base_url, "plain-model", text_messages("ttl question")).await;
+    assert_eq!(header(&second, "x-cache").as_deref(), Some("HIT"));
+    second.bytes().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let expired = post_chat(&h.base_url, "plain-model", text_messages("ttl question")).await;
+    assert_eq!(header(&expired, "x-cache").as_deref(), Some("MISS"));
+    assert_eq!(h.upstream.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn 网关启动及热更新代理确实改变_https_连接出口() {
+    let first_proxy = MockState::default();
+    let second_proxy = MockState::default();
+    let mut tasks = Vec::new();
+    let mut proxy_urls = Vec::new();
+    for state in [first_proxy.clone(), second_proxy.clone()] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        proxy_urls.push(format!("http://{}", listener.local_addr().unwrap()));
+        // HTTPS 的 CONNECT 在本机直接终止，避免 TLS/真实域名解析或收费上游。
+        let app = Router::new().fallback(move || {
+            let state = state.clone();
+            async move {
+                state.calls.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        });
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+    }
+    let h = spawn(false, |cfg| cfg.http_proxy = Some(proxy_urls[0].clone())).await;
+    let mut provider = h.gateway.providers.read()[0].clone();
+    provider.base_url = "https://gateway-upstream.invalid/v1".into();
+    repo::upsert_provider(h._db.pool(), &provider)
+        .await
+        .unwrap();
+    h.gateway.reload_providers().await.unwrap();
+
+    let first = post_chat(&h.base_url, "plain-model", text_messages("proxy first")).await;
+    let status = first.status();
+    let body = first.text().await.unwrap();
+    assert!(status.is_server_error(), "{status}: {body}");
+    assert_eq!(
+        first_proxy.calls.load(Ordering::SeqCst),
+        1,
+        "启动时必须使用配置的代理"
+    );
+    assert_eq!(second_proxy.calls.load(Ordering::SeqCst), 0);
+
+    let mut cfg = h.gateway.cfg_snapshot();
+    cfg.http_proxy = Some(proxy_urls[1].clone());
+    h.gateway.update_cfg(cfg);
+    // 第一条 CONNECT 的故意拒绝会触发健康冷却；清除该夹具状态只验证出口热切换。
+    h.gateway.health.reset(&provider.id, "plain-model");
+    let second = post_chat(&h.base_url, "plain-model", text_messages("proxy second")).await;
+    assert!(second.status().is_server_error());
+    second.bytes().await.unwrap();
+    assert_eq!(
+        first_proxy.calls.load(Ordering::SeqCst),
+        1,
+        "热更新后不能继续使用旧代理"
+    );
+    assert_eq!(second_proxy.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.upstream.calls.load(Ordering::SeqCst),
+        0,
+        "请求必须经由代理而非测试原上游"
+    );
+    for task in tasks {
+        task.abort();
+    }
 }

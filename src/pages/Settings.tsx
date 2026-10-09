@@ -22,6 +22,14 @@ function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function cacheValidationError(cache: AppConfig["cache"] | undefined) {
+  if (!Number.isSafeInteger(cache?.capacity ?? 200) || (cache?.capacity ?? 200) < 1
+    || !Number.isSafeInteger(cache?.ttl_secs ?? 0) || (cache?.ttl_secs ?? 0) < 0) {
+    return "缓存容量必须是至少 1 的安全整数，有效期必须是非负安全整数";
+  }
+  return null;
+}
+
 function restartMessage(result: ConfigUpdateResult | SnapshotApplyResult) {
   if (!result.restart_required) return "已保存并热生效";
   return `已保存。${result.restart_reasons.join("、")}已变更；请从系统托盘退出并重新启动 LLM Gateway 后生效。`;
@@ -55,6 +63,7 @@ function newCustomRule(providerId: string): CustomRouteRule {
 
 export default function SettingsPage() {
   const [cfg, setCfg] = useState<AppConfig | null>(null);
+  const [loading, setLoading] = useState(true);
   const [keyInfo, setKeyInfo] = useState<Record<string, string> | null>(null);
   const [msg, setMsg] = useState<Message | null>(null);
   const [snaps, setSnaps] = useState<SnapshotView[]>([]);
@@ -70,7 +79,7 @@ export default function SettingsPage() {
   // B2 预算三件套。金额用「元」在界面上编辑，提交前乘 1e6 转 micros ——
   // 后端用整数 micros 比对，界面用元更直观，换算只在这一处发生。
   const [editingRemoteKeyBudget, setEditingRemoteKeyBudget] = useState("");
-  const [editingRemoteKeyCurrency, setEditingRemoteKeyCurrency] = useState("USD");
+  const [editingRemoteKeyCurrency, setEditingRemoteKeyCurrency] = useState("usd");
   const [editingRemoteKeyModels, setEditingRemoteKeyModels] = useState("");
   const [lanConfirmationOpen, setLanConfirmationOpen] = useState(false);
   const [remoteConfirmationOpen, setRemoteConfirmationOpen] = useState(false);
@@ -81,12 +90,20 @@ export default function SettingsPage() {
   const [selfCheck, setSelfCheck] = useState<SelfCheckResult | null>(null);
   // 原始远程 Key 不进入 React state，关闭一次性展示窗口后立即清除。
   const oneTimeSecretRef = useRef<string | null>(null);
+  const mounted = useRef(false);
+  const loadVersion = useRef(0);
+  const controlsLocked = busy !== null || loading;
 
   const notifyConfigChanged = (config: AppConfig) => {
     window.dispatchEvent(new CustomEvent<AppConfig>("llm-gateway-config-changed", { detail: config }));
   };
 
-  const load = async () => {
+  const load = async (propagateError = false) => {
+    if (!mounted.current) return false;
+    const version = ++loadVersion.current;
+    const isCurrent = () => mounted.current && version === loadVersion.current;
+    setLoading(true);
+    setMsg(null);
     try {
       const [config, key, snapshots, keys, providerList] = await Promise.all([
         api.getConfig(),
@@ -95,44 +112,63 @@ export default function SettingsPage() {
         api.listRemoteAccessKeys(),
         api.listProviders(),
       ]);
+      if (!isCurrent()) return false;
       setCfg(config);
       setKeyInfo(key);
       setSnaps(snapshots);
       setRemoteKeys(keys);
       setProviders(providerList);
       setCustomRulesDraft(null);
+      return true;
     } catch (error) {
+      if (!isCurrent()) return false;
       setMsg({ kind: "err", text: `加载设置失败：${errorText(error)}` });
+      if (propagateError) throw new Error(`操作已完成，但设置刷新失败：${errorText(error)}`);
+      return false;
+    } finally {
+      if (isCurrent()) setLoading(false);
     }
   };
 
   useEffect(() => {
+    mounted.current = true;
     void load();
-  }, []);
-
-  useEffect(() => () => {
-    oneTimeSecretRef.current = null;
+    return () => {
+      mounted.current = false;
+      loadVersion.current++;
+      oneTimeSecretRef.current = null;
+    };
   }, []);
 
   const patch = async (changes: Partial<AppConfig>) => {
-    if (!cfg) return;
+    if (!cfg || !mounted.current || controlsLocked) return;
     const next = { ...cfg, ...changes };
     if (!Number.isInteger(next.port) || next.port < 1 || next.port > 65535) {
       setMsg({ kind: "err", text: "端口必须是 1 到 65535 之间的整数" });
       return;
     }
+    const cacheError = cacheValidationError(next.cache);
+    if (cacheError) {
+      setMsg({ kind: "err", text: cacheError });
+      return;
+    }
 
+    const version = ++loadVersion.current;
+    const isCurrent = () => mounted.current && version === loadVersion.current;
     setBusy("config");
     try {
       const result = await api.updateConfig(next);
+      if (!isCurrent()) return;
       setCfg(result.config);
       notifyConfigChanged(result.config);
-      setKeyInfo(await api.getUnifiedKey());
+      const key = await api.getUnifiedKey();
+      if (!isCurrent()) return;
+      setKeyInfo(key);
       setMsg({ kind: "ok", text: restartMessage(result) });
     } catch (error) {
-      setMsg({ kind: "err", text: `保存设置失败：${errorText(error)}` });
+      if (isCurrent()) setMsg({ kind: "err", text: `保存设置失败：${errorText(error)}` });
     } finally {
-      setBusy(null);
+      if (isCurrent()) setBusy(null);
     }
   };
 
@@ -142,6 +178,17 @@ export default function SettingsPage() {
       return;
     }
     void patch({ [field]: value } as Partial<AppConfig>);
+  };
+
+  const saveCache = (changes: Partial<AppConfig["cache"]>) => {
+    if (!cfg) return;
+    const cache = { ...(cfg.cache ?? { enabled: false, capacity: 200, ttl_secs: 0 }), ttl_secs: cfg.cache?.ttl_secs ?? 0, ...changes };
+    const cacheError = cacheValidationError(cache);
+    if (cacheError) {
+      setMsg({ kind: "err", text: cacheError });
+      return;
+    }
+    void patch({ cache });
   };
 
   const closeOneTimeSecret = () => {
@@ -168,7 +215,7 @@ export default function SettingsPage() {
       setOneTimeSecretLabel(result.key.label);
       setRemoteKeyLabel("");
       setRemoteKeyRpmLimit(60);
-      await load();
+      if (!await load(true)) return;
       setMsg({ kind: "ok", text: `已创建“${result.key.label}”的远程访问 Key，请立即保存一次性 secret。` });
     } catch (error) {
       setMsg({ kind: "err", text: `创建远程访问 Key 失败：${errorText(error)}` });
@@ -198,6 +245,11 @@ export default function SettingsPage() {
       setMsg({ kind: "err", text: "每分钟请求上限必须是 1 到 100000 之间的整数" });
       return;
     }
+    if (changes.monthly_budget_micros !== undefined
+      && (!Number.isSafeInteger(changes.monthly_budget_micros) || changes.monthly_budget_micros < 0)) {
+      setMsg({ kind: "err", text: "月度预算必须是可精确表示的非负金额" });
+      return;
+    }
     if (
       cfg?.remote_mode.enabled &&
       key.enabled &&
@@ -212,7 +264,7 @@ export default function SettingsPage() {
     try {
       await api.updateRemoteAccessKey({ id: key.id, ...changes, label: changes.label.trim() });
       setEditingRemoteKey(null);
-      await load();
+      if (!await load(true)) return;
       setMsg({ kind: "ok", text: `已更新远程访问 Key“${changes.label.trim()}”` });
     } catch (error) {
       setMsg({ kind: "err", text: `更新远程访问 Key 失败：${errorText(error)}` });
@@ -235,7 +287,7 @@ export default function SettingsPage() {
     setBusy(`remote-key-${key.id}`);
     try {
       await api.deleteRemoteAccessKey(key.id);
-      await load();
+      if (!await load(true)) return;
       setMsg({ kind: "ok", text: `已删除远程访问 Key“${key.label}”` });
     } catch (error) {
       setMsg({ kind: "err", text: `删除远程访问 Key 失败：${errorText(error)}` });
@@ -276,7 +328,12 @@ export default function SettingsPage() {
     updateCustomRules((rules) => rules.map((rule, position) => position === index ? next : rule));
   };
   const saveCustomRules = async () => {
-    if (!cfg) return;
+    if (!cfg || !mounted.current || controlsLocked) return;
+    const cacheError = cacheValidationError(cfg.cache);
+    if (cacheError) {
+      setMsg({ kind: "err", text: cacheError });
+      return;
+    }
     const rules = customRules.map((rule) => {
       const prefix = rule.prefix.trim();
       switch (rule.action.type) {
@@ -309,21 +366,30 @@ export default function SettingsPage() {
       }
     }
 
+    const version = ++loadVersion.current;
+    const isCurrent = () => mounted.current && version === loadVersion.current;
     setBusy("custom-rules");
     try {
       const result = await api.updateConfig({ ...cfg, custom_rules: rules });
+      if (!isCurrent()) return;
       setCfg(result.config);
       notifyConfigChanged(result.config);
       setCustomRulesDraft(null);
       setMsg({ kind: "ok", text: "自定义路由规则已保存并热生效" });
     } catch (error) {
-      setMsg({ kind: "err", text: `保存自定义路由规则失败：${errorText(error)}` });
+      if (isCurrent()) setMsg({ kind: "err", text: `保存自定义路由规则失败：${errorText(error)}` });
     } finally {
-      setBusy(null);
+      if (isCurrent()) setBusy(null);
     }
   };
 
-  if (!cfg || !keyInfo) return <div className="empty">加载设置中</div>;
+  if (!cfg || !keyInfo) return <div>
+    <h2>设置</h2>
+    {msg && <div role="alert" className="msg err">{msg.text}</div>}
+    {loading
+      ? <div className="empty" role="status">加载设置中</div>
+      : <button onClick={() => void load()}>重试加载设置</button>}
+  </div>;
 
   const enabledRemoteKeyCount = remoteKeys.filter((key) => key.enabled).length;
 
@@ -360,7 +426,7 @@ ${keyInfo.ollama_endpoint}`}
         </div>
         <div className="row" style={{ marginTop: 10 }}>
           <button
-            disabled={busy !== null}
+            disabled={controlsLocked}
             onClick={() => {
               void (async () => {
                 try {
@@ -375,14 +441,14 @@ ${keyInfo.ollama_endpoint}`}
             复制 Key
           </button>
           <button
-            disabled={busy !== null}
+            disabled={controlsLocked}
             onClick={() => {
               if (!window.confirm("轮换后，所有客户端都必须更新为新的统一 Key。确定继续吗？")) return;
               void (async () => {
                 setBusy("rotate-key");
                 try {
                   await api.rotateUnifiedKey();
-                  await load();
+                  if (!await load(true)) return;
                   setMsg({ kind: "ok", text: "统一 Key 已轮换，请更新已接入的客户端" });
                 } catch (error) {
                   setMsg({ kind: "err", text: `轮换失败：${errorText(error)}` });
@@ -405,13 +471,14 @@ ${keyInfo.ollama_endpoint}`}
             <input value={cfg.bind} disabled />
           </div>
           <div className="field">
-            <label>端口</label>
+            <label htmlFor="gateway-port">端口</label>
             <input
+              id="gateway-port"
               type="number"
               min={1}
               max={65535}
               value={cfg.port}
-              disabled={busy === "config"}
+              disabled={controlsLocked}
               onChange={(event) => setCfg({ ...cfg, port: Number(event.target.value) })}
               onBlur={() => saveNumber("port", cfg.port)}
             />
@@ -422,7 +489,7 @@ ${keyInfo.ollama_endpoint}`}
               type="number"
               min={1}
               value={cfg.upstream_timeout_secs}
-              disabled={busy === "config"}
+              disabled={controlsLocked}
               onChange={(event) => setCfg({ ...cfg, upstream_timeout_secs: Number(event.target.value) })}
               onBlur={() => saveNumber("upstream_timeout_secs", cfg.upstream_timeout_secs)}
             />
@@ -432,7 +499,7 @@ ${keyInfo.ollama_endpoint}`}
           <input
             type="checkbox"
             checked={cfg.allow_lan}
-            disabled={busy === "config" || cfg.remote_mode.enabled}
+            disabled={controlsLocked || cfg.remote_mode.enabled}
             onChange={(event) => {
               if (event.target.checked) {
                 setLanConfirmationOpen(true);
@@ -466,7 +533,7 @@ ${keyInfo.ollama_endpoint}`}
               type="url"
               value={cfg.remote_mode.public_url ?? ""}
               placeholder="https://llm.example.com"
-              disabled={busy === "config"}
+              disabled={controlsLocked}
               onChange={(event) => setCfg({
                 ...cfg,
                 remote_mode: { ...cfg.remote_mode, public_url: event.target.value },
@@ -490,7 +557,7 @@ ${keyInfo.ollama_endpoint}`}
           <input
             type="checkbox"
             checked={cfg.remote_mode.enabled}
-            disabled={busy === "config" || enabledRemoteKeyCount === 0}
+            disabled={controlsLocked || enabledRemoteKeyCount === 0}
             onChange={(event) => {
               if (event.target.checked) {
                 prepareRemoteModeEnable();
@@ -515,7 +582,7 @@ ${keyInfo.ollama_endpoint}`}
             <label>新访问 Key 名称</label>
             <input
               value={remoteKeyLabel}
-              disabled={busy !== null}
+              disabled={controlsLocked}
               maxLength={64}
               placeholder="例如 我的笔记本"
               onChange={(event) => setRemoteKeyLabel(event.target.value)}
@@ -528,7 +595,7 @@ ${keyInfo.ollama_endpoint}`}
               min={1}
               max={100000}
               value={remoteKeyRpmLimit}
-              disabled={busy !== null}
+              disabled={controlsLocked}
               onChange={(event) => setRemoteKeyRpmLimit(Number(event.target.value))}
             />
           </div>
@@ -536,7 +603,7 @@ ${keyInfo.ollama_endpoint}`}
         <div className="row" style={{ marginTop: -2 }}>
           <button
             className="primary"
-            disabled={busy !== null || !remoteKeyLabel.trim()}
+            disabled={controlsLocked || !remoteKeyLabel.trim()}
             onClick={() => void createRemoteAccessKey()}
           >
             创建并显示一次性 Key
@@ -572,7 +639,7 @@ ${keyInfo.ollama_endpoint}`}
                     <td>{key.rpm_limit}</td>
                     <td className="muted">
                       {key.monthly_budget_micros > 0
-                        ? `${key.monthly_budget_micros / 1_000_000} ${key.budget_currency || "—"}`
+                        ? `${key.monthly_budget_micros / 1_000_000} ${key.budget_currency.toUpperCase() || "—"}`
                         : "不限"}
                     </td>
                     <td className="muted" style={{ fontSize: 11 }}>
@@ -585,7 +652,7 @@ ${keyInfo.ollama_endpoint}`}
                       <div className="row compact-actions">
                         <button
                           className="ghost"
-                          disabled={busy !== null}
+                          disabled={controlsLocked}
                           onClick={() => {
                             setEditingRemoteKey(key);
                             setEditingRemoteKeyLabel(key.label);
@@ -597,14 +664,15 @@ ${keyInfo.ollama_endpoint}`}
                                 ? String(key.monthly_budget_micros / 1_000_000)
                                 : "",
                             );
-                            setEditingRemoteKeyCurrency(key.budget_currency || "USD");
+                            setEditingRemoteKeyCurrency(key.budget_currency.trim().toLowerCase() || "usd");
+                            setMsg(null);
                             setEditingRemoteKeyModels(key.allowed_models.join(", "));
                           }}
                         >
                           编辑
                         </button>
                         <button
-                          disabled={busy !== null}
+                          disabled={controlsLocked}
                           onClick={() => void updateRemoteAccessKey(key, {
                             label: key.label,
                             enabled: !key.enabled,
@@ -615,7 +683,7 @@ ${keyInfo.ollama_endpoint}`}
                         </button>
                         <button
                           className="danger"
-                          disabled={busy !== null}
+                          disabled={controlsLocked}
                           onClick={() => void deleteRemoteAccessKey(key)}
                         >
                           删除
@@ -639,7 +707,7 @@ ${keyInfo.ollama_endpoint}`}
               type="number"
               min={0}
               value={cfg.max_fallback_attempts}
-              disabled={busy === "config"}
+              disabled={controlsLocked}
               onChange={(event) => setCfg({ ...cfg, max_fallback_attempts: Number(event.target.value) })}
               onBlur={() => saveNumber("max_fallback_attempts", cfg.max_fallback_attempts)}
             />
@@ -650,7 +718,7 @@ ${keyInfo.ollama_endpoint}`}
               type="number"
               min={0}
               value={cfg.sticky_ttl_secs}
-              disabled={busy === "config"}
+              disabled={controlsLocked}
               onChange={(event) => setCfg({ ...cfg, sticky_ttl_secs: Number(event.target.value) })}
               onBlur={() => saveNumber("sticky_ttl_secs", cfg.sticky_ttl_secs)}
             />
@@ -661,7 +729,7 @@ ${keyInfo.ollama_endpoint}`}
               type="number"
               min={1}
               value={cfg.compact_threshold_tokens}
-              disabled={busy === "config"}
+              disabled={controlsLocked}
               onChange={(event) => setCfg({ ...cfg, compact_threshold_tokens: Number(event.target.value) })}
               onBlur={() => saveNumber("compact_threshold_tokens", cfg.compact_threshold_tokens)}
             />
@@ -671,11 +739,56 @@ ${keyInfo.ollama_endpoint}`}
           <input
             type="checkbox"
             checked={cfg.failover_enabled}
-            disabled={busy === "config"}
+            disabled={controlsLocked}
             onChange={(event) => void patch({ failover_enabled: event.target.checked })}
           />
           启用自动故障转移
         </label>
+      </div>
+
+      <div className="card" data-testid="exact-cache-settings">
+        <strong>精确响应缓存</strong>
+        <div className="sub">
+          相同的非流式纯文本请求可复用已成功生成的回答。流式、多模态、工具调用和联网搜索等请求会绕过缓存。
+          有效期为 0 表示不过期；设置大于 0 的秒数后，缓存到期会重新请求上游。
+        </div>
+        <label className="row setting-toggle" style={{ gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={cfg.cache?.enabled ?? false}
+            disabled={controlsLocked}
+            onChange={(event) => saveCache({ enabled: event.target.checked })}
+          />
+          启用精确响应缓存
+        </label>
+        <div className="grid2" style={{ marginTop: 10 }}>
+          <div className="field">
+            <label htmlFor="cache-capacity">最多保留回答数</label>
+            <input
+              id="cache-capacity"
+              type="number"
+              min={1}
+              step={1}
+              value={cfg.cache?.capacity ?? 200}
+              disabled={controlsLocked}
+              onChange={(event) => setCfg({ ...cfg, cache: { ...(cfg.cache ?? { enabled: false, capacity: 200, ttl_secs: 0 }), capacity: Number(event.target.value) } })}
+              onBlur={() => saveCache({ capacity: cfg.cache?.capacity ?? 200 })}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="cache-ttl">回答有效期（秒，0 为不过期）</label>
+            <input
+              id="cache-ttl"
+              type="number"
+              min={0}
+              step={1}
+              value={cfg.cache?.ttl_secs ?? 0}
+              disabled={controlsLocked}
+              onChange={(event) => setCfg({ ...cfg, cache: { ...(cfg.cache ?? { enabled: false, capacity: 200, ttl_secs: 0 }), ttl_secs: Number(event.target.value) } })}
+              onBlur={() => saveCache({ ttl_secs: cfg.cache?.ttl_secs ?? 0 })}
+            />
+          </div>
+        </div>
       </div>
 
       {cfg.routing_strategy === "custom" && (
@@ -689,7 +802,7 @@ ${keyInfo.ollama_endpoint}`}
             </div>
             <button
               className="ghost"
-              disabled={busy !== null}
+              disabled={controlsLocked}
               onClick={() => updateCustomRules((rules) => [...rules, newCustomRule(providers[0]?.id ?? "")])}
             >
               添加规则
@@ -711,7 +824,7 @@ ${keyInfo.ollama_endpoint}`}
                       <label>模型名前缀</label>
                       <input
                         value={rule.prefix}
-                        disabled={busy !== null}
+                        disabled={controlsLocked}
                         placeholder="例如 claude-"
                         onChange={(event) => replaceCustomRule(index, { ...rule, prefix: event.target.value })}
                       />
@@ -720,7 +833,7 @@ ${keyInfo.ollama_endpoint}`}
                       <label>动作</label>
                       <select
                         value={action.type}
-                        disabled={busy !== null}
+                        disabled={controlsLocked}
                         onChange={(event) => replaceCustomRule(index, {
                           ...rule,
                           action: defaultRuleAction(
@@ -739,7 +852,7 @@ ${keyInfo.ollama_endpoint}`}
                         <label>方言</label>
                         <select
                           value={action.dialect}
-                          disabled={busy !== null}
+                          disabled={controlsLocked}
                           onChange={(event) => replaceCustomRule(index, {
                             ...rule,
                             action: { type: "only_dialect", dialect: event.target.value as Dialect },
@@ -756,7 +869,7 @@ ${keyInfo.ollama_endpoint}`}
                         <label>目标 Provider</label>
                         <select
                           value={action.provider_id}
-                          disabled={busy !== null}
+                          disabled={controlsLocked}
                           onChange={(event) => {
                             const provider_id = event.target.value;
                             replaceCustomRule(index, {
@@ -784,7 +897,7 @@ ${keyInfo.ollama_endpoint}`}
                           type="number"
                           step={1}
                           value={action.bonus}
-                          disabled={busy !== null}
+                          disabled={controlsLocked}
                           onChange={(event) => replaceCustomRule(index, {
                             ...rule,
                             action: {
@@ -800,7 +913,7 @@ ${keyInfo.ollama_endpoint}`}
                       className="danger ghost icon-button custom-rule-delete"
                       title="删除规则"
                       aria-label={`删除第 ${index + 1} 条规则`}
-                      disabled={busy !== null}
+                      disabled={controlsLocked}
                       onClick={() => updateCustomRules((rules) => rules.filter((_, position) => position !== index))}
                     >
                       ×
@@ -813,14 +926,14 @@ ${keyInfo.ollama_endpoint}`}
 
           <div className="row end" style={{ marginTop: 12 }}>
             <button
-              disabled={busy !== null || JSON.stringify(customRules) === JSON.stringify(cfg.custom_rules)}
+              disabled={controlsLocked || JSON.stringify(customRules) === JSON.stringify(cfg.custom_rules)}
               onClick={() => setCustomRulesDraft(null)}
             >
               还原
             </button>
             <button
               className="primary"
-              disabled={busy !== null || JSON.stringify(customRules) === JSON.stringify(cfg.custom_rules)}
+              disabled={controlsLocked || JSON.stringify(customRules) === JSON.stringify(cfg.custom_rules)}
               onClick={() => void saveCustomRules()}
             >
               {busy === "custom-rules" ? "保存中" : "保存规则"}
@@ -840,7 +953,7 @@ ${keyInfo.ollama_endpoint}`}
         </div>
         <div className="row">
           <button
-            disabled={busy !== null}
+            disabled={controlsLocked}
             onClick={() => {
               void (async () => {
                 setBusy("cli-detect");
@@ -859,7 +972,7 @@ ${keyInfo.ollama_endpoint}`}
             {busy === "cli-detect" ? "检测中…" : "检测本机 CLI"}
           </button>
           <button
-            disabled={busy !== null}
+            disabled={controlsLocked}
             onClick={() => {
               void (async () => {
                 setBusy("cli-check");
@@ -940,7 +1053,7 @@ ${keyInfo.ollama_endpoint}`}
                     <td>
                       <button
                         className="ghost"
-                        disabled={busy !== null || !actionEnabled}
+                        disabled={controlsLocked || !actionEnabled}
                         title={actionTitle}
                         onClick={() => {
                           const lead = isScript
@@ -990,7 +1103,7 @@ ${keyInfo.ollama_endpoint}`}
             <input
               type="checkbox"
               checked={cfg.takeover.claude_code}
-              disabled={busy !== null}
+              disabled={controlsLocked}
               onChange={(event) => void patch({ takeover: { ...cfg.takeover, claude_code: event.target.checked } })}
             />
             Claude Code
@@ -999,7 +1112,7 @@ ${keyInfo.ollama_endpoint}`}
             <input
               type="checkbox"
               checked={cfg.takeover.codex}
-              disabled={busy !== null}
+              disabled={controlsLocked}
               onChange={(event) => void patch({ takeover: { ...cfg.takeover, codex: event.target.checked } })}
             />
             Codex CLI
@@ -1008,7 +1121,7 @@ ${keyInfo.ollama_endpoint}`}
             <input
               type="checkbox"
               checked={cfg.takeover.opencode}
-              disabled={busy !== null}
+              disabled={controlsLocked}
               onChange={(event) => void patch({ takeover: { ...cfg.takeover, opencode: event.target.checked } })}
             />
             OpenCode
@@ -1017,7 +1130,7 @@ ${keyInfo.ollama_endpoint}`}
             <input
               type="checkbox"
               checked={cfg.takeover.crush}
-              disabled={busy !== null}
+              disabled={controlsLocked}
               onChange={(event) => void patch({ takeover: { ...cfg.takeover, crush: event.target.checked } })}
             />
             Crush
@@ -1026,14 +1139,14 @@ ${keyInfo.ollama_endpoint}`}
             <input
               type="checkbox"
               checked={cfg.takeover.gemini_cli}
-              disabled={busy !== null || !cfg.takeover.gemini_cli}
+              disabled={controlsLocked || !cfg.takeover.gemini_cli}
               onChange={(event) => void patch({ takeover: { ...cfg.takeover, gemini_cli: event.target.checked } })}
             />
             Gemini CLI（暂不支持）
           </label>
           <button
             className="primary"
-            disabled={busy !== null || cfg.takeover.gemini_cli}
+            disabled={controlsLocked || cfg.takeover.gemini_cli}
             title={cfg.takeover.gemini_cli ? "请先取消 Gemini CLI 的旧接管选项" : undefined}
             onClick={() => {
               void (async () => {
@@ -1083,7 +1196,7 @@ ${keyInfo.ollama_endpoint}`}
         </div>
         <div className="row">
           <button
-            disabled={busy !== null}
+            disabled={controlsLocked}
             onClick={() => {
               void (async () => {
                 setBusy("self-check");
@@ -1124,19 +1237,19 @@ ${keyInfo.ollama_endpoint}`}
         <div className="row">
           <input
             value={snapName}
-            disabled={busy !== null}
+            disabled={controlsLocked}
             onChange={(event) => setSnapName(event.target.value)}
             placeholder="快照名称，例如 编码"
           />
           <button
-            disabled={busy !== null || !snapName.trim()}
+            disabled={controlsLocked || !snapName.trim()}
             onClick={() => {
               void (async () => {
                 setBusy("snapshot-create");
                 try {
                   await api.createSnapshot(snapName.trim());
                   setSnapName("");
-                  await load();
+                  if (!await load(true)) return;
                   setMsg({ kind: "ok", text: "已保存当前配置快照" });
                 } catch (error) {
                   setMsg({ kind: "err", text: `保存快照失败：${errorText(error)}` });
@@ -1173,7 +1286,7 @@ ${keyInfo.ollama_endpoint}`}
                     <td>
                       <button
                         className="ghost"
-                        disabled={busy !== null}
+                        disabled={controlsLocked}
                         onClick={() => {
                           if (!window.confirm(`应用快照“${snapshot.name}”会替换当前 Provider、模型映射和路由配置。确定继续吗？`)) return;
                           void (async () => {
@@ -1182,7 +1295,7 @@ ${keyInfo.ollama_endpoint}`}
                               const result = await api.applySnapshot(snapshot.id);
                               setCfg(result.config);
                               notifyConfigChanged(result.config);
-                              await load();
+                              if (!await load(true)) return;
                               setMsg({ kind: "ok", text: `已应用快照“${snapshot.name}”。${restartMessage(result)}` });
                             } catch (error) {
                               setMsg({ kind: "err", text: `应用快照失败：${errorText(error)}` });
@@ -1212,7 +1325,7 @@ ${keyInfo.ollama_endpoint}`}
         </div>
         <div className="row">
           <button
-            disabled={busy !== null}
+            disabled={controlsLocked}
             onClick={() => {
               void (async () => {
                 try {
@@ -1233,7 +1346,7 @@ ${keyInfo.ollama_endpoint}`}
             导出配置包
           </button>
           <button
-            disabled={busy !== null}
+            disabled={controlsLocked}
             onClick={() => {
               void (async () => {
                 try {
@@ -1246,7 +1359,7 @@ ${keyInfo.ollama_endpoint}`}
                   const imported = await api.getConfig();
                   setCfg(imported);
                   notifyConfigChanged(imported);
-                  await load();
+                  if (!await load(true)) return;
                   const { result } = outcome;
                   const missing = result.providers_missing_key.length
                     ? `。以下 Provider 的 Key 需要用本机主密钥重新填写：${result.providers_missing_key.join("、")}`
@@ -1309,12 +1422,13 @@ ${keyInfo.ollama_endpoint}`}
         <div className="modal-mask" onClick={() => setEditingRemoteKey(null)}>
           <div className="modal" onClick={(event) => event.stopPropagation()}>
             <h3>编辑远程访问 Key</h3>
+            {msg?.kind === "err" && <div role="alert" className="msg err">{msg.text}</div>}
             <div className="field">
               <label>名称</label>
               <input
                 value={editingRemoteKeyLabel}
                 maxLength={64}
-                disabled={busy !== null}
+                disabled={controlsLocked}
                 onChange={(event) => setEditingRemoteKeyLabel(event.target.value)}
               />
             </div>
@@ -1325,7 +1439,7 @@ ${keyInfo.ollama_endpoint}`}
                 min={1}
                 max={100000}
                 value={editingRemoteKeyRpmLimit}
-                disabled={busy !== null}
+                disabled={controlsLocked}
                 onChange={(event) => setEditingRemoteKeyRpmLimit(Number(event.target.value))}
               />
             </div>
@@ -1343,20 +1457,21 @@ ${keyInfo.ollama_endpoint}`}
                 step="0.01"
                 placeholder="不限"
                 value={editingRemoteKeyBudget}
-                disabled={busy !== null}
+                disabled={controlsLocked}
                 onChange={(event) => setEditingRemoteKeyBudget(event.target.value)}
               />
             </div>
             <div className="field">
               <label htmlFor="remote-key-currency">预算币种</label>
-              <input
+              <select
                 id="remote-key-currency"
                 value={editingRemoteKeyCurrency}
-                maxLength={8}
-                placeholder="USD"
-                disabled={busy !== null || !editingRemoteKeyBudget.trim()}
+                disabled={controlsLocked || !editingRemoteKeyBudget.trim()}
                 onChange={(event) => setEditingRemoteKeyCurrency(event.target.value)}
-              />
+              >
+                <option value="usd">美元 USD</option>
+                <option value="cny">人民币 CNY</option>
+              </select>
             </div>
             <div className="field">
               <label htmlFor="remote-key-models">模型白名单（逗号分隔，留空 = 不限）</label>
@@ -1364,7 +1479,7 @@ ${keyInfo.ollama_endpoint}`}
                 id="remote-key-models"
                 value={editingRemoteKeyModels}
                 placeholder="gpt-4o, claude-*, *-turbo"
-                disabled={busy !== null}
+                disabled={controlsLocked}
                 onChange={(event) => setEditingRemoteKeyModels(event.target.value)}
               />
             </div>
@@ -1374,10 +1489,10 @@ ${keyInfo.ollama_endpoint}`}
               （<span className="mono">gpt-4</span> 不会放行 <span className="mono">gpt-4o</span>）。
             </div>
             <div className="row end" style={{ marginTop: 18 }}>
-              <button disabled={busy !== null} onClick={() => setEditingRemoteKey(null)}>取消</button>
+              <button disabled={controlsLocked} onClick={() => setEditingRemoteKey(null)}>取消</button>
               <button
                 className="primary"
-                disabled={busy !== null || !editingRemoteKeyLabel.trim()}
+                disabled={controlsLocked || !editingRemoteKeyLabel.trim()}
                 onClick={() => void updateRemoteAccessKey(editingRemoteKey, {
                   label: editingRemoteKeyLabel,
                   enabled: editingRemoteKey.enabled,

@@ -46,6 +46,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -91,6 +92,8 @@ pub enum BypassReason {
     ResponseHasToolCalls,
     /// 缓存总开关关着
     Disabled,
+    /// 请求使用的配置快照已失效，不能读取或填充新代次的缓存。
+    ConfigurationChanged,
 }
 
 impl BypassReason {
@@ -103,12 +106,13 @@ impl BypassReason {
             BypassReason::UpstreamError => "upstream_error",
             BypassReason::ResponseHasToolCalls => "response_has_tool_calls",
             BypassReason::Disabled => "disabled",
+            BypassReason::ConfigurationChanged => "configuration_changed",
         }
     }
 }
 
 /// 缓存配置。`enabled` 默认 **false** —— 默认关是卡片写死的。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -119,6 +123,9 @@ pub struct CacheConfig {
     /// 条目数则是确定的、可预测的，不会因为一条超大响应把整表清空。
     #[serde(default = "default_capacity")]
     pub capacity: usize,
+    /// 有效期（秒）；0 保留历史行为，不自动过期。命中不延长有效期。
+    #[serde(default)]
+    pub ttl_secs: u64,
 }
 
 fn default_capacity() -> usize {
@@ -130,6 +137,7 @@ impl Default for CacheConfig {
         Self {
             enabled: false,
             capacity: default_capacity(),
+            ttl_secs: 0,
         }
     }
 }
@@ -139,9 +147,22 @@ pub enum Lookup {
     /// 命中
     Hit(Value),
     /// 未命中，继续走上游（键已经算好，回填时复用）
-    Miss(String),
+    Miss(CacheMiss),
     /// 明确绕过，不走缓存
     Bypass(BypassReason),
+}
+
+/// MISS 的回填凭据。键和代次只能由 lookup 产生，防止在清空后复活旧响应。
+#[derive(Debug, Clone)]
+pub struct CacheMiss {
+    key: String,
+    generation: u64,
+}
+
+impl CacheMiss {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
 }
 
 /// 精确响应缓存。
@@ -161,11 +182,37 @@ pub struct ResponseCache {
 }
 
 struct Inner {
-    map: BTreeMap<String, Value>,
+    map: BTreeMap<String, Entry>,
     /// LRU 顺序：队尾最新。用 Vec 而不是链表——容量是几百，
     /// `position` + `remove` 的 O(n) 完全够，换来的是可读性。
     order: Vec<String>,
-    capacity: usize,
+    config: CacheConfig,
+    generation: u64,
+}
+
+struct Entry {
+    value: Value,
+    inserted_at: Instant,
+}
+
+impl Inner {
+    fn clear(&mut self) -> usize {
+        let removed = self.map.len();
+        self.map.clear();
+        self.order.clear();
+        self.generation = self.generation.wrapping_add(1);
+        removed
+    }
+
+    fn purge_expired(&mut self, now: Instant) {
+        if self.config.ttl_secs == 0 {
+            return;
+        }
+        let ttl = Duration::from_secs(self.config.ttl_secs);
+        self.map
+            .retain(|_, entry| now.saturating_duration_since(entry.inserted_at) < ttl);
+        self.order.retain(|key| self.map.contains_key(key));
+    }
 }
 
 impl Default for ResponseCache {
@@ -180,7 +227,8 @@ impl ResponseCache {
             inner: std::sync::Mutex::new(Inner {
                 map: BTreeMap::new(),
                 order: Vec::new(),
-                capacity: cfg.capacity.max(1),
+                config: cfg,
+                generation: 0,
             }),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -189,12 +237,31 @@ impl ResponseCache {
         }
     }
 
+    /// Read counters and stored entries without expiring or otherwise changing the cache.
+    /// Expired entries remain included until a normal cache operation purges them.
+    pub fn snapshot_stats(&self) -> CacheStats {
+        CacheStats {
+            entries: self
+                .inner
+                .lock()
+                .map(|guard| guard.map.len() as u64)
+                .unwrap_or_default(),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            bypasses: self.bypasses.load(Ordering::Relaxed),
+            invalidations: self.invalidations.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             entries: self
                 .inner
                 .lock()
-                .map(|g| g.map.len() as u64)
+                .map(|mut guard| {
+                    guard.purge_expired(Instant::now());
+                    guard.map.len() as u64
+                })
                 .unwrap_or_default(),
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
@@ -208,22 +275,54 @@ impl ResponseCache {
     /// 漏一个就是「改了配置却不生效」的经典症状：界面显示保存成功，
     /// 运行时却还在返回旧答案。所以在那几个入口显式调用，不靠猜。
     pub fn invalidate_all(&self) -> usize {
-        let removed = match self.inner.lock() {
-            Ok(mut guard) => {
-                let n = guard.map.len();
-                guard.map.clear();
-                guard.order.clear();
-                n
-            }
-            Err(_) => 0,
-        };
+        let removed = self
+            .inner
+            .lock()
+            .map(|mut guard| guard.clear())
+            .unwrap_or(0);
         self.invalidations.fetch_add(1, Ordering::Relaxed);
         removed
+    }
+
+    /// 更新实例配置与代次在同一把锁内完成，旧 MISS 不能越过更新回填。
+    pub fn reconfigure(&self, cfg: &CacheConfig) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.config = cfg.clone();
+            guard.clear();
+        }
+        self.invalidations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().map(|guard| guard.generation).unwrap_or(0)
     }
 
     /// 查一次。`cfg` 关着时**立刻返回 Bypass(Disabled)**，
     /// 不做任何哈希与查表——这是「关闭时路径逐位等价」的实现方式。
     pub fn lookup(&self, cfg: &CacheConfig, input: &CacheKeyInput<'_>) -> Lookup {
+        if !cfg.enabled {
+            return Lookup::Bypass(BypassReason::Disabled);
+        }
+        self.lookup_for_generation(cfg, input, self.generation())
+    }
+
+    /// 带请求配置快照的代次检查，覆盖「旧请求直到清空后才开始 lookup」的窗口。
+    pub fn lookup_for_generation(
+        &self,
+        cfg: &CacheConfig,
+        input: &CacheKeyInput<'_>,
+        generation: u64,
+    ) -> Lookup {
+        self.lookup_at(cfg, input, generation, Instant::now())
+    }
+
+    fn lookup_at(
+        &self,
+        cfg: &CacheConfig,
+        input: &CacheKeyInput<'_>,
+        generation: u64,
+        now: Instant,
+    ) -> Lookup {
         if !cfg.enabled {
             return Lookup::Bypass(BypassReason::Disabled);
         }
@@ -233,15 +332,22 @@ impl ResponseCache {
         }
 
         let key = cache_key(input);
-        let hit = self.inner.lock().ok().and_then(|mut guard| {
-            let value = guard.map.get(&key).cloned()?;
+        let Ok(mut guard) = self.inner.lock() else {
+            return Lookup::Bypass(BypassReason::ConfigurationChanged);
+        };
+        if generation != guard.generation || cfg != &guard.config {
+            self.bypasses.fetch_add(1, Ordering::Relaxed);
+            return Lookup::Bypass(BypassReason::ConfigurationChanged);
+        }
+        guard.purge_expired(now);
+        let hit = guard.map.get(&key).map(|entry| entry.value.clone());
+        if hit.is_some() {
             // 命中即提到队尾（最近使用）
             if let Some(pos) = guard.order.iter().position(|k| k == &key) {
                 let k = guard.order.remove(pos);
                 guard.order.push(k);
             }
-            Some(value)
-        });
+        }
 
         match hit {
             Some(value) => {
@@ -250,23 +356,42 @@ impl ResponseCache {
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
-                Lookup::Miss(key)
+                Lookup::Miss(CacheMiss {
+                    key,
+                    generation: guard.generation,
+                })
             }
         }
     }
 
     /// 回填。`key` 来自 [`Lookup::Miss`]，避免重算一次哈希。
-    pub fn store(&self, key: &str, value: Value) {
+    pub fn store(&self, miss: &CacheMiss, value: Value) -> bool {
+        self.store_at(miss, value, Instant::now())
+    }
+
+    fn store_at(&self, miss: &CacheMiss, value: Value, now: Instant) -> bool {
         let Ok(mut guard) = self.inner.lock() else {
-            return;
+            return false;
         };
-        if guard.map.insert(key.to_string(), value).is_none() {
-            guard.order.push(key.to_string());
+        if miss.generation != guard.generation || !guard.config.enabled {
+            return false;
         }
-        while guard.order.len() > guard.capacity {
+        guard.purge_expired(now);
+        guard.map.insert(
+            miss.key.clone(),
+            Entry {
+                value,
+                inserted_at: now,
+            },
+        );
+        // 同一键的并发 MISS 最后一次回填也应成为最近使用。
+        guard.order.retain(|key| key != &miss.key);
+        guard.order.push(miss.key.clone());
+        while guard.order.len() > guard.config.capacity.max(1) {
             let oldest = guard.order.remove(0);
             guard.map.remove(&oldest);
         }
+        true
     }
 }
 
@@ -624,6 +749,7 @@ mod tests {
         let cfg = CacheConfig {
             enabled: true,
             capacity: 2,
+            ..Default::default()
         };
         let cache = ResponseCache::new(cfg.clone());
         let req = json!({"messages": []});
@@ -644,6 +770,7 @@ mod tests {
         let cfg = CacheConfig {
             enabled: true,
             capacity: 2,
+            ..Default::default()
         };
         let cache = ResponseCache::new(cfg.clone());
         let mut keys = Vec::new();
@@ -672,6 +799,7 @@ mod tests {
         let cfg = CacheConfig {
             enabled: true,
             capacity: 2,
+            ..Default::default()
         };
         let cache = ResponseCache::new(cfg.clone());
         let r0 = json!({"messages": [], "n": 0});
@@ -714,6 +842,7 @@ mod tests {
         let cfg = CacheConfig {
             enabled: true,
             capacity: 8,
+            ..Default::default()
         };
         let cache = ResponseCache::new(cfg.clone());
         let req = json!({"messages": []});
@@ -754,5 +883,161 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(cache_key(&input(&req, "s")), first);
         }
+    }
+
+    #[test]
+    fn 清空后旧_miss_不能重新回填() {
+        let cfg = CacheConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let cache = ResponseCache::new(cfg.clone());
+        let req = json!({"messages": []});
+        let key = match cache.lookup(&cfg, &input(&req, "s")) {
+            Lookup::Miss(key) => key,
+            _ => panic!("首次必须 MISS"),
+        };
+        cache.invalidate_all();
+        cache.store(&key, json!({"obsolete": true}));
+        assert_eq!(cache.stats().entries, 0, "旧 MISS 不能在清空后回填");
+        assert!(matches!(
+            cache.lookup(&cfg, &input(&req, "s")),
+            Lookup::Miss(_)
+        ));
+    }
+
+    #[test]
+    fn 旧请求在清空后才查询也必须绕过() {
+        let cfg = CacheConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let cache = ResponseCache::new(cfg.clone());
+        let old_generation = cache.generation();
+        cache.invalidate_all();
+        let req = json!({"messages": []});
+        assert!(matches!(
+            cache.lookup_for_generation(&cfg, &input(&req, "s"), old_generation),
+            Lookup::Bypass(BypassReason::ConfigurationChanged)
+        ));
+        assert!(matches!(
+            cache.lookup(&cfg, &input(&req, "s")),
+            Lookup::Miss(_)
+        ));
+    }
+
+    #[test]
+    fn 热更新实例容量且拒绝旧配置回填() {
+        let mut cfg = CacheConfig {
+            enabled: true,
+            capacity: 3,
+            ..Default::default()
+        };
+        let cache = ResponseCache::new(cfg.clone());
+        let req = json!({"n": 0});
+        let old = match cache.lookup(&cfg, &input(&req, "s")) {
+            Lookup::Miss(miss) => miss,
+            _ => panic!(),
+        };
+        cfg.capacity = 1;
+        cache.reconfigure(&cfg);
+        assert!(!cache.store(&old, json!("obsolete")));
+        for n in 1..=2 {
+            let request = json!({"n": n});
+            let miss = match cache.lookup(&cfg, &input(&request, "s")) {
+                Lookup::Miss(miss) => miss,
+                _ => panic!(),
+            };
+            assert!(cache.store(&miss, json!(n)));
+        }
+        assert_eq!(cache.stats().entries, 1);
+        assert!(matches!(
+            cache.lookup(&cfg, &input(&json!({"n": 1}), "s")),
+            Lookup::Miss(_)
+        ));
+        assert!(matches!(
+            cache.lookup(&cfg, &input(&json!({"n": 2}), "s")),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn ttl_使用写入时间且命中不续期() {
+        let cfg = CacheConfig {
+            enabled: true,
+            ttl_secs: 1,
+            ..Default::default()
+        };
+        let cache = ResponseCache::new(cfg.clone());
+        let req = json!({});
+        let now = Instant::now();
+        let miss = match cache.lookup_at(&cfg, &input(&req, "s"), 0, now) {
+            Lookup::Miss(miss) => miss,
+            _ => panic!(),
+        };
+        assert!(cache.store_at(&miss, json!("answer"), now));
+        assert!(matches!(
+            cache.lookup_at(&cfg, &input(&req, "s"), 0, now + Duration::from_millis(999)),
+            Lookup::Hit(_)
+        ));
+        assert!(matches!(
+            cache.lookup_at(&cfg, &input(&req, "s"), 0, now + Duration::from_secs(1)),
+            Lookup::Miss(_)
+        ));
+        assert_eq!(cache.stats().entries, 0);
+    }
+
+    #[test]
+    fn 默认零_ttl_保留不过期行为() {
+        let cfg: CacheConfig =
+            serde_json::from_value(json!({"enabled": true, "capacity": 2})).unwrap();
+        assert_eq!(cfg.ttl_secs, 0);
+        let cache = ResponseCache::new(cfg.clone());
+        let req = json!({});
+        let now = Instant::now();
+        let miss = match cache.lookup_at(&cfg, &input(&req, "s"), 0, now) {
+            Lookup::Miss(miss) => miss,
+            _ => panic!(),
+        };
+        cache.store_at(&miss, json!("answer"), now);
+        assert!(matches!(
+            cache.lookup_at(&cfg, &input(&req, "s"), 0, now + Duration::from_secs(86400)),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn 热更新_ttl_以新配置为准且不接受旧快照() {
+        let old_cfg = CacheConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let cache = ResponseCache::new(old_cfg.clone());
+        let cfg = CacheConfig {
+            ttl_secs: 1,
+            ..old_cfg.clone()
+        };
+        cache.reconfigure(&cfg);
+        let req = json!({});
+        assert!(matches!(
+            cache.lookup(&old_cfg, &input(&req, "s")),
+            Lookup::Bypass(BypassReason::ConfigurationChanged)
+        ));
+        let now = Instant::now();
+        let generation = cache.generation();
+        let miss = match cache.lookup_at(&cfg, &input(&req, "s"), generation, now) {
+            Lookup::Miss(miss) => miss,
+            _ => panic!(),
+        };
+        cache.store_at(&miss, json!("answer"), now);
+        assert!(matches!(
+            cache.lookup_at(
+                &cfg,
+                &input(&req, "s"),
+                generation,
+                now + Duration::from_secs(1)
+            ),
+            Lookup::Miss(_)
+        ));
     }
 }

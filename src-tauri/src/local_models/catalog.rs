@@ -196,8 +196,8 @@ pub fn to_model_ref(info: &LocalModelInfo) -> ModelRef {
         price: None,
         overrides: None,
         local: Some(info.meta.clone()),
-        enabled: true,
         capabilities: None,
+        enabled: true,
     }
 }
 

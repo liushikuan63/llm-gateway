@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const tauriRoot = resolve(projectRoot, "src-tauri");
@@ -119,4 +120,38 @@ if (!readme.includes("master.key") || !readme.includes("AES-256-GCM") || !readme
   fail("README security storage description must cover AES, DPAPI, master.key, and LLMGW_MASTER_KEY");
 }
 
-console.log("release configuration verified");
+const resourcePrefix = "resources/mihomo/";
+if (!config.bundle?.resources?.includes(`${resourcePrefix}*`)) {
+  fail("the pinned Mihomo archives and notices must be bundled");
+}
+const manifest = JSON.parse(readFileSync(requireFile(`${resourcePrefix}manifest.json`), "utf8"));
+const installer = readFileSync(resolve(tauriRoot, "src/vpn_install.rs"), "utf8");
+for (const [constant, value] of [
+  ["VERSION", manifest.version], ["ZIP_SHA256", manifest.archive_sha256],
+  ["EXE_SHA256", manifest.executable_sha256], ["ASSET_URL", manifest.asset_url],
+]) {
+  const match = installer.match(new RegExp(`pub const ${constant}: &str = "([^"]+)";`));
+  if (match?.[1] !== value) fail(`Mihomo manifest and runtime ${constant} must agree`);
+}
+if (manifest.platform !== "windows-amd64-compatible" || manifest.modified !== false || manifest.license !== "GPL-3.0") {
+  fail("Mihomo platform, upstream modification status and license must be explicit");
+}
+for (const [file, digest] of [
+  [manifest.asset_name, manifest.archive_sha256],
+  [manifest.source_archive, manifest.source_sha256],
+  [manifest.license_file, manifest.license_sha256],
+]) {
+  if (!/^[a-zA-Z0-9._-]+$/.test(file ?? "") || !/^[a-f0-9]{64}$/.test(digest ?? "")) {
+    fail("Mihomo resource names and checksums must be safe and pinned");
+  }
+  const actual = createHash("sha256").update(readFileSync(requireFile(`${resourcePrefix}${file}`))).digest("hex");
+  if (actual !== digest) fail(`Mihomo resource checksum mismatch: ${file}`);
+}
+const sourceNotice = readFileSync(requireFile(`${resourcePrefix}SOURCE.txt`), "utf8");
+if (readFileSync(requireFile(`${resourcePrefix}LLM-Gateway-LICENSE.txt`), "utf8") !== readFileSync(resolve(projectRoot, "LICENSE"), "utf8")) {
+  fail("the bundled project-owned license must match LICENSE");
+}
+if (!sourceNotice.includes(manifest.source_archive) || !sourceNotice.includes(manifest.source_url)) {
+  fail("Mihomo source notice must identify the included source and upstream URL");
+}
+console.log("release configuration verified (pinned Mihomo archive, source and license)");

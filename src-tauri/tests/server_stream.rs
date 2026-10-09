@@ -896,3 +896,242 @@ async fn 流式完成后健康统计记下吞吐() {
     gateway_task.abort();
     upstream_task.abort();
 }
+
+async fn spawn_auth_stream_upstream(
+    refused_calls: usize,
+    truncate_after_delta: bool,
+) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = counter.clone();
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) < refused_calls {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": {"message": "invalid key"}})),
+                    )
+                        .into_response();
+                }
+                let body = Body::from_stream(async_stream::stream! {
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"auth stream reply\"}}]}\n\n"
+                    ));
+                    if !truncate_after_delta {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+                    }
+                });
+                Response::builder()
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(body)
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1"), calls, task)
+}
+
+fn auth_stream_provider(id: &str, url: String, priority: i32, with_key: bool) -> Provider {
+    let mut provider = mock_provider(url);
+    provider.id = id.into();
+    provider.name = id.into();
+    provider.priority = priority;
+    if with_key {
+        provider.api_key_enc = llm_gateway_lib::crypto::encrypt("stream-test-key").unwrap();
+    }
+    provider
+}
+
+async fn auth_stream_config(
+    mode: llm_gateway_lib::config::AuthFailureMode,
+    max_attempts: usize,
+) -> AppConfig {
+    let mut config = AppConfig {
+        port: unused_loopback_port().await,
+        unified_key: "stream-test-key".into(),
+        max_fallback_attempts: max_attempts,
+        ..Default::default()
+    };
+    config.auth_failure.mode = mode;
+    config.auth_failure.confirm_retries = 1;
+    config
+}
+
+async fn send_auth_stream(base_url: &str) -> reqwest::Response {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth("stream-test-key")
+        .json(&openai_stream_body("auth policy question"))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stream_strict_立即返回鉴权错误且不复测换家() {
+    use llm_gateway_lib::config::AuthFailureMode;
+    let (bad_url, bad_calls, bad_task) = spawn_auth_stream_upstream(usize::MAX, false).await;
+    let (good_url, good_calls, good_task) = spawn_auth_stream_upstream(0, false).await;
+    let config = auth_stream_config(AuthFailureMode::Strict, 4).await;
+    let (db, _, task, base) = spawn_gateway_with_config(
+        vec![
+            auth_stream_provider("bad", bad_url, 1, true),
+            auth_stream_provider("good", good_url, 2, true),
+        ],
+        config,
+    )
+    .await;
+    let response = send_auth_stream(&base).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    response.bytes().await.unwrap();
+    assert_eq!(bad_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(good_calls.load(Ordering::SeqCst), 0);
+    assert!(repo::list_providers(db.pool())
+        .await
+        .unwrap()
+        .iter()
+        .all(|provider| provider.enabled));
+    task.abort();
+    bad_task.abort();
+    good_task.abort();
+}
+
+#[tokio::test]
+async fn stream_复测恢复后继续同家且不自动停用() {
+    use llm_gateway_lib::config::AuthFailureMode;
+    let (bad_url, bad_calls, bad_task) = spawn_auth_stream_upstream(1, false).await;
+    let (good_url, good_calls, good_task) = spawn_auth_stream_upstream(0, false).await;
+    let config = auth_stream_config(AuthFailureMode::SkipAndDisable, 4).await;
+    let (db, _, task, base) = spawn_gateway_with_config(
+        vec![
+            auth_stream_provider("bad", bad_url, 1, true),
+            auth_stream_provider("good", good_url, 2, true),
+        ],
+        config,
+    )
+    .await;
+    let response = send_auth_stream(&base).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-routed-via"], "bad/integration-model");
+    assert_eq!(response.headers()["x-fallback-attempts"], "2");
+    assert!(response.text().await.unwrap().contains("auth stream reply"));
+    assert_eq!(bad_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(good_calls.load(Ordering::SeqCst), 0);
+    assert!(repo::list_providers(db.pool())
+        .await
+        .unwrap()
+        .iter()
+        .all(|provider| provider.enabled));
+    task.abort();
+    bad_task.abort();
+    good_task.abort();
+}
+
+#[tokio::test]
+async fn stream_确认鉴权失败后停用并跳过免密钥候选() {
+    use llm_gateway_lib::config::AuthFailureMode;
+    let (bad_url, bad_calls, bad_task) = spawn_auth_stream_upstream(usize::MAX, false).await;
+    let (free_url, free_calls, free_task) = spawn_auth_stream_upstream(0, false).await;
+    let (good_url, good_calls, good_task) = spawn_auth_stream_upstream(0, false).await;
+    let config = auth_stream_config(AuthFailureMode::SkipAndDisable, 4).await;
+    let (db, _, task, base) = spawn_gateway_with_config(
+        vec![
+            auth_stream_provider("bad", bad_url, 1, true),
+            auth_stream_provider("free", free_url, 2, false),
+            auth_stream_provider("good", good_url, 3, true),
+        ],
+        config,
+    )
+    .await;
+    let response = send_auth_stream(&base).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-routed-via"], "good/integration-model");
+    assert_eq!(response.headers()["x-fallback-attempts"], "3");
+    assert!(response.text().await.unwrap().contains("[DONE]"));
+    assert_eq!(bad_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(free_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(good_calls.load(Ordering::SeqCst), 1);
+    let mut disabled = false;
+    for _ in 0..80 {
+        if repo::list_providers(db.pool())
+            .await
+            .unwrap()
+            .iter()
+            .any(|provider| provider.id == "bad" && !provider.enabled)
+        {
+            disabled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(disabled, "SkipAndDisable 确认失败后必须落库停用");
+    task.abort();
+    bad_task.abort();
+    free_task.abort();
+    good_task.abort();
+}
+
+#[tokio::test]
+async fn stream_确认复测不能穿透最大尝试次数() {
+    use llm_gateway_lib::config::AuthFailureMode;
+    let (bad_url, bad_calls, bad_task) = spawn_auth_stream_upstream(usize::MAX, false).await;
+    let (good_url, good_calls, good_task) = spawn_auth_stream_upstream(0, false).await;
+    let config = auth_stream_config(AuthFailureMode::SkipAndDisable, 2).await;
+    let (_db, _, task, base) = spawn_gateway_with_config(
+        vec![
+            auth_stream_provider("bad", bad_url, 1, true),
+            auth_stream_provider("good", good_url, 2, true),
+        ],
+        config,
+    )
+    .await;
+    let response = send_auth_stream(&base).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        bad_calls.load(Ordering::SeqCst),
+        2,
+        "预算两次须用于首次和确认"
+    );
+    assert_eq!(good_calls.load(Ordering::SeqCst), 0, "确认已耗尽尝试预算");
+    task.abort();
+    bad_task.abort();
+    good_task.abort();
+}
+
+#[tokio::test]
+async fn stream_首字节后的失败不复测不换家() {
+    use llm_gateway_lib::config::AuthFailureMode;
+    let (bad_url, bad_calls, bad_task) = spawn_auth_stream_upstream(0, true).await;
+    let (good_url, good_calls, good_task) = spawn_auth_stream_upstream(0, false).await;
+    let config = auth_stream_config(AuthFailureMode::SkipAndDisable, 4).await;
+    let (_db, _, task, base) = spawn_gateway_with_config(
+        vec![
+            auth_stream_provider("bad", bad_url, 1, true),
+            auth_stream_provider("good", good_url, 2, true),
+        ],
+        config,
+    )
+    .await;
+    let response = send_auth_stream(&base).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("auth stream reply"));
+    assert!(body.contains("error"));
+    assert!(!body.contains("[DONE]"), "部分输出后失败不能假装完整成功");
+    assert_eq!(bad_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(good_calls.load(Ordering::SeqCst), 0);
+    task.abort();
+    bad_task.abort();
+    good_task.abort();
+}

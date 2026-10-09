@@ -14,14 +14,14 @@
 
     What is deliberately NOT part of the gate (see ci.yml header for the
     measured reasons):
-      - tauri:build  (the MSI step downloads WiX and its downloader times out
-        on a 39MB file even though a direct download of the same URL is fine)
-      - verify:ui    (needs a running dev server; Vite binds IPv6 only)
+      - tauri:build  (separate Windows package acceptance; first-time WiX
+        download previously timed out; cached NSIS/MSI builds now pass)
+      - verify:ui    (separate browser acceptance with a running dev server)
       - cargo test -- --ignored  (real upstream smoke tests need credentials)
 
 .PARAMETER Step
-    Run a single step by name: fmt, clippy, check, test, build, manual,
-    release, plan, all (default).
+    Run a single step by name: fmt, clippy, check, test, scripts, build,
+    manual, release, plan, redaction, all (default).
 #>
 [CmdletBinding()]
 param(
@@ -95,30 +95,20 @@ function Invoke-RustSteps {
 # literal in ui-smoke.cjs was committed with CI fully green, because
 # nothing ever parsed it. `node --check` costs ~0.1s and closes that gap.
 function Invoke-ScriptSyntaxStep {
-    # .cjs AND .mjs: the generator scripts added for the protocol contracts are
-    # .mjs, and a syntax error there would otherwise only surface when someone
-    # happens to run them by hand.
-    $scripts = Get-ChildItem (Join-Path $RepoRoot 'scripts') -File |
-        Where-Object { $_.Extension -in '.cjs', '.mjs', '.js' }
-    Invoke-Step 'scripts' {
-        foreach ($s in $scripts) { & node --check $s.FullName }
-        # Fixture redaction scan. Kept inside this step rather than getting its
-        # own: it only walks tests/fixtures (milliseconds), and a separate step
-        # would make `-Step scripts` behave differently from `-Step all`.
-        & node (Join-Path $RepoRoot 'scripts/check-fixture-redaction.mjs')
-    }
+    # Share one fail-fast implementation with CI. Checking LASTEXITCODE only
+    # after a foreach loop lets a later valid file hide an earlier failure.
+    Invoke-Step 'scripts' { & npm run verify:scripts }
 }
 
 function Invoke-FrontendSteps {
+    Invoke-ScriptSyntaxStep
     foreach ($n in @('build', 'manual', 'release', 'plan', 'redaction')) {
         switch ($n) {
             'build'   { Invoke-Step $n { & npm run build } }
             'manual'  { Invoke-Step $n { & npm run verify:manual } }
             'release' { Invoke-Step $n { & npm run verify:release } }
             'plan'    { Invoke-Step $n { & npm run verify:plan } }
-            # B7 判据 1/2：日志里不得出现凭据标识符。
-            # 脚本自带样本自测（判据 2 的「故意泄漏必须红」），
-            # 所以这一步同时验扫描器本身还在工作。
+            # Verify both the redaction scanner and the production sources.
             'redaction' { Invoke-Step $n { & npm run verify:redaction } }
         }
     }
@@ -128,7 +118,7 @@ Set-Location -LiteralPath $RepoRoot
 try {
     $rustSteps = @('fmt', 'clippy', 'check', 'test')
     switch ($Step) {
-        'all'     { Import-RustEnv; Invoke-ScriptSyntaxStep; Invoke-RustSteps; Invoke-FrontendSteps }
+        'all'     { Import-RustEnv; Invoke-RustSteps; Invoke-FrontendSteps }
         # Without this case `-Step scripts` falls into the default branch below,
         # whose inner switch has no 'scripts' arm: nothing runs, and reading
         # $LASTEXITCODE then trips StrictMode ("检索不到变量 $LASTEXITCODE").

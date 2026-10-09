@@ -11,9 +11,10 @@ const baseUrl = process.env.LLMGW_UI_URL || "http://127.0.0.1:5173";
 const manualSections = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../src/content/user-manual.json"), "utf8")).sections;
 assert(manualSections.length >= 10, `手册章节只有 ${manualSections.length} 个，内容来源可能已损坏`);
 
-async function fixture({ empty = false, configFailure = false, providerFailure = false, bootWarning = null } = {}) {
+async function fixture({ empty = false, configFailure = false, providerFailure = false, settingsFailure = false, bootWarning = null } = {}) {
   window.isTauri = true;
-  const model = (id, context = 32768, price = null, extra = {}) => ({ alias: id, upstream: id, enabled: true, model_type: "chat", upstream_path: null, context_window: context, supports_tools: true, supports_vision: false, supports_audio: false, supports_video: false, supports_stream: true, price, overrides: null, ...extra });
+  window.__fixtureSettingsFailure = settingsFailure;
+  const model = (id, context = 32768, price = null, extra = {}) => ({ alias: id, upstream: id, enabled: true, model_type: "chat", upstream_path: null, context_window: context, supports_tools: true, supports_vision: false, supports_audio: false, supports_video: false, supports_thinking: false, supports_stream: true, price, overrides: null, local: null, ...extra });
   // 带峰谷价的模型：谷时（UTC 16:30–00:30）打五折，用于验证时段规则的往返保存。
   const peakValleyPrice = { prompt: 2, completion: 8, currency: "cny", tiers: [], source: "manual", rules: [
     { label: "谷时", start_minute: 990, end_minute: 30, prompt_multiplier: 0.5, completion_multiplier: 0.25 },
@@ -49,16 +50,17 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     // D4 级联：夹具必须带这一段，否则 `cfg.cascade` 在真环境里是 undefined，
     // 页面会白屏而测试全绿（CLAUDE.md 铁律 10 点名的正是这个坑）。
     cascade: { max_escalations: 0, min_confidence: 0.6 },
+    cache: { enabled: false, capacity: 200, ttl_secs: 0 },
     smart_routing: {
       enabled: true, classifier: "jev",
       jev: { base_url: "http://127.0.0.1:8009/v1/systemone", model: "rl-agent", timeout_ms: 1200, max_state_chars: 4000,
-        auto_start: { enabled: false, binary: "", port: 8009 } },
+        auto_start: { enabled: false, exe_path: "", script_path: "", model_dir: "", port: 8009, threads: 8, boot_wait_ms: 20000 } },
       timeout_ms: 1200, min_confidence: 0.35, min_margin: 0.25,
       // 预优化默认关闭：先用关闭态验"开关关着时字段不生效"，
       // 再打开验 UI 能提交并回填。
       prompt_refine: { enabled: false, provider_id: null, model: null, timeout_ms: 2000, max_chars: 2000, clarity_noul: 0.72, min_chars: 24 },
     },
-    search: { enabled: true, backend: "tavily", searxng_url: null, max_results: 5, timeout_ms: 8000, inject_as: "text" },
+    search: { enabled: true, backend: "tavily", searxng_url: null, max_results: 5, timeout_ms: 8000, inject_as: "system" },
     local_models: {
       enabled: true, probe_timeout_ms: 2000,
       endpoints: [
@@ -68,6 +70,59 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       ],
     },
   };
+  window.__fixtureVpnStatus = {
+    settings: { kernel_path: "", mixed_port: 17890, controller_port: 17909 },
+    running: false, kernel_ready: false, profile_ready: false, pid: null, version: null,
+    proxy_url: "http://127.0.0.1:17890", mode: "rule", error: null,
+  };
+  window.__fixtureManagedKernelPath = "C:/fixture/managed/mihomo.exe";
+  window.__fixtureVpnKernelInstalled = false;
+  window.__fixtureVpnKernelSupported = true;
+  window.__fixtureVpnPreviousKernel = null;
+  window.__fixtureVpnKernelPending = false;
+  const vpnKernelInfo = () => ({
+    supported: window.__fixtureVpnKernelSupported,
+    version: "v1.19.32",
+    installed: window.__fixtureVpnKernelInstalled,
+    managed: window.__fixtureVpnStatus.settings.kernel_path === window.__fixtureManagedKernelPath,
+    can_rollback: window.__fixtureVpnStatus.settings.kernel_path === window.__fixtureManagedKernelPath && Boolean(window.__fixtureVpnPreviousKernel),
+    license_url: "https://github.com/MetaCubeX/mihomo/blob/v1.19.32/LICENSE",
+    source_url: "https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32",
+  });
+  const gatewayDiagnostics = () => {
+    const config = window.__fixtureConfig;
+    const providers = window.__fixtureProviders;
+    const keys = window.__fixtureRemoteKeys;
+    const budgets = keys.filter(key => key.enabled && key.monthly_budget_micros > 0);
+    const budgetCounts = { USD: 0, CNY: 0, unknown: 0 };
+    budgets.forEach(key => { const parsed = key.budget_currency.toUpperCase(); const currency = ["USD", "CNY"].includes(parsed) ? parsed : "unknown"; budgetCounts[currency]++; });
+    const proxy = config.http_proxy;
+    const managedProxy = new URL(window.__fixtureVpnStatus.proxy_url).toString();
+    return {
+      schema_version: 1, generated_at: "2026-10-09T12:00:00Z", overall: "error",
+      checks: [
+        { id: "providers", status: "ok", title: "供应商配置", detail: "本地配置可读，启用供应商具备模型映射。" },
+        { id: "cache", status: "unknown", title: "精确响应缓存", detail: "缓存当前关闭，尚无命中样本。" },
+        { id: "vpn", status: "warning", title: "VPN 内核", detail: "VPN 内核已停止；未绑定受管代理。" },
+        { id: "access", status: "error", title: "访问配置检查示例", detail: "存在需要处理的本地配置项；本次检查未调用模型。" },
+      ],
+      summary: {
+        providers_total: providers.length, providers_enabled: providers.filter(provider => provider.enabled).length,
+        providers_disabled: providers.filter(provider => !provider.enabled).length,
+        models_enabled: providers.filter(provider => provider.enabled).flatMap(provider => provider.models).filter(model => model.enabled).length,
+        cache_enabled: config.cache.enabled, cache_capacity: config.cache.capacity, cache_ttl_secs: config.cache.ttl_secs,
+        cache_entries: 0, cache_hits: 0, cache_misses: 0,
+        remote_keys_enabled: keys.filter(key => key.enabled).length, budgeted_keys: budgets.length,
+        budget_currency_counts: Object.entries(budgetCounts).map(([currency, count]) => ({ currency, count })),
+        vpn_running: window.__fixtureVpnStatus.running,
+        proxy_mode: !proxy ? "none" : new URL(proxy).toString() === managedProxy ? "managed_vpn" : "external",
+      },
+    };
+  };
+  window.__fixtureVpnProxies = [
+    { name: "代理选择", kind: "Selector", now: "示例节点 A", members: ["示例节点 A", "示例节点 B"] },
+    { name: "自动测速", kind: "URLTest", now: "示例节点 A", members: ["示例节点 A", "示例节点 B"] },
+  ];
   // D2 能力账本：三种情形各一条 —— 真冲突、多来源但一致、只有单一来源。
   // 「一致」那条是必须的：把「两个来源说了同一个值」也标成冲突，
   // 会让用户去处理一个根本不存在的问题。
@@ -343,8 +398,118 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     invoke: async (cmd, args) => {
     window.__fixtureCalls.push(cmd);
     switch (cmd) {
-      case "list_providers": if (providerFailure) throw new Error("模拟供应商读取失败"); return structuredClone(window.__fixtureProviders);
+      case "list_providers":
+        if (providerFailure) throw new Error("模拟供应商读取失败");
+        if (window.__fixtureProviderHold) await new Promise(resolve => (window.__fixtureProviderPending ??= []).push(resolve));
+        return structuredClone(window.__fixtureProviders);
       case "get_config": if (configFailure) throw new Error("模拟配置读取失败"); return structuredClone(window.__fixtureConfig);
+      case "vpn_status": return structuredClone(window.__fixtureVpnStatus);
+      case "vpn_kernel_info":
+        if (window.__fixtureVpnKernelInfoFailure) throw new Error("模拟官方内核信息读取失败");
+        return vpnKernelInfo();
+      case "install_vpn_kernel": {
+        if (window.__fixtureVpnStatus.running) throw new Error("请先停止内核");
+        if (!window.__fixtureVpnKernelSupported) throw new Error("当前平台不支持安装");
+        if (window.__fixtureVpnInstallHold) await new Promise(resolve => (window.__fixtureVpnInstallPending ??= []).push(resolve));
+        if (window.__fixtureVpnInstallFailure) throw new Error("模拟官方内核下载失败");
+        const previous = window.__fixtureVpnStatus.settings.kernel_path;
+        if (previous !== window.__fixtureManagedKernelPath) {
+          window.__fixtureVpnPreviousKernel = previous || null;
+          window.__fixtureVpnStatus.settings.kernel_path = window.__fixtureManagedKernelPath;
+          window.__fixtureVpnKernelPending = true;
+        }
+        window.__fixtureVpnKernelInstalled = true;
+        window.__fixtureVpnStatus.kernel_ready = true;
+        window.__fixtureVpnStatus.version = null;
+        return structuredClone(window.__fixtureVpnStatus);
+      }
+      case "rollback_vpn_kernel":
+        if (window.__fixtureVpnStatus.running) throw new Error("请先停止内核");
+        if (!window.__fixtureVpnPreviousKernel) throw new Error("没有可回滚的内核");
+        if (window.__fixtureVpnStatus.settings.kernel_path !== window.__fixtureManagedKernelPath) throw new Error("当前选择的内核没有可回滚的安装记录");
+        if (window.__fixtureVpnRollbackFailure) throw new Error("模拟内核回滚失败");
+        window.__fixtureVpnStatus.settings.kernel_path = window.__fixtureVpnPreviousKernel;
+        window.__fixtureVpnKernelPending = false;
+        window.__fixtureVpnStatus.kernel_ready = true;
+        window.__fixtureVpnStatus.version = null;
+        return structuredClone(window.__fixtureVpnStatus);
+      case "get_gateway_diagnostics": {
+        const plan = window.__fixtureDiagnosticsPlans?.shift() ?? {};
+        const report = structuredClone(plan.report ?? gatewayDiagnostics());
+        const request = { completed: false, report: structuredClone(report) };
+        (window.__fixtureDiagnosticsRequests ??= []).push(request);
+        if (plan.delayMs) await new Promise(resolve => setTimeout(resolve, plan.delayMs));
+        if (window.__fixtureDiagnosticsHold) await new Promise(resolve => (window.__fixtureDiagnosticsPending ??= []).push(resolve));
+        request.completed = true;
+        if (plan.error || window.__fixtureDiagnosticsFailure) throw new Error(plan.error || "模拟诊断读取失败");
+        return report;
+      }
+      case "export_gateway_diagnostics":
+        if (window.__fixtureDiagnosticsExportHold) await new Promise(resolve => (window.__fixtureDiagnosticsExportPending ??= []).push(resolve));
+        if (window.__fixtureDiagnosticsExportFailure) throw new Error("模拟导出失败 C:/private-user/path.json https://private.example/secret");
+        window.__fixtureDiagnosticsExport = { dest: args.dest, report: gatewayDiagnostics() };
+        return null;
+      case "save_vpn_settings": {
+        const settings = structuredClone(args.settings);
+        if ([settings.mixed_port, settings.controller_port].some(port => !Number.isInteger(port) || port < 1 || port > 65535)
+          || settings.mixed_port === settings.controller_port) throw new Error("端口必须是不同的有效整数");
+        if (window.__fixtureVpnStatus.running) throw new Error("请先停止内核");
+        const previousProxy = new URL(window.__fixtureVpnStatus.proxy_url).toString();
+        const currentProxy = window.__fixtureConfig.http_proxy ? new URL(window.__fixtureConfig.http_proxy).toString() : null;
+        if (currentProxy === previousProxy) window.__fixtureConfig.http_proxy = new URL(`http://127.0.0.1:${settings.mixed_port}`).toString();
+        if (settings.kernel_path !== window.__fixtureVpnStatus.settings.kernel_path) window.__fixtureVpnKernelPending = false;
+        window.__fixtureVpnStatus.settings = settings;
+        window.__fixtureVpnStatus.kernel_ready = Boolean(settings.kernel_path);
+        window.__fixtureVpnStatus.version = null;
+        window.__fixtureVpnStatus.proxy_url = `http://127.0.0.1:${settings.mixed_port}`;
+        return structuredClone(window.__fixtureVpnStatus);
+      }
+      case "import_vpn_profile":
+        if (window.__fixtureVpnImportFailure) throw new Error("HTTP 401 for https://fixture.test/sub?token=fake-subscription-token");
+        if (args.input.url && !args.input.url.startsWith("https://")) throw new Error("只接受 HTTPS 订阅");
+        (window.__fixtureVpnImports ??= []).push({ local: Boolean(args.input.path), subscription: Boolean(args.input.url) });
+        window.__fixtureVpnStatus.profile_ready = true;
+        return structuredClone(window.__fixtureVpnStatus);
+      case "start_vpn":
+        if (!window.__fixtureVpnStatus.kernel_ready || !window.__fixtureVpnStatus.profile_ready) throw new Error("请先配置内核和节点");
+        if (window.__fixtureVpnStartFailure) {
+          if (window.__fixtureVpnKernelPending && window.__fixtureVpnPreviousKernel) window.__fixtureVpnStatus.settings.kernel_path = window.__fixtureVpnPreviousKernel;
+          window.__fixtureVpnKernelPending = false;
+          throw new Error("模拟新内核启动失败；已恢复之前使用的内核并保持停止");
+        }
+        window.__fixtureVpnStatus.running = true;
+        window.__fixtureVpnKernelPending = false;
+        window.__fixtureVpnStatus.pid = 4242;
+        window.__fixtureVpnStatus.version = "Mihomo fixture";
+        return structuredClone(window.__fixtureVpnStatus);
+      case "stop_vpn":
+        window.__fixtureVpnStatus.running = false;
+        window.__fixtureVpnStatus.pid = null;
+        window.__fixtureVpnStatus.version = null;
+        return structuredClone(window.__fixtureVpnStatus);
+      case "list_vpn_proxies":
+        if (window.__fixtureVpnProxyFailure) throw new Error("模拟控制器暂不可用");
+        return structuredClone(window.__fixtureVpnProxies);
+      case "select_vpn_proxy": {
+        const group = window.__fixtureVpnProxies.find(proxy => proxy.name === args.group);
+        if (!group || group.kind !== "Selector" || !group.members.includes(args.name)) throw new Error("仅能切换 Selector 组的已知节点");
+        group.now = args.name;
+        return null;
+      }
+      case "set_vpn_mode":
+        if (!["rule", "global", "direct"].includes(args.mode)) throw new Error("不支持的模式");
+        window.__fixtureVpnStatus.mode = args.mode;
+        return null;
+      case "use_vpn_for_gateway": {
+        const managed = new URL(window.__fixtureVpnStatus.proxy_url).toString();
+        const current = window.__fixtureConfig.http_proxy ? new URL(window.__fixtureConfig.http_proxy).toString() : null;
+        if (args.enabled) {
+          if (!window.__fixtureVpnStatus.running) throw new Error("请先启动内核");
+          window.__fixtureConfig.http_proxy = managed;
+        } else if (current === managed) window.__fixtureConfig.http_proxy = null;
+        else throw new Error("网关当前使用其他代理，已保留其配置");
+        return { config: structuredClone(window.__fixtureConfig), restart_required: false, restart_reasons: [] };
+      }
       // D2：能力账本导出。**夹具必须给出与后端 `CapabilitySet` 相同的形状**
       // （`values[维度][来源] = { value, source }`）—— 形状不对时页面会静默
       // 显示「数据不足」，那与「真的没有数据」看起来一模一样。
@@ -383,12 +548,27 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       case "upsert_provider": {
         const input = structuredClone(args.input);
         window.__fixtureSaved.push(input);
-        const next = { ...input, id: input.id || "fixture-new", api_key: undefined, api_key_masked: "已保存", is_active: false };
+        const previous = window.__fixtureProviders.find(p => p.id === input.id);
+        const next = { ...input, id: input.id || "fixture-new", api_key: undefined, api_key_masked: "已保存",
+          is_active: previous?.is_active ?? false, runtime_id: previous?.runtime_id ?? null };
         window.__fixtureProviders = [...window.__fixtureProviders.filter(p => p.id !== next.id), next]; return next.id;
       }
-      case "update_config": window.__fixtureConfig = structuredClone(args.cfg); return { config: args.cfg, restart_required: false, restart_reasons: [] };
+      case "update_config":
+        (window.__fixtureConfigUpdates ??= []).push(structuredClone(args.cfg));
+        window.__fixtureConfig = { ...structuredClone(args.cfg), unified_key: window.__fixtureConfig.unified_key };
+        if (window.__fixtureConfig.http_proxy) window.__fixtureConfig.http_proxy = new URL(window.__fixtureConfig.http_proxy).toString();
+        if (window.__fixtureConfigHold) await new Promise(resolve => (window.__fixtureConfigPending ??= []).push(resolve));
+        return { config: structuredClone(window.__fixtureConfig), restart_required: false, restart_reasons: [] };
       case "test_provider": return { ok: true, latency_ms: 42, model: "sample/chat" };
-      case "list_snapshots": return [];
+      case "list_snapshots":
+        if (window.__fixtureSettingsFailure) throw new Error("模拟设置读取失败");
+        {
+          const plan = window.__fixtureSettingsLoadPlans?.shift();
+          if (plan?.nextPort) window.__fixtureConfig.port = plan.nextPort;
+          if (plan?.delayMs) await new Promise(resolve => setTimeout(resolve, plan.delayMs));
+          if (plan?.error) throw new Error(plan.error);
+        }
+        return [];
       // B2：远程 Key 夹具**必须带预算三件套**。给空数组的话新列永远不渲染，
       // 漏字段导致的白屏也永远不会被发现 —— 卡片点名过这个坑。
       case "list_remote_access_keys": return structuredClone(window.__fixtureRemoteKeys);
@@ -409,11 +589,16 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         const idx = window.__fixtureRemoteKeys.findIndex(k => k.id === args.input.id);
         if (idx < 0) throw new Error("远程访问 Key 不存在");
         const prev = window.__fixtureRemoteKeys[idx];
+        const budget = args.input.monthly_budget_micros ?? prev.monthly_budget_micros;
+        const currency = (args.input.budget_currency ?? prev.budget_currency).trim().toLowerCase();
+        if (!Number.isSafeInteger(budget) || budget < 0) throw new Error("月度预算不能为负数或超出可精确表示范围");
+        if (budget > 0 && !["usd", "cny"].includes(currency)) throw new Error("设置月度预算时，币种必须为 USD 或 CNY");
+        (window.__fixtureRemoteKeyUpdates ??= []).push(structuredClone(args.input));
         window.__fixtureRemoteKeys[idx] = {
           ...prev,
           label: args.input.label, enabled: args.input.enabled, rpm_limit: args.input.rpm_limit,
-          monthly_budget_micros: args.input.monthly_budget_micros ?? prev.monthly_budget_micros,
-          budget_currency: args.input.budget_currency ?? prev.budget_currency,
+          monthly_budget_micros: budget,
+          budget_currency: budget > 0 ? currency : "",
           allowed_models: args.input.allowed_models ?? prev.allowed_models,
           updated_at: "2026-09-12T01:00:00Z",
         };
@@ -431,6 +616,8 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       // 两边都算过。这里实现与后端同口径的几个条件。
       case "query_requests": {
         const f = args.filter || {};
+        const auditRequest = { filter: structuredClone(f), completed: false };
+        (window.__fixtureAuditRequests ??= []).push(auditRequest);
         let rows = structuredClone(window.__fixtureRequests);
         if (f.provider) rows = rows.filter(r => r.routed_provider === f.provider);
         if (f.model) rows = rows.filter(r => r.routed_model === f.model);
@@ -466,9 +653,16 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
           refined_prompt: null,
           ...r,
         }));
+        const delayMs = window.__fixtureAuditDelays?.shift() ?? 0;
+        if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
+        if (window.__fixtureAuditHold) {
+          await new Promise(resolve => (window.__fixtureAuditPending ??= []).push(resolve));
+        }
+        auditRequest.completed = true;
         return { rows: withAuditCols, total, truncated: offset + page.length < total };
       }
       case "export_requests": {
+        if (window.__fixtureExportFailure) throw new Error("模拟审计导出失败");
         const f = args.filter || {};
         let n = window.__fixtureRequests.length;
         if (f.only_errors) n = window.__fixtureRequests.filter(r => r.error !== null).length;
@@ -484,14 +678,17 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
             : null,
         };
       }
-      case "plugin:dialog|save": return "C:/fixture/audit-export";
-      case "stats_overview": return structuredClone(window.__fixtureStats);
+      case "plugin:dialog|save": return window.__fixtureSavePath !== undefined ? window.__fixtureSavePath : "C:/fixture/audit-export";
+      case "plugin:opener|open_url": window.__fixtureOpenedOfficialUrl = args.url; return null;
+      case "stats_overview":
+        if (window.__fixtureStatsFailure) throw new Error("模拟统计概要读取失败");
+        return structuredClone(window.__fixtureStats);
       case "import_bundle": {
         if (args.src.includes("broken")) throw new Error("该目录里没有 config.toml 或 gateway.db，不是导出包");
         return { result: { providers_imported: 2, models_imported: 5, providers_missing_key: ["异地服务"], config_imported: true, preserved_security_fields: ["统一访问 Key", "远程 HTTPS 模式"] }, backup_dir: "C:/fixture/backup-20260912-010203" };
       }
       case "export_bundle": return null;
-      case "plugin:dialog|open": return "C:/fixture/bundle";
+      case "plugin:dialog|open": return window.__fixtureDialogPath ?? "C:/fixture/bundle";
       case "pricing_status": return window.__fixturePricingStatus;
       case "refresh_pricing":
         window.__fixturePricingStatus = { at: "2026-09-12T02:00:00Z", manual: true, feed_url: "https://openrouter.ai/api/v1/models", feed_models: 443, updated: 2, skipped_manual: 1, unmatched: 1 };
@@ -499,7 +696,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
           ? { ...p, models: p.models.map(m => ({ ...m, price: { prompt: 3, completion: 15, currency: "usd", tiers: [], rules: [], source: "catalog" } })) }
           : p);
         return { feed_models: 443, updated: [{ provider_id: "anthropic", provider: "Anthropic", alias: "claude-sonnet", prompt: 3, completion: 15, currency: "usd", tiers: 0 }], skipped_manual: 1, unmatched: [{ provider_id: "ollama", provider: "本地 Ollama", alias: "qwen-local" }], feed_url: "https://openrouter.ai/api/v1/models" };
-      case "list_token_calibrations": return [
+      case "list_token_calibrations": return window.__fixtureCalibrationsCleared ? [] : [
         { provider_id: "openrouter", model: "vendor/chat:free", samples: 12, ratio: 1.35, updated_at: "2026-09-12T01:30:00Z" },
         { provider_id: "ollama", model: "qwen-local", samples: 3, ratio: 0.92, updated_at: "2026-09-11T22:10:00Z" },
       ];
@@ -563,7 +760,8 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       }
       case "delete_session": window.__fixtureSessions = window.__fixtureSessions.filter(item => item.id !== args.id); return null;
       case "apply_takeover": return [{ client: "Codex", path: "C:/fixture/.codex/config.toml", backup_path: "C:/fixture/.codex/config.toml.backup-test", status: "updated" }];
-      case "get_unified_key": return { unified_key: "fixture-only", openai_endpoint: "http://127.0.0.1:15721/v1" };
+      case "get_unified_key": return { key: window.__fixtureConfig.unified_key, base_url: "http://127.0.0.1:15721", openai_endpoint: "http://127.0.0.1:15721/v1", anthropic_endpoint: "http://127.0.0.1:15721", ollama_endpoint: "http://127.0.0.1:15721" };
+      case "rotate_unified_key": window.__fixtureConfig.unified_key = "fixture-rotated-only"; return window.__fixtureConfig.unified_key;
       // 本地模型 / 智能模式 / 联网搜索
       case "list_local_runtimes": return structuredClone(window.__fixtureLocalRuntimes);
       case "list_local_models": {
@@ -680,6 +878,557 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
   } };
 }
 
+async function verifyAsyncPages(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  page.on("pageerror", error => errors.push(`async-pages: ${error.message}`));
+  const consoleErrors = [];
+  page.on("console", message => { if (message.type() === "error") consoleErrors.push(message.text()); });
+  page.on("dialog", dialog => dialog.accept());
+  await page.goto(baseUrl);
+  await page.getByRole("heading", { name: "OpenRouter", exact: true }).waitFor();
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  await nav.getByRole("button", { name: "用量与审计", exact: true }).click();
+  await page.locator(".requests-table tbody tr.request-row").first().waitFor();
+  await page.evaluate(() => { window.__fixtureAuditDelays = [350, 0]; });
+  await page.locator("#audit-status").fill("4xx");
+  await page.waitForFunction(() => window.__fixtureAuditRequests.some(r => r.filter.status === "4xx" && !r.completed));
+  await page.locator("#audit-status").fill("5xx");
+  await page.waitForFunction(() => window.__fixtureAuditRequests.some(r => r.filter.status === "5xx" && r.completed));
+  await page.waitForFunction(() => window.__fixtureAuditRequests.some(r => r.filter.status === "4xx" && r.completed));
+  await page.waitForTimeout(50);
+  assert.equal(await page.locator(".requests-table tbody tr.request-row").count(), 0,
+    "旧4xx查询晚返回后不能覆盖当前5xx筛选的空结果");
+  assert.equal(await page.locator("#audit-status").inputValue(), "5xx");
+  await page.locator(".card").filter({ has: page.locator(".audit-filters") }).screenshot({ path: path.join(output, "stats-filter-out-of-order.png") });
+  await page.evaluate(() => { window.__fixtureAuditHold = true; window.__fixtureAuditPending = []; });
+  await page.locator(".page-heading").getByRole("button", { name: "刷新", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureAuditPending.length === 1);
+  const calibrationCard = page.locator(".card").filter({ hasText: "Token 计数校准" });
+  assert.equal(await calibrationCard.locator("tbody tr").count(), 2, "前置：校准旧样本确实存在");
+  await calibrationCard.getByRole("button", { name: "重置校准", exact: true }).click();
+  await page.locator(".msg.ok").filter({ hasText: "已清空" }).waitFor();
+  await page.evaluate(() => {
+    window.__fixtureAuditHold = false;
+    window.__fixtureAuditPending.splice(0).forEach(resolve => resolve());
+  });
+  await page.waitForFunction(() => !document.querySelector(".page-heading button").disabled);
+  assert.equal(await calibrationCard.locator("tbody tr").count(), 0, "清空后晚到的旧poll不能复活校准样本");
+  await calibrationCard.screenshot({ path: path.join(output, "stats-calibration-clear-race.png") });
+
+  // StrictMode runs the mount effect twice: the first configuration snapshot must expire.
+  await page.evaluate(() => { window.__fixtureSettingsLoadPlans = [{ delayMs: 350, nextPort: 15888 }, {}]; });
+  await nav.getByRole("button", { name: "设置", exact: true }).click();
+  await page.getByText("统一接入地址", { exact: true }).waitFor();
+  await page.waitForTimeout(450);
+  assert.equal(await page.locator("#gateway-port").inputValue(), "15888",
+    "StrictMode第一次加载的旧配置不能覆盖第二次加载结果");
+  assert.equal(await page.getByRole("alert").count(), 0);
+  await page.locator("#gateway-port").scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, "settings-load-out-of-order.png"), fullPage: true });
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureSettingsLoadPlans = [{ delayMs: 350, error: "过期设置请求失败" }, {}]; });
+  await nav.getByRole("button", { name: "设置", exact: true }).click();
+  await page.getByText("统一接入地址", { exact: true }).waitFor();
+  await page.waitForTimeout(450);
+  assert.equal(await page.getByRole("alert").count(), 0,
+    "过期设置请求失败不能把已加载成功的页面改成错误状态");
+  await page.screenshot({ path: path.join(output, "settings-stale-error-ignored.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureProviderHold = true; window.__fixtureProviderPending = []; });
+  await page.getByRole("button", { name: "轮换 Key", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureProviderPending.length === 1);
+  assert.equal(await page.locator("#gateway-port").isEnabled(), false, "轮换Key及刷新期间不能提交旧配置快照");
+  assert.equal(await page.locator("#cache-ttl").isEnabled(), false, "其他异步操作期间缓存编辑也应锁定");
+  await page.locator("#gateway-port").scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, "settings-operation-locked.png"), fullPage: true });
+  await page.evaluate(() => {
+    window.__fixtureProviderHold = false;
+    window.__fixtureProviderPending.splice(0).forEach(resolve => resolve());
+  });
+  await page.waitForFunction(() => !document.querySelector("#gateway-port").disabled);
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.unified_key), "fixture-rotated-only");
+  const cacheCard = page.getByTestId("exact-cache-settings");
+  assert.equal(await cacheCard.getByLabel("启用精确响应缓存").isChecked(), false, "缓存默认关闭");
+  assert.equal(await page.locator("#cache-ttl").inputValue(), "0", "默认有效期0保持不过期");
+  await page.locator("#cache-ttl").fill("120");
+  await page.locator("#cache-ttl").press("Tab");
+  await page.waitForFunction(() => window.__fixtureConfig.cache.ttl_secs === 120);
+  await cacheCard.getByLabel("启用精确响应缓存").check();
+  await page.waitForFunction(() => window.__fixtureConfig.cache.enabled === true);
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.cache.capacity), 200, "开关和有效期保存不能覆盖容量");
+  const cacheSaves = await page.evaluate(() => window.__fixtureConfigUpdates.length);
+  await page.locator("#cache-capacity").fill("0");
+  await page.locator("#cache-capacity").press("Tab");
+  await page.getByRole("alert").filter({ hasText: "缓存容量必须" }).waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureConfigUpdates.length), cacheSaves, "容量0不能提交到后端");
+  await page.locator("#cache-capacity").fill("400");
+  await page.locator("#cache-capacity").press("Tab");
+  await page.waitForFunction(() => window.__fixtureConfig.cache.capacity === 400);
+  await page.locator("#cache-ttl").fill("9007199254740992");
+  await page.locator("#cache-ttl").press("Tab");
+  await page.getByRole("alert").filter({ hasText: "缓存容量必须" }).waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.cache.ttl_secs), 120, "超出安全整数的有效期不能保存");
+  const beforeInvalidPatch = await page.evaluate(() => window.__fixtureConfigUpdates.length);
+  await page.getByLabel("启用自动故障转移").click();
+  assert.equal(await page.evaluate(() => window.__fixtureConfigUpdates.length), beforeInvalidPatch,
+    "其他配置入口也不能提交残留的非法缓存草稿");
+  await page.locator("#cache-ttl").fill("0");
+  await page.locator("#cache-ttl").press("Tab");
+  await page.waitForFunction(() => window.__fixtureConfig.cache.ttl_secs === 0);
+  assert.equal(await cacheCard.getByLabel("启用精确响应缓存").isChecked(), true);
+  await cacheCard.screenshot({ path: path.join(output, "settings-exact-cache.png") });
+  await page.evaluate(() => {
+    window.__fixtureConfigHold = true;
+    window.__fixtureConfigPending = [];
+    window.__fixtureConfigEvents = 0;
+    window.addEventListener("llm-gateway-config-changed", () => window.__fixtureConfigEvents++);
+  });
+  await page.locator("#gateway-port").fill("15999");
+  await page.locator("#gateway-port").press("Tab");
+  await page.waitForFunction(() => window.__fixtureConfigPending.length === 1);
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => {
+    window.__fixtureConfigHold = false;
+    window.__fixtureConfigPending.splice(0).forEach(resolve => resolve());
+  });
+  await page.waitForTimeout(50);
+  assert.equal(await page.evaluate(() => window.__fixtureConfigEvents), 0, "设置卸载后旧保存结果不能发布过期UI事件");
+  assert(await page.evaluate(() => window.__fixtureConfigUpdates.every(cfg => cfg.unified_key === "fixture-rotated-only")),
+    "轮换后的配置保存不应提交旧统一Key");
+  await page.evaluate(() => { window.__fixtureConfig.routing_strategy = "custom"; });
+  await nav.getByRole("button", { name: "设置", exact: true }).click();
+  await page.getByRole("button", { name: "添加规则", exact: true }).click();
+  await page.getByPlaceholder("例如 claude-").fill("safe-");
+  await page.locator("#cache-ttl").fill("9007199254740992");
+  await page.locator("#cache-ttl").press("Tab");
+  await page.getByRole("alert").filter({ hasText: "缓存容量必须" }).waitFor();
+  const beforeInvalidRuleSave = await page.evaluate(() => window.__fixtureConfigUpdates.length);
+  await page.getByRole("button", { name: "保存规则", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.__fixtureConfigUpdates.length), beforeInvalidRuleSave,
+    "自定义规则入口也不能提交残留的非法缓存草稿");
+  await page.locator("#cache-ttl").fill("0");
+  await page.locator("#cache-ttl").press("Tab");
+  await page.waitForFunction(() => !document.querySelector("#cache-ttl").disabled);
+  await page.evaluate(() => { window.__fixtureConfigHold = true; window.__fixtureConfigPending = []; });
+  const beforeLateRuleEvents = await page.evaluate(() => window.__fixtureConfigEvents);
+  await page.getByRole("button", { name: "保存规则", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureConfigPending.length === 1);
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => {
+    window.__fixtureConfigHold = false;
+    window.__fixtureConfigPending.splice(0).forEach(resolve => resolve());
+  });
+  await page.waitForTimeout(50);
+  assert.equal(await page.evaluate(() => window.__fixtureConfigEvents), beforeLateRuleEvents,
+    "自定义规则卸载后旧保存结果不能发布过期UI事件");
+  assert.deepEqual(consoleErrors, [], "异步页面检查不应出现控制台错误");
+  await context.close();
+
+  const pollContext = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await pollContext.addInitScript(fixture);
+  // Speed up only the application's five-second polling timer, keeping request delays real.
+  await pollContext.addInitScript(() => {
+    const timeout = window.setTimeout.bind(window), interval = window.setInterval.bind(window);
+    window.setTimeout = (callback, delay, ...args) => timeout(callback, delay === 5000 ? 80 : delay, ...args);
+    window.setInterval = (callback, delay, ...args) => interval(callback, delay === 5000 ? 80 : delay, ...args);
+  });
+  const pollPage = await pollContext.newPage();
+  pollPage.on("pageerror", error => errors.push(`stats-poll: ${error.message}`));
+  pollPage.on("dialog", dialog => dialog.accept());
+  await pollPage.goto(baseUrl);
+  await pollPage.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "用量与审计", exact: true }).click();
+  await pollPage.locator(".requests-table tbody tr.request-row").first().waitFor();
+  await pollPage.evaluate(() => {
+    window.__fixtureAuditHold = true;
+    window.__fixtureAuditPending = [];
+    window.__fixtureStatsFailure = true;
+  });
+  await pollPage.locator(".page-heading").getByRole("button", { name: "刷新", exact: true }).click();
+  await pollPage.waitForFunction(() => window.__fixtureAuditPending.length >= 1);
+  await pollPage.waitForTimeout(250);
+  assert.equal(await pollPage.evaluate(() => window.__fixtureAuditPending.length), 1,
+    "查询未结束时五秒轮询不能再启动同一筛选查询");
+  await pollPage.evaluate(() => {
+    window.__fixtureAuditHold = false;
+    window.__fixtureStatsFailure = false;
+    window.__fixtureAuditPending.splice(0).forEach(resolve => resolve());
+  });
+  await pollPage.locator(".page-heading").getByRole("button", { name: "刷新", exact: true }).waitFor();
+  await pollPage.waitForFunction(() => !document.body.innerText.includes("加载统计失败"));
+  await pollPage.locator("#audit-export-jsonl").click();
+  await pollPage.locator(".msg.ok").filter({ hasText: "已导出" }).waitFor();
+  await pollPage.waitForTimeout(250);
+  assert((await pollPage.locator(".msg.ok").innerText()).includes("已导出"),
+    "后台刷新成功不能清除审计导出反馈");
+  await pollPage.locator(".msg.ok").scrollIntoViewIfNeeded();
+  await pollPage.screenshot({ path: path.join(output, "stats-export-feedback-retained.png"), fullPage: true });
+  await pollPage.evaluate(() => { window.__fixtureExportFailure = true; });
+  await pollPage.locator("#audit-export-jsonl").click();
+  await pollPage.locator(".msg.err").filter({ hasText: "导出失败" }).waitFor();
+  await pollPage.waitForTimeout(250);
+  assert((await pollPage.locator(".msg.err").innerText()).includes("模拟审计导出失败"),
+    "后台刷新成功不能清除导出失败信息");
+  await pollPage.locator(".msg.err").scrollIntoViewIfNeeded();
+  await pollPage.screenshot({ path: path.join(output, "stats-export-error-retained.png"), fullPage: true });
+  await pollContext.close();
+}
+
+async function verifyVpnPage(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  const consoleErrors = [];
+  page.on("pageerror", error => errors.push(`vpn: ${error.message}`));
+  page.on("console", message => { if (message.type() === "error") consoleErrors.push(message.text()); });
+  page.on("dialog", dialog => dialog.accept());
+  await page.goto(baseUrl);
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "VPN 与代理", exact: true }).click();
+  await page.getByTestId("vpn-page").waitFor();
+  const gateway = page.getByLabel("网关使用此 VPN 代理");
+  assert.equal(await page.getByRole("button", { name: "启动内核", exact: true }).isEnabled(), false,
+    "没有内核和节点时必须明确提示并禁止启动");
+  assert.equal(await gateway.isEnabled(), false, "默认停止状态不能把网关切向未启动的代理");
+  assert.equal(await page.evaluate(() => window.__fixtureVpnStatus.running), false);
+  await page.screenshot({ path: path.join(output, "vpn-default-off.png"), fullPage: true, animations: "disabled" });
+  await page.evaluate(() => { window.__fixtureDialogPath = "C:/fixture/mihomo.exe"; });
+  await page.getByRole("button", { name: "选择内核", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector("#vpn-kernel-path")?.value === "C:/fixture/mihomo.exe");
+  await page.locator("#vpn-mixed-port").fill("17909");
+  await page.getByRole("button", { name: "保存内核设置", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "不同整数" }).waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "save_vpn_settings").length), 0,
+    "重复端口不得提交到后端");
+  await page.locator("#vpn-mixed-port").fill("17890");
+  await page.getByRole("button", { name: "保存内核设置", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureVpnStatus.kernel_ready === true);
+  await page.getByRole("button", { name: "导入本地 YAML", exact: true }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "启动内核", exact: true }).isEnabled(), false,
+    "仅有内核时仍需导入节点");
+  await page.evaluate(() => { window.__fixtureDialogPath = "C:/fixture/nodes.yaml"; });
+  await page.getByRole("button", { name: "导入本地 YAML", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureVpnStatus.profile_ready === true);
+  assert.deepEqual(await page.evaluate(() => window.__fixtureVpnImports), [{ local: true, subscription: false }]);
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.includes("start_vpn")), false,
+    "保存配置和导入节点不得自动启动内核");
+  await page.evaluate(() => { window.__fixtureVpnImportFailure = true; });
+  await page.locator("#vpn-subscription").fill("https://fixture.test/sub?token=fake-subscription-token");
+  await page.getByRole("button", { name: "导入订阅", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "HTTP 401" }).waitFor();
+  assert(!(await page.locator("body").innerText()).includes("fake-subscription-token"),
+    "后端导入错误中的订阅地址不能显示在页面");
+  assert.equal(await page.locator("#vpn-subscription").inputValue(), "", "提交后清除订阅输入");
+  await page.evaluate(() => { window.__fixtureVpnImportFailure = false; });
+  await page.locator("#vpn-subscription").fill("https://fixture.test/nodes");
+  await page.getByRole("button", { name: "导入订阅", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureVpnImports.length === 2);
+  assert.deepEqual(await page.evaluate(() => window.__fixtureVpnImports[1]), { local: false, subscription: true });
+  assert.equal(await page.locator("#vpn-subscription").inputValue(), "");
+  await page.getByRole("button", { name: "启动内核", exact: true }).click();
+  await page.getByRole("button", { name: "停止内核", exact: true }).waitFor();
+  assert.equal(await page.locator("#vpn-kernel-path").isEnabled(), false, "运行时先停止才能更换内核");
+  assert.equal(await page.getByRole("button", { name: "导入本地 YAML", exact: true }).isEnabled(), false);
+  assert.deepEqual(await page.locator("#vpn-mode option").evaluateAll(nodes => nodes.map(node => node.value)), ["rule", "global", "direct"]);
+  for (const mode of ["global", "direct", "rule"]) {
+    await page.locator("#vpn-mode").selectOption(mode);
+    await page.waitForFunction(expected => window.__fixtureVpnStatus.mode === expected, mode);
+    await page.waitForFunction(expected => document.querySelector("#vpn-mode")?.value === expected, mode);
+  }
+  await page.getByLabel("选择组 代理选择", { exact: true }).selectOption("示例节点 B");
+  await page.waitForFunction(() => window.__fixtureVpnProxies[0].now === "示例节点 B");
+  assert.equal(await page.getByLabel("选择组 自动测速", { exact: true }).count(), 0,
+    "URLTest等非Selector组不能提供手动切换控件");
+  await page.evaluate(() => { window.__fixtureVpnProxyFailure = true; });
+  await page.getByRole("button", { name: "刷新状态", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "节点列表加载失败" }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "停止内核", exact: true }).isEnabled(), true,
+    "控制器故障时仍然能停止受管内核");
+  await page.getByRole("alert").filter({ hasText: "节点列表加载失败" }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, "vpn-controller-unavailable.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureVpnProxyFailure = false; });
+  await page.getByRole("button", { name: "刷新状态", exact: true }).click();
+  await page.getByLabel("选择组 代理选择", { exact: true }).waitFor();
+  await gateway.check();
+  await page.waitForFunction(() => window.__fixtureConfig.http_proxy === "http://127.0.0.1:17890/");
+  await page.waitForTimeout(50);
+  assert.equal(await gateway.isChecked(), true, "真实规范化尾斜杠代理仍必须显示已启用");
+  await page.getByTestId("vpn-page").getByRole("heading", { name: "VPN 与代理", exact: true }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, "vpn-running.png"), fullPage: true });
+  await page.locator(".card").filter({ hasText: "节点与选择组" }).screenshot({ path: path.join(output, "vpn-selector-node.png") });
+  for (const width of [900, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `VPN页面不能横向溢出: ${width}`);
+    await page.screenshot({ path: path.join(output, `vpn-${width}.png`), fullPage: true });
+  }
+  await page.setViewportSize({ width: 1180, height: 900 });
+  await page.getByRole("button", { name: "停止内核", exact: true }).click();
+  await page.getByRole("button", { name: "启动内核", exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureVpnStatus.running), false);
+  assert.equal(await gateway.isEnabled(), true, "停止后仍能取消已保存的受管代理");
+  const retainedProxyNotice = page.getByRole("status").filter({ hasText: "VPN 内核已停止，网关仍保留此代理" });
+  await retainedProxyNotice.waitFor();
+  assert.equal(await retainedProxyNotice.innerText(), "VPN 内核已停止，网关仍保留此代理。请重新启动内核，或取消『网关使用此 VPN 代理』以恢复出口。",
+    "停止后应明确提示重新启动或取消受管代理恢复出口");
+  await page.locator("#vpn-mixed-port").fill("17891");
+  await page.getByRole("button", { name: "保存内核设置", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureVpnStatus.settings.mixed_port === 17891);
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.http_proxy), "http://127.0.0.1:17891/",
+    "已归属受管VPN的绑定必须跟随端口改变");
+  await page.waitForFunction(() => document.querySelector('[data-testid="vpn-page"] input[type="checkbox"]')?.checked === true);
+  await page.locator(".card").filter({ hasText: "模式与网关接入" }).screenshot({ path: path.join(output, "vpn-port-binding-follows.png") });
+  await gateway.uncheck();
+  await page.waitForFunction(() => window.__fixtureConfig.http_proxy === null);
+  await page.waitForFunction(() => !document.body.innerText.includes("VPN 内核已停止，网关仍保留此代理"));
+  assert.equal(await retainedProxyNotice.count(), 0, "取消受管代理后停止提示必须消失");
+  await page.locator("#vpn-mixed-port").fill("17892");
+  await page.getByRole("button", { name: "保存内核设置", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureVpnStatus.settings.mixed_port === 17892);
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.http_proxy), null, "未启用时改端口不能自动绑定网关");
+  await page.evaluate(() => { window.__fixtureConfig.http_proxy = "http://127.0.0.1:28888/"; });
+  await page.getByRole("button", { name: "刷新状态", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector("#vpn-mixed-port").disabled);
+  await page.locator("#vpn-mixed-port").fill("17893");
+  await page.getByRole("button", { name: "保存内核设置", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureVpnStatus.settings.mixed_port === 17893);
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.http_proxy), "http://127.0.0.1:28888/",
+    "其他代理不归属受管VPN，改端口不能覆盖它");
+  const cancelOther = await page.evaluate(async () => {
+    try { await window.__TAURI_INTERNALS__.invoke("use_vpn_for_gateway", { enabled: false }); return null; }
+    catch (error) { return String(error); }
+  });
+  assert(cancelOther.includes("保留其配置"));
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.http_proxy), "http://127.0.0.1:28888/", "取消VPN不能清除其他代理");
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.some(cmd => /system_proxy|tun/.test(cmd))), false,
+    "MVP不得调用系统代理或TUN修改接口");
+  assert.deepEqual(consoleErrors, [], "VPN页面不应出现控制台错误");
+  await context.close();
+}
+
+async function verifyVpnKernel(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  const consoleErrors = [];
+  page.on("pageerror", error => errors.push(`vpn-kernel: ${error.message}`));
+  page.on("console", message => { if (message.type() === "error") consoleErrors.push(message.text()); });
+  let acceptConfirmation = true;
+  const confirmations = [];
+  page.on("dialog", dialog => { confirmations.push(dialog.message()); return acceptConfirmation ? dialog.accept() : dialog.dismiss(); });
+  await page.goto(baseUrl);
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  await nav.getByRole("button", { name: "VPN 与代理", exact: true }).click();
+  const install = page.getByRole("button", { name: "安装/修复官方内核", exact: true });
+  const rollback = page.getByRole("button", { name: "回滚内核", exact: true });
+  await install.waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.includes("install_vpn_kernel")), false, "进入VPN页不会默认安装内核");
+  assert.equal(await rollback.isEnabled(), false, "没有前版内核时不能回滚");
+  assert.equal(await page.getByRole("link", { name: "官方许可", exact: true }).getAttribute("href"), "https://github.com/MetaCubeX/mihomo/blob/v1.19.32/LICENSE");
+  assert.equal(await page.getByRole("link", { name: "官方源码", exact: true }).getAttribute("href"), "https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32");
+  await page.getByRole("link", { name: "官方许可", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureOpenedOfficialUrl === "https://github.com/MetaCubeX/mihomo/blob/v1.19.32/LICENSE");
+  await page.getByTestId("vpn-kernel-install").screenshot({ path: path.join(output, "vpn-kernel-default.png") });
+  await page.locator("#vpn-kernel-path").fill("C:/fixture/custom-mihomo.exe");
+  await page.locator("#vpn-mixed-port").fill("17896");
+  await install.click();
+  await page.getByRole("alert").filter({ hasText: "有未保存的改动" }).waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "install_vpn_kernel").length), 0, "安装不能静默抹去未保存的内核路径和端口草稿");
+  assert.equal(await page.locator("#vpn-kernel-path").inputValue(), "C:/fixture/custom-mihomo.exe");
+  assert.equal(await page.locator("#vpn-mixed-port").inputValue(), "17896");
+  await page.getByRole("button", { name: "保存内核设置", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector("#vpn-kernel-path").disabled);
+  acceptConfirmation = false;
+  await install.click();
+  assert(confirmations.at(-1).includes("不会覆盖你原来的 EXE 文件"), "更换自选内核前必须明确路径切换和文件保护");
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "install_vpn_kernel").length), 0, "拒绝确认不得触发安装");
+  assert.equal(await page.evaluate(() => window.__fixtureVpnStatus.settings.kernel_path), "C:/fixture/custom-mihomo.exe");
+  acceptConfirmation = true;
+  await page.evaluate(() => { window.__fixtureVpnInstallFailure = true; });
+  await install.click();
+  await page.getByRole("alert").filter({ hasText: "模拟官方内核下载失败" }).waitFor();
+  assert.equal(await page.locator("#vpn-kernel-path").inputValue(), "C:/fixture/custom-mihomo.exe", "下载失败不改变自选内核路径");
+  assert.equal(await page.evaluate(() => window.__fixtureVpnKernelInstalled), false);
+  await page.getByRole("alert").filter({ hasText: "模拟官方内核下载失败" }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, "vpn-kernel-install-error.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureVpnInstallFailure = false; window.__fixtureVpnInstallHold = true; window.__fixtureVpnInstallPending = []; });
+  await install.click();
+  await page.waitForFunction(() => window.__fixtureVpnInstallPending.length === 1);
+  await page.getByRole("status").filter({ hasText: "正在准备并校验随附的官方内核" }).waitFor();
+  assert.equal(await install.isEnabled(), false);
+  assert.equal(await rollback.isEnabled(), false);
+  assert.equal(await page.locator("#vpn-mixed-port").isEnabled(), false, "安装进行中应锁定配置修改");
+  await page.getByTestId("vpn-kernel-install").screenshot({ path: path.join(output, "vpn-kernel-installing.png") });
+  await page.evaluate(() => { window.__fixtureVpnInstallHold = false; window.__fixtureVpnInstallPending.splice(0).forEach(resolve => resolve()); });
+  await page.getByRole("status").filter({ hasText: "官方内核已安装" }).waitFor();
+  assert.equal(await page.locator("#vpn-kernel-path").inputValue(), "C:/fixture/managed/mihomo.exe");
+  assert.equal(await page.locator("#vpn-mixed-port").inputValue(), "17896", "安装仅切换路径，已保存端口不丢失");
+  assert.equal(await page.evaluate(() => window.__fixtureVpnStatus.running), false, "安装成功不自动启动内核");
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.includes("start_vpn")), false);
+  assert.equal(await rollback.isEnabled(), true, "原有效手动内核可以回滚恢复其路径");
+  await page.getByTestId("vpn-kernel-install").screenshot({ path: path.join(output, "vpn-kernel-installed.png") });
+  await install.click();
+  await page.getByRole("status").filter({ hasText: "官方内核已安装" }).waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureVpnPreviousKernel), "C:/fixture/custom-mihomo.exe", "幂等修复不能覆盖前版记录");
+  await page.evaluate(() => { window.__fixtureDialogPath = "C:/fixture/nodes.yaml"; });
+  await page.getByRole("button", { name: "导入本地 YAML", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureVpnStartFailure = true; });
+  await page.getByRole("button", { name: "启动内核", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "模拟新内核启动失败" }).waitFor();
+  assert.equal(await page.locator("#vpn-kernel-path").inputValue(), "C:/fixture/custom-mihomo.exe", "首次启动失败后的自动回退必须刷新真实内核路径");
+  assert.equal(await page.evaluate(() => window.__fixtureVpnStatus.running), false);
+  await page.locator(".card").filter({ hasText: "内核与端口" }).screenshot({ path: path.join(output, "vpn-kernel-start-recovery.png") });
+  await page.evaluate(() => { window.__fixtureVpnStartFailure = false; });
+  await install.click();
+  await page.getByRole("status").filter({ hasText: "官方内核已安装" }).waitFor();
+  await page.getByRole("button", { name: "启动内核", exact: true }).click();
+  await page.getByRole("button", { name: "停止内核", exact: true }).waitFor();
+  assert.equal(await install.isEnabled(), false, "运行中禁止更换内核");
+  assert.equal(await rollback.isEnabled(), false, "运行中禁止回滚内核");
+  await page.getByRole("button", { name: "停止内核", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector("#vpn-kernel-path").disabled);
+  await page.evaluate(() => { window.__fixtureVpnRollbackFailure = true; });
+  await rollback.click();
+  await page.getByRole("alert").filter({ hasText: "模拟内核回滚失败" }).waitFor();
+  assert.equal(await page.locator("#vpn-kernel-path").inputValue(), "C:/fixture/managed/mihomo.exe");
+  await page.evaluate(() => { window.__fixtureVpnRollbackFailure = false; });
+  await rollback.click();
+  await page.getByRole("status").filter({ hasText: "已恢复之前使用的内核" }).waitFor();
+  assert.equal(await page.locator("#vpn-kernel-path").inputValue(), "C:/fixture/custom-mihomo.exe");
+  assert.equal(await page.evaluate(() => window.__fixtureVpnStatus.running), false);
+  await page.locator(".card").filter({ hasText: "内核与端口" }).screenshot({ path: path.join(output, "vpn-kernel-rollback.png") });
+  for (const width of [900, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `内核安装/回滚页面不能横向溢出: ${width}`);
+    await page.locator(".card").filter({ hasText: "内核与端口" }).screenshot({ path: path.join(output, `vpn-kernel-${width}.png`) });
+  }
+  await page.setViewportSize({ width: 1180, height: 900 });
+  await page.evaluate(() => { window.__fixtureVpnKernelSupported = false; });
+  await page.getByRole("button", { name: "刷新状态", exact: true }).click();
+  await page.getByText("当前平台暂不支持自动安装，请选择本机 Mihomo 内核。", { exact: true }).waitFor();
+  assert.equal(await install.isEnabled(), false);
+  await page.evaluate(() => { window.__fixtureVpnKernelSupported = true; window.__fixtureVpnKernelInfoFailure = true; });
+  await page.getByRole("button", { name: "刷新状态", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "官方内核信息暂不可读" }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "启动内核", exact: true }).isEnabled(), true, "官核信息失败不阻断手动内核使用");
+  assert.deepEqual(consoleErrors, [], "官核安装界面不能出现控制台错误");
+  await context.close();
+}
+
+async function verifyDiagnostics(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  const consoleErrors = [];
+  page.on("pageerror", error => errors.push(`diagnostics: ${error.message}`));
+  page.on("console", message => { if (message.type() === "error") consoleErrors.push(message.text()); });
+  await page.goto(baseUrl);
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  await page.evaluate(() => { window.__fixtureDiagnosticsFailure = true; });
+  await nav.getByRole("button", { name: "本地诊断", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "读取本地诊断失败" }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "导出脱敏 JSON", exact: true }).isEnabled(), false);
+  await page.screenshot({ path: path.join(output, "diagnostics-load-error.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureDiagnosticsFailure = false; });
+  await page.getByRole("button", { name: "刷新诊断", exact: true }).click();
+  await page.getByTestId("diagnostics-summary").waitFor();
+  assert((await page.getByTestId("diagnostics-summary").innerText()).includes("5 个供应商 · 4 个启用 · 1 个停用"));
+  for (const status of ["正常", "需留意", "异常", "未知"]) assert((await page.getByTestId("diagnostics-checks").innerText()).includes(status), `诊断正确渲染${status}检查项`);
+  assert((await page.getByTestId("diagnostics-page").innerText()).includes("不发起模型调用"));
+  assert(!(await page.getByTestId("diagnostics-page").innerText()).includes("fixture-only"), "诊断页面不能显示统一Key");
+  assert(!(await page.getByTestId("diagnostics-page").innerText()).includes("openrouter.ai"), "诊断页面不能显示用户服务地址");
+  await page.screenshot({ path: path.join(output, "diagnostics-desktop.png"), fullPage: true });
+  await page.evaluate(() => {
+    const report = structuredClone(window.__fixtureDiagnosticsRequests.at(-1).report);
+    report.overall = "unknown"; report.checks = []; report.summary.budget_currency_counts = []; report.summary.vpn_running = null; report.summary.proxy_mode = "external";
+    window.__fixtureDiagnosticsPlans = [{ report }];
+  });
+  await page.getByRole("button", { name: "刷新诊断", exact: true }).click();
+  await page.getByText("尚无检查结果，不能据此确认网关正常。", { exact: true }).waitFor();
+  assert((await page.getByTestId("diagnostics-overall").innerText()).includes("未知"));
+  assert((await page.getByTestId("diagnostics-summary").innerText()).includes("VPN 内核状态未知"), "忙或无法读取的VPN状态不能假装停止");
+  assert((await page.getByTestId("diagnostics-summary").innerText()).includes("代理归属未知"), "VPN状态未知时不能把显式代理断定为其他代理");
+  assert(!(await page.getByTestId("diagnostics-summary").innerText()).includes("其他代理"));
+  await page.waitForFunction(() => {
+    const tag = document.querySelector('[data-testid="diagnostics-overall"] .tag');
+    const muted = document.querySelector('[data-testid="diagnostics-page"] .page-heading .sub');
+    return tag && muted && getComputedStyle(tag).color === getComputedStyle(muted).color;
+  });
+  await page.screenshot({ path: path.join(output, "diagnostics-empty-unknown.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureSavePath = "C:/fixture/gateway-diagnostics.json"; });
+  await page.getByRole("button", { name: "导出脱敏 JSON", exact: true }).click();
+  await page.getByRole("status").filter({ hasText: "脱敏诊断报告已导出。" }).waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureDiagnosticsExport.dest), "C:/fixture/gateway-diagnostics.json", "导出dest参数精确对齐IPC合同");
+  const exported = await page.evaluate(() => JSON.stringify(window.__fixtureDiagnosticsExport.report));
+  assert(!exported.includes("fixture-only") && !exported.includes("openrouter.ai") && !exported.includes("api_key"), "导出夹具不能包含凭据和用户地址");
+  await page.getByRole("button", { name: "刷新诊断", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="diagnostics-page"] .page-heading button').disabled);
+  await page.getByRole("status").filter({ hasText: "脱敏诊断报告已导出。" }).waitFor();
+  await page.screenshot({ path: path.join(output, "diagnostics-export-success.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureDiagnosticsExportFailure = true; });
+  await page.getByRole("button", { name: "导出脱敏 JSON", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "脱敏诊断报告导出失败" }).waitFor();
+  await page.getByRole("button", { name: "刷新诊断", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="diagnostics-page"] .page-heading button').disabled);
+  await page.getByRole("alert").filter({ hasText: "脱敏诊断报告导出失败" }).waitFor();
+  assert(!(await page.locator("body").innerText()).includes("private-user") && !(await page.locator("body").innerText()).includes("private.example"), "导出错误不泄露文件路径或服务地址");
+  await page.screenshot({ path: path.join(output, "diagnostics-export-error.png"), fullPage: true });
+  const exportsBeforeCancel = await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "export_gateway_diagnostics").length);
+  await page.evaluate(() => { window.__fixtureSavePath = null; });
+  await page.getByRole("button", { name: "导出脱敏 JSON", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('[data-testid="diagnostics-page"] .page-heading button:last-child').textContent === "导出脱敏 JSON");
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "export_gateway_diagnostics").length), exportsBeforeCancel, "取消文件对话框不得导出");
+  await page.evaluate(() => { window.__fixtureDiagnosticsHold = true; window.__fixtureDiagnosticsPending = []; });
+  const readsBefore = await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "get_gateway_diagnostics").length);
+  await page.getByRole("button", { name: "刷新诊断", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureDiagnosticsPending.length === 1);
+  await page.evaluate(() => { const button = document.querySelector('[data-testid="diagnostics-page"] .page-heading button'); button.click(); button.click(); });
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "get_gateway_diagnostics").length), readsBefore + 1, "刷新单飞，未完成时不能重复读取");
+  await page.evaluate(() => { window.__fixtureDiagnosticsHold = false; window.__fixtureDiagnosticsPending.splice(0).forEach(resolve => resolve()); });
+  await page.waitForFunction(() => !document.querySelector('[data-testid="diagnostics-page"] .page-heading button').disabled);
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => {
+    const old = structuredClone(window.__fixtureDiagnosticsRequests.at(-1).report);
+    old.overall = "error"; old.checks[0].title = "过期诊断结果";
+    window.__fixtureDiagnosticsPlans = [{ delayMs: 350, report: old }, {}];
+  });
+  await nav.getByRole("button", { name: "本地诊断", exact: true }).click();
+  await page.getByTestId("diagnostics-summary").waitFor();
+  await page.waitForTimeout(450);
+  assert(!(await page.getByTestId("diagnostics-checks").innerText()).includes("过期诊断结果"), "StrictMode旧诊断结果不能覆盖新结果");
+  await page.screenshot({ path: path.join(output, "diagnostics-out-of-order.png"), fullPage: true });
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureDiagnosticsPlans = [{ delayMs: 350, error: "过期诊断失败" }, {}]; });
+  await nav.getByRole("button", { name: "本地诊断", exact: true }).click();
+  await page.getByTestId("diagnostics-summary").waitFor();
+  await page.waitForTimeout(450);
+  assert.equal(await page.getByRole("alert").count(), 0, "过期诊断失败不能污染成功的状态");
+  await page.evaluate(() => { window.__fixtureSavePath = "C:/fixture/gateway-diagnostics.json"; window.__fixtureDiagnosticsExportHold = true; window.__fixtureDiagnosticsExportPending = []; });
+  await page.getByRole("button", { name: "导出脱敏 JSON", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureDiagnosticsExportPending.length === 1);
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await nav.getByRole("button", { name: "本地诊断", exact: true }).click();
+  await page.getByTestId("diagnostics-summary").waitFor();
+  await page.evaluate(() => { window.__fixtureDiagnosticsExportHold = false; window.__fixtureDiagnosticsExportPending.splice(0).forEach(resolve => resolve()); });
+  await page.waitForTimeout(50);
+  assert.equal(await page.getByRole("alert").count(), 0, "导航退出后迟到的导出失败不发布到新页面");
+  await page.evaluate(() => { window.__fixtureDiagnosticsHold = true; window.__fixtureDiagnosticsPending = []; window.__fixtureDiagnosticsPlans = [{ error: "卸载后的旧诊断失败" }]; });
+  await page.getByRole("button", { name: "刷新诊断", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureDiagnosticsPending.length === 1);
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureDiagnosticsHold = false; });
+  await nav.getByRole("button", { name: "本地诊断", exact: true }).click();
+  await page.getByTestId("diagnostics-summary").waitFor();
+  await page.evaluate(() => { window.__fixtureDiagnosticsPending.splice(0).forEach(resolve => resolve()); });
+  await page.waitForTimeout(50);
+  assert.equal(await page.getByRole("alert").count(), 0, "导航退出后迟到的读取失败不发布到新页面");
+  for (const width of [900, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `本地诊断页面不能横向溢出: ${width}`);
+    await page.screenshot({ path: path.join(output, `diagnostics-${width}.png`), fullPage: true });
+  }
+  assert.deepEqual(consoleErrors, [], "本地诊断不能出现控制台错误");
+  await context.close();
+}
+
 (async () => {
   fs.mkdirSync(output, { recursive: true });
   const browser = await chromium.launch({ headless: true, ...(process.env.LLMGW_BROWSER_CHANNEL ? { channel: process.env.LLMGW_BROWSER_CHANNEL } : {}) });
@@ -692,6 +1441,31 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     page.on("dialog", dialog => dialog.accept());
     await page.goto(baseUrl);
     await page.getByRole("heading", { name: "OpenRouter", exact: true }).waitFor();
+
+    // Initial settings errors must be visible, and retry must recover the page.
+    const failedSettingsContext = await browser.newContext({ viewport: { width: 1180, height: 760 }, reducedMotion: "reduce" });
+    await failedSettingsContext.addInitScript(fixture, { settingsFailure: true });
+    const failedSettingsPage = await failedSettingsContext.newPage();
+    failedSettingsPage.on("pageerror", error => errors.push(`settings: ${error.message}`));
+    await failedSettingsPage.goto(baseUrl);
+    await failedSettingsPage.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
+    await failedSettingsPage.getByRole("alert").filter({ hasText: "加载设置失败" }).waitFor({ timeout: 5000 });
+    assert.equal(await failedSettingsPage.getByText("加载设置中", { exact: true }).count(), 0,
+      "初次加载失败后不能一直显示加载中");
+    await failedSettingsPage.screenshot({ path: path.join(output, "settings-load-error.png"), fullPage: true });
+    await failedSettingsPage.evaluate(() => { window.__fixtureSettingsFailure = false; });
+    await failedSettingsPage.getByRole("button", { name: "重试加载设置", exact: true }).click();
+    await failedSettingsPage.getByText("统一接入地址", { exact: true }).waitFor({ timeout: 5000 });
+    assert(!(await failedSettingsPage.locator(".code").first().innerText()).includes("undefined"),
+      "接入示例中的 Key 与协议地址必须和真实 IPC 返回字段对齐");
+    assert.equal(await failedSettingsPage.getByRole("alert").count(), 0,
+      "重试成功后应清除加载错误");
+    await failedSettingsPage.screenshot({ path: path.join(output, "settings-load-recovered.png"), fullPage: true });
+    await failedSettingsContext.close();
+    await verifyAsyncPages(browser, errors);
+    await verifyVpnPage(browser, errors);
+    await verifyVpnKernel(browser, errors);
+    await verifyDiagnostics(browser, errors);
 
     // 「接口协议」下拉必须列出全部五种方言。少一种的症状是**静默的**：
     // 新建的供应商压根没法选那个协议，而测试全绿、界面也不报错。
@@ -851,6 +1625,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.waitForFunction(
       () => document.querySelectorAll(".provider-more[open]").length === 0, null, { timeout: 3000 },
     );
+    await page.screenshot({ path: path.join(output, "provider-menu-escape-closed.png"), fullPage: true });
     await page.locator(".provider-more > summary").first().click();
     await page.waitForFunction(
       () => document.querySelectorAll(".provider-more[open]").length === 1, null, { timeout: 3000 },
@@ -859,6 +1634,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     await page.waitForFunction(
       () => document.querySelectorAll(".provider-more[open]").length === 0, null, { timeout: 3000 },
     );
+    await page.screenshot({ path: path.join(output, "provider-menu-outside-closed.png"), fullPage: true });
     assert.equal(await openMenus(), 0, "截图前菜单必须已收起");
     const runtimeBadges = page.locator(".provider-card .provider-runtime");
     assert.equal(
@@ -889,6 +1665,20 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       "没配运行时的供应商不该出现这个徽标 —— 否则用户以为所有请求都走本机 CLI",
     );
     await runtimeCard.screenshot({ path: path.join(output, "provider-runtime-badge.png") });
+
+    // Normal configuration actions must keep the runtime routing mode.
+    await runtimeCard.getByRole("button", { name: "停用", exact: true }).click();
+    await page.waitForFunction(() => window.__fixtureProviders.find(p => p.id === "anthropic")?.enabled === false);
+    assert.equal(await runtimeCard.locator(".provider-runtime").count(), 1, "停用供应商不能清空账号运行时");
+    await runtimeCard.getByRole("button", { name: "启用", exact: true }).click();
+    await page.waitForFunction(() => window.__fixtureProviders.find(p => p.id === "anthropic")?.enabled === true);
+    await runtimeCard.getByRole("button", { name: "配置", exact: true }).click();
+    await page.locator(".provider-advanced > summary").click();
+    await page.locator("#provider-note").fill("账号运行时配置回归");
+    await page.getByRole("button", { name: "保存供应商", exact: true }).click();
+    await page.locator(".provider-editor").waitFor({ state: "hidden" });
+    assert.equal(await page.evaluate(() => window.__fixtureProviders.find(p => p.id === "anthropic")?.runtime_id), "codex-work");
+    await runtimeCard.screenshot({ path: path.join(output, "provider-runtime-preserved.png") });
 
     /* A5 运行时管理：让另外三个 IPC 真的有消费者                        */
     const runtimesPanel = page.locator(".agent-runtimes");
@@ -1580,7 +2370,7 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await page.locator("#audit-status").fill("5xx");
     await page.waitForTimeout(400);
     assert.equal(await rowCount(), 0, "夹具里没有 5xx，应筛成空表");
-    assert((await page.locator(".empty").innerText()).includes("暂无"),
+    assert((await page.locator(".card").filter({ has: page.locator(".audit-filters") }).locator(".empty").innerText()).includes("暂无"),
       "筛成空表时要显示空态，而不是一张没有表头的怪表");
     await page.locator("#audit-reset").click();
     await page.waitForTimeout(400);
@@ -1706,17 +2496,26 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await budgetInput.waitFor({ timeout: 5000 });
     assert.equal(await budgetInput.inputValue(), "5",
       "5000000 micros 必须回填成 5（元），直接印 micros 会让用户改错量级");
-    assert.equal(await page.locator("#remote-key-currency").inputValue(), "USD");
+    assert.equal(await page.locator("#remote-key-currency").inputValue(), "usd");
+    assert.deepEqual(await page.locator("#remote-key-currency option").evaluateAll(nodes => nodes.map(n => n.value)), ["usd", "cny"]);
     assert.equal(await page.locator("#remote-key-models").inputValue(),
       "gpt-4o, claude-*");
     await page.screenshot({ path: path.join(output, "remote-key-budget-editor.png"), fullPage: true });
 
     // 改预算后保存，列表要跟着变 —— 证明 change 真的落到了夹具（= 后端）。
+    await budgetInput.fill("-1");
+    await page.getByRole("button", { name: "保存更改", exact: true }).click();
+    await page.locator(".modal").getByRole("alert").filter({ hasText: "月度预算必须" }).waitFor({ timeout: 5000 });
+    assert.equal(await page.evaluate(() => window.__fixtureRemoteKeyUpdates?.length ?? 0), 0,
+      "非法预算必须在调用后端前拒绝");
+    await page.screenshot({ path: path.join(output, "remote-key-invalid-budget.png"), fullPage: true });
     await budgetInput.fill("12.5");
     await page.getByRole("button", { name: "保存更改", exact: true }).click();
     await page.waitForTimeout(300);
     assert((await keyCard.innerText()).includes("12.5 USD"),
       `保存后列表要显示新预算，实际：${(await keyCard.innerText()).replace(/\n/g, "|")}`);
+    assert.equal(await page.evaluate(() => window.__fixtureRemoteKeys.find(k => k.id === "rk-fixture-limited")?.budget_currency), "usd",
+      "预算币种必须与真实审计使用的 usd 一致");
     // 反向：清空预算表示「不限」，不能变成 0
     await keyCard.locator("tr").filter({ hasText: "受限设备" })
       .getByRole("button", { name: "编辑", exact: true }).click();
@@ -2289,6 +3088,6 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await preview.goto(baseUrl);
     await preview.getByRole("heading", { name: "浏览器预览已隔离", exact: true }).waitFor();
     assert.equal(await preview.locator(".provider-card").count(), 0);
-    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, first-use guidance, persisted skip/completion, manual search, offline HTML, themes, startup splash, pet HUD/actions, responsive layouts and preview isolation; screenshots=${output}`);
+    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, first-use guidance, persisted skip/completion, manual search, offline HTML, themes, startup splash, pet HUD/actions, async page races, polling feedback, exact cache settings, VPN controls, official kernel install/rollback, redacted local diagnostics, responsive layouts and preview isolation; screenshots=${output}`);
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

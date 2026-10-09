@@ -258,7 +258,7 @@ impl<'a> FailoverChain<'a> {
             ));
         }
 
-        let limit = self.max_attempts.min(self.candidates.len());
+        let limit = self.max_attempts;
         let mut attempts = 0usize;
         let mut last_err: Option<GatewayError> = None;
         // 一旦发生过鉴权失败，后续候选**不得落到免 Key 后端**（本地 Ollama、
@@ -266,7 +266,11 @@ impl<'a> FailoverChain<'a> {
         // 悄悄换一家不需要凭据的服务——那既可能泄露上下文，也让错误更难追。
         let mut no_keyless_fallback = false;
 
-        for c in self.candidates.iter().take(limit) {
+        for c in self.candidates {
+            // 确认复测也占用尝试预算；按候选数量 take 会在复测之后继续多发一次。
+            if attempts >= limit {
+                break;
+            }
             if no_keyless_fallback && c.provider.api_key_enc.trim().is_empty() {
                 tracing::warn!(
                     "鉴权失败后跳过免 Key 后端 [{} / {}]",
@@ -323,6 +327,9 @@ impl<'a> FailoverChain<'a> {
                         if !is_fatal_auth(&e) || self.auth_mode == AuthFailureMode::Strict {
                             return Err(e);
                         }
+                        // 即使复测结果变成 429 等暂态故障，先前的鉴权拒绝也不能
+                        // 成为发送到免 Key 服务的理由。
+                        no_keyless_fallback = true;
                         match self
                             .confirm_auth_failure(c, &mut f, records, &mut attempts)
                             .await
@@ -338,10 +345,7 @@ impl<'a> FailoverChain<'a> {
                                 });
                             }
                             ConfirmOutcome::StillRefused => {
-                                // 已确认不可用：调用方的 on_failure 按策略自动停用
-                                // 这家供应商，这里换下一家继续。
                                 // 已确认不可用：上层按策略把这家供应商自动停用，这里换下一家继续。
-                                no_keyless_fallback = true;
                                 on_auth_confirmed(&c.provider, &e);
                                 last_err = Some(e);
                                 continue;

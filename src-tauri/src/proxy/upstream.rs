@@ -29,7 +29,7 @@ fn overrides(model: &str, p: &Provider) -> Option<ModelOverrides> {
 }
 
 pub struct UpstreamClient {
-    http: reqwest::Client,
+    http: parking_lot::RwLock<std::result::Result<reqwest::Client, String>>,
 }
 
 pub enum PassthroughResponse {
@@ -48,7 +48,13 @@ impl Default for UpstreamClient {
 
 impl UpstreamClient {
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
+        Self {
+            http: parking_lot::RwLock::new(Self::build_http(None)),
+        }
+    }
+
+    fn build_http(proxy: Option<&str>) -> std::result::Result<reqwest::Client, String> {
+        let builder = reqwest::Client::builder()
             .pool_max_idle_per_host(16)
             .connect_timeout(Duration::from_secs(10))
             // 总超时在每次请求上按 provider 覆盖
@@ -57,10 +63,19 @@ impl UpstreamClient {
             // 未校验的 Location 跳转到其他网络目标。
             .redirect(reqwest::redirect::Policy::none())
             .gzip(true)
-            .brotli(true)
+            .brotli(true);
+        crate::outbound::apply_proxy(builder, proxy)?
             .build()
-            .expect("build reqwest client");
-        Self { http }
+            .map_err(|_| "无法创建上游代理连接".to_string())
+    }
+
+    /// Hot reload the client pool. Existing requests keep their own client clone.
+    pub fn set_proxy(&self, proxy: Option<&str>) {
+        *self.http.write() = Self::build_http(proxy);
+    }
+
+    fn client(&self) -> Result<reqwest::Client> {
+        self.http.read().clone().map_err(GatewayError::Protocol)
     }
 
     fn headers_for(p: &Provider, api_key: &str) -> Result<HeaderMap> {
@@ -239,7 +254,7 @@ impl UpstreamClient {
         Self::apply_extra_headers(&mut headers, overrides(model, p).as_ref())?;
 
         let resp = self
-            .http
+            .client()?
             .post(url)
             .timeout(timeout)
             .headers(headers)
@@ -330,7 +345,7 @@ impl UpstreamClient {
         }
 
         let resp = self
-            .http
+            .client()?
             .post(url)
             .timeout(timeout)
             .headers(headers)
@@ -401,7 +416,7 @@ impl UpstreamClient {
         Self::apply_extra_headers(&mut headers, overrides(model, p).as_ref())?;
 
         let resp = self
-            .http
+            .client()?
             .post(url)
             .timeout(timeout)
             .headers(headers)

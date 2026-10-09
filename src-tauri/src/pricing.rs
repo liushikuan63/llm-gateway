@@ -67,16 +67,13 @@ pub async fn fetch_feed(url: &str, proxy: Option<&str>) -> Result<Vec<FeedPrice>
     if parsed.scheme() != "https" {
         return Err("定价源必须使用 HTTPS".into());
     }
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .timeout(FEED_TIMEOUT)
         .connect_timeout(FEED_CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .gzip(true)
         .brotli(true);
-    if let Some(proxy) = proxy.filter(|proxy| !proxy.trim().is_empty()) {
-        builder = builder
-            .proxy(reqwest::Proxy::all(proxy.trim()).map_err(|_| "HTTP 代理地址无效".to_string())?);
-    }
+    let builder = crate::outbound::apply_proxy(builder, proxy)?;
     let client = builder.build().map_err(|e| e.to_string())?;
 
     let response = client

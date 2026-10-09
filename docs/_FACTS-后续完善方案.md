@@ -385,6 +385,74 @@ CLAUDE.md 的「**密钥不进配置**」禁的是**明文**落进会随快照/�
 
 ---
 
+## L. 2026-10-09 核对与修复台账
+
+本节是当前代码复验后的补充；§A–§K 的数字与状态属于原盘点日期，不能当作当前基线。正式版的行为基准仍为 `src-tauri/tests/`。完整实测说明见 [交付与验证记录](验证记录.md#2026-10-09-代码与文档核对修复)。
+
+同日首批全量基线（最新增量见 §M）：`scripts/ci-local.ps1 -Step all` → **1031 passed / 0 failed / 15 ignored，CI OK，exit 0**；完整浏览器 `verify:ui` exit 0，新截图已生成。工具链为 Node 24.19.0 / npm 11.17.0 / Rust-Cargo 1.99.0 / Windows MSVC。定向判据与先红后绿证据见下表及验证记录；ignored 不算通过。
+
+| 事实 | 当前代码/测试证据 |
+| --- | --- |
+| 月预算币种保存为实际计费使用的 `usd` / `cny`；消费累计兼容旧大写及首尾空白，未知/空币种不能保存为非零预算 | `src-tauri/src/budget.rs:68`、`src-tauri/src/commands.rs:616`；`cargo test --lib budget::tests --jobs 1` 20 passed |
+| 白名单在普通聊天、Embedding/图片/语音、Responses 压缩三条公共分发路径生效；关闭预算开关、本机统一 Key、空名单不限制 | `src-tauri/src/proxy/server.rs:2860`、`src-tauri/tests/budget_gate.rs:712`；定向 suite 15 passed |
+| 缓存 HIT 在返回前保存问答及粘性，审计关联本次 trace 并记零新增消费；正文保留原 usage | `src-tauri/src/proxy/server.rs:3424`、`src-tauri/tests/response_cache.rs:294`、`src-tauri/tests/response_cache.rs:351`；suite 13 passed |
+| 常规供应商配置保存通过 SQL 原子保留 runtime_id，新 ID 无绑定，底层显式绑定/清空行为不变 | `src-tauri/src/db/repo.rs:126`、`src-tauri/tests/provider_config.rs:27`；suite 3 passed |
+| 设置初次加载失败可见并可重试；预算编辑拒绝非法金额 | `src/pages/Settings.tsx:108`、`scripts/ui-smoke.cjs`；完整 verify:ui exit 0，新截图已生成 |
+| CI 与本机共用语法/夹具门禁，Windows run 明确使用 pwsh，fmt 指定 src-tauri manifest，manual/redaction 独立执行 | `.github/workflows/ci.yml`、`scripts/ci-local.ps1`、`scripts/check-script-syntax.mjs`；坏语法注入 exit 1，恢复 exit 0 |
+| Node 是同级独立参考实现，不能逐行对齐或作为 Rust 验收标准；本轮修复其 Gemini URL，测试 76/76 | 同级参考项目（外部）`../llm-gateway-node/`；正式基准仍为 `src-tauri/tests/` |
+
+首批源码复验还确认：当时搜索枚举有 Tavily/Brave/SearXNG/BingCn/DuckDuckGo 五种；非流式鉴权默认 SkipAndDisable 与 1 次复测，流式路径仍按原不可重试错误返回。README 与单一手册源已据此订正。详见 `src-tauri/src/config.rs:616`、`src-tauri/src/proxy/server.rs`、`src/content/user-manual.json`。
+
+首批结束时待独立复现与修复的线索（§M 已继续处理）：缓存清空后在途回填、缓存 capacity 热更新、流式鉴权策略接线、用量筛选请求竞态，以及设置后续刷新失败可能被成功提示覆盖。本轮没有把这些标成已完成。
+
+## M. 2026-10-09 运行时一致性与 VPN 增量（第一阶段历史）
+
+最终全量基线：`scripts/ci-local.ps1 -Step all` → **CI OK / DELIVERY_CI_EXIT=0，1063 passed / 0 failed / 16 ignored**，56 份 Rust suite 输出；UI **81 张截图 / UI_SMOKE_OK / exit 0**；独立 Node **92/92 / exit 0**。真实 Mihomo 显式验收 **1 passed / 0 failed / 8 filtered out / exit 0** 单列，不重复计入默认通过数。
+
+本节继续 §L 的后续线索，不以 VPN 替换原 A–D 或 R1–R4 方向。任务及可复制执行方案见 [增量 VibeCoding 任务卡](VibeCoding任务卡-运行时一致性与VPN集成.md)，最终验收见 [验证记录](验证记录.md#2026-10-09-运行时一致性与-vpn-增量)。§L 的 1031/76 和流式策略描述是同日首批修复完成时的快照。
+
+| 方向 | 当前行为与依据 |
+| --- | --- |
+| R1 精确缓存 | MISS 携带失效代次，同 mutex 中核验后才回填；旧配置快照不能取得新代次。容量热更新，ttl_secs 默认 0、使用单调时间且命中不续期。所有配置发布入口共用 GatewayState.update_cfg。cache 单测与 response_cache 的实际 HTTP 回归覆盖失效、旧请求、容量和有效期。 |
+| 配置提交与统一 Key | 5 个配置写入口共用无 await 提交临界区，持 AppState.config 写锁完成继承最新 Key/轮换、落盘与 GatewayState 发布；旧快照不能复活 Key，失败不发布。2 条真实临时文件回归先红后绿，快照响应返回实际提交配置。 |
+| R2 流式鉴权 | 连接与首个可用事件共同进入 FailoverChain，复用 Strict/Skip/SkipAndDisable、复测、豁免及停用。初次/复测/切换共用总尝试预算；遭鉴权拒绝不转免 Key。首块输出后仍不重放，首块前 EOF 可降级。auth_failover / server_stream 实际 mock 请求验证。 |
+| R3 页面异步一致性 | Stats 按请求/生命周期忽略旧结果，轮询等待所有请求完成才重新计时；错误与操作提示分开，清空校准后旧结果不能复活样本。Settings 锁定进行中操作，拒绝卸载后的迟到配置事件，缓存校验覆盖所有保存入口。浏览器可控 Promise 回归及 81 张截图通过。 |
+| R4 Node 参考实现 | LF/CRLF/CR SSE、多行 data、Ollama NDJSON、OpenAI usage-only、分块 UTF-8 与完整消息元数据重叠修复。缺完成标记/错误/坏 JSON 不写成功审计；已输出的流不降级。独立 npm test 92/92，不混入 Rust 数量。 |
+| V1 受管内核与节点 | 新 VpnManager 管理独立 Mihomo 子进程，不连接或停止用户 FlClash；固定回环控制器鉴权、加密节点、受管主配置、运行时明文清理。只导入 proxies，保持 TUN/DNS/allow-lan 关闭。-t 后还检查真实 provider 和 Selector 节点；空组 REJECT。全局模式先将 GLOBAL 选到 VPN。 |
+| 网关代理实际接线 | outbound 统一代理校验/本地绕过。GatewayState 构造及热发布更新实际普通/流式/透传客户端，搜索/改写、模型目录、额度、定价及 CLI 版本查询接入。真实 HTTPS CONNECT mock 在 response_cache 中验证初始化与端口热切换，而非只检查配置字段。 |
+| 代理归属与端口变更 | 比较规范化 URL；只迁移仍属于旧 VPN 的网关绑定，未绑定不启用，其他代理不覆盖；联动失败恢复内核设置。停止内核保留绑定，取消只清除自己地址。outbound 单测与 UI 三组回归验证。 |
+
+真实内核独立验证使用官方固定版本 **Mihomo v1.19.32**；ZIP SHA-256 为 `974a4d7ad69aed27aa2e8f91d61113573c14dadb14562c63e58effabf59816f0`，下载内容与官方 release 元数据匹配。节点仅指向 `127.0.0.1:9`，不发业务网络请求；实测有效节点加载、空/错误节点拒绝、GLOBAL 选择、TUN/allow-lan 关闭及失败清理。默认 ignored 的 `real_mihomo_file_provider_offline_acceptance` 另行显式运行，不能把默认跳过写成通过。
+
+V1 仍由用户选择本地内核文件。**尚未交付**内核预置/自动安装升级、系统代理/TUN/管理员服务、订阅自动更新/完整分流测速；这些分别在 V2/V3。N1 只读诊断、N2 请求形状路由预演、N3 并发预算预占、N4 契约矩阵继续保留，未以计划替代实现。未验证真实外部节点、订阅和收费上游，未生成新安装包或改变原许可证。
+
+## N. 2026-10-09 内核发行与本地诊断
+
+继续 §M 的 V2/N1，原 A–D 和 R1–R4 保留。当前实现没有新增依赖、表结构或路由权重。V2/N1 的本轮实现、完整本机门禁与发行验收已完成；NSIS 实际安装/卸载和 MSI 提取运行分别记录，MSI 整机安装仍未测试。最新数值、两包哈希及历史对照见 [交付与验证记录](验证记录.md)。
+
+| 方向 | 当前行为与证据 |
+| --- | --- |
+| V2 固定发行 | `src-tauri/src/vpn_install.rs:24` 固定 v1.19.32 Windows amd64 compatible、官方资产、ZIP/EXE SHA。IPC 不接受下载地址或摘要。安全解压指定唯一 EXE、校验 PE 架构及真实 `-v`；同卷暂存/原子安装。 |
+| 随附资源与许可 | `src-tauri/resources/mihomo/manifest.json` 列出固定 ZIP、对应源码 ZIP、原样 GPL-3.0 及哈希；项目自有 MIT 单独随附。`scripts/verify-release.mjs` 核验资源、运行时常量及源说明。故意改坏 manifest 摘要时退出 1，恢复后退出 0。 |
+| 安装/回滚生命周期 | `src-tauri/src/vpn.rs:459` 随附包优先、缺包才下载；`settings.json` 同时原子保存选择和安装记录。运行中禁止安装/回滚；同版幂等，保留之前有效选择且不覆盖用户 EXE；首次新核启动失败恢复选择但不自动启动旧核。 |
+| V2 离线验收 | 默认 vpn_install 8 passed/0 failed/1 ignored；显式官方 ZIP 1 passed/0 failed 单列。实包覆盖校验、损坏 ZIP、取消及暂存清理、幂等、回滚和首次启动恢复。 |
+| N1 只读报告 | `src-tauri/src/diagnostics.rs:101` 独立 collect；仅本地 DB/内存，不走模型自检、HTTP/TCP、status 刷新或 cache purge。监听只信自己实际 bind，比较全部 5 个重启字段，取消时 RAII 清除。VPN 纯 try_lock 与已有进程句柄，忙时 running=null。 |
+| N1 脱敏与计数 | `src-tauri/src/diagnostics.rs:424` 白名单导出，文本错误不含原始 SQL/路径。启用模型仅计启用供应商；预算仅计启用正限额 Key，USD/CNY/unknown 分桶。7 条离线回归；旧 stats 清理缓存的红阶段 exit 101，新 snapshot_stats 全绿。 |
+| UI 与真实包端 | V2/N1 新增 16 张截图，旧 81 保留，共 97 张；生产 build/完整 UI 全绿。`src/pages/Diagnostics.tsx:114` 在 VPN 状态未知且存在显式代理时显示归属未知。安装包真实 WebView IPC 由 `scripts/package-smoke.cjs` 单独验收，两包各 8 项，不能以浏览器夹具代替。 |
+| 隔离验收 | `src-tauri/src/config.rs:1076` 只接受绝对 `LLMGW_DATA_DIR` 定向本工具默认配置、DB、master.key、日志与 VPN 数据根；验收另设 WebView2 目录并关闭 Agent。相对值回默认，不迁移外部 CLI/Agent 产物，也不覆盖环境变量主密钥；日志写入失败仍可回系统 Temp。这不是完整 portable 或系统沙箱。 |
+| 真实退出清理 | `src-tauri/src/lib.rs:407` 在 `RunEvent::Exit` 显式 `shutdown_blocking()`。`scripts/package-exit.ps1` 核验本任务窗口线程后投递 WM_QUIT；实际包验断言核心 PID 退出、端口关闭、运行时节点和带 secret 的主配置删除。未将其写成托盘按钮实测或所有 Rust Drop 均执行。 |
+| 进程树测试就绪 | `src-tauri/src/proc_util.rs:83` 后仅测试夹具变更：UUID 私有目录、15 秒就绪截止、2 秒受控启动延迟及 RAII 失败清理；检测命令失败不能假装已退出。生产段与原文件字节一致。格式/Clippy/全目标编译和原有 3 条定向测试再次通过，不重复计入全量 1078。 |
+
+本轮最终 `scripts/ci-local.ps1 -Step all` → **CI OK / exit 0，1078 passed / 0 failed / 17 ignored**；UI **97 张截图 / UI_SMOKE_OK / exit 0**；Node **92/92 / exit 0**。官方实核 V1 与官方 ZIP 安装两项各 **1 passed / 0 failed / exit 0** 单列，不重复计入默认通过数。21 章手册共源及其余本机门禁通过，17 项默认 ignored 不算已验证全部线上环境。
+
+本轮 **0.2.0 Windows x64 未签名** NSIS/MSI 构建 exit 0。NSIS 静默安装 exit 0，已安装 EXE 真实 WebView/IPC **8 检查 / exit 0**；实际卸载 exit 0，并等待子进程完成，确认程序/resources 删除、测试注册项清理、私有测试数据保留。原用户配置、主密钥、DB/WAL/SHM 共 **5 文件**大小与哈希不变。MSI `/a /qn TARGETDIR=私有目录` 提取 exit 0，提取 EXE 的真实 WebView/IPC **8 检查 / exit 0**；没有执行整机 MSI 安装。
+
+两包随附的 6 份资源与仓库一致。MSI 另核对 EXE/DLL，共 8 项载荷；包内 EXE 与 release 只有官方 Tauri bundle 标记的 3 字节差异（UNK→NSS/MSI），统一这 3 字节后其余字节一致。两包大小/摘要已只读复核：NSIS **28576593 bytes**、`a5a8296c3c9f1ce6c6ba749d39147478f2a154ec6b092a1bbc9d3b42e89b61cb`；MSI **30777344 bytes**、`03a951b80254c4ce429c1ab18cca056c19251d30778e7b3c1ec3cca3bd46cd6b`。本机证据在 `%TEMP%/llmgw-package-acceptance-20261009` 的两份 `*-results-final/package-smoke-result.json`、截图/诊断 JSON 和 `uninstall-and-user-data.json`，两份结果均 `passed=true/checks=8`。
+
+载荷一致性可复用 `scripts/verify-installed-package.cjs`：按 `--bundle nsis|msi` 和绝对 `--dir` 核对资源目录及 EXE，仅允许一个固定位置的官方 bundle 标记差异，不豁免其他字节变化。
+
+N2 请求形状预演、N3 并发预算预占、N4 跨实现契约矩阵、V3 系统代理/TUN/权限服务继续列在 [增量任务卡](VibeCoding任务卡-运行时一致性与VPN集成.md)。真实外部节点/订阅、系统网络接管和收费上游仍未作为本轮离线验收内容。此时报告是多个瞬时快照，不能承诺跨配置/VPN/DB 原子一致。
+
 ## F. 本文的过期条件
 
 出现下列任一情况，本文即失效，必须重新盘点而不是直接沿用：

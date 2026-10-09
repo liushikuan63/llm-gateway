@@ -121,7 +121,17 @@ fn read_local_meta(row: &sqlx::sqlite::SqliteRow) -> Option<LocalMeta> {
     (!parsed.runtime.trim().is_empty()).then_some(parsed)
 }
 
+/// Save the editable provider configuration without changing its runtime binding.
+/// Runtime assignment is managed separately; new IDs start without a binding.
+pub async fn upsert_provider_config(pool: &SqlitePool, p: &Provider) -> Result<()> {
+    save_provider(pool, p, true).await
+}
+
 pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
+    save_provider(pool, p, false).await
+}
+
+async fn save_provider(pool: &SqlitePool, p: &Provider, preserve_runtime: bool) -> Result<()> {
     let now = Utc::now();
     sqlx::query(
         r#"INSERT INTO providers
@@ -131,7 +141,7 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
              name=excluded.name, dialect=excluded.dialect, base_url=excluded.base_url,
              api_key_enc=excluded.api_key_enc, enabled=excluded.enabled, priority=excluded.priority,
              rpm_limit=excluded.rpm_limit, intelligence=excluded.intelligence, note=excluded.note,
-             runtime_id=excluded.runtime_id,
+             runtime_id=CASE WHEN ? THEN providers.runtime_id ELSE excluded.runtime_id END,
              updated_at=excluded.updated_at"#,
     )
     .bind(&p.id)
@@ -144,9 +154,14 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
     .bind(p.rpm_limit)
     .bind(p.intelligence)
     .bind(&p.note)
-    .bind(&p.runtime_id)
+    .bind(if preserve_runtime {
+        None
+    } else {
+        p.runtime_id.as_deref()
+    })
     .bind(now)
     .bind(now)
+    .bind(preserve_runtime)
     .execute(pool)
     .await?;
 

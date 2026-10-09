@@ -230,7 +230,7 @@ pub async fn upsert_provider(
         updated_at: now,
     };
 
-    repo::upsert_provider(state.db.pool(), &p)
+    repo::upsert_provider_config(state.db.pool(), &p)
         .await
         .map_err(|e| e.to_string())?;
     // 内核缓存要同步刷新，否则新加的 provider 不会立刻进路由表
@@ -336,6 +336,163 @@ pub struct ConfigUpdateResult {
     pub restart_reasons: Vec<String>,
 }
 
+enum ConfigCommit<'a> {
+    Save(&'a AppConfig),
+    RotateKey,
+}
+
+/// 无 await 的配置提交临界区；锁序始终是 AppState.config -> GatewayState.cfg。
+/// 保存失败时既不发布运行时配置，也不替换当前配置。
+fn commit_config_with(
+    config: &parking_lot::RwLock<AppConfig>,
+    change: ConfigCommit<'_>,
+    persist: impl FnOnce(&AppConfig) -> Result<(), String>,
+    publish: impl FnOnce(&AppConfig),
+) -> Result<AppConfig, String> {
+    let mut current = config.write();
+    let next = match change {
+        ConfigCommit::Save(cfg) => {
+            let mut next = cfg.clone();
+            // 普通保存、快照与导入可能来自旧快照，统一继承提交时的最新 Key。
+            next.unified_key = current.unified_key.clone();
+            next
+        }
+        ConfigCommit::RotateKey => {
+            let mut next = current.clone();
+            next.unified_key = crypto::new_unified_key();
+            next
+        }
+    };
+    persist(&next)?;
+    publish(&next);
+    *current = next.clone();
+    Ok(next)
+}
+
+fn commit_config(state: &AppState, change: ConfigCommit<'_>) -> Result<AppConfig, String> {
+    commit_config_with(
+        &state.config,
+        change,
+        |cfg| cfg.save().map_err(|error| error.to_string()),
+        |cfg| state.gateway.update_cfg(cfg.clone()),
+    )
+}
+
+#[cfg(test)]
+mod config_commit_tests {
+    use super::{commit_config_with, ConfigCommit};
+    use crate::config::AppConfig;
+    use parking_lot::RwLock;
+    use std::cell::{Cell, RefCell};
+    use std::path::PathBuf;
+
+    struct TempConfig(PathBuf);
+
+    impl TempConfig {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "llm-gateway-config-commit-{}.toml",
+                uuid::Uuid::new_v4()
+            )))
+        }
+
+        fn persist(&self, cfg: &AppConfig) -> Result<(), String> {
+            let text = toml::to_string_pretty(cfg).map_err(|error| error.to_string())?;
+            std::fs::write(&self.0, text).map_err(|error| error.to_string())
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn old_snapshot_finishing_after_rotation_keeps_the_latest_key_on_disk_and_in_runtime() {
+        let config = RwLock::new(AppConfig::default());
+        let mut old_snapshot = config.read().clone();
+        let previous_key = old_snapshot.unified_key.clone();
+        let disk = TempConfig::new();
+        let published = RefCell::new(Vec::new());
+        let rotated = commit_config_with(
+            &config,
+            ConfigCommit::RotateKey,
+            |cfg| {
+                assert!(config.try_write().is_none(), "落盘期间其他配置提交必须等待");
+                disk.persist(cfg)
+            },
+            |cfg| {
+                assert!(config.try_write().is_none(), "运行时发布期间仍须串行提交");
+                published.borrow_mut().push(cfg.clone());
+            },
+        )
+        .unwrap();
+        assert!(rotated.unified_key != previous_key, "轮换必须产生新的 Key");
+
+        // 模拟快照/普通保存已读取旧配置，直到轮换结束后才完成前置 await。
+        old_snapshot.cache.capacity = 17;
+        let saved = commit_config_with(
+            &config,
+            ConfigCommit::Save(&old_snapshot),
+            |cfg| disk.persist(cfg),
+            |cfg| published.borrow_mut().push(cfg.clone()),
+        )
+        .unwrap();
+        let persisted: AppConfig =
+            toml::from_str(&std::fs::read_to_string(&disk.0).unwrap()).unwrap();
+        assert!(
+            saved.unified_key == rotated.unified_key,
+            "旧快照不能复活旧 Key"
+        );
+        assert!(
+            config.read().unified_key == rotated.unified_key,
+            "内存应保留最新 Key"
+        );
+        assert!(
+            persisted.unified_key == rotated.unified_key,
+            "磁盘应保留最新 Key"
+        );
+        assert!(
+            published.borrow().last().unwrap().unified_key == rotated.unified_key,
+            "运行时发布应保留最新 Key"
+        );
+        assert_eq!(persisted.cache.capacity, 17);
+        assert_eq!(config.read().cache.capacity, 17);
+    }
+
+    #[test]
+    fn failed_persistence_never_publishes_or_changes_the_current_key() {
+        let config = RwLock::new(AppConfig::default());
+        let previous = config.read().clone();
+        let disk = TempConfig::new();
+        // 父路径故意是文件，产生真实写入错误，不接触用户配置目录。
+        disk.persist(&previous).unwrap();
+        let published = Cell::new(false);
+        let result = commit_config_with(
+            &config,
+            ConfigCommit::RotateKey,
+            |cfg| {
+                let text = toml::to_string_pretty(cfg).map_err(|error| error.to_string())?;
+                std::fs::write(disk.0.join("config.toml"), text).map_err(|error| error.to_string())
+            },
+            |_| published.set(true),
+        );
+        assert!(result.is_err());
+        assert!(!published.get());
+        assert!(
+            config.read().unified_key == previous.unified_key,
+            "落盘失败不能更新 Key"
+        );
+        let persisted: AppConfig =
+            toml::from_str(&std::fs::read_to_string(&disk.0).unwrap()).unwrap();
+        assert!(
+            persisted.unified_key == previous.unified_key,
+            "落盘失败应保留原文件"
+        );
+    }
+}
+
 fn listener_restart_reasons(previous: &AppConfig, next: &AppConfig) -> Vec<String> {
     let mut reasons = Vec::new();
     if previous.bind != next.bind {
@@ -358,6 +515,151 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String>
     Ok(state.config.read().clone())
 }
 
+/* -------------------------- Managed VPN kernel -------------------------- */
+
+#[tauri::command]
+pub async fn vpn_status(state: State<'_, AppState>) -> Result<crate::vpn::VpnStatus, String> {
+    state.vpn.status().await
+}
+
+#[tauri::command]
+pub async fn vpn_kernel_info(
+    state: State<'_, AppState>,
+) -> Result<crate::vpn_install::VpnKernelInfo, String> {
+    state.vpn.kernel_info().await
+}
+
+#[tauri::command]
+pub async fn install_vpn_kernel(
+    state: State<'_, AppState>,
+) -> Result<crate::vpn::VpnStatus, String> {
+    state.vpn.install_kernel().await
+}
+
+#[tauri::command]
+pub async fn rollback_vpn_kernel(
+    state: State<'_, AppState>,
+) -> Result<crate::vpn::VpnStatus, String> {
+    state.vpn.rollback_kernel().await
+}
+
+async fn local_diagnostics(state: &AppState) -> crate::diagnostics::DiagnosticsReport {
+    let cfg = state.gateway.cfg_snapshot();
+    let vpn = state
+        .vpn
+        .diagnostics_snapshot()
+        .map(|snapshot| crate::diagnostics::VpnDiagnostics {
+            running: snapshot.running,
+            mixed_port: snapshot.mixed_port,
+            has_error: snapshot.has_error,
+        });
+    crate::diagnostics::collect(&cfg, &state.gateway, vpn).await
+}
+
+#[tauri::command]
+pub async fn get_gateway_diagnostics(
+    state: State<'_, AppState>,
+) -> Result<crate::diagnostics::DiagnosticsReport, String> {
+    Ok(local_diagnostics(&state).await)
+}
+
+#[tauri::command]
+pub async fn export_gateway_diagnostics(
+    state: State<'_, AppState>,
+    dest: String,
+) -> Result<(), String> {
+    let report = local_diagnostics(&state).await;
+    crate::diagnostics::export_json(&report, std::path::Path::new(&dest))
+}
+
+#[tauri::command]
+pub async fn save_vpn_settings(
+    state: State<'_, AppState>,
+    settings: crate::vpn::VpnSettings,
+) -> Result<crate::vpn::VpnStatus, String> {
+    let previous = state.vpn.status().await?;
+    let mut cfg = state.config.read().clone();
+    let next_proxy = format!("http://127.0.0.1:{}", settings.mixed_port);
+    let rebound = crate::outbound::rebind_managed_proxy(
+        cfg.http_proxy.as_deref(),
+        &previous.proxy_url,
+        &next_proxy,
+    )?;
+    let next = state.vpn.save_settings(settings).await?;
+    if cfg.http_proxy != rebound {
+        cfg.http_proxy = rebound;
+        let manager = state.vpn.clone();
+        if update_config(state, cfg).await.is_err() {
+            if manager.save_settings(previous.settings).await.is_err() {
+                return Err("网关代理联动保存失败；请重新核对 VPN 端口和网关代理配置".into());
+            }
+            return Err("网关代理联动保存失败，已恢复原 VPN 设置".into());
+        }
+    }
+    Ok(next)
+}
+
+#[tauri::command]
+pub async fn import_vpn_profile(
+    state: State<'_, AppState>,
+    input: crate::vpn::VpnProfileInput,
+) -> Result<crate::vpn::VpnStatus, String> {
+    state.vpn.import_profile(input).await
+}
+
+#[tauri::command]
+pub async fn start_vpn(state: State<'_, AppState>) -> Result<crate::vpn::VpnStatus, String> {
+    state.vpn.start().await
+}
+
+#[tauri::command]
+pub async fn stop_vpn(state: State<'_, AppState>) -> Result<crate::vpn::VpnStatus, String> {
+    state.vpn.stop().await
+}
+
+#[tauri::command]
+pub async fn list_vpn_proxies(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::vpn::VpnProxy>, String> {
+    state.vpn.proxies().await
+}
+
+#[tauri::command]
+pub async fn select_vpn_proxy(
+    state: State<'_, AppState>,
+    group: String,
+    name: String,
+) -> Result<(), String> {
+    state.vpn.select_proxy(&group, &name).await
+}
+
+#[tauri::command]
+pub async fn set_vpn_mode(state: State<'_, AppState>, mode: String) -> Result<(), String> {
+    state.vpn.set_mode(&mode).await
+}
+
+#[tauri::command]
+pub async fn use_vpn_for_gateway(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<ConfigUpdateResult, String> {
+    let status = state.vpn.status().await?;
+    if enabled && (!status.running || status.error.is_some()) {
+        return Err("请先启动可用的 VPN 内核，再应用为网关代理".into());
+    }
+    let managed_proxy = crate::outbound::validate_proxy(Some(&status.proxy_url))?;
+    let mut cfg = state.config.read().clone();
+    let current_proxy = crate::outbound::validate_proxy(cfg.http_proxy.as_deref())?;
+    if enabled {
+        cfg.http_proxy = managed_proxy;
+    } else if current_proxy == managed_proxy {
+        cfg.http_proxy = None;
+    } else {
+        return Err("网关当前使用其他代理，已保留其配置".into());
+    }
+    update_config(state, cfg).await
+}
+
 #[tauri::command]
 pub async fn update_config(
     state: State<'_, AppState>,
@@ -365,6 +667,7 @@ pub async fn update_config(
 ) -> Result<ConfigUpdateResult, String> {
     let previous = state.config.read().clone();
     let mut cfg = cfg;
+    cfg.http_proxy = crate::outbound::validate_proxy(cfg.http_proxy.as_deref())?;
     // 远程反代与局域网直连是互斥的暴露模型。配置层会把二者规范化为
     // 0.0.0.0 或 127.0.0.1，不能信任前端或手工编辑传来的 bind 值。
     cfg.normalize_custom_rules();
@@ -380,19 +683,7 @@ pub async fn update_config(
         return Err("启用远程 HTTPS 反代模式前，必须先创建并启用至少一个独立访问 Key".into());
     }
     let restart_reasons = listener_restart_reasons(&previous, &cfg);
-    cfg.save().map_err(|e| e.to_string())?;
-    *state.config.write() = cfg.clone();
-    *state.gateway.cfg.write() = cfg.clone();
-    // Router 持有本轮不可变快照；配置热更新后必须同步替换它，才能让下一次
-    // custom 策略请求立即使用 UI 中保存的新规则。
-    state
-        .gateway
-        .router
-        .set_custom_rules(cfg.custom_rules.clone());
-    // 配置变更必须清缓存。`reload_providers` 覆盖供应商/模型/价格三类变更，
-    // 但那条路走不到这里（本命令改的是 cfg，不是 providers 表）。
-    // 漏掉它的症状是「改了策略但答案还是旧的」，而界面显示保存成功。
-    state.gateway.cache.invalidate_all();
+    let cfg = commit_config(&state, ConfigCommit::Save(&cfg))?;
     Ok(ConfigUpdateResult {
         config: cfg,
         restart_required: !restart_reasons.is_empty(),
@@ -422,11 +713,7 @@ pub async fn get_unified_key(state: State<'_, AppState>) -> Result<serde_json::V
 
 #[tauri::command]
 pub async fn rotate_unified_key(state: State<'_, AppState>) -> Result<String, String> {
-    let mut cfg = state.config.read().clone();
-    cfg.unified_key = crypto::new_unified_key();
-    cfg.save().map_err(|e| e.to_string())?;
-    *state.config.write() = cfg.clone();
-    *state.gateway.cfg.write() = cfg.clone();
+    let cfg = commit_config(&state, ConfigCommit::RotateKey)?;
     Ok(cfg.unified_key)
 }
 
@@ -603,8 +890,7 @@ pub async fn update_remote_access_key(
     let budget = (
         input
             .monthly_budget_micros
-            .unwrap_or(current.monthly_budget_micros)
-            .max(0),
+            .unwrap_or(current.monthly_budget_micros),
         input
             .budget_currency
             .clone()
@@ -614,6 +900,7 @@ pub async fn update_remote_access_key(
             .clone()
             .unwrap_or_else(|| current.allowed_models.clone()),
     );
+    let budget_currency = crate::budget::normalize_budget_currency(budget.0, &budget.1)?;
 
     if !repo::update_remote_access_key(
         state.db.pool(),
@@ -621,7 +908,7 @@ pub async fn update_remote_access_key(
         &label,
         input.enabled,
         rpm_limit,
-        (budget.0, &budget.1, &budget.2),
+        (budget.0, &budget_currency, &budget.2),
     )
     .await
     .map_err(|e| e.to_string())?
@@ -1060,6 +1347,7 @@ pub async fn apply_snapshot(
     // 安全边界，不允许通过项目快照覆盖。
     cfg.unified_key = previous.unified_key.clone();
     cfg.remote_mode = previous.remote_mode.clone();
+    cfg.http_proxy = crate::outbound::validate_proxy(cfg.http_proxy.as_deref())?;
     cfg.normalize_custom_rules();
     cfg.validate_custom_rules().map_err(|e| e.to_string())?;
     cfg.normalize_listener();
@@ -1075,13 +1363,7 @@ pub async fn apply_snapshot(
     let restart_reasons = listener_restart_reasons(&previous, &cfg);
 
     replace_snapshot_providers(state.db.pool(), &providers).await?;
-    cfg.save().map_err(|e| e.to_string())?;
-    *state.config.write() = cfg.clone();
-    *state.gateway.cfg.write() = cfg.clone();
-    state
-        .gateway
-        .router
-        .set_custom_rules(cfg.custom_rules.clone());
+    let cfg = commit_config(&state, ConfigCommit::Save(&cfg))?;
     state
         .gateway
         .reload_providers()
@@ -3792,9 +4074,7 @@ pub async fn update_search_settings(
         next.search.inject_as = input.inject_as;
         next.normalize_local();
         crate::search::validate(&next.search).map_err(|e| e.to_string())?;
-        next.save().map_err(|e| e.to_string())?;
-        *state.gateway.cfg.write() = next.clone();
-        *state.config.write() = next;
+        commit_config(&state, ConfigCommit::Save(&next))?;
     }
     if input.clear_api_key {
         repo::delete_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY)
@@ -3829,7 +4109,7 @@ pub async fn test_search_backend(
         Ok(Some(encoded)) => crypto::decrypt(&encoded).ok(),
         _ => None,
     };
-    let http = reqwest::Client::new();
+    let http = crate::outbound::search_client(cfg.http_proxy.as_deref())?;
     Ok(crate::search::test_backend(&http, &cfg.search, key.as_deref(), &text).await)
 }
 
@@ -4096,17 +4376,12 @@ pub async fn import_bundle(
         preserved_security_fields.push("远程 HTTPS 模式".to_string());
         cfg.unified_key = previous.unified_key.clone();
         cfg.remote_mode = previous.remote_mode.clone();
+        cfg.http_proxy = crate::outbound::validate_proxy(cfg.http_proxy.as_deref())?;
         cfg.normalize_custom_rules();
         cfg.validate_custom_rules().map_err(|e| e.to_string())?;
         cfg.normalize_listener();
         cfg.validate_remote_mode().map_err(|e| e.to_string())?;
-        cfg.save().map_err(|e| e.to_string())?;
-        *state.config.write() = cfg.clone();
-        *state.gateway.cfg.write() = cfg.clone();
-        state
-            .gateway
-            .router
-            .set_custom_rules(cfg.custom_rules.clone());
+        commit_config(&state, ConfigCommit::Save(&cfg))?;
         config_imported = true;
     }
 
@@ -4158,6 +4433,7 @@ pub fn set_autostart(enabled: bool) -> Result<AutostartView, String> {
 pub async fn scan_stale_models(
     state: State<'_, AppState>,
 ) -> Result<crate::stale_models::StaleScanResult, String> {
+    let proxy = state.config.read().http_proxy.clone();
     let providers = repo::list_providers(state.db.pool())
         .await
         .map_err(|e| format!("无法读取已保存的 Provider：{e}"))?;
@@ -4170,7 +4446,7 @@ pub async fn scan_stale_models(
             continue;
         }
         // 拿上游目录。拿不到就整家标为「无法判定」。
-        let catalog = fetch_catalog(&provider).await;
+        let catalog = fetch_catalog(&provider, proxy.as_deref()).await;
         if catalog.is_none() {
             catalog_unavailable.push(provider.name.clone());
         }
@@ -4197,7 +4473,10 @@ pub async fn scan_stale_models(
 
 /// 拉取某供应商的上游模型目录。失败返回 `None`（不是 `Err`）——
 /// 调用方要把「拉不到」与「拉到但为空」区分开。
-async fn fetch_catalog(provider: &Provider) -> Option<std::collections::BTreeSet<String>> {
+async fn fetch_catalog(
+    provider: &Provider,
+    proxy: Option<&str>,
+) -> Option<std::collections::BTreeSet<String>> {
     // 只有目录可信的方言才走这条路；Anthropic 的 /v1/models 只列自家模型，
     // 拿它判别家聚合站会把所有模型误判成失效。
     if !crate::stale_models::catalog_is_authoritative(provider.dialect) {
@@ -4210,7 +4489,7 @@ async fn fetch_catalog(provider: &Provider) -> Option<std::collections::BTreeSet
         api_key: String::new(),
     };
     let saved = provider.clone();
-    crate::model_catalog::discover(&input, Some(&saved), None)
+    crate::model_catalog::discover(&input, Some(&saved), proxy)
         .await
         .ok()
         .map(|response| response.models.into_iter().map(|m| m.id).collect())

@@ -25,9 +25,14 @@ import { dirname, join, resolve, relative } from 'node:path';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const QUIET = process.argv.includes('--quiet');
 
+// 受检文档。CLAUDE.md 与 README 也进来，因为它们承载「主任务目标」，
+// 一旦它们指向了不存在的路径，后续会话按它开工会直接走偏。
 const DOCS = [
   'docs/_FACTS-后续完善方案.md',
   'docs/VibeCoding任务卡-后续完善方案.md',
+  'docs/VibeCoding任务卡-运行时一致性与VPN集成.md',
+  'CLAUDE.md',
+  'README.md',
 ];
 
 const problems = [];
@@ -62,7 +67,11 @@ const contents = new Map(DOCS.map((rel) => [rel, readFileSync(join(ROOT, rel), '
 // 允许的「未来文件」根目录：这些目录下的新文件被视为「计划中」，不算引用错误。
 // 关键：豁免**只对任务卡生效**。事实源描述的是「现状」，
 // 它引用的每一个路径都必须真实存在——否则事实源就在描述不存在的东西。
-const FUTURE_PREFIXES = ['src-tauri/src/', 'src-tauri/tests/', 'scripts/', '.github/', 'AGENTS.md'];
+const FUTURE_PREFIXES = [
+  'src-tauri/src/', 'src-tauri/tests/',
+  'scripts/', '.github/', 'src/pages/', 'src-tauri/src/protocol/', 'src-tauri/src/router/',
+  'AGENTS.md',
+];
 const PLAN_DOC = 'docs/VibeCoding任务卡-后续完善方案.md';
 // 事实源不允许任何豁免（外部项目已用行内「（外部）」标记单独处理）
 const isFactsDoc = (f) => f.endsWith('_FACTS-后续完善方案.md');
@@ -206,9 +215,9 @@ if (!facts.includes('VibeCoding任务卡-后续完善方案.md')) {
   problems.push({ file: 'docs/_FACTS-后续完善方案.md', line: 0, msg: '未反向引用任务卡' });
 }
 
-// 2b. 任务卡里的卡号（A0..C4）必须与 §3 表格里的卡号一致
-const cardIds = [...plan.matchAll(/### 【([A-C]\d)】/g)].map((m) => m[1]);
-const overviewIds = [...plan.matchAll(/\*\*(A\d|B\d|C\d)\*\*/g)].map((m) => m[1]);
+// 2b. 任务卡里的卡号（A0..D5）必须与 §3 表格里的卡号一致
+const cardIds = [...plan.matchAll(/### 【([A-D]\d)】/g)].map((m) => m[1]);
+const overviewIds = [...plan.matchAll(/\*\*([A-D]\d)\*\*/g)].map((m) => m[1]);
 const missingCards = overviewIds.filter((id) => !cardIds.includes(id));
 const extraCards = cardIds.filter((id) => !overviewIds.includes(id));
 if (missingCards.length) {
@@ -216,6 +225,41 @@ if (missingCards.length) {
 }
 if (extraCards.length) {
   problems.push({ file: 'docs/VibeCoding任务卡-后续完善方案.md', line: 0, msg: `正文有卡但 §3 概览里没有: ${extraCards.join(', ')}` });
+}
+
+// 2c. 主任务目标必须在三处载体同时存在，且批次口径一致。
+//     CLAUDE.md 是 AI 助手每次开工读到的第一句；它一旦退回旧批次口径，
+//     后续会话就会按已废弃的排期动手——这是本项目真实发生过的失败模式。
+const claude = contents.get('CLAUDE.md');
+const readme = contents.get('README.md');
+if (!claude.includes('主任务目标')) {
+  problems.push({ file: 'CLAUDE.md', line: 0, msg: '缺少「主任务目标」段（助手开工读到的第一句）' });
+}
+if (!plan.includes('## 主任务目标')) {
+  problems.push({ file: 'docs/VibeCoding任务卡-后续完善方案.md', line: 0, msg: '缺少顶层「## 主任务目标」章节' });
+}
+// 取 README 顶部「当前阶段」那一段（从该行到下一个非引用行）。
+// 不用正则 + ^ 多行标志：那样容易匹配失败而静默返回空串，
+// 结果是「全部报缺」而不是「全部通过」——两种都是错的，只是错法不同。
+const readmeLines = readme.split('\n');
+const stageStart = readmeLines.findIndex((l) => l.includes('当前阶段'));
+const readmeStage = stageStart >= 0
+  ? readmeLines.slice(stageStart, readmeLines.findIndex((l, i) => i > stageStart && !l.startsWith('>')))
+      .join('\n')
+  : '';
+for (const v of ['0.4.0', '0.5.0', '0.6.0', '0.7.0']) {
+  if (!claude.includes(v)) {
+    problems.push({ file: 'CLAUDE.md', line: 0, msg: `主任务目标缺少批次版本 ${v}` });
+  }
+  if (!readmeStage.includes(v)) {
+    problems.push({ file: 'README.md', line: 0, msg: `「当前阶段」说明缺少批次版本 ${v}` });
+  }
+}
+
+// 2d. 硬依赖链必须在 CLAUDE.md 里写明：A3 不落地则 D 批不许动手。
+//     这是本方案唯一的「不许开始」规则，丢掉它 D 批就会被提前开工。
+if (!claude.includes('A3 不落地')) {
+  problems.push({ file: 'CLAUDE.md', line: 0, msg: '缺少硬依赖链声明「A3 不落地，D 批整批不许动手」' });
 }
 
 // ---------- 3. 输出 ----------

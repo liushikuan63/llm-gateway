@@ -1,0 +1,22 @@
+Mihomo v1.19.32 - unmodified upstream Windows amd64 compatible release
+
+This separately executed component is distributed under its upstream GPL-3.0
+license, reproduced without changes in LICENSE in this directory. No warranty
+is provided. It is not covered by LLM Gateway's project-owned MIT license.
+
+The matching upstream source archive is included alongside the binary archive:
+  mihomo-v1.19.32-source.zip
+It contains the upstream source, go.mod/go.sum and build workflows. See the
+upstream documentation and workflows for building this version. Both archives
+and the license have SHA-256 checksums in manifest.json.
+
+Upstream source:
+  https://github.com/MetaCubeX/mihomo/tree/v1.19.32
+Source archive:
+  https://codeload.github.com/MetaCubeX/mihomo/zip/refs/tags/v1.19.32
+Release and original binary:
+  https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32
+
+LLM Gateway installs this archive only on an explicit user action. It verifies
+the pinned archive and executable checksums, Windows amd64 format, and version.
+It never replaces a user-selected executable or starts a kernel automatically.

@@ -1074,6 +1074,12 @@ pub fn validate_http_url(raw: &str) -> anyhow::Result<()> {
 }
 
 pub fn app_data_dir() -> PathBuf {
+    // Explicit portable/test mode keeps installer acceptance away from existing user data.
+    if let Some(directory) = std::env::var_os("LLMGW_DATA_DIR").map(PathBuf::from) {
+        if directory.is_absolute() {
+            return directory;
+        }
+    }
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("llm-gateway")

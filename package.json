@@ -15,6 +15,7 @@
     "docs:manual": "node scripts/generate-manual.mjs",
     "verify:manual": "node scripts/generate-manual.mjs --check",
     "verify:plan": "node scripts/check-plan-refs.mjs",
+    "verify:scripts": "node --test scripts/check-script-syntax.test.mjs && node scripts/check-script-syntax.mjs && node scripts/check-fixture-redaction.mjs",
     "verify:redaction": "node scripts/check-log-redaction.mjs --self-test && node scripts/check-log-redaction.mjs",
     "icons": "node scripts/generate-icons.mjs"
   },

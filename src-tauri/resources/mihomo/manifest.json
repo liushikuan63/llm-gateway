@@ -1,0 +1,18 @@
+{
+  "component": "Mihomo",
+  "version": "v1.19.32",
+  "platform": "windows-amd64-compatible",
+  "license": "GPL-3.0",
+  "license_file": "LICENSE",
+  "license_sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+  "release_url": "https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32",
+  "asset_name": "mihomo-windows-amd64-compatible-v1.19.32.zip",
+  "asset_url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-amd64-compatible-v1.19.32.zip",
+  "archive_sha256": "974a4d7ad69aed27aa2e8f91d61113573c14dadb14562c63e58effabf59816f0",
+  "executable_name": "mihomo-windows-amd64-compatible.exe",
+  "executable_sha256": "04f8d7fc2b314771e1ecbf15951d59f0e1cb7914503c88cfb6972ff6a824e314",
+  "source_archive": "mihomo-v1.19.32-source.zip",
+  "source_url": "https://codeload.github.com/MetaCubeX/mihomo/zip/refs/tags/v1.19.32",
+  "source_sha256": "135f16d1e309f8c0ce2303c86fd38a38624a229e7185ceb74d1d3a4f0d4b66f1",
+  "modified": false
+}

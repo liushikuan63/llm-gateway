@@ -278,7 +278,7 @@ fn resolve_api_key(
 }
 
 fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
-    let mut builder = Client::builder()
+    let builder = Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .pool_max_idle_per_host(4)
@@ -286,11 +286,7 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .gzip(true)
         .brotli(true);
 
-    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|proxy| !proxy.is_empty()) {
-        let proxy = reqwest::Proxy::all(proxy_url)
-            .map_err(|_| "系统代理配置无效，无法获取模型目录".to_string())?;
-        builder = builder.proxy(proxy);
-    }
+    let builder = crate::outbound::apply_proxy(builder, proxy_url)?;
 
     builder
         .build()

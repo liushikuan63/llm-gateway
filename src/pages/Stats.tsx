@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { api, AttemptRecord, AuditFilter, formatMoney, RequestLog, SpendBucket, SpendByDimension, SpendDaily, StatsOverview, TokenCalibration } from "../api";
 
 function errorText(error: unknown) {
@@ -73,7 +73,12 @@ export default function StatsPage() {
   const [calibrations, setCalibrations] = useState<TokenCalibration[]>([]);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [msg, setMsg] = useState<{ kind: "err" | "ok"; text: string } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const loadRef = useRef<() => Promise<void>>(async () => {});
+  const mounted = useRef(false);
+  const lifecycle = useRef(0);
+  const calibrationRevision = useRef(0);
 
   // ---------- B3 审计筛选 ----------
   //
@@ -90,35 +95,60 @@ export default function StatsPage() {
     // 用户会看到一张空表，以为「没有记录」。
     setFilter((prev) => ({ ...prev, ...next, offset: 0 }));
 
-  const load = async () => {
-    setRefreshing(true);
-    try {
-      const [overview, page, calibrationRows] = await Promise.all([
-        api.statsOverview(),
-        api.queryRequests({ ...filter, limit: 120 }),
-        api.listTokenCalibrations(),
-      ]);
-      setStats(overview);
-      setRows(page.rows);
-      setTotal(page.total);
-      setTruncated(page.truncated);
-      setCalibrations(calibrationRows);
-      setMsg(null);
-    } catch (error) {
-      setMsg({ kind: "err", text: `加载统计失败：${errorText(error)}` });
-    } finally {
-      setRefreshing(false);
-    }
-  };
+  const load = () => loadRef.current();
 
   useEffect(() => {
-    void load();
-    const timer = window.setInterval(() => void load(), 5000);
-    return () => window.clearInterval(timer);
-    // 依赖 filter：条件变了必须立刻重查。留在旧结果上会让人以为
-    // 「筛选没生效」—— 而表里显示的其实是上一次查询的数据。
-    // 依赖整个对象是安全的：`setFilter` 每次都产生新对象，
-    // 且只有用户操作与 `patchFilter` 会调它。
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      lifecycle.current++;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let inFlight = false;
+    let timer: number | undefined;
+    const loadCurrent = async () => {
+      if (!active || inFlight) return;
+      inFlight = true;
+      setRefreshing(true);
+      const revision = calibrationRevision.current;
+      try {
+        const requests = [
+          api.statsOverview(),
+          api.queryRequests({ ...filter, limit: 120 }),
+          api.listTokenCalibrations(),
+        ] as const;
+        // A rejected summary must not release the polling guard while audit IPC is pending.
+        await Promise.allSettled(requests);
+        if (!active) return;
+        const [overview, page, calibrationRows] = await Promise.all(requests);
+        if (!active) return;
+        setStats(overview);
+        setRows(page.rows);
+        setTotal(page.total);
+        setTruncated(page.truncated);
+        if (revision === calibrationRevision.current) setCalibrations(calibrationRows);
+        setLoadError(null);
+      } catch (error) {
+        if (active) setLoadError(`加载统计失败：${errorText(error)}`);
+      } finally {
+        inFlight = false;
+        if (active) setRefreshing(false);
+      }
+    };
+    const poll = async () => {
+      await loadCurrent();
+      if (active) timer = window.setTimeout(() => void poll(), 5000);
+    };
+    loadRef.current = loadCurrent;
+    void poll();
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      if (loadRef.current === loadCurrent) loadRef.current = async () => {};
+    };
   }, [filter]);
 
   /**
@@ -128,6 +158,8 @@ export default function StatsPage() {
    * 桌面应用里用户对「文件去哪了」的预期只有他自己知道。
    */
   const exportAudit = async (format: "jsonl" | "csv") => {
+    const version = lifecycle.current;
+    const isCurrent = () => mounted.current && lifecycle.current === version;
     setExporting(true);
     setMsg(null);
     try {
@@ -139,8 +171,9 @@ export default function StatsPage() {
             : [{ name: "JSON Lines", extensions: ["jsonl"] }],
       });
       // 用户取消 → 什么都不做，也不报错（取消不是失败）
-      if (!dest) return;
+      if (!dest || !isCurrent()) return;
       const result = await api.exportRequests(filter, format, dest);
+      if (!isCurrent()) return;
       setMsg({
         kind: "ok",
         text: `已导出 ${formatNumber(result.written)} 条到 ${result.path}${
@@ -148,9 +181,9 @@ export default function StatsPage() {
         }`,
       });
     } catch (error) {
-      setMsg({ kind: "err", text: `导出失败：${errorText(error)}` });
+      if (isCurrent()) setMsg({ kind: "err", text: `导出失败：${errorText(error)}` });
     } finally {
-      setExporting(false);
+      if (isCurrent()) setExporting(false);
     }
   };
 
@@ -167,7 +200,8 @@ export default function StatsPage() {
         <button onClick={() => void load()} disabled={refreshing}>{refreshing ? "刷新中" : "刷新"}</button>
       </div>
 
-      {msg && <div className={`msg ${msg.kind}`}>{msg.text}</div>}
+      {loadError && <div role="alert" className="msg err">{loadError}</div>}
+      {msg && <div role={msg.kind === "err" ? "alert" : "status"} className={`msg ${msg.kind}`}>{msg.text}</div>}
 
       <div className="grid4" style={{ marginBottom: 14 }}>
         <div className="stat">
@@ -354,13 +388,17 @@ export default function StatsPage() {
               disabled={!calibrations.length}
               onClick={() => {
                 if (!window.confirm("清空校准样本后，估算会回到未校准状态（比值 1.0），直到积累新样本。确定继续吗？")) return;
+                const version = lifecycle.current;
+                const isCurrent = () => mounted.current && lifecycle.current === version;
                 void (async () => {
                   try {
                     const removed = await api.clearTokenCalibrations();
+                    if (!isCurrent()) return;
+                    calibrationRevision.current++;
                     setCalibrations([]);
                     setMsg({ kind: "ok", text: `已清空 ${removed} 条校准记录` });
                   } catch (error) {
-                    setMsg({ kind: "err", text: `清空校准失败：${errorText(error)}` });
+                    if (isCurrent()) setMsg({ kind: "err", text: `清空校准失败：${errorText(error)}` });
                   }
                 })();
               }}

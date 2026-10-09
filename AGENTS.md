@@ -3,7 +3,7 @@
 **只写索引与入口，不复制内容。** 细节都在下面这些文件里。
 
 ## 这是什么
-统一 LLM 网关桌面应用（Rust + Tauri 2 + React 19）。一个地址、一个 Key，
+统一 LLM 网关桌面应用（Rust + Tauri 2 + React 18）。一个地址、一个 Key，
 四套协议面（OpenAI / Anthropic / Gemini / Ollama），负责**选对模型**、看得见花费、拦得住超支。
 
 ## 去哪里读（按需要，别通读）
@@ -12,6 +12,7 @@
 | --- | --- |
 | 硬约束、执行纪律、模式隔离红线 | [`CLAUDE.md`](CLAUDE.md) |
 | 当前批次要做什么 | [`docs/VibeCoding任务卡-后续完善方案.md`](docs/VibeCoding任务卡-后续完善方案.md) |
+| 运行时优化与内置 VPN 增量任务 | [`docs/VibeCoding任务卡-运行时一致性与VPN集成.md`](docs/VibeCoding任务卡-运行时一致性与VPN集成.md) |
 | 现状陈述的证据（`路径:行号`）与落地台账 | [`docs/_FACTS-后续完善方案.md`](docs/_FACTS-后续完善方案.md) |
 | 整体架构 | [`docs/统一LLM网关设计方案.md`](docs/统一LLM网关设计方案.md) |
 | 智能路由 / 本地模型 / 搜索 | [`docs/智能路由与本地模型设计方案.md`](docs/智能路由与本地模型设计方案.md) |

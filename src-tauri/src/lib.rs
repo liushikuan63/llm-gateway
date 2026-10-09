@@ -14,6 +14,7 @@ pub mod config;
 pub mod context;
 pub mod crypto;
 pub mod db;
+pub mod diagnostics;
 pub mod domain;
 pub mod error;
 pub mod intellect;
@@ -22,6 +23,7 @@ pub mod log_rotate;
 pub mod mcp;
 pub mod media;
 pub mod model_catalog;
+pub mod outbound;
 pub mod pet_window;
 pub mod petdex;
 pub mod pricing;
@@ -35,6 +37,8 @@ pub mod search;
 pub mod stale_models;
 pub mod telemetry;
 pub mod trace;
+pub mod vpn;
+pub mod vpn_install;
 
 use crate::config::AppConfig;
 use crate::proxy::server::GatewayState;
@@ -55,6 +59,7 @@ pub struct AppState {
     /// **进程级共享**（`Arc`）：适配器是无状态的、只读的，
     /// 每个请求各造一份没有意义。A6/A7 加真适配器时也在这里注册一次。
     pub adapters: Arc<crate::agent_upstream::AdapterRegistry>,
+    pub vpn: Arc<crate::vpn::VpnManager>,
 }
 
 /// 在事件循环启动后异步完成后端初始化，避免阻塞首帧渲染。
@@ -131,12 +136,21 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
         }
     }
 
+    let vpn_root = config::app_data_dir().join("vpn");
+    let vpn_manager = match app.path().resolve(
+        "resources/mihomo/mihomo-windows-amd64-compatible-v1.19.32.zip",
+        tauri::path::BaseDirectory::Resource,
+    ) {
+        Ok(archive) => vpn::VpnManager::with_bundled_archive(vpn_root, archive),
+        Err(_) => vpn::VpnManager::new(vpn_root),
+    };
     app.manage(AppState {
         db,
         config: Arc::new(parking_lot::RwLock::new(cfg)),
         gateway: gateway.clone(),
         // A5：内置假适配器 + A6/A7 的真适配器 + B8 的外部插件（上面刚加载）。
         adapters: Arc::new(adapters),
+        vpn: Arc::new(vpn_manager),
     });
 
     let gw = gateway.clone();
@@ -289,6 +303,20 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::vpn_status,
+            commands::vpn_kernel_info,
+            commands::install_vpn_kernel,
+            commands::rollback_vpn_kernel,
+            commands::get_gateway_diagnostics,
+            commands::export_gateway_diagnostics,
+            commands::save_vpn_settings,
+            commands::import_vpn_profile,
+            commands::start_vpn,
+            commands::stop_vpn,
+            commands::list_vpn_proxies,
+            commands::select_vpn_proxy,
+            commands::set_vpn_mode,
+            commands::use_vpn_for_gateway,
             commands::get_boot_state,
             commands::list_providers,
             provider_quota::get_provider_quota,
@@ -376,6 +404,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            if matches!(&event, tauri::RunEvent::Exit) {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.vpn.shutdown_blocking();
+                }
+            }
             if let tauri::RunEvent::WindowEvent {
                 label,
                 event: tauri::WindowEvent::CloseRequested { api, .. },

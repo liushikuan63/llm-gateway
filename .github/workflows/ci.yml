@@ -5,10 +5,10 @@
 # 任何一侧改动都要同步另一侧，否则两边会悄悄漂移。
 #
 # 本批不放进 CI 的东西（每条都有实测理由，不是保守）：
-#   - `npm run tauri:build`：MSI 那步 Tauri 会自动下 WiX，39MB 被它的下载器
-#     判超时（同一 URL 直连正常）。见 CLAUDE.md「本机编译环境」。
-#   - `npm run verify:ui`：需要先起 dev server，且本机 Vite 只绑 IPv6。
-#     留到 A3 之后单独评估。
+#   - `npm run tauri:build`：在 Windows 交付验收中单独执行；打包工具首次
+#     下载曾超时，本机现已使用缓存并完成 NSIS/MSI 构建和实际载荷验收。
+#   - `npm run verify:ui`：需要运行中的 dev server；本机单独用 127.0.0.1
+#     执行并检查截图，当前工作流不启动浏览器或安装程序。
 #   - `cargo test -- --ignored`：真实上游烟测要凭据，runner 上没有。
 
 name: CI
@@ -23,6 +23,10 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
   rust:
@@ -76,38 +80,22 @@ jobs:
       - name: npm ci
         run: npm ci
 
+      # Scripts are outside the frontend compilation. Share the fail-fast
+      # checker with ci-local.ps1 so a later success cannot mask a bad file.
+      - name: scripts syntax and fixture redaction
+        run: npm run verify:scripts
+
       - name: npm run build
         run: npm run build
 
       - name: npm run verify:manual
         run: npm run verify:manual
 
-      # scripts/*.cjs is not compiled by `npm run build` (only src/ is),
-      # and verify:manual only inspects docs. Measured 2026-10-05: a broken
-      # object literal in ui-smoke.cjs landed with CI fully green because
-      # nothing ever parsed that file. Keep this step.
-      #
-      # FIXED 2026-10-06 (C4): this step used to have TWO `run:` keys in the
-      # same mapping --
-      #     run: for f in scripts/*.cjs; do node --check "$f"; done
-      #     run: npm run verify:manual
-      # A duplicate key means the last one wins, so the syntax check NEVER RAN
-      # and this step silently re-ran verify:manual (which already has its own
-      # step above). The guard that the comment calls "keep this step" was dead
-      # the whole time. Do not add a second `run:` here.
-      - name: scripts syntax
-        shell: bash
-        run: |
-          for f in scripts/*.cjs scripts/*.mjs scripts/*.js; do
-            [ -e "$f" ] || continue
-            node --check "$f"
-          done
-          # Fixture redaction scan (C3): samples come from vendor docs and must
-          # not carry credentials into the repo.
-          node scripts/check-fixture-redaction.mjs
-
       - name: npm run verify:release
         run: npm run verify:release
 
       - name: npm run verify:plan
         run: npm run verify:plan
+
+      - name: npm run verify:redaction
+        run: npm run verify:redaction
