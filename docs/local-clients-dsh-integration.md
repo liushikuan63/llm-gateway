@@ -144,10 +144,16 @@ GET  /v2/plugin/auth/token?state=<state>        ← 取 token 的关键一步，
 ```
 
 - 本地服务器路径常量：`/login-confirm`、`/login-success`、`/authorize`
-- 域名：`www.trae.cn`（`www.trae.com.cn` 会 **301** 过去）；实测直接 GET 这些 API 返回 SPA HTML，
-  说明还需正确的 method/header（未完成的部分）
-- **待补**：`clientId` 与 `loginHost` 来自 **bootConfig**（主进程持有；渲染进程的
-  `sololiteConfiguration` 为 nullish，取不到）
+- 域名：`www.trae.cn`（`www.trae.com.cn` 会 **301** 过去）。`/authorization` 实测返回 **200**（SPA），
+  **即授权 URL 成立**；而直接 GET 那些 API 端点返回 SPA HTML，说明还需正确的 method/header
+- **`clientId` 已找到**（`out/main.js` 里 `$v()` 的兜底值）：
+  SOLO Lite → `en1oxy7wnw8j9n`；TRAE → `ono9krqynydwx5`。
+  `loginHost` 名义上来自 `bootConfig.account.saas.prod`，Trae CN 实测就是 `www.trae.cn`
+- 认证头格式（代码确认）：`Authorization: Cloud-IDE-JWT <token>`
+- **实现**：`D:\Software\workbuddy2api\trae-login.js`（本地回调 + PKCE S256 + ExchangeToken）
+  - ✅ 已验证：本地回调服务器起得来、授权 URL 成立（200）
+  - ⚠️ **未验证**：用 code 换 token 的 `/trae/api/v3/oauth/ExchangeToken`
+    —— 那是主进程发起的调用，参数形状靠逆向推断，可能需要按报错调整
 - 已有凭据（备用）：`.trae-token.json` — `Cloud-IDE-JWT`，`source: refresh_token`
 
 ---
