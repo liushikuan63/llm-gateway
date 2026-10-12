@@ -79,9 +79,12 @@ node login-jump.js status        # 三家网关与账号状态
 
 | 客户端 | 状态 | 协议要点 |
 |---|---|---|
-| **Qoder** | ✅ **已实现可用** | 网关自带的 PKCE 设备流 |
-| **WorkBuddy** | ✅ **已实现可用** | `auth/state` → 浏览器 → `auth/token` 轮询 |
+| **Qoder** | ✅ **已实测验证**（2026-10-12 23:13 授权入池，`source=oauth`/`family=device`；新凭据出流 200/1.4s） | 网关自带的 PKCE 设备流 |
+| **WorkBuddy** | ✅ 已实现（待你走一次浏览器授权验证） | `auth/state` → 浏览器 → `auth/token` 轮询 |
 | **Trae** | ⚠️ 协议已完整逆向，实现待做 | 本地回调服务器 + PKCE + ExchangeToken |
+
+> 同一 Qoder 账号走登录跳转后，账号池里那条记录的 `source` 会从本地读取变成 `oauth`——
+> 是**更新**而非新增（uid 不变），凭据换成设备流那份。
 
 ### Qoder（走网关现成能力）
 
@@ -95,6 +98,19 @@ GET /accounts/login/poll?state=<state>
 
 注意：`/accounts/*` 是**面板路由**，必须先 `POST /panel/login {password}` 拿 token，再带
 `X-Panel-Token` 头（不是 `Authorization`）。这一步踩过。
+
+**实操要点（实测踩到）**：
+
+1. **窗口是服务端硬性 600 秒**（`qoder_accounts.py` 的 `LOGIN_TTL_SECONDS = 600`），
+   超时后 `poll` 返回 `expired`，必须重跑命令生成新链接。准备好了再发起，别让它空等。
+2. **浏览器需要一个 Qoder 登录态**：授权链接 `https://qoder.com.cn/device/selectAccounts?…`
+   在未登录的浏览器里会 **302 到 `/users/sign-in?oauth_callback=…`**，页面只有
+   「个人登录 / 企业登录 / 使用阿里云登录 / 立即注册」。**桌面端登录着不等于浏览器登录着**。
+   所以要么先在浏览器登录一次，要么点「使用阿里云登录」。
+3. 顺序是 **先登录 → 再到「选择账号」页点确认授权**。只"登录"不点确认授权，轮询会一直是 `pending`
+   （本次实测：用户第一轮就是卡在这里，窗口过期）。
+4. 授权成功后 `poll` 返回 `ok`，账号池里该 uid 的 `source` 变 `oauth`、`tokenFamily` 变 `device`，
+   `expires_at` 刷新。
 
 ### WorkBuddy（完整链路，之前漏了中间一步）
 
