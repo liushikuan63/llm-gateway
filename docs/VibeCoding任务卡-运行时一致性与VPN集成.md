@@ -230,6 +230,8 @@ mojie 的 config.json 不是严格 JSON（serde_json 解析失败是其真实状
 
 验收：`cargo test --jobs 1`（其中 `vpn_external` 14 例，含「非回环地址必须拒绝」「畸形订阅头不 panic 且不给假的剩余值」等对照组）、`npm run build`、`npm run verify:ui`（产出 `vpn-external.png` 截图，并有「不可用只显示原因、不残留上一次额度」的对照断言）三项退出码均为 0。
 
+现场底数一律以[事实源 P 节](_FACTS-后续完善方案.md)为准，接续前先读它——包括：mojie 的可执行文件与配置路径、控制器端口为什么不能硬编码、`/proxies` 里混着的伪装节点、额度两个来源为何取值不同、三个能力的原始复现命令，以及本轮两处自查纠错（额度算法漏减 upload、刷新按钮未挂 `loadExternal`）。
+
 ### N1 · 一键只读诊断与脱敏导出
 
 现有 `run_gateway_self_check` 会发最小模型请求，因此“本地诊断”使用独立只读实现。收集监听状态、配置是否需重启、候选/禁用数量、缓存统计、预算口径、VPN 是否运行及受管代理是否失联；不发送 HTTP/TCP/模型或公网请求。报告区分 unknown/warning/error，导出只含结构化白名单字段，不含 Key、订阅、请求正文、名称、地址、用户路径或底层错误。

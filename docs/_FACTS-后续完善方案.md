@@ -472,6 +472,84 @@ N2 请求形状预演、N3 并发预算预占、N4 跨实现契约矩阵、V3 �
 
 持久交付位于 `D:/Java/GitHub/llm-auto/artifacts/LLM-Gateway-0.2.1-20261010`，包大小、SHA-256、真实验收结果与边界见[验证记录](验证记录.md)。独立证据在 `%TEMP%/llmgw-accounts-acceptance-20261010/`；不覆盖上一批 0.2.0 文件，不将私有测试数据库或密钥复制进交付目录。
 
+## P. 2026-10-13 外部 VPN（mojie）只读接入
+
+按[运行时一致性与 VPN 集成任务卡](VibeCoding任务卡-运行时一致性与VPN集成.md)的 V4 实现：读用户自己的 VPN 客户端，不启动、不停止、不改动它的进程与配置。本节记录现场底数与踩点，供后续接续。
+
+### P.1 用户的 VPN 客户端是 mojie，不是 FlClash
+
+本机同时装着 FlClash（`D:\Program Files\FlClash`，只有 `FlClashHelperService` 在跑）与**魔戒 mojie**，但实际在用、且占着代理端口的是 **mojie**：
+
+| 项 | 实测值 |
+| --- | --- |
+| 可执行文件 | `D:\Program Files\mojie\魔戒.exe`（Electron 应用，约 154 MB） |
+| 配置目录 | `%APPDATA%\mojie`（即 `C:\Users\Admin\AppData\Roaming\mojie`） |
+| 内核配置 | `config.yaml`：`mixed-port: 17890`、`external-controller: 127.0.0.1:18606`、47 条 proxies |
+| 应用配置 | `config.json`：**不是严格 JSON**（`serde_json` 解析失败是其真实状态），含 `subLink` 等字段 |
+| 内核 | Mihomo **v1.19.20**（`GET /version` → `{"meta":true,"version":"v1.19.20"}`） |
+| 端口 | 代理 `17890`（mixed-port）/ 控制器 **`18606`**（external-controller，**无 secret**） |
+| 节点 | 53 条：27 Vmess、10 AnyTLS、6 Hysteria2，另有 Selector/URLTest/Fallback/Direct 等；Selector 名 `MoJie` |
+| 系统代理 | `ProxyEnable=0`（关闭），`ProxyServer` 仍写着 `127.0.0.1:17890` |
+
+**判别方法**（别靠猜）：`netstat -ano -p TCP` 找监听 17890 的 pid，再查该 pid 的进程名，即可确认是谁在提供服务。
+
+### P.2 mojie 把账号信息伪装成节点
+
+接它时最容易踩的点：`/proxies` 里混着**不是节点**的条目——
+
+- `剩余流量：712.08 GB`
+- `套餐到期：长期有效`
+
+遍历节点时必须按名字排除它们，否则会被当成可切换节点显示出来。
+
+### P.3 额度有两个来源，订阅头才准（用户提示参考 FlClash / v2rayN 后核实）
+
+mojie 的订阅**返回标准 `Subscription-Userinfo` 响应头**：
+
+| 来源 | 值 | 性质 |
+| --- | --- | --- |
+| 订阅头 | 708.37 → 708.67 GB（随用量变化） | **实时**，取它 |
+| 伪节点名 | 712.08 GB（不动） | 滞后快照 |
+
+原始头样例（`expire` 为空是 mojie 的真实行为）：
+
+```text
+subscription-userinfo: upload=21606895115; download=22775131682; total=805306368000; expire=
+```
+
+算法：**剩余 = total - upload - download，上传也要减**。只减 download 会偏大 20 GB 量级（实测错值 728.79 GB）。到期时间因为 `expire` 为空，只能取伪节点名里的「长期有效」之类。
+
+### P.4 三个能力的取法与复现命令
+
+```text
+额度   GET /proxies                          → 遍历节点名取「剩余流量」（兜底）
+      + 订阅响应头 subscription-userinfo      → 优先，见 P.3
+延迟   GET /proxies                          → 各节点 history[].delay
+      GET /proxies/<name>/delay?timeout=5000&url=http://www.gstatic.com/generate_204
+网速   GET /traffic                          → 流式，每帧 {"up":<bytes/s>,"down":<bytes/s>}，取首帧即断
+```
+
+（上述路径都拼在 `http://127.0.0.1:18606` 上。）控制器地址**不硬编码**：从 `config.yaml` 读 `external-controller`，且**只接受回环地址**——配置里若写对外监听地址就拒绝发请求，有测试对照。
+
+### P.5 本轮两处自查纠错（留档，别再犯）
+
+1. **额度算法**：临时探测脚本写成 `total - download`（漏减 upload），得出 728.79 GB；正确值 708.67 GB。现由 `tests/vpn_external.rs` 的 `parses_subscription_userinfo` 锁住。
+2. **刷新不生效**：`src/pages/Vpn.tsx` 的「刷新状态」只调 `load()`，而外部卡片依赖 `loadExternal()`——初始版本没把它挂进 `load`，点了刷新卡片不动。`verify:ui` 的对照断言抓出该缺陷，修法是把 `void loadExternal()` 放进 `load` 的 `finally`。
+
+### P.6 命令行旁路（非交付物）
+
+`D:\Software\mojie-ctl\mojie-ctl.js`（`status` / `quota` / `delay [节点名]` / `traffic [帧数]`）用同一套数据源，便于不进 GUI 核数。**它不在本仓内**，只是本机工具。
+
+### P.7 边界与未做
+
+- **只读**：不启动、不停止、不改动 mojie 的进程与配置，也不占用它的端口。V4 即此定位。
+- 未做 **TUN / 系统代理接管**（属 V3 范围）；未测多标签并发轮询；卡片不提供切换节点等写操作。
+- 若日后要「接管」（控制 mojie：切节点、启停、改配置），那是**新范围**，需另行裁决——它会改动用户的客户端状态。
+
+### P.8 本批验证（全部退出码 0）
+
+`cargo check --jobs 1` · `cargo test --jobs 1`（全量 0 failed，新增 `vpn_external` 14 例带对照组）· `npm run build` · `npm run verify:ui`（UI_SMOKE_OK + `vpn-external.png` 截图，含"不可用只显示原因、不残留旧额度、不升级为页面级报错"的对照断言）· `npm run verify:plan`。
+
 ## F. 本文的过期条件
 
 出现下列任一情况，本文即失效，必须重新盘点而不是直接沿用：
