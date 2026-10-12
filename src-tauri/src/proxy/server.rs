@@ -760,9 +760,47 @@ async fn gw_health(State(state): State<Arc<GatewayState>>) -> impl IntoResponse 
     }))
 }
 
+/// `/gw/stats`：最近 24 小时的请求概览，外加**网关进程内的运行态计数**。
+///
+/// 后两项（`dedup` / `cache`）来自内存而不是数据库，所以它们算的是
+/// **本进程启动以来**的累计值，与 `requests` 表的 24 小时窗口不同口径 ——
+/// 字段里直接写清楚，免得读日志的人把两个时间窗混起来。
+///
+/// 去重这一项是「有没有在重复回答」的唯一可查证据：只看响应是看不出
+/// 一次重复被放行了还是被拦了的。`duplicates == 0` 说明网关**不是**重复的来源，
+/// 该往客户端侧排查；> 0 才轮到调窗口与模式。
 async fn gw_stats(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     match repo::stats_overview(state.db.pool()).await {
-        Ok(v) => Json(v).into_response(),
+        Ok(mut overview) => {
+            let dedup = state.dedup.stats();
+            let cache = state.cache.snapshot_stats();
+            if let Some(object) = overview.as_object_mut() {
+                let mode = state.cfg_snapshot().dedup.mode;
+                object.insert(
+                    "dedup".to_string(),
+                    serde_json::json!({
+                        "mode": mode.code(),
+                        "window_note": "进程内累计，非 24 小时窗口",
+                        "entries": dedup.entries,
+                        "duplicates": dedup.duplicates,
+                        "conflicts": dedup.conflicts,
+                        "observed": dedup.observed,
+                    }),
+                );
+                object.insert(
+                    "cache".to_string(),
+                    serde_json::json!({
+                        "window_note": "进程内累计，非 24 小时窗口",
+                        "entries": cache.entries,
+                        "hits": cache.hits,
+                        "misses": cache.misses,
+                        "bypasses": cache.bypasses,
+                        "invalidations": cache.invalidations,
+                    }),
+                );
+            }
+            Json(overview).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

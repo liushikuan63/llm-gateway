@@ -228,6 +228,20 @@ fn header(response: &reqwest::Response, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 读 `/gw/stats` 的原始 JSON。用来断言「运行态计数真的暴露出来了」——
+/// 只在代码里加字段不算交付，能从一个真实 HTTP 响应里读出来才算。
+async fn gateway_stats(base_url: &str) -> serde_json::Value {
+    client()
+        .get(format!("{base_url}/gw/stats"))
+        .bearer_auth(KEY)
+        .send()
+        .await
+        .expect("请求 /gw/stats")
+        .json()
+        .await
+        .expect("/gw/stats 必须是 JSON")
+}
+
 /// 反例（对照组）：去重关着时，同一份请求发两次 ⇒ 上游被调用两次。
 ///
 /// 这条必须存在：否则「开启时上游只被调用一次」可能只是因为上游根本没被调用过。
@@ -380,3 +394,44 @@ async fn 抑制模式下带工具的重复请求不参与去重() {
     );
     let _ = first;
 }
+
+/// `/gw/stats` 必须把去重计数暴露出来 —— 观察模式的全部价值就在这个数字上。
+///
+/// 判据分两段：重复前必须是 0，重复后必须是 1。只断言「字段存在」不够：
+/// 一个永远返回 0 的字段也能让「字段存在」的断言通过，而那样观察模式
+/// 就等于没在观察。
+#[tokio::test]
+async fn 观察模式的重复计数通过_gw_stats_可见() {
+    let h = spawn(DedupMode::Observe).await;
+
+    let before = gateway_stats(&h.base_url).await;
+    assert_eq!(
+        before["dedup"]["duplicates"], 0,
+        "还没有重复时计数必须是 0（否则计数是假的）"
+    );
+    assert_eq!(before["dedup"]["mode"], "observe");
+    assert_eq!(before["dedup"]["observed"], 0);
+    assert!(
+        before["dedup"]["window_note"].is_string(),
+        "必须标明这是进程内累计，避免与 24 小时窗口混淆"
+    );
+    assert!(
+        before["cache"].is_object(),
+        "缓存计数同样要在同一响应里可读"
+    );
+
+    let body = chat_body(serde_json::json!([{ "role": "user", "content": "同一个问题" }]));
+    let _ = post_twice(&h.base_url, &body).await;
+
+    let after = gateway_stats(&h.base_url).await;
+    assert_eq!(
+        after["dedup"]["duplicates"], 1,
+        "重复发生后计数必须变成 1 —— 这是「网关是不是重复来源」的唯一证据"
+    );
+    assert_eq!(after["dedup"]["observed"], 1, "观察模式下的重复计入 observed");
+    assert_eq!(
+        after["dedup"]["conflicts"], 0,
+        "观察模式不许拒绝，更不许记成拒绝"
+    );
+}
+
