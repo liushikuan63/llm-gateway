@@ -66,6 +66,76 @@ Qoder 侧无此要求（网关独立读凭据文件）。
 
 ---
 
+## 二·补、登录跳转取鉴权（不依赖客户端，与本地读取并存）
+
+统一工具：`D:\Software\workbuddy2api\login-jump.js`
+
+```powershell
+node login-jump.js qoder cn      # Qoder 中国版设备授权（浏览器完成，token 直接入网关账号池）
+node login-jump.js qoder intl    # 国际版
+node login-jump.js workbuddy     # WorkBuddy 登录跳转（拿到凭据写进 .env）
+node login-jump.js status        # 三家网关与账号状态
+```
+
+| 客户端 | 状态 | 协议要点 |
+|---|---|---|
+| **Qoder** | ✅ **已实现可用** | 网关自带的 PKCE 设备流 |
+| **WorkBuddy** | ✅ **已实现可用** | `auth/state` → 浏览器 → `auth/token` 轮询 |
+| **Trae** | ⚠️ 协议已完整逆向，实现待做 | 本地回调服务器 + PKCE + ExchangeToken |
+
+### Qoder（走网关现成能力）
+
+```
+POST /accounts/login/start {realm}    （面板路由，要 X-Panel-Token 头）
+  → {state, authUrl}
+浏览器打开 authUrl 授权
+GET /accounts/login/poll?state=<state>
+  → pending / ok（token 直接入账号池，落 accounts/<uid>.json）
+```
+
+注意：`/accounts/*` 是**面板路由**，必须先 `POST /panel/login {password}` 拿 token，再带
+`X-Panel-Token` 头（不是 `Authorization`）。这一步踩过。
+
+### WorkBuddy（完整链路，之前漏了中间一步）
+
+```
+POST https://www.workbuddy.ai/v2/plugin/auth/state?platform=workbuddy-ai
+     Headers: X-No-Authorization: true（另有 X-No-User-Id / X-No-Enterprise-Id / X-No-Department-Info）
+  → {state, authUrl}
+浏览器打开 authUrl 授权
+GET  /v2/plugin/auth/token?state=<state>        ← 取 token 的关键一步，同样用 X-No-Authorization
+  → 未授权 {"code":11217,"msg":"11217:login ing..."}（实测确认）
+  → 已授权 {data:{accessToken, refreshToken, expiresIn, ...}}
+（**这一步是不需要 Bearer 的**；需要 Bearer 的是后面的 /v2/plugin/login/account，属于取账号信息，
+  不是取 token。之前误以为"取 token 必须带 Bearer"而判定此路不通，是错的。）
+```
+
+取到的凭据写入 `D:\Software\workbuddy2api\.env`（已 gitignore），重启 workbuddy 桥接生效。
+
+### Trae（协议已逆向，实现未做）
+
+```
+1. 起本地服务器：http.createServer().listen(0, '127.0.0.1')   → 随机端口
+2. 授权 URL（loginUrlBuilder.buildLoginUrl 逆向）：
+   {consoleHost}/authorization?login_version=1&auth_from=solo|trae&login_channel=native_ide
+     &plugin_version=<tronBuildVersion|local>&auth_type=local&client_id=<...>&redirect=0
+     &login_trace_id=<uuid>&auth_callback_url=http://127.0.0.1:<port>/authorize
+     &machine_id=<...>&device_id=<...>&code_challenge=<...>&code_challenge_method=S256
+     （solo 还要 &hide_saas_login=true）
+3. 浏览器授权 → 回调本地 /authorize（携带 code 与 userInfo）
+4. 换 token：POST /trae/api/v3/oauth/ExchangeToken
+   配套端点：/cloudide/api/v3/trae/GetUserInfo、/cloudide/api/v3/trae/CheckLogin
+```
+
+- 本地服务器路径常量：`/login-confirm`、`/login-success`、`/authorize`
+- 域名：`www.trae.cn`（`www.trae.com.cn` 会 **301** 过去）；实测直接 GET 这些 API 返回 SPA HTML，
+  说明还需正确的 method/header（未完成的部分）
+- **待补**：`clientId` 与 `loginHost` 来自 **bootConfig**（主进程持有；渲染进程的
+  `sololiteConfiguration` 为 nullish，取不到）
+- 已有凭据（备用）：`.trae-token.json` — `Cloud-IDE-JWT`，`source: refresh_token`
+
+---
+
 ## 三、Qoder CN
 
 - 网关 `D:\Software\qoder2api-hub`（v1.3.4，纯 stdlib）
