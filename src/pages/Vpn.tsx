@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { api, AppConfig, VpnKernelInfo, VpnProxy, VpnSettings, VpnStatus } from "../api";
+import { api, AppConfig, ExternalVpnStatus, VpnKernelInfo, VpnProxy, VpnSettings, VpnStatus } from "../api";
 
 type Message = { kind: "ok" | "err"; text: string };
 const DEFAULT_SETTINGS: VpnSettings = { kernel_path: "", mixed_port: 17890, controller_port: 17909 };
 const MODES = { rule: "规则模式", global: "全局模式", direct: "直连模式" };
+
+/** 字节格式化（订阅用量用）。无法格式化时返回 "—"。 */
+function formatBytes(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  const gb = value / 1024 / 1024 / 1024;
+  return `${gb.toFixed(2)} GB`;
+}
 
 function errorText(error: unknown) {
   const text = error instanceof Error ? error.message : String(error);
@@ -23,6 +30,8 @@ export default function VpnPage() {
   const [proxies, setProxies] = useState<VpnProxy[]>([]);
   const [kernelInfo, setKernelInfo] = useState<VpnKernelInfo | null>(null);
   const [kernelInfoError, setKernelInfoError] = useState<string | null>(null);
+  // 外部 VPN（魔戒 mojie）只读快照。null = 还在探测；探测失败也拿得到结构体（带 error）。
+  const [external, setExternal] = useState<ExternalVpnStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
@@ -32,6 +41,21 @@ export default function VpnPage() {
   const dirty = useRef(false);
   const operationVersion = useRef(0);
   const operationInFlight = useRef(false);
+
+  /**
+   * 单独探一次外部 VPN（mojie）。
+   *
+   * 故意**不放进 load 的 Promise.allSettled**：它会发一次订阅请求（最长 12 秒），
+   * 混进主流程会拖慢整页；而且它失败只该影响这张卡片，不该让"读取 VPN 状态失败"弹出来。
+   */
+  const loadExternal = async () => {
+    try {
+      const next = await api.externalVpnStatus();
+      if (mounted.current) setExternal(next);
+    } catch {
+      if (mounted.current) setExternal(null);
+    }
+  };
 
   const load = async (propagateError = false) => {
     if (!mounted.current) return false;
@@ -75,12 +99,16 @@ export default function VpnPage() {
       return false;
     } finally {
       if (current()) setLoading(false);
+      // 每次 load 都顺带刷新外部 VPN：否则"刷新状态"按钮不会更新那张卡片
+      // （UI 冒烟抓到过这个缺陷：夹具换了数据，卡片还停在旧值）。
+      void loadExternal();
     }
   };
 
   useEffect(() => {
     mounted.current = true;
     void load();
+    void loadExternal();
     return () => {
       mounted.current = false;
       version.current++;
@@ -222,6 +250,54 @@ export default function VpnPage() {
           ? <button className="danger" disabled={locked} onClick={() => { if (window.confirm("停止内核会中断正在通过它发送的请求。确定停止吗？")) void run("stop", () => api.stopVpn(), "VPN 内核已停止"); }}>停止内核</button>
           : <button className="primary" disabled={locked || !status.kernel_ready || !status.profile_ready} onClick={() => void run("start", () => api.startVpn(), "VPN 内核已启动")}>启动内核</button>}
       </div>
+    </div>
+    <div className="card" data-testid="external-vpn">
+      <div className="spread">
+        <strong>外部 VPN（魔戒 mojie）</strong>
+        <span className={`tag ${external?.available ? "ok" : ""}`}>
+          {external === null ? "探测中…" : external.available ? "已接入" : "未探测到"}
+        </span>
+      </div>
+      {external === null && <div className="sub" role="status">正在探测外部 VPN…</div>}
+      {external !== null && !external.available && (
+        <div className="sub">{errorText(external.error ?? "未探测到 mojie 客户端")}</div>
+      )}
+      {external !== null && external.available && <>
+        <div className="row" style={{ flexWrap: "wrap" }}>
+          <span className="mono">剩余额度：{external.quota ?? "未知"}</span>
+          {external.expire && <span className="muted">到期：{external.expire}</span>}
+          {external.kernel && <span className="muted">内核 {external.kernel}</span>}
+        </div>
+        {external.subscription && (
+          <div className="sub">
+            订阅用量：已用上行 {formatBytes(external.subscription.upload_bytes)} ·
+            下行 {formatBytes(external.subscription.download_bytes)} ·
+            总量 {formatBytes(external.subscription.total_bytes)}
+          </div>
+        )}
+        <div className="row" style={{ flexWrap: "wrap" }}>
+          <span className="mono">当前节点：{external.current ?? "未选择"}</span>
+          {external.delay_ms !== null && <span className="muted">延迟 {external.delay_ms} ms</span>}
+          {external.up_kbps !== null && external.down_kbps !== null && (
+            <span className="muted">↑ {external.up_kbps.toFixed(1)} KB/s · ↓ {external.down_kbps.toFixed(1)} KB/s</span>
+          )}
+        </div>
+        <div className="sub">
+          数据来自 mojie 自带的 Mihomo 控制器（只读：不启动、不停止、不改动它的进程与配置）。
+        </div>
+        {external.nodes.length > 0 && (
+          <details>
+            <summary className="sub">节点延迟（{external.nodes.length} 个，按延迟升序）</summary>
+            <div className="row" style={{ flexWrap: "wrap" }}>
+              {external.nodes.slice(0, 12).map((node) => (
+                <span key={node.name} className="mono">
+                  {node.delay_ms === null ? "—" : `${node.delay_ms} ms`} {node.name}
+                </span>
+              ))}
+            </div>
+          </details>
+        )}
+      </>}
     </div>
     <div className="card">
       <strong>内核与端口</strong>

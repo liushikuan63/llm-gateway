@@ -40,6 +40,7 @@ pub mod stale_models;
 pub mod telemetry;
 pub mod trace;
 pub mod vpn;
+pub mod vpn_external;
 pub mod vpn_install;
 
 use crate::config::AppConfig;
@@ -315,6 +316,7 @@ pub fn run() {
             commands::clear_benefit_token,
             commands::benefit_runs,
             commands::vpn_status,
+            commands::external_vpn_status,
             commands::vpn_kernel_info,
             commands::install_vpn_kernel,
             commands::rollback_vpn_kernel,

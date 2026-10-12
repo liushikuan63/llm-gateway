@@ -619,6 +619,16 @@ pub async fn vpn_status(state: State<'_, AppState>) -> Result<crate::vpn::VpnSta
     state.vpn.status().await
 }
 
+/// 外部 VPN（魔戒 mojie）的只读状态：剩余额度、节点延迟、实时网速。
+///
+/// 与上面的托管内核**完全独立**：不启动、不停止、不修改 mojie 的任何进程或配置，
+/// 只读它自己的 Mihomo 控制器接口。探测失败也返回结构体（带 `error` 字段），
+/// 所以这里不会抛 Err —— 界面据此显示提示而不是报错。
+#[tauri::command]
+pub async fn external_vpn_status() -> Result<crate::vpn_external::ExternalVpnStatus, String> {
+    Ok(crate::vpn_external::probe().await)
+}
+
 #[tauri::command]
 pub async fn vpn_kernel_info(
     state: State<'_, AppState>,

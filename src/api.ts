@@ -285,6 +285,42 @@ export interface VpnProxy {
   members: string[];
 }
 
+/** 订阅用量（标准 Subscription-Userinfo 头，FlClash / v2rayN 同款来源）。 */
+export interface ExternalVpnSubscription {
+  upload_bytes: number | null;
+  download_bytes: number | null;
+  total_bytes: number | null;
+  expire_at: number | null;
+}
+
+/** 外部 VPN 的一个节点。 */
+export interface ExternalVpnNode {
+  name: string;
+  kind: string;
+  delay_ms: number | null;
+}
+
+/**
+ * 外部 VPN（魔戒 mojie）的只读快照。
+ * 与本应用托管的内核无关：只读，不启动/停止/修改对方任何进程或配置。
+ * 字段与 Rust 侧 `ExternalVpnStatus` 一一对应（serde 默认 snake_case）。
+ */
+export interface ExternalVpnStatus {
+  available: boolean;
+  config_path: string;
+  controller: string | null;
+  kernel: string | null;
+  quota: string | null;
+  subscription: ExternalVpnSubscription | null;
+  expire: string | null;
+  current: string | null;
+  delay_ms: number | null;
+  nodes: ExternalVpnNode[];
+  up_kbps: number | null;
+  down_kbps: number | null;
+  error: string | null;
+}
+
 export interface VpnProfileInput {
   path?: string | null;
   url?: string | null;
@@ -1183,6 +1219,7 @@ export interface PetAsset {
 
 export const api = {
   vpnStatus: () => invoke<VpnStatus>("vpn_status"),
+  externalVpnStatus: () => invoke<ExternalVpnStatus>("external_vpn_status"),
   vpnKernelInfo: () => invoke<VpnKernelInfo>("vpn_kernel_info"),
   installVpnKernel: () => invoke<VpnStatus>("install_vpn_kernel"),
   rollbackVpnKernel: () => invoke<VpnStatus>("rollback_vpn_kernel"),

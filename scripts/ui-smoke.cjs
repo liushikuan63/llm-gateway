@@ -76,6 +76,26 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     running: false, kernel_ready: false, profile_ready: false, pid: null, version: null,
     proxy_url: "http://127.0.0.1:17890", mode: "rule", error: null,
   };
+  // 外部 VPN（mojie）只读快照的夹具。数值取自本机真机实测，便于肉眼核对卡片。
+  window.__fixtureExternalVpnStatus = {
+    available: true,
+    config_path: "C:/fixture/mojie/config.yaml",
+    controller: "127.0.0.1:18606",
+    kernel: "v1.19.20",
+    quota: "708.67 GB",
+    subscription: { upload_bytes: 21606895115, download_bytes: 22775131682, total_bytes: 805306368000, expire_at: null },
+    expire: "长期有效",
+    current: "新加坡-优化-GPT",
+    delay_ms: 4019,
+    nodes: [
+      { name: "香港HK-HY2", kind: "Hysteria2", delay_ms: 351 },
+      { name: "台湾-优化", kind: "Vmess", delay_ms: 513 },
+      { name: "新加坡-优化-GPT", kind: "Vmess", delay_ms: 4019 },
+    ],
+    up_kbps: 1.8,
+    down_kbps: 48.2,
+    error: null,
+  };
   window.__fixtureBenefitTokens = {};
   window.__fixtureBenefitRuns = [];
   window.__fixtureBenefitClaimed = {};
@@ -466,6 +486,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         return { run, outcome: !["granted", "replayed"].includes(mode) ? null : { platform: account.platform, campaign_id: "daily", campaign_key: "daily-20261010", status: "CLAIMED", replayed: mode === "replayed", granted: mode === "granted", amount: 100, kind: "CREDITS", claimed_at: "2026-10-10T03:01:00Z", expires_at: "2026-11-09T03:01:00Z", message: messages[mode] } };
       }
       case "vpn_status": return structuredClone(window.__fixtureVpnStatus);
+      case "external_vpn_status": return structuredClone(window.__fixtureExternalVpnStatus);
       case "vpn_kernel_info":
         if (window.__fixtureVpnKernelInfoFailure) throw new Error("模拟官方内核信息读取失败");
         return vpnKernelInfo();
@@ -1162,6 +1183,55 @@ async function verifyVpnPage(browser, errors) {
   assert.equal(await gateway.isEnabled(), false, "默认停止状态不能把网关切向未启动的代理");
   assert.equal(await page.evaluate(() => window.__fixtureVpnStatus.running), false);
   await page.screenshot({ path: path.join(output, "vpn-default-off.png"), fullPage: true, animations: "disabled" });
+
+  // ── 外部 VPN（mojie）卡片 ────────────────────────────────────────────────
+  // 断言数值必须与夹具一致：夹具值取自真机实测，若界面取错字段/漏格式化就会红。
+  const externalCard = page.getByTestId("external-vpn");
+  await externalCard.waitFor();
+  const externalText = await externalCard.innerText();
+  assert(externalText.includes("已接入"), `外部 VPN 可用时应标已接入：实际=${externalText}`);
+  assert(externalText.includes("708.67 GB"), `剩余额度应为订阅头算出的 708.67 GB：实际=${externalText}`);
+  assert(externalText.includes("长期有效"), `到期应显示：实际=${externalText}`);
+  assert(externalText.includes("v1.19.20"), `内核版本应显示：实际=${externalText}`);
+  assert(externalText.includes("新加坡-优化-GPT"), `当前节点应显示：实际=${externalText}`);
+  assert(externalText.includes("4019 ms"), `延迟应显示：实际=${externalText}`);
+  assert(externalText.includes("1.8 KB/s") && externalText.includes("48.2 KB/s"),
+    `上下行网速都应显示：实际=${externalText}`);
+  assert(externalText.includes("只读"), "卡片必须写明对 mojie 只读，避免误会成会去改动客户端");
+  assert.equal(
+    await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "external_vpn_status").length > 0),
+    true, "卡片必须真的调用 external_vpn_status，而不是渲染静态文案");
+  await page.screenshot({ path: path.join(output, "vpn-external.png"), fullPage: true, animations: "disabled" });
+
+  // 对照组：mojie 不可用时只在该卡片里给说明，不产生页面级报错。
+  await page.evaluate(() => {
+    window.__fixtureExternalVpnStatus = {
+      available: false, config_path: "C:/fixture/mojie/config.yaml", controller: null, kernel: null,
+      quota: null, subscription: null, expire: null, current: null, delay_ms: null, nodes: [],
+      up_kbps: null, down_kbps: null, error: "mojie 配置里没有可用的 external-controller",
+    };
+  });
+  await page.getByRole("button", { name: /刷新状态|读取中/ }).click();
+  await page.waitForFunction(() => document.querySelector('[data-testid="external-vpn"]')?.innerText.includes("未探测到"));
+  const unavailableText = await page.getByTestId("external-vpn").innerText();
+  assert(unavailableText.includes("external-controller"), `不可用时应给出具体原因：实际=${unavailableText}`);
+  assert(!unavailableText.includes("708.67 GB"), "对照组：不可用时不得残留上一次的额度数字");
+  // 不断言"页面级 alert 数为 0"（别的用例可能已留下 alert），只断言外部 VPN 的问题没有升级成页面级报错。
+  const alertTexts = await page.getByRole("alert").allInnerTexts();
+  assert(!alertTexts.some(text => /mojie|外部 VPN|external/i.test(text)),
+    `外部 VPN 不可用只应写在该卡片里，不能升级为页面级报错：实际=${JSON.stringify(alertTexts)}`);
+  // 复原夹具，避免影响后续用例。
+  await page.evaluate(() => {
+    window.__fixtureExternalVpnStatus = {
+      available: true, config_path: "C:/fixture/mojie/config.yaml", controller: "127.0.0.1:18606",
+      kernel: "v1.19.20", quota: "708.67 GB",
+      subscription: { upload_bytes: 21606895115, download_bytes: 22775131682, total_bytes: 805306368000, expire_at: null },
+      expire: "长期有效", current: "新加坡-优化-GPT", delay_ms: 4019,
+      nodes: [{ name: "香港HK-HY2", kind: "Hysteria2", delay_ms: 351 }],
+      up_kbps: 1.8, down_kbps: 48.2, error: null,
+    };
+  });
+
   await page.evaluate(() => { window.__fixtureDialogPath = "C:/fixture/mihomo.exe"; });
   await page.getByRole("button", { name: "选择内核", exact: true }).click();
   await page.waitForFunction(() => document.querySelector("#vpn-kernel-path")?.value === "C:/fixture/mihomo.exe");
@@ -3367,6 +3437,6 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await preview.goto(baseUrl);
     await preview.getByRole("heading", { name: "浏览器预览已隔离", exact: true }).waitFor();
     assert.equal(await preview.locator(".provider-card").count(), 0);
-    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, first-use guidance, persisted skip/completion, manual search, offline HTML, themes, startup splash, pet HUD/actions, async page races, polling feedback, exact cache settings, VPN controls, official kernel install/rollback, redacted local diagnostics, account benefits/claim results/tokens/history, account runtime options/binding, responsive layouts and preview isolation; screenshots=${output}`);
+    console.log(`UI_SMOKE_OK: discovery, defaults, overrides, deduplication, sessions, switching races, compression, backup display, quota/expiry, first-use guidance, persisted skip/completion, manual search, offline HTML, themes, startup splash, pet HUD/actions, async page races, polling feedback, exact cache settings, VPN controls, external VPN status, official kernel install/rollback, redacted local diagnostics, account benefits/claim results/tokens/history, account runtime options/binding, responsive layouts and preview isolation; screenshots=${output}`);
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

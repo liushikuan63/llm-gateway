@@ -206,6 +206,30 @@ RunEvent::Exit显式清理用自有窗口线程WM_QUIT复验，不代替托盘�
 
 验收必须用隔离 Windows 环境验证管理员授权失败、端口冲突、FlClash 共存、休眠恢复、应用崩溃、原系统代理恢复和卸载后无残留。未通过之前不自动启用整机网络接管。
 
+### V4 · 接入外部 VPN 客户端（只读）
+
+本工具管理的内核之外，用户自己装着「魔戒 mojie」（Electron 客户端 + 内置 Mihomo）。本节只做**读取**：不启动、不停止、不修改它的进程与配置，也不占用它的端口。三个能力与数据来源均已实测：
+
+| 能力 | 来源 | 实测值 |
+| --- | --- | --- |
+| 剩余额度 | 订阅的 `Subscription-Userinfo` 响应头优先（FlClash / v2rayN 同款做法）；退回 mojie 塞在节点名里的「剩余流量：X GB」快照 | 订阅头算出 708.67 GB；伪节点名是滞后快照（712.08 GB） |
+| 连接延迟 | `GET /proxies` 的 `history[].delay`；要即时值用 `GET /proxies/<name>/delay` | 43 个节点有历史；主动测「台湾-优化」= 3225 ms |
+| 实时网速 | `GET /traffic`（流式，取首帧即断开） | ↑1.8 / ↓48.2 KB/s |
+
+```text
+输入：新增 src-tauri/src/vpn_external.rs、tests/vpn_external.rs，commands.rs 加 external_vpn_status，
+src/pages/Vpn.tsx 加卡片，src/api.ts 加类型与调用，scripts/ui-smoke.cjs 加夹具与断言。
+控制器地址不硬编码：从 mojie 自己的 config.yaml 读 external-controller（本机实测 127.0.0.1:18606），
+且只接受回环地址——配置里若写的是对外监听地址，一律拒绝发起请求（有测试对照）。
+该文件不使用 regex（依赖列表里没有），文本解析全部手写。
+订阅地址属凭据：只在函数内用于发请求，不进日志、不进返回结构体、不出现在任何错误信息里。
+探测失败（客户端没开 / 没有控制器 / 订阅取不到）返回带 error 的结构体而不抛错，
+界面只在该卡片内说明原因，不升级为页面级报错。
+mojie 的 config.json 不是严格 JSON（serde_json 解析失败是其真实状态），订阅地址按文本提取。
+```
+
+验收：`cargo test --jobs 1`（其中 `vpn_external` 14 例，含「非回环地址必须拒绝」「畸形订阅头不 panic 且不给假的剩余值」等对照组）、`npm run build`、`npm run verify:ui`（产出 `vpn-external.png` 截图，并有「不可用只显示原因、不残留上一次额度」的对照断言）三项退出码均为 0。
+
 ### N1 · 一键只读诊断与脱敏导出
 
 现有 `run_gateway_self_check` 会发最小模型请求，因此“本地诊断”使用独立只读实现。收集监听状态、配置是否需重启、候选/禁用数量、缓存统计、预算口径、VPN 是否运行及受管代理是否失联；不发送 HTTP/TCP/模型或公网请求。报告区分 unknown/warning/error，导出只含结构化白名单字段，不含 Key、订阅、请求正文、名称、地址、用户路径或底层错误。
