@@ -38,6 +38,7 @@ use crate::domain::{
     RemoteAccessKey, Role, ToolCall, Usage,
 };
 use crate::error::{GatewayError, Result};
+use crate::proxy::dedup::{DedupDecision, DedupOutcome, DedupRegistry, Verdict};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::upstream::{PassthroughResponse, UpstreamClient, UpstreamEvent};
 use crate::router::cascade::{CascadeRunRequest, CascadeStop, ConfidenceReading};
@@ -140,6 +141,12 @@ pub struct GatewayState {
     compaction_lock: tokio::sync::Mutex<()>,
     /// 精确响应缓存。**默认关**：关着时 dispatch 不做哈希、不查表、不加头。
     pub cache: Arc<crate::cache::ResponseCache>,
+    /// 重复请求抑制。**默认关**：关着时 dispatch 连指纹都不算。
+    ///
+    /// 与 `cache` 分开两个实例：它们算的是**同一个请求的哈希**，但用途不同
+    /// （一个是省钱、一个是止重复）、生命周期不同（一个按配置代次失效、
+    /// 一个按时间窗口失效），合用一份状态会让一次改动同时影响两个功能。
+    pub dedup: Arc<crate::proxy::dedup::DedupRegistry>,
     /// 只有实际 listener 位于回环地址时才会激活远程反代认证逻辑。
     listener_is_loopback: AtomicBool,
     listener_snapshot: parking_lot::RwLock<Option<ListenerSnapshot>>,
@@ -177,6 +184,8 @@ impl GatewayState {
         ));
         let ctx = ContextStore::new(db.clone());
         let cache = Arc::new(crate::cache::ResponseCache::new(cfg.cache.clone()));
+        // 去重表在构造期拿一份配置副本；之后的变更走 `update_cfg`。
+        let cfg_dedup = cfg.dedup.clone();
         let upstream = Arc::new(UpstreamClient::new());
         upstream.set_proxy(cfg.http_proxy.as_deref());
         let benefits = Arc::new(crate::benefits::BenefitsCenter::new(db.pool().clone()));
@@ -192,6 +201,7 @@ impl GatewayState {
             benefits,
             ctx,
             cache,
+            dedup: Arc::new(DedupRegistry::new(cfg_dedup)),
             providers: Arc::new(parking_lot::RwLock::new(Vec::new())),
             active: Arc::new(parking_lot::RwLock::new(None)),
             remote_access_keys: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -240,6 +250,10 @@ impl GatewayState {
         // 唯一不在它覆盖范围内的是 `update_config`（改的是 cfg 不是 providers），
         // 那里单独调一次。
         self.cache.invalidate_all();
+        // 去重的条目同样要清：供应商/模型变了以后，同一条请求可能落到别的上游，
+        // 复用上一次的响应就不再是「同一次请求的两次投递」了。
+        // **计数不清**：它不是缓存内容，而是「到底有没有重复」的证据。
+        self.dedup.clear();
         Ok(())
     }
 
@@ -274,6 +288,9 @@ impl GatewayState {
         self.router.set_custom_rules(cfg.custom_rules.clone());
         self.upstream.set_proxy(cfg.http_proxy.as_deref());
         self.cache.reconfigure(&cfg.cache);
+        // 去重配置热更新：条目里存的是「上一次的执行结果」，
+        // 换了模式或窗口之后它们的可比性已经变了，清掉重来。
+        self.dedup.rewire(&cfg.dedup);
         *current = cfg;
     }
 
@@ -3262,6 +3279,23 @@ async fn dispatch(
         }
     }
 
+    // 6) 重复请求抑制。**判据在入口处定，执行与登记在这里**：
+    //
+    // - 放在路由与上下文重建**之后**：那样一次重复请求照样会触碰会话、跑分类器，
+    //   而它本来就是应当被抑制掉的那一次。
+    // - 放在执行**之前**：这正是「让第二次不再发上游」的位置。
+    //
+    // 指纹由「请求内容 + 会话 + 客户端」派生，不依赖调用方回传任何 id ——
+    // 主流 SDK 客户端不保证回传幂等键，而网关侧派生键对它们一律有效。
+    let fingerprint = dedup_fingerprint(&state, client.as_deref(), &req);
+    let permit = match state.dedup.begin(fingerprint.as_deref()).await {
+        DedupDecision::Off => None,
+        DedupDecision::Take(permit) => Some(permit),
+        DedupDecision::Share { verdict, .. } => {
+            return duplicate_conflict_response(verdict, fingerprint.as_deref().unwrap_or(""));
+        }
+    };
+
     // 6) 执行（区分流式/非流式）
     let dispatch_input = DispatchInput {
         req,
@@ -3282,11 +3316,106 @@ async fn dispatch(
         // 响应头，不清洗就是 HTTP 头注入面。
         trace_id: trace_id.clone(),
     };
-    if dispatch_input.req.stream {
+    let streaming = dispatch_input.req.stream;
+    let response = if streaming {
         stream_dispatch(state.clone(), dispatch_input).await
     } else {
         normal_dispatch(state.clone(), dispatch_input).await
+    };
+
+    // 7) 登记结果，供下一次重复请求判定。
+    //
+    // **只记「有没有成功交付过」**，不缓冲响应体：流式响应边生成边发，
+    // 缓冲它等于把流式变成「等完再一次给出」；而非流式请求在本项目的
+    // 调用方上不是重复投递的来源。登记这一个 bit 就够判定「该拒绝还是该放行」。
+    if let Some(permit) = &permit {
+        let outcome = if response.status().as_u16() < 400 {
+            DedupOutcome::Delivered
+        } else {
+            DedupOutcome::Failed
+        };
+        state.dedup.finish(permit, outcome);
     }
+    response
+}
+
+/// 该不该给这次请求算指纹。返回 `None` 表示这次请求不参与去重。
+///
+/// **四条排除规则各有理由，不要为了「多拦一点」放宽**：
+///
+/// | 排除项 | 放开的后果 |
+/// | --- | --- |
+/// | 带 `tools` | 工具调用的正确性依赖当轮上下文，合并会执行过期动作 |
+/// | 多模态（图/音/视频） | 同样的文字配不同的图是两回事，而图的内容不参与指纹 |
+/// | 会话 id 为空 | 无会话上下文时，两次相同提问无法区分「重试」与「用户又问一遍」 |
+/// | 请求体序列化失败 | 拿不到稳定指纹，判了也是错的 |
+fn dedup_fingerprint(state: &GatewayState, client: Option<&str>, req: &ChatRequest) -> Option<String> {
+    let cfg = state.cfg_snapshot();
+    if !crate::proxy::dedup::should_compute_fingerprint(&cfg.dedup) {
+        return None;
+    }
+    if req.tools.is_some() {
+        return None;
+    }
+    if request_has_media(req) {
+        return None;
+    }
+    let request_json = match serde_json::to_string(req) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!("去重：请求体无法序列化，本次跳过判定：{error}");
+            return None;
+        }
+    };
+    Some(crate::proxy::dedup::request_fingerprint(
+        &crate::proxy::dedup::FingerprintInput {
+            request_json: &request_json,
+            client,
+        },
+    ))
+}
+
+/// 请求里是否带了多模态内容（图 / 音 / 视频）。
+///
+/// 判据只看**内容形态**，不看模型能力：同样的文字配不同的图是两次不同的请求，
+/// 而图的内容不参与指纹比对，所以这类请求一律不参与去重。
+fn request_has_media(req: &ChatRequest) -> bool {
+    req.messages.iter().any(|message| match &message.content {
+        Content::Text(_) => false,
+        Content::Parts(parts) => parts.iter().any(|part| {
+            matches!(
+                part,
+                Part::ImageUrl { .. } | Part::InputAudio { .. } | Part::VideoUrl { .. }
+            )
+        }),
+    })
+}
+
+/// 判为重复时的明确拒绝。
+///
+/// 为什么是 409 而不是静默返回一份重复内容：重复内容会在客户端渲染成
+/// **两份回答**，正是要修的毛病；而 4xx 至少能被日志与客户端如实记录。
+/// `X-Dedup-Count` 与 `X-Dedup-Verdict` 只带零信息量的判定结果与投递标识前缀，
+/// 不含请求内容。
+fn duplicate_conflict_response(verdict: Verdict, fingerprint: &str) -> Response {
+    let short = fingerprint.chars().take(16).collect::<String>();
+    let body = serde_json::json!({
+        "error": {
+            "type": "duplicate_request",
+            "message": format!(
+                "网关判定本次为重复请求（同会话、同内容、判定窗口内已执行过一次）。\
+                 上一次的响应是流式的，无法重新发送，因此本次明确拒绝而不是重复执行。\
+                 投递标识前 16 位：{short}"
+            ),
+            "code": verdict.code(),
+        }
+    });
+    let mut response = (axum::http::StatusCode::CONFLICT, Json(body)).into_response();
+    response.headers_mut().insert(
+        "x-dedup",
+        axum::http::HeaderValue::from_static(verdict.code()),
+    );
+    response
 }
 
 const CONTEXT_HISTORY_LIMIT: usize = 1_000;

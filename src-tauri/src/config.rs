@@ -493,6 +493,10 @@ pub struct AppConfig {
     pub auth_failure: AuthFailureConfig,
     /// 精确响应缓存。**默认关闭** —— 关闭时 dispatch 路径与改动前逐位等价。
     pub cache: crate::cache::CacheConfig,
+    /// 重复请求抑制。**默认关闭且默认只观察** ——
+    /// 它拦的是「同一个请求被执行两次」，症状就是用户只问一次却收到两份回答。
+    /// 关闭时 dispatch 连指纹都不算，路径与改动前逐位等价。
+    pub dedup: crate::proxy::dedup::DedupConfig,
     /// B2 预算闸门与模型白名单的总开关。默认开 —— Key 上设了预算就该生效，
     /// 否则就是「开着没反应的开关」。默认路径零成本靠的是
     /// 「Key 的 monthly_budget_micros == 0 直接跳过」，不是把总开关关掉。
@@ -786,6 +790,7 @@ impl Default for AppConfig {
             ollama_options: OllamaOptionsConfig::default(),
             auth_failure: AuthFailureConfig::default(),
             cache: crate::cache::CacheConfig::default(),
+            dedup: crate::proxy::dedup::DedupConfig::default(),
             budget: crate::budget::BudgetConfig::default(),
             audit: crate::audit::AuditConfig::default(),
             telemetry: crate::trace::TelemetryConfig::default(),
