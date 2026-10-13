@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "resources": [],
+    "icon": ["icons/macos-generated/icon.icns"],
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  }
+}

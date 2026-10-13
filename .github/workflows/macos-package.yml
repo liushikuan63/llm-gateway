@@ -1,0 +1,50 @@
+name: macOS universal package
+
+on:
+  push:
+    branches: [codex/macos-universal-0.2.1-20261013]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Universal DMG (Intel and Apple Silicon)
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install locked frontend dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Prepare both Rust targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+          xcodebuild -version
+      - name: Generate macOS icon from existing application artwork
+        run: npm run tauri -- icon src-tauri/icons/icon.png --output src-tauri/icons/macos-generated
+      - name: Build ad-hoc signed universal app and DMG
+        run: npm run tauri -- build --target universal-apple-darwin --bundles app,dmg -- --locked
+      - name: Verify installer, mounted app, version, architectures and signature
+        run: python3 scripts/verify-macos-package.py
+      - name: Save installer and verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: LLM-Gateway-0.2.1-macos-universal
+          path: macos-artifacts/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
