@@ -11,6 +11,78 @@ use llm_gateway_lib::domain::{AgentRuntime, Message};
 use serde_json::{json, Value};
 
 #[tokio::test]
+async fn workbuddy_direct_runtime_resolves_account_and_preserves_cli_paths() {
+    use llm_gateway_lib::agent_upstream::runtime::{resolve_chat_runtime, ChatRuntime};
+    let db = Db::connect_in_memory().await.unwrap();
+    let registry = AdapterRegistry::with_builtins();
+    for account in ["personal", "enterprise"] {
+        let mut runtime = AgentRuntime::new(format!("wb-{account}"), "workbuddy-model", account);
+        runtime.options = Some(json!({"account_id":account,"model_aliases":{"public":"upstream"}}));
+        repo::upsert_agent_runtime(db.pool(), &runtime)
+            .await
+            .unwrap();
+        match resolve_chat_runtime(db.pool(), &registry, &runtime.id)
+            .await
+            .unwrap()
+        {
+            ChatRuntime::WorkBuddy {
+                account_id,
+                aliases,
+                ..
+            } => {
+                assert_eq!(account_id, account);
+                assert_eq!(aliases["public"], "upstream");
+            }
+            _ => panic!("direct account resolved through CLI"),
+        }
+        assert!(resolve_runtime(db.pool(), &registry, &runtime.id)
+            .await
+            .is_err());
+        runtime.enabled = false;
+        repo::upsert_agent_runtime(db.pool(), &runtime)
+            .await
+            .unwrap();
+        assert!(resolve_chat_runtime(db.pool(), &registry, &runtime.id)
+            .await
+            .err()
+            .unwrap()
+            .contains("停用"));
+    }
+    assert!(matches!(
+        resolve_chat_runtime(db.pool(), &registry, "fake")
+            .await
+            .unwrap(),
+        ChatRuntime::Agent(_)
+    ));
+    assert!(
+        resolve_chat_runtime(db.pool(), &registry, "workbuddy-model")
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn workbuddy_direct_options_reject_endpoints_commands_and_credentials() {
+    use llm_gateway_lib::agent_upstream::runtime::workbuddy_options;
+    assert!(workbuddy_options(Some(&json!({"account_id":"local_1"}))).is_ok());
+    for input in [
+        json!({"account_id":""}),
+        json!({"account_id":"a/b"}),
+        json!({"account_id":"a","headers":{}}),
+        json!({"account_id":"a","token":"fixture"}),
+        json!({"account_id":"a","endpoint":"https://example.invalid"}),
+        json!({"account_id":"a","executable":"anything"}),
+        json!({"account_id":"a","model_aliases":{"m":1}}),
+    ] {
+        assert!(
+            workbuddy_options(Some(&input)).is_err(),
+            "accepted invalid runtime options"
+        );
+    }
+    assert!(workbuddy_options(None).is_err());
+}
+
+#[tokio::test]
 async fn custom_runtime_kind_and_model_aliases_reach_the_actual_adapter() {
     let db = Db::connect_in_memory().await.unwrap();
     let registry = AdapterRegistry::with_builtins();

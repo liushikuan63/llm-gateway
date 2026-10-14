@@ -103,23 +103,38 @@ fn provider(id: &str, base_url: String, models: Vec<ModelRef>) -> Provider {
     }
 }
 
-async fn unused_loopback_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+struct GatewayTask(JoinHandle<llm_gateway_lib::error::Result<()>>);
+impl GatewayTask {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+impl Drop for GatewayTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
-async fn wait_for_gateway(base_url: &str) {
-    let client = reqwest::Client::new();
+async fn wait_for_gateway(state: &Arc<GatewayState>, task: &mut GatewayTask) -> String {
+    let client = client();
     for _ in 0..120 {
-        if client
-            .get(format!("{base_url}/healthz"))
-            .send()
-            .await
-            .is_ok_and(|response| response.status() == reqwest::StatusCode::OK)
-        {
-            return;
+        if task.0.is_finished() {
+            panic!(
+                "own gateway did not remain running: {:?}",
+                (&mut task.0).await
+            );
+        }
+        if let Some(listener) = state.listener_snapshot() {
+            assert!(listener.bound_addr.ip().is_loopback());
+            let base_url = format!("http://{}", listener.bound_addr);
+            if client
+                .get(format!("{base_url}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status() == reqwest::StatusCode::OK)
+            {
+                return base_url;
+            }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -142,7 +157,7 @@ async fn spawn_upstream() -> (String, MockState) {
 async fn spawn_gateway(
     upstream: &str,
     mutate: impl FnOnce(&mut AppConfig),
-) -> (db::Db, AppConfig, JoinHandle<()>, String) {
+) -> (db::Db, AppConfig, GatewayTask, String) {
     let db = db::Db::connect_in_memory().await.unwrap();
     repo::upsert_provider(
         db.pool(),
@@ -158,21 +173,18 @@ async fn spawn_gateway(
     .await
     .unwrap();
     let mut config = AppConfig {
-        port: unused_loopback_port().await,
+        port: 0,
         unified_key: KEY.into(),
         ..Default::default()
     };
     mutate(&mut config);
     let gateway = Arc::new(GatewayState::new(db.clone(), config.clone()));
     gateway.reload_providers().await.unwrap();
-    let task = tokio::spawn({
+    let mut task = GatewayTask(tokio::spawn({
         let gateway = gateway.clone();
-        async move {
-            let _ = serve(gateway).await;
-        }
-    });
-    let base_url = format!("http://{}:{}", config.bind, config.port);
-    wait_for_gateway(&base_url).await;
+        async move { serve(gateway).await }
+    }));
+    let base_url = wait_for_gateway(&gateway, &mut task).await;
     (db, config, task, base_url)
 }
 
@@ -181,6 +193,79 @@ fn client() -> reqwest::Client {
         .no_proxy()
         .build()
         .expect("构造 client")
+}
+
+#[tokio::test]
+async fn concurrent_fixture_gateways_own_distinct_live_listeners() {
+    let (upstream, _state) = spawn_upstream().await;
+    let (first, second) = tokio::join!(
+        spawn_gateway(&upstream, |_| {}),
+        spawn_gateway(&upstream, |_| {})
+    );
+    let (_db1, _cfg1, task1, base1) = first;
+    let (_db2, _cfg2, _task2, base2) = second;
+    assert_ne!(base1, base2, "活跃网关各自拥有实际绑定的端口");
+    assert_eq!(
+        client()
+            .get(format!("{base1}/healthz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        client()
+            .get(format!("{base2}/healthz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    task1.abort();
+    for _ in 0..100 {
+        if client()
+            .get(format!("{base1}/healthz"))
+            .send()
+            .await
+            .is_err()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(client()
+        .get(format!("{base1}/healthz"))
+        .send()
+        .await
+        .is_err());
+    assert_eq!(
+        client()
+            .get(format!("{base2}/healthz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK,
+        "关闭自有第一个夹具不影响第二个网关"
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "own gateway did not remain running")]
+async fn fixture_bind_failure_is_reported_before_accepting_a_health_response() {
+    let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cfg = AppConfig {
+        port: occupied.local_addr().unwrap().port(),
+        unified_key: KEY.into(),
+        ..Default::default()
+    };
+    let db = db::Db::connect_in_memory().await.unwrap();
+    let state = Arc::new(GatewayState::new(db, cfg));
+    let task_state = state.clone();
+    let mut task = GatewayTask(tokio::spawn(async move { serve(task_state).await }));
+    let _ = wait_for_gateway(&state, &mut task).await;
 }
 
 async fn chat(base_url: &str, model: &str, messages: serde_json::Value) -> reqwest::Response {
@@ -623,7 +708,7 @@ async fn spawn_refine_gateway(
     refine_base: &str,
     jev_base: &str,
     mutate: impl FnOnce(&mut AppConfig),
-) -> (db::Db, String, MockState) {
+) -> (db::Db, String, MockState, GatewayTask) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
     let upstream_state = MockState::default();
@@ -667,7 +752,7 @@ async fn spawn_refine_gateway(
     .unwrap();
 
     let mut config = AppConfig {
-        port: unused_loopback_port().await,
+        port: 0,
         unified_key: KEY.into(),
         ..Default::default()
     };
@@ -680,16 +765,12 @@ async fn spawn_refine_gateway(
     mutate(&mut config);
     let gateway = Arc::new(GatewayState::new(db.clone(), config.clone()));
     gateway.reload_providers().await.unwrap();
-    let task = tokio::spawn({
+    let mut task = GatewayTask(tokio::spawn({
         let gateway = gateway.clone();
-        async move {
-            let _ = serve(gateway).await;
-        }
-    });
-    std::mem::forget(task); // 让网关活到测试结束
-    let base = format!("http://{}:{}", config.bind, config.port);
-    wait_for_gateway(&base).await;
-    (db, base, upstream_state)
+        async move { serve(gateway).await }
+    }));
+    let base = wait_for_gateway(&gateway, &mut task).await;
+    (db, base, upstream_state, task)
 }
 
 /// 带工具的请求体。**必须带工具**——这是让主路由排除掉改写端点的关键（见 `refine_model`）。
@@ -748,7 +829,7 @@ async fn chat_with_tools(base_url: &str, model: &str, text: &str) -> reqwest::Re
 async fn 改写成功后上游收到的是新提示词() {
     let (refine_base, refine_hits) = spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
     let jev = spawn_jev(0.10).await; // clarity 极低 ⇒ 需要改写
-    let (_db, base, upstream_state) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
+    let (_db, base, upstream_state, _task) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
         cfg.smart_routing.prompt_refine.enabled = true;
     })
     .await;
@@ -777,7 +858,7 @@ async fn 改写成功后上游收到的是新提示词() {
 async fn 改写关闭时上游收到的是原文() {
     let (refine_base, refine_hits) = spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
     let jev = spawn_jev(0.10).await;
-    let (_db, base, upstream_state) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
+    let (_db, base, upstream_state, _task) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
         // Jev 说需要改写，但**开关关着**——这一条验的是开关本身。
         cfg.smart_routing.prompt_refine.enabled = false;
     })
@@ -808,7 +889,7 @@ async fn jev_说清楚时不做改写() {
     // 反向对照：上一条可能因为「Jev 从来没说需要改写」而通过。
     let (refine_base, refine_hits) = spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
     let jev = spawn_jev(0.95).await; // clarity 很高 ⇒ 提示词已经够清楚
-    let (_db, base, upstream_state) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
+    let (_db, base, upstream_state, _task) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
         cfg.smart_routing.prompt_refine.enabled = true;
     })
     .await;
@@ -838,7 +919,7 @@ async fn 改写端点报错时请求照常走完且提示词未被污染() {
     // 这两种是不同的失败，混在一起会漏掉真正要验的那条路径。
     let (broken_base, broken_hits) = spawn_broken_refiner().await;
     let jev = spawn_jev(0.10).await;
-    let (_db, base, upstream_state) = spawn_refine_gateway(&broken_base, &jev, |cfg| {
+    let (_db, base, upstream_state, _task) = spawn_refine_gateway(&broken_base, &jev, |cfg| {
         cfg.smart_routing.prompt_refine.enabled = true;
         cfg.smart_routing.prompt_refine.timeout_ms = 2000;
     })
@@ -878,7 +959,7 @@ async fn 没有可用改写目标时明确说明而不是沉默() {
     // 否则用户会以为预优化已经开了却一直没效果。
     let (refine_base, _hits) = spawn_refiner("改写结果").await;
     let jev = spawn_jev(0.10).await;
-    let (db, base, _state) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
+    let (db, base, _state, _task) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
         cfg.smart_routing.prompt_refine.enabled = true;
         // 指向一个不在候选链里的供应商：pick_target 会回落到全链，
         // 所以这里改用「模型名为空」来制造真正的 None。
@@ -911,7 +992,7 @@ async fn 没有可用改写目标时明确说明而不是沉默() {
 async fn 审计记录了改写前后的长度() {
     let (refine_base, _hits) = spawn_refiner("请检查边界条件，并说明在并发下的行为").await;
     let jev = spawn_jev(0.10).await;
-    let (db, base, _state) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
+    let (db, base, _state, _task) = spawn_refine_gateway(&refine_base, &jev, |cfg| {
         cfg.smart_routing.prompt_refine.enabled = true;
     })
     .await;

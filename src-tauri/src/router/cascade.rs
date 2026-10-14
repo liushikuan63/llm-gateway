@@ -274,14 +274,32 @@ pub struct CascadeRun<T> {
 pub async fn run_cascade<T, S, Sf, C, Cf>(
     policy: &CascadePolicy,
     run: CascadeRunRequest,
-    mut send: S,
-    mut confidence: C,
+    send: S,
+    confidence: C,
 ) -> Result<CascadeRun<T>>
 where
     S: FnMut(usize) -> Sf,
     Sf: std::future::Future<Output = Result<T>>,
     C: FnMut(&T) -> Cf,
     Cf: std::future::Future<Output = ConfidenceReading>,
+{
+    run_cascade_with_cursor(policy, run, send, confidence, |_, start| start).await
+}
+
+/// The actual winning candidate can be later than `start` after HTTP failover.
+pub async fn run_cascade_with_cursor<T, S, Sf, C, Cf, P>(
+    policy: &CascadePolicy,
+    run: CascadeRunRequest,
+    mut send: S,
+    mut confidence: C,
+    mut position: P,
+) -> Result<CascadeRun<T>>
+where
+    S: FnMut(usize) -> Sf,
+    Sf: std::future::Future<Output = Result<T>>,
+    C: FnMut(&T) -> Cf,
+    Cf: std::future::Future<Output = ConfidenceReading>,
+    P: FnMut(&T, usize) -> usize,
 {
     let policy = policy.sanitized();
     // 【铁律 2 模式隔离】关着时**连置信度都不读**。
@@ -322,7 +340,16 @@ where
             },
         );
         if decision == CascadeDecision::Escalate {
-            start = attempt + 1;
+            let next = position(&value, start).max(start).saturating_add(1);
+            if next >= run.candidates {
+                return Ok(CascadeRun {
+                    value,
+                    attempts: readings.len(),
+                    stop: CascadeStop::Exhausted,
+                    readings,
+                });
+            }
+            start = next;
             continue;
         }
         // `Accept` 的每一种原因（够自信 / 到上限 / 没有下一档 / 通道不可用 /

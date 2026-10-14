@@ -550,6 +550,18 @@ subscription-userinfo: upload=21606895115; download=22775131682; total=805306368
 
 `cargo check --jobs 1` · `cargo test --jobs 1`（全量 0 failed，新增 `vpn_external` 14 例带对照组）· `npm run build` · `npm run verify:ui`（UI_SMOKE_OK + `vpn-external.png` 截图，含"不可用只显示原因、不残留旧额度、不升级为页面级报错"的对照断言）· `npm run verify:plan`。
 
+## Q. 2026-10-13 VPN 与客户端复验
+
+追加的软件内集成（本次源码与分项验证；最终安装证据见专项记录）：`src-tauri/src/client_bridges.rs:74` 管理自有桥接，生产 JS 通过 `include_str!` 嵌入；`src-tauri/src/managed_runtime.rs:96` 启动前验证固定 Node/Xray SHA-256；`src-tauri/src/vpn_xray.rs:38` 仅导入支持的单一代理出站，私有出站加密，临时运行文件随停止/退出清理。软件内入口为 `src/pages/Clients.tsx:1` 与 `src/pages/XrayPanel.tsx:1`；Qoder 登记使用 `src-tauri/src/db/repo.rs:13` 的单一事务，不启用额外 Agent 文件读写入口。分项实测 Rust lib 401 + 集成 9 通过；26 章手册共用内置内容与离线 HTML，桌面说明见 [快速开始](桌面快速开始.md)。
+
+2026-10-13 的最新 VPN 与客户端复验见 [专项记录](2026-10-13-VPN与客户端接管验收.md)和 [DSH 接入记录](local-clients-dsh-integration.md)。本轮已修复 mojie 请求重复/乱序及节点组解析、Trae 首条回复时间戳与虚假模型选择、桥接健康与进程归属；三家真实请求通过，Trae 当前只支持 `trae-desktop`。最终完整门禁为 63 suites / 1148 passed / 0 failed / 19 ignored / exit 0，三条显式实机 VPN 用例另验。当前 DSH GUI 热加载、系统代理/TUN、登录 token 交换与逐模型调用仍未作为通过结论。
+
+## R. 2026-10-13 聊天、评分与自动路由
+
+客户端接入模型按普通供应商参与原评分和自动路由：原配置保留 10 家，新增 Qoder、WorkBuddy、Trae、Qoder CLI 共 27 个模型，合计 14 家 / 156 个模型；27 个新增模型均被评分且可参选，登记前后 requests 均 95 行。聊天支持自动或供应商限定的模型、多轮、真实路由与用量反馈，切页保留进行中的请求，失败保留输入。最大 token 服从上游支持；Trae 的实际上下文仍由客户端管理。
+
+修复停用模型参选、评分预览与总开关/Custom/可用性不一致、流式绕过 CLI 绑定、并发额度占位与大 RPM 耗尽、失效凭据重复尝试、级联策略/游标/逐跳费用和健康统计、压缩与改写账号分派、聊天实际监听地址等缺陷。没有修改评分权重、策略参数、数据库表结构或增加 crate。最终完整 CI：65 组 Rust 结果，1,179 passed / 0 failed / 19 ignored，退出 0；浏览器 127 张截图。安装和桌面交付的最终证据见 [专项记录](2026-10-13-聊天与自动路由验收.md)。19 项忽略不作为通过；本机 27B 提示词改写实测超时，已验证安全回退。
+
 ## F. 本文的过期条件
 
 出现下列任一情况，本文即失效，必须重新盘点而不是直接沿用：
@@ -559,3 +571,53 @@ subscription-userinfo: upload=21606895115; download=22775131682; total=805306368
 3. `docs/0.3.0验证记录.md` 之后新增验证记录文件；
 4. **A2 的在途改动（开机自启 / Ollama options 透传 / Responses 协议）任一提交** —— 提交后 IPC 面的命令数会变（B18 过期），`mod autostart` 的结构也会变。**先跑 `git status --short` 确认工作区干净再按本文动手。**
 5. `models` 表新增 `capabilities_json` 列（D1 落地）—— §H.3 的资产清单与 §H.2 的缺口判定都要重算。
+
+## 2026-10-13 全项目完善与本机客户端用量
+
+十张顺序实施卡已完成；Codex/dsh/Qoder CLI 本机用量按需只读，保留未知值和部分结果，不与网关账本合并。聊天元数据/导出/IME、会话分页、Responses 工具流、非聊天计价、审计筛选分页、CLI 进程生命周期、VPN 有界响应和 Xray 只读归属诊断已修复。Rust 1234 passed / 0 failed / 19 ignored，68 组；Clippy 首次告警修正后通过，浏览器 134 新截图，安装版 24 项免费验收。Qoder 国际版今日 100 CREDITS 经已登录活动页领取成功，不代表网关自动签到。具体实现及限制见 [专项验收](2026-10-13-全项目完善与日志用量验收.md)。
+
+
+## 2026-10-14 持续目标与 WorkBuddy 独立授权后端
+
+最新S1/S6首批：能力来源保存、事实表、Ollama思考位与编辑器开关已实现并安装。72组摘要1331 passed/0 failed/19 ignored，另10条外部实际跳过；Clippy/fmt、139浏览器截图、10定向浏览器、4合成数据真实IPC和3真实账号/用量检查通过。199输入/21资源，新安装规范化EXE SHA256为b33f98c974e4a526f281e88e05952a158e1e210de0054ef911be223c2ece931e，原三账号、14/87/95、密钥/配置/首个失败收据前后摘要一致。参考[能力首批验收](2026-10-14-能力来源与事实展示验收.md)，不将首批通过写成S1/S6整卡或全平台模型完成。
+
+本节为前阶段历史结果。后续 WorkBuddy 登录页面、共享认证和五协议模型适配已进入实际 NSIS 安装包；全量 1320 passed / 0 failed / 19 ignored，另有 10 条真实跳过消息。正式及安装版原生页面各 5 项通过，实际资料/用量 3 项通过，均未发模型/领取请求。199 生产输入文件与 21 包资源校验通过；完整用户授权、真实刷新/模型、新日发放仍待验证。详见[最新模型直连与安装验收](2026-10-14-WorkBuddy模型直连与安装验收.md)。
+
+所有既有卡、已确认可优化项及真实交付缺口已归入[持续任务索引](持续目标与任务索引.md)。WorkBuddy国际版授权/取消/轮询/显式刷新后端已实现，17项新回归、29项相关回归通过；全量Rust 70组/1272 passed/0 failed/19 ignored，Clippy/fmt/debug build退出0。真实匿名start→pending→cancel验证客户端数0，无模型/领取/刷新；完整用户授权、真实刷新、登录页面和模型直连仍未完成。当前新源码未进入02:09已安装Trae修复版；原账号/配置/密钥/历史失败收据和安装版均保留。详细范围与证据见[阶段验收](2026-10-14-WorkBuddy独立授权后端验收.md)。
+
+
+## 2026-10-14 Qoder设备认证与WorkBuddy真实一次请求（最新在建阶段）
+
+上文各个版本的结果保留为历史。当前源码新加入Qoder两区独立设备认证/五IPC/后台命令/页面；显式ms有效期、身份核验、区域/代次CAS及取消/过期/刷新有19项专项通过，14浏览器专项及完整浏览器141张图退出0，独立只读复审无P1/P2。真实Qoder用户网页同意、刷新、jobToken/模型尚未验，新源码尚未完成本阶段安装。
+
+WorkBuddy完整用户官方网页登录已真实通过，原应用新加一个自有加密会话，27项真实目录可读。用户的一次模型授权已用于已安装S1版：deepseek-v4.1-flash，“只回复 OK”，单次上游HTTP400/code11128、零重试、无Done/回复/usage；不是模型调用成功或零费用证据。原收据SHA747efe9d01e8e6f1ca37e4affc58749c54670d4192d55160be06238df5f1c68d与原三权益认证/14/87/95/密钥/配置/Trae失败原件保留。
+
+生产WorkBuddy request_body发现缺首system合同，已仅在无首system时补中性消息并计入模型输入预算，完整原历史/工具/媒体保留；41项专项红绿及只读复审通过，五协议HTTP夹具现要求首system。最新完整Cargo为父目录qoder-workbuddy-full-tests-final.log，结果与安装未完成前不复用旧1350或1331作当前全量结论。普通test_provider直接走普通UpstreamClient，账号runtime测试入口不一致已入R5.6/UX3。
+
+本阶段最终完整1351/0/19、另10跳过，Clippy/fmt/141图、真实NSIS更新、201源/21资源、Qoder原生7/CLI5/两区匿名pending、WorkBuddy登录读回与窗口/healthz/监听归属均通过。详情与费用/真实范围见[2026-10-14-Qoder独立登录与WorkBuddy协议修复验收.md](2026-10-14-Qoder独立登录与WorkBuddy协议修复验收.md)。新Qoder真实登录/模型、WorkBuddy补system后真模型仍未通过；全目标未完成。
+
+后续R5.5 jobToken认证新增于src-tauri/src/qoder_auth/job.rs，并接四IPC/后台命令；不新增依赖/schema/路由参数。模型相对有效期按当前公开程序毫秒合同独立解析，设备仍为秒；持久加密单次预约、取消墓碑和设备/模型CAS禁止同代失败重放。31项专项通过，最新全量执行中；三项复审缺口已修复，最后提交后读取等待的回归须以新全量结果为准。后台入口仅证明凭据准备状态，inference_verified固定false；尚未真实Qoder授权/模型认证/推理，新源码也尚未安装。详情[Qoder模型认证阶段验收](2026-10-14-Qoder模型认证阶段验收.md)。
+
+
+2026-10-14 10:24 两区真实独立登录已完成；每区一次job签发后，新增job自身主体验证与旧pair verification_required兼容保护，真实一次refresh补验均成功。原资料/两份WorkBuddy失败收据保持完整，零Qoder模型/领取/自动重试。最新全量1367/0/19，另10真实外部跳过；新NSIS实际安装/21资源与MSI行政提取通过，202生产源，清单SHA d007dddd602324f6a038e2c255956663808e74d75bbe5e3e6ec865da99d44cbe。新格式旧二进制不可读，私有资料及旧安装备份已保留。证据与全部边界见[模型认证阶段验收](2026-10-14-Qoder模型认证阶段验收.md)，下一项签名目录/区域绑定/完整模型协议，全部目标active。
+
+
+2026-10-14 11:45 WorkBuddy第三次新增单次授权真实模型已通过：HTTP200/OK/stop/DONE1，输入14输出1总15、reported credit0，一条审计/一次attempt/零重试。正式注册24目录模型后15供应商/111模型/95原请求，旧各行完整保留；一次正式登录刷新及同一身份核验通过。三份模型收据原件保全，额外模型授权已使用，真实工具/媒体未验。Qoder独立COSY签名/codec管道11项离线通过，未打包/接Rust/发真实目录；最小私有签名上下文不含原始姓名邮箱。继续R5.5真实目录和完整模型协议。详见[WorkBuddy直连验收](2026-10-14-WorkBuddy模型直连与安装验收.md)。
+
+
+## 2026-10-14 12:22 独立目录阶段接续
+
+Qoder独立COSY认证已接Rust私有管道、固定区域目录GET、CLI --qoder-model-catalog/--qoder-signing-prepare及Tauri qoder_model_catalog。以自有资料的隔离克隆、真实debug二进制执行，两区分别仅读取一次官方目录：Global17/CN14；并验证本应用的job-signing私有加密上下文各一份，正式供应商/模型/请求/认证各表及config/master不变。无SDK/第三方客户端/本地HTTP桥接/第三方凭据读取，无模型、领取、认证刷新或自动重试。此前模型授权已消费；下一次收费模型请求需新的适用授权。
+
+签名用途绑定region/issuer/device代次/job access代次、账号/组织/自有安装UUID/有效期；只接受principal_verified，JobToken自身userinfo再次核验，组织标签使用该Bearer，隐私默认false且不发同意。Node纯原生crypto，env_clear、私有stdin/stdout/stderr，8MiB入/4MiB出/4KiB错误/10秒限制，超时及取消只清理自有进程。新安装仅包含cosy.cjs/worker.cjs，不含SDK/WASM/合成oracle。当前程序中公开WASM仅用于隔离合成对照。
+
+目录只返回模型ID/显示名/格式、声明的enabled/vision/thinking/free及credit_multiplier；缺失保留None。该倍率是积分倍率，不是现金价格。2MiB响应、固定区域主机、拒绝重定向/重试；签名前后和目录返回后检查认证代次/到期。公有DTO前拒绝明文认证、RSA封装key、encrypt_user_info及本次Authorization/Cosy-Key的反射。独立复审发现的缓存等待跨expiry和反射遗漏均以真实RED exit101暴露，修复后46项原生专项/0失败/0忽略；40脚本/23语法/13夹具，tsc/Vite、Clippy、112 Rust日志扫描+11自测、10规划和28手册章节门禁通过。
+
+完整Cargo session64941当前仍编译执行，不能把专项46视为完整通过；本阶段安装尚未执行，正式安装仍是此前1367回归/202源/21资源版。release:prepare新211源和两签名资源已备齐，安装/原生IPC/MSI提取脚本已准备。真实目录成功不代表模型推理、完整历史、工具/媒体、usage或event:finish权威终态已验证。下一阶段独立模型协议仍需完成；不注册尚不能调用的Qoder供应商。
+
+12:05任务已实际自动领取两区各100积分，平台granted且非replayed；Trae原00:05失败收据仍保留，总任务exit1仅反映该旧失败，无重复领取。正式WorkBuddy第三次请求HTTP200/OK/14输入1输出且授权已用，三原收据不可重放。当前正式15供应商/111模型/95请求；全部R5/S/UX/N/V与原18卡目标active。
+
+聊天持久化成功压缩12次，最后2026-10-14T03:49:53.577Z。仍无原生创建/交接/归档工具，先前后台入口拒绝，未完成原生轮转；沿已有交接继续独立工作，不使用独立app-server模型控制器替代桌面。
+
+
+2026-10-14 13:04 默认并行全量最终通过：72组1381 passed/0failed/19ignored，另10外部服务缺席的字面跳过，不能作外部真机通过；Clippy/fmt0。首次两份默认并行失败日志保留，路由夹具三个确定隔离缺口已修并通过16项默认并行，首事故当时根因仍不追认。新安装版211生产源/23资源、两区目录17/14、真实原生IPC4项、自有应用退出及正式资料/收据/双触发保护均通过；没有新增模型请求。真实目录认证阶段完成，完整模型协议继续实施。源码未提交推送。

@@ -60,3 +60,27 @@
 .explain-table th { color: var(--muted); font-weight: 500; }
 .explain-total td { font-weight: 600; border-top: 1px solid var(--border); }
 .explain-candidate code { font-size: 11px; }
+
+.capability-facts { min-width: 0; padding: 18px; border: 1px solid var(--border); border-radius: 11px; }
+.facts-heading { display: flex; gap: 20px; align-items: flex-start; justify-content: space-between; }
+.facts-heading h3 { font-size: 15px; margin: 0; }
+.facts-heading label { flex: 0 0 230px; display: grid; gap: 6px; font-size: 12px; }
+.facts-heading input { width: 100%; min-width: 0; box-sizing: border-box; }
+.facts-table-scroll { max-width: 100%; overflow-x: auto; margin-top: 15px; }
+.facts-table { width: 100%; min-width: 820px; border-collapse: collapse; font-size: 12px; }
+.facts-table th, .facts-table td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.facts-table th { color: var(--muted); font-weight: 500; }
+.facts-table td:first-child { overflow-wrap: anywhere; max-width: 220px; }
+.facts-table small { display: block; color: var(--muted); line-height: 1.7; }
+.facts-pagination { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.facts-pagination > span:first-child { margin-right: auto; }
+.capabilities-page { min-width: 0; }
+@media (max-width: 700px) {
+  .facts-heading { flex-direction: column; gap: 12px; }
+  .facts-heading label { flex-basis: auto; width: 100%; }
+  .capability-facts { padding: 12px; }
+  .explain-input { flex-wrap: wrap; }
+  .explain-input input { min-width: 0; max-width: 100%; flex: 1; }
+  .explain-candidate summary { flex-wrap: wrap; overflow-wrap: anywhere; }
+  .explain-candidate, .pareto-section { min-width: 0; overflow-x: auto; }
+}

@@ -2,12 +2,193 @@
 
 use chrono::Utc;
 use serde::Serialize;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::domain::*;
 use crate::error::Result;
 
 /* ------------------------------- Providers ------------------------------- */
+
+fn desktop_bridge_name(kind: &str) -> Result<&'static str> {
+    match kind {
+        "qoder" => Ok("Qoder"),
+        "workbuddy" => Ok("WorkBuddy"),
+        "trae" => Ok("Trae CN"),
+        _ => Err(crate::error::GatewayError::Protocol("未知客户端".into())),
+    }
+}
+
+fn desktop_bridge_identity(kind: &str, id: &str, note: Option<&str>) -> bool {
+    let prefix = format!("p-client-{kind}-");
+    let owned_id = id.strip_prefix(&prefix).is_some_and(|suffix| {
+        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    owned_id || note == Some(format!("由客户端接入登记（{kind}）").as_str())
+}
+
+/// Move only addresses still managed by the bridge settings. The caller owns the
+/// transaction so a settings-write failure can roll back the provider updates.
+pub async fn migrate_desktop_bridge_port(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    kind: &str,
+    old_port: u16,
+    new_port: u16,
+) -> Result<u64> {
+    desktop_bridge_name(kind)?;
+    if old_port == 0 || new_port == 0 {
+        return Err(crate::error::GatewayError::Protocol("桥接端口无效".into()));
+    }
+    if old_port == new_port {
+        return Ok(0);
+    }
+    let old_url = format!("http://127.0.0.1:{old_port}/v1");
+    let new_url = format!("http://127.0.0.1:{new_port}/v1");
+    let rows = sqlx::query("SELECT id,note FROM providers WHERE base_url=? AND runtime_id IS NULL AND dialect='openai'")
+        .bind(&old_url).fetch_all(&mut **tx).await?;
+    let mut changed = 0;
+    for row in rows {
+        let id: String = row.get("id");
+        let note: Option<String> = row.get("note");
+        if desktop_bridge_identity(kind, &id, note.as_deref()) {
+            changed += sqlx::query(
+                "UPDATE providers SET base_url=?,updated_at=? WHERE id=? AND base_url=?",
+            )
+            .bind(&new_url)
+            .bind(Utc::now())
+            .bind(&id)
+            .bind(&old_url)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+        }
+    }
+    Ok(changed)
+}
+
+/// Reconnect adds newly discovered bridge models without overwriting any user settings.
+pub async fn register_desktop_bridge(
+    pool: &SqlitePool,
+    kind: &str,
+    port: u16,
+    models: &[String],
+) -> Result<String> {
+    let name = desktop_bridge_name(kind)?;
+    if port == 0
+        || models.is_empty()
+        || models.len() > 512
+        || models
+            .iter()
+            .any(|m| m.trim().is_empty() || m.len() > 512 || m.chars().any(char::is_control))
+    {
+        return Err(crate::error::GatewayError::Protocol(
+            "桥接模型目录无效".into(),
+        ));
+    }
+    let marker = format!("由客户端接入登记（{kind}）");
+    let url = format!("http://127.0.0.1:{port}/v1");
+    let now = Utc::now();
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query("SELECT id,base_url,note FROM providers WHERE runtime_id IS NULL AND dialect='openai' ORDER BY created_at,id")
+        .fetch_all(&mut *tx).await?;
+    let owned: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            desktop_bridge_identity(
+                kind,
+                &row.get::<String, _>("id"),
+                row.get::<Option<String>, _>("note").as_deref(),
+            )
+        })
+        .collect();
+    let existing = owned
+        .iter()
+        .find(|row| row.get::<String, _>("base_url") == url);
+    let id = if let Some(row) = existing {
+        row.get::<String, _>("id")
+    } else {
+        if !owned.is_empty() {
+            return Err(crate::error::GatewayError::Protocol(
+                "该客户端已登记到其他地址，请在供应商页核对现有地址；原配置保留".into(),
+            ));
+        }
+        let id = format!("p-client-{kind}-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO providers(id,name,dialect,base_url,api_key_enc,enabled,priority,rpm_limit,intelligence,note,created_at,updated_at) VALUES(?,?,'openai',?,'',1,30,?,60,?,?,?)")
+            .bind(&id).bind(format!("{name} 桌面桥接")).bind(&url).bind(if kind == "trae" { 1_i64 } else { 0 })
+            .bind(&marker).bind(now).bind(now).execute(&mut *tx).await?;
+        id
+    };
+    for model in models {
+        // Compare upstream too: renamed aliases must not create duplicate model entries.
+        sqlx::query("INSERT INTO models(id,provider_id,alias,upstream,context_window,supports_tools,supports_vision,supports_audio,supports_video,supports_thinking,supports_stream,enabled) SELECT ?,?,?,?,32768,0,0,0,0,0,1,1 WHERE NOT EXISTS(SELECT 1 FROM models WHERE provider_id=? AND (upstream=? OR alias=?))")
+            .bind(format!("m-{}", uuid::Uuid::new_v4().simple())).bind(&id).bind(format!("{kind}/{model}")).bind(model)
+            .bind(&id).bind(model).bind(format!("{kind}/{model}")).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Single transaction for built-in Qoder onboarding; repeats preserve user edits.
+pub async fn register_desktop_qoder(
+    pool: &SqlitePool,
+    executable: &str,
+    base_url: &str,
+) -> Result<String> {
+    let stem = std::path::Path::new(executable)
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let kind = if matches!(stem.as_str(), "qodercn" | "qoderclicn") {
+        "qoder-cn"
+    } else {
+        "qoder"
+    };
+    let mut tx = pool.begin().await?;
+    let runtime = sqlx::query(
+        "SELECT kind, enabled, options_json FROM agent_runtimes WHERE id = 'desktop-qoder'",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = runtime {
+        let options = row
+            .get::<Option<String>, _>("options_json")
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        if row.get::<String, _>("kind") != kind
+            || row.get::<i64, _>("enabled") != 1
+            || options.as_ref().and_then(|o| o["executable"].as_str()) != Some(executable)
+        {
+            return Err(crate::error::GatewayError::Other(anyhow::anyhow!(
+                "desktop-qoder 运行时已有其他设置，请在供应商页核对；原设置保留"
+            )));
+        }
+    } else {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO agent_runtimes(id,kind,label,options_json,enabled,created_at,updated_at) VALUES('desktop-qoder',?,'Qoder 本机 CLI',?,1,?,?)")
+            .bind(kind).bind(serde_json::json!({"executable":executable}).to_string()).bind(&now).bind(&now).execute(&mut *tx).await?;
+    }
+    let id = "p-desktop-qoder";
+    let marker = "由客户端接入登记（qoder-cli）";
+    if let Some(row) = sqlx::query("SELECT runtime_id FROM providers WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        if row.get::<Option<String>, _>("runtime_id").as_deref() != Some("desktop-qoder") {
+            return Err(crate::error::GatewayError::Other(anyhow::anyhow!(
+                "Qoder 登记标识已被其他供应商使用，请在供应商页核对；原配置保留"
+            )));
+        }
+        tx.commit().await?;
+        return Ok(id.into());
+    }
+    let now = Utc::now();
+    sqlx::query("INSERT INTO providers(id,name,dialect,base_url,api_key_enc,enabled,priority,rpm_limit,intelligence,note,runtime_id,created_at,updated_at) VALUES(?,'Qoder 本机 CLI','openai',?,'',1,30,0,60,?,'desktop-qoder',?,?)")
+        .bind(id).bind(base_url).bind(marker).bind(now).bind(now).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO models(id,provider_id,alias,upstream,context_window,supports_stream) VALUES('m-desktop-qoder-auto',?,'qoder-cli-auto','auto',32768,0)")
+        .bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(id.into())
+}
 
 pub async fn list_providers(pool: &SqlitePool) -> Result<Vec<Provider>> {
     let rows = sqlx::query(
@@ -22,25 +203,29 @@ pub async fn list_providers(pool: &SqlitePool) -> Result<Vec<Provider>> {
     for r in rows {
         let pid: String = r.get("id");
         let models = list_models_of(pool, &pid).await?;
-        out.push(Provider {
-            id: pid,
-            name: r.get("name"),
-            dialect: parse_dialect(&r.get::<String, _>("dialect")),
-            base_url: r.get("base_url"),
-            api_key_enc: r.get("api_key_enc"),
-            enabled: r.get::<i64, _>("enabled") == 1,
-            priority: r.get("priority"),
-            models,
-            rpm_limit: r.get("rpm_limit"),
-            intelligence: r.get("intelligence"),
-            note: r.get("note"),
-            // 任务卡二 A5：老行是 NULL ⇒ `None` ⇒ 走原有 HTTP 直连路径。
-            runtime_id: r.get("runtime_id"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        });
+        out.push(read_provider(&r, models));
     }
     Ok(out)
+}
+
+fn read_provider(r: &sqlx::sqlite::SqliteRow, models: Vec<ModelRef>) -> Provider {
+    Provider {
+        id: r.get("id"),
+        name: r.get("name"),
+        dialect: parse_dialect(&r.get::<String, _>("dialect")),
+        base_url: r.get("base_url"),
+        api_key_enc: r.get("api_key_enc"),
+        enabled: r.get::<i64, _>("enabled") == 1,
+        priority: r.get("priority"),
+        models,
+        rpm_limit: r.get("rpm_limit"),
+        intelligence: r.get("intelligence"),
+        note: r.get("note"),
+        // 任务卡二 A5：老行是 NULL ⇒ `None` ⇒ 走原有 HTTP 直连路径。
+        runtime_id: r.get("runtime_id"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    }
 }
 
 fn parse_dialect(s: &str) -> Dialect {
@@ -63,6 +248,14 @@ fn dialect_str(d: Dialect) -> &'static str {
 }
 
 pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<ModelRef>> {
+    let mut connection = pool.acquire().await?;
+    list_models_on(&mut connection, provider_id).await
+}
+
+async fn list_models_on(
+    connection: &mut SqliteConnection,
+    provider_id: &str,
+) -> Result<Vec<ModelRef>> {
     let rows = sqlx::query(
         r#"SELECT alias, upstream, context_window, supports_tools, supports_vision,
                   supports_audio, supports_video, supports_thinking, supports_stream, model_type,
@@ -71,7 +264,7 @@ pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<
            FROM models WHERE provider_id = ?"#,
     )
     .bind(provider_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     Ok(rows
         .into_iter()
@@ -132,6 +325,17 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
 }
 
 async fn save_provider(pool: &SqlitePool, p: &Provider, preserve_runtime: bool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    save_provider_on(&mut tx, p, preserve_runtime).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn save_provider_on(
+    connection: &mut SqliteConnection,
+    p: &Provider,
+    preserve_runtime: bool,
+) -> Result<()> {
     let now = Utc::now();
     sqlx::query(
         r#"INSERT INTO providers
@@ -162,47 +366,133 @@ async fn save_provider(pool: &SqlitePool, p: &Provider, preserve_runtime: bool) 
     .bind(now)
     .bind(now)
     .bind(preserve_runtime)
-    .execute(pool)
+    .execute(&mut *connection)
+    .await?;
+
+    // The provider write above holds SQLite's writer reservation. Read sources
+    // inside this transaction so a concurrent import is either already included
+    // or waits until the whole settings save commits.
+    let previous = sqlx::query(
+        "SELECT alias,upstream,upstream_path,model_type,capability_sources_json,capabilities_json \
+         FROM models WHERE provider_id=?",
+    )
+    .bind(&p.id)
+    .fetch_all(&mut *connection)
     .await?;
 
     // 模型列表整体替换，简单且不会留下孤儿
     sqlx::query("DELETE FROM models WHERE provider_id = ?")
         .bind(&p.id)
-        .execute(pool)
+        .execute(&mut *connection)
         .await?;
     for m in &p.models {
-        let price = m
-            .price
-            .as_ref()
-            .filter(|price| price.is_valid())
-            .and_then(|price| serde_json::to_string(price).ok());
-        let overrides = m
-            .overrides
-            .as_ref()
-            .filter(|overrides| !overrides.is_empty())
-            .and_then(|overrides| serde_json::to_string(overrides).ok());
-        let local = m
-            .local
-            .as_ref()
-            .filter(|local| !local.runtime.trim().is_empty())
-            .and_then(|local| serde_json::to_string(local).ok());
-        // D1：**必须一起写**。`upsert_provider` 是 DELETE 后重插，
-        // INSERT 不写这一列的话会落 NULL —— 于是「在编辑器里点一次保存，
-        // 刚标定的模型能力就全没了」。`enabled` 字段的注释记着同款事故。
-        let capabilities = m
-            .capabilities
-            .as_ref()
-            .and_then(|c| serde_json::to_string(c).ok());
-        sqlx::query(
-            r#"INSERT OR REPLACE INTO models
+        insert_model_on(connection, &p.id, m, true).await?;
+        let same_target = |row: &&sqlx::sqlite::SqliteRow| {
+            row.get::<String, _>("upstream") == m.upstream
+                && row.get::<Option<String>, _>("upstream_path") == m.upstream_path
+                && row.get::<String, _>("model_type") == m.model_type.code()
+        };
+        let matching: Vec<_> = previous.iter().filter(same_target).collect();
+        let exact = matching
+            .iter()
+            .copied()
+            .find(|row| row.get::<String, _>("alias") == m.alias);
+        // A rename can carry the ledger only when both old and new lists have
+        // exactly one entry for this target. Duplicate aliases never borrow a
+        // different model entry's evidence.
+        let source = exact.or_else(|| {
+            let new_count = p
+                .models
+                .iter()
+                .filter(|other| {
+                    other.upstream == m.upstream
+                        && other.upstream_path == m.upstream_path
+                        && other.model_type == m.model_type
+                })
+                .count();
+            (matching.len() == 1 && new_count == 1).then(|| matching[0])
+        });
+        if let Some(row) = source {
+            if let Some(raw) = row.get::<Option<String>, _>("capability_sources_json") {
+                // Preserve the raw ledger, including future fields and the
+                // existing invalid-JSON read fallback. Its resolved values come
+                // from the same database snapshot, not a stale editor payload.
+                sqlx::query(
+                    "UPDATE models SET capability_sources_json=?,capabilities_json=? \
+                     WHERE provider_id=? AND alias=?",
+                )
+                .bind(raw)
+                .bind(row.get::<Option<String>, _>("capabilities_json"))
+                .bind(&p.id)
+                .bind(&m.alias)
+                .execute(&mut *connection)
+                .await?;
+            }
+        } else if previous.iter().any(|row| {
+            row.get::<Option<String>, _>("capability_sources_json")
+                .is_some()
+        }) {
+            // Editor payloads also carry the old ledger's resolved scores.
+            // When identity changed or a rename is ambiguous, neither column
+            // can be attributed to the replacement. Even alias and upstream
+            // may both have changed, and a concurrent import may have changed
+            // the old scores. Do not guess ancestry from score equality.
+            // New evidence belongs in the explicit capability import/write
+            // path. Providers without an old ledger keep flat-only compatibility.
+            sqlx::query("UPDATE models SET capabilities_json=NULL WHERE provider_id=? AND alias=?")
+                .bind(&p.id)
+                .bind(&m.alias)
+                .execute(&mut *connection)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn insert_model_on(
+    connection: &mut SqliteConnection,
+    provider_id: &str,
+    m: &ModelRef,
+    replace: bool,
+) -> Result<()> {
+    let price = m
+        .price
+        .as_ref()
+        .filter(|price| price.is_valid())
+        .and_then(|price| serde_json::to_string(price).ok());
+    let overrides = m
+        .overrides
+        .as_ref()
+        .filter(|overrides| !overrides.is_empty())
+        .and_then(|overrides| serde_json::to_string(overrides).ok());
+    let local = m
+        .local
+        .as_ref()
+        .filter(|local| !local.runtime.trim().is_empty())
+        .and_then(|local| serde_json::to_string(local).ok());
+    // D1：**必须一起写**。`upsert_provider` 是 DELETE 后重插，
+    // INSERT 不写这一列的话会落 NULL —— 于是「在编辑器里点一次保存，
+    // 刚标定的模型能力就全没了」。`enabled` 字段的注释记着同款事故。
+    let capabilities = m
+        .capabilities
+        .as_ref()
+        .and_then(|c| serde_json::to_string(c).ok());
+    let insert = if replace {
+        "INSERT OR REPLACE"
+    } else {
+        "INSERT"
+    };
+    let statement = format!(
+        r#"{insert} INTO models
                  (id, provider_id, alias, upstream, context_window, supports_tools, supports_vision,
                   supports_audio, supports_video, supports_thinking, supports_stream, model_type,
                    upstream_path, price_json, overrides_json, local_json, enabled,
                    capabilities_json)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
-        )
-        .bind(format!("{}:{}", p.id, m.alias))
-        .bind(&p.id)
+    );
+    sqlx::query(&statement)
+        .bind(format!("{}:{}", provider_id, m.alias))
+        .bind(provider_id)
         .bind(&m.alias)
         .bind(&m.upstream)
         .bind(m.context_window)
@@ -219,10 +509,193 @@ async fn save_provider(pool: &SqlitePool, p: &Provider, preserve_runtime: bool) 
         .bind(local)
         .bind(m.enabled as i64)
         .bind(capabilities)
-        .execute(pool)
+        .execute(&mut *connection)
         .await?;
-    }
     Ok(())
+}
+
+/// Register an account's direct model provider atomically. Reconnecting only
+/// appends unseen upstream IDs; existing configuration and model rows remain intact.
+pub async fn register_workbuddy_provider(
+    pool: &SqlitePool,
+    proposed: &Provider,
+    runtime: &AgentRuntime,
+) -> Result<Provider> {
+    register_direct_account_provider(
+        pool,
+        proposed,
+        runtime,
+        "workbuddy-model",
+        crate::workbuddy_auth::WorkBuddyAuth::issuer(),
+    )
+    .await
+}
+
+pub async fn register_qoder_provider(
+    pool: &SqlitePool,
+    proposed: &Provider,
+    runtime: &AgentRuntime,
+    region: crate::qoder_auth::Region,
+) -> Result<Provider> {
+    let (bound, _, _) = crate::agent_upstream::runtime::qoder_options(runtime.options.as_ref())
+        .map_err(crate::error::GatewayError::Protocol)?;
+    if bound != region {
+        return Err(crate::error::GatewayError::Protocol(
+            "Qoder登记区域与账号运行时不一致".into(),
+        ));
+    }
+    register_direct_account_provider(
+        pool,
+        proposed,
+        runtime,
+        "qoder-model",
+        region.model_origin(),
+    )
+    .await
+    .map_err(|e| match e {
+        crate::error::GatewayError::Protocol(message) => {
+            crate::error::GatewayError::Protocol(message.replace("WorkBuddy", "Qoder"))
+        }
+        error => error,
+    })
+}
+
+fn direct_account_identity(kind: &str, options: Option<&serde_json::Value>) -> Result<String> {
+    match kind {
+        "workbuddy-model" => crate::agent_upstream::runtime::workbuddy_options(options)
+            .map(|(account, _)| account)
+            .map_err(crate::error::GatewayError::Protocol),
+        "qoder-model" => crate::agent_upstream::runtime::qoder_options(options)
+            .map(|(region, account, _)| format!("{region:?}\0{account}"))
+            .map_err(crate::error::GatewayError::Protocol),
+        _ => Err(crate::error::GatewayError::Protocol(
+            "不支持的独立账号运行时类型".into(),
+        )),
+    }
+}
+
+async fn register_direct_account_provider(
+    pool: &SqlitePool,
+    proposed: &Provider,
+    runtime: &AgentRuntime,
+    kind: &str,
+    origin: &str,
+) -> Result<Provider> {
+    let invalid = |message: String| crate::error::GatewayError::Protocol(message);
+    runtime.validate().map_err(invalid)?;
+    if runtime.kind != kind {
+        return Err(invalid(
+            "WorkBuddy 登记只接受 workbuddy-model 运行时".into(),
+        ));
+    }
+    let account_id = direct_account_identity(kind, runtime.options.as_ref())?;
+    if proposed.id.trim().is_empty()
+        || proposed.runtime_id.as_deref() != Some(runtime.id.as_str())
+        || proposed.base_url != origin
+        || proposed.dialect != Dialect::OpenAI
+        || !proposed.api_key_enc.is_empty()
+    {
+        return Err(invalid(
+            "WorkBuddy 供应商必须绑定对应账号运行时和固定直连地址，且不存 API Key".into(),
+        ));
+    }
+    if proposed.models.is_empty()
+        || proposed.models.len() > 512
+        || proposed.models.iter().any(|model| {
+            [&model.alias, &model.upstream].iter().any(|value| {
+                value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+            })
+        })
+    {
+        return Err(invalid("WorkBuddy 模型目录无效".into()));
+    }
+
+    // Acquire the SQLite write reservation before reading, so concurrent edits
+    // finish before the configuration snapshot used for collision checks.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let existing_runtime = sqlx::query(
+        "SELECT id,kind,label,options_json,enabled,created_at,updated_at FROM agent_runtimes WHERE id=?",
+    )
+    .bind(&runtime.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = &existing_runtime {
+        let raw = row.get::<Option<String>, _>("options_json");
+        let options = raw
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(|_| invalid("WorkBuddy 运行时已有无效配置，原配置保留".into()))?;
+        let existing_account = direct_account_identity(kind, options.as_ref())?;
+        if row.get::<String, _>("kind") != runtime.kind || existing_account != account_id {
+            return Err(invalid(
+                "WorkBuddy 运行时标识已被其他账号或适配器使用，原配置保留".into(),
+            ));
+        }
+    }
+    let existing_provider = sqlx::query(
+        "SELECT id,name,dialect,base_url,api_key_enc,enabled,priority,rpm_limit,intelligence,note,runtime_id,created_at,updated_at FROM providers WHERE id=?",
+    )
+    .bind(&proposed.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = &existing_provider {
+        if row.get::<Option<String>, _>("runtime_id").as_deref() != Some(runtime.id.as_str())
+            || row.get::<String, _>("base_url") != proposed.base_url
+            || row.get::<String, _>("dialect") != "openai"
+            || !row.get::<String, _>("api_key_enc").is_empty()
+        {
+            return Err(invalid(
+                "WorkBuddy 供应商标识已被其他运行时或地址使用，原配置保留".into(),
+            ));
+        }
+    }
+    let models = list_models_on(&mut tx, &proposed.id).await?;
+    if existing_runtime.is_none() {
+        sqlx::query("INSERT INTO agent_runtimes(id,kind,label,options_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&runtime.id)
+            .bind(&runtime.kind)
+            .bind(&runtime.label)
+            .bind(runtime.options.as_ref().map(serde_json::Value::to_string))
+            .bind(runtime.enabled as i64)
+            .bind(runtime.created_at.to_rfc3339())
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+    }
+    if existing_provider.is_none() {
+        let mut empty = proposed.clone();
+        empty.models.clear();
+        save_provider_on(&mut tx, &empty, false).await?;
+    }
+    let mut upstreams: std::collections::HashSet<_> =
+        models.iter().map(|model| model.upstream.clone()).collect();
+    let mut aliases: std::collections::HashSet<_> =
+        models.iter().map(|model| model.alias.clone()).collect();
+    for proposed_model in &proposed.models {
+        if !upstreams.insert(proposed_model.upstream.clone()) {
+            continue;
+        }
+        let mut model = proposed_model.clone();
+        let mut suffix = 2;
+        while aliases.contains(&model.alias) {
+            model.alias = format!("{}-{suffix}", proposed_model.alias);
+            suffix += 1;
+        }
+        aliases.insert(model.alias.clone());
+        // No REPLACE: even an unexpected global model-ID collision must fail
+        // without removing another provider's model.
+        insert_model_on(&mut tx, &proposed.id, &model, false).await?;
+    }
+    let row = sqlx::query(
+        "SELECT id,name,dialect,base_url,api_key_enc,enabled,priority,rpm_limit,intelligence,note,runtime_id,created_at,updated_at FROM providers WHERE id=?",
+    )
+    .bind(&proposed.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let actual = read_provider(&row, list_models_on(&mut tx, &proposed.id).await?);
+    tx.commit().await?;
+    Ok(actual)
 }
 
 /* ------------------------- D1 模型级能力分 ------------------------- */
@@ -645,10 +1118,8 @@ pub async fn query_requests_for_export(
 /// 是没有意义的（USD 100 + CNY 100 ≠ 200）。判定方按 Key 自己的
 /// `budget_currency` 去取对应那一组，见 `budget::spent_in_currency`。
 ///
-/// 只统计**成功**的请求：失败的请求没有真实消费，把 4xx/5xx 的
-/// `cost` 也算进去会让预算被"幽灵消费"顶满。
-/// 但要保留 `cost IS NOT NULL` 这一条 —— 没配价格的请求 cost 为 NULL，
-/// 它们本来就不该参与金额累计（它们也没花钱）。
+/// 统计已知费用，包括级联中前序成功、最终失败的请求所产生的消费。
+/// `cost IS NOT NULL` 排除未知金额；未知不代表免费，也不能凭空计入金额。
 pub async fn sum_cost_by_currency_for_key(
     pool: &SqlitePool,
     key_id: &str,
@@ -800,6 +1271,54 @@ pub async fn set_session_title_if_empty(
     .await?;
 
     Ok((result.rows_affected() == 1).then_some(now))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionMessagesPage {
+    pub rows: Vec<SessionMessage>,
+    pub has_more: bool,
+    pub next_cursor: Option<i64>,
+}
+
+/// Management history includes compacted messages. The exclusive ID cursor is stable across appends.
+pub async fn session_messages_page(
+    pool: &SqlitePool,
+    session_id: &str,
+    after_id: Option<i64>,
+    limit: i64,
+) -> Result<SessionMessagesPage> {
+    let after_id = after_id.unwrap_or(0);
+    if after_id < 0 {
+        return Err(crate::error::GatewayError::Protocol(
+            "消息游标不能为负数".into(),
+        ));
+    }
+    let limit = limit.clamp(1, 500);
+    let mut rows: Vec<_> = sqlx::query(
+        r#"SELECT id, session_id, role, content, tool_calls, tool_call_id, name,
+                  routed_provider, routed_model, compacted, prompt_tokens, completion_tokens, created_at
+           FROM session_messages WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?"#,
+    )
+    .bind(session_id)
+    .bind(after_id)
+    .bind(limit + 1)
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(row_to_msg)
+    .collect();
+    let has_more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next_cursor = if has_more {
+        rows.last().map(|row| row.id)
+    } else {
+        None
+    };
+    Ok(SessionMessagesPage {
+        rows,
+        has_more,
+        next_cursor,
+    })
 }
 
 /// 取最近 N 条未被压缩的消息（按 id 升序），用于拼装上游请求
@@ -1385,6 +1904,26 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
     log_request_at(pool, Utc::now().timestamp(), log).await
 }
 
+#[derive(Clone)]
+pub struct UsageEntry {
+    pub provider_id: String,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub cost: Option<f64>,
+    pub currency: Option<String>,
+    pub errors: i64,
+}
+
+/// One gateway request, with separately attributed upstream calls for daily usage.
+pub async fn log_request_with_usage(
+    pool: &SqlitePool,
+    log: RequestLog<'_>,
+    usage: &[UsageEntry],
+) -> Result<()> {
+    log_request_internal(pool, Utc::now().timestamp(), log, Some(usage)).await
+}
+
 /// 与 [`log_request`] 相同，但**时间戳由调用方给**。
 ///
 /// 存在的理由：审计的时间区间过滤、月份切换、分页顺序都要靠不同的 `ts`
@@ -1392,6 +1931,16 @@ pub async fn log_request(pool: &SqlitePool, log: RequestLog<'_>) -> Result<()> {
 /// 那既慢又不稳（CLAUDE.md 第 11 条的同款教训：时间夹具不能靠等）。
 /// 生产路径仍然走 [`log_request`]。
 pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> Result<()> {
+    log_request_internal(pool, ts, log, None).await
+}
+
+async fn log_request_internal(
+    pool: &SqlitePool,
+    ts: i64,
+    log: RequestLog<'_>,
+    usage: Option<&[UsageEntry]>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
     // D4 ③：这次请求有没有**点名**具体模型（`auto` / `smart` 这类虚拟名不算）。
     //
     // 在这里算而不是让 9 个调用点各传一个布尔：那个值完全由
@@ -1467,7 +2016,7 @@ pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> 
     // 级联信息只有 `normal_dispatch` 知道，算不出来。
     .bind(log.route.cascade_attempts)
     .bind(log.route.cascade_stop.as_deref())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     // 日粒度聚合，供用量看板直接查，不用每次扫全表。
@@ -1477,10 +2026,21 @@ pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> 
         .unwrap_or_else(Utc::now)
         .format("%Y-%m-%d")
         .to_string();
-    let pid = log.routed_provider.unwrap_or("unknown");
-    let mid = log.routed_model.unwrap_or("unknown");
-    let currency = log.currency.unwrap_or("");
-    sqlx::query(
+    let default_usage = [UsageEntry {
+        provider_id: log.routed_provider.unwrap_or("unknown").into(),
+        model: log.routed_model.unwrap_or("unknown").into(),
+        prompt_tokens: log.prompt_tokens,
+        completion_tokens: log.completion_tokens,
+        cost: log.cost,
+        currency: log.currency.map(str::to_owned),
+        errors: if log.status.unwrap_or(200) >= 400 {
+            1
+        } else {
+            0
+        },
+    }];
+    for entry in usage.unwrap_or(&default_usage) {
+        sqlx::query(
         r#"INSERT INTO usage_daily (day, provider_id, model, currency, requests, prompt_tokens, completion_tokens, errors, cost)
            VALUES (?,?,?,?,1,?,?,?,?)
            ON CONFLICT(day, provider_id, model, currency) DO UPDATE SET
@@ -1490,17 +2050,18 @@ pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> 
              errors = errors + excluded.errors,
              cost = cost + excluded.cost"#,
     )
-    .bind(day)
-    .bind(pid)
-    .bind(mid)
-    .bind(currency)
-    .bind(log.prompt_tokens)
-    .bind(log.completion_tokens)
-    .bind(if log.status.unwrap_or(200) >= 400 { 1 } else { 0 })
-    .bind(log.cost.unwrap_or(0.0))
-    .execute(pool)
+    .bind(&day)
+    .bind(&entry.provider_id)
+    .bind(&entry.model)
+    .bind(entry.currency.as_deref().unwrap_or(""))
+    .bind(entry.prompt_tokens)
+    .bind(entry.completion_tokens)
+    .bind(entry.errors)
+    .bind(entry.cost.unwrap_or(0.0))
+    .execute(&mut *tx)
     .await?;
-
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1915,9 +2476,12 @@ pub async fn list_routable_providers(pool: &SqlitePool) -> Result<Vec<Provider>>
     Ok(list_providers(pool)
         .await?
         .into_iter()
-        .map(|mut p| {
+        .filter_map(|mut p| {
+            let had_models = !p.models.is_empty();
             p.models.retain(|m| m.enabled);
-            p
+            // Preserve the legacy truly-empty provider default, but never revive
+            // an explicitly configured provider whose models were all disabled.
+            (!had_models || !p.models.is_empty()).then_some(p)
         })
         .collect())
 }

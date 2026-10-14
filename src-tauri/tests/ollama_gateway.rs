@@ -138,6 +138,8 @@ fn ollama_non_stream_response_preserves_tool_calls_and_usage() {
                 total_tokens: 18,
                 ..Default::default()
             }),
+            reasoning_content: None,
+            refusal: None,
         },
         "llama3.3",
     );

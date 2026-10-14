@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from "react";
+import ClientUsagePanel from "./ClientUsagePanel";
 import { api, AttemptRecord, AuditFilter, formatMoney, RequestLog, SpendBucket, SpendByDimension, SpendDaily, StatsOverview, TokenCalibration } from "../api";
 
 function errorText(error: unknown) {
@@ -89,11 +90,28 @@ export default function StatsPage() {
   const [total, setTotal] = useState(0);
   const [truncated, setTruncated] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [fromTime, setFromTime] = useState("");
+  const [toTime, setToTime] = useState("");
+  const [timeError, setTimeError] = useState<string | null>(null);
+  const pageOffset = filter.offset ?? 0;
 
   const patchFilter = (next: Partial<AuditFilter>) =>
     // 换条件时**必须回到第一页**：留在第 3 页而结果只剩 5 条，
     // 用户会看到一张空表，以为「没有记录」。
     setFilter((prev) => ({ ...prev, ...next, offset: 0 }));
+
+  const changeTimes = (from: string, to: string) => {
+    setFromTime(from); setToTime(to);
+    const start = from ? new Date(from).getTime() / 1000 : null;
+    const end = to ? new Date(to).getTime() / 1000 : null;
+    if ((start !== null && !Number.isFinite(start)) || (end !== null && !Number.isFinite(end)) ||
+        (start !== null && end !== null && start > end)) {
+      setTimeError("开始时间不能晚于结束时间；列表仍显示上次有效筛选结果。"); return;
+    }
+    setTimeError(null);
+    patchFilter({ from_ts: start, to_ts: end });
+  };
+  useEffect(() => { setExpanded(null); }, [filter]);
 
   const load = () => loadRef.current();
 
@@ -172,7 +190,7 @@ export default function StatsPage() {
       });
       // 用户取消 → 什么都不做，也不报错（取消不是失败）
       if (!dest || !isCurrent()) return;
-      const result = await api.exportRequests(filter, format, dest);
+      const result = await api.exportRequests({ ...filter, offset: 0, limit: null }, format, dest);
       if (!isCurrent()) return;
       setMsg({
         kind: "ok",
@@ -203,6 +221,7 @@ export default function StatsPage() {
       {loadError && <div role="alert" className="msg err">{loadError}</div>}
       {msg && <div role={msg.kind === "err" ? "alert" : "status"} className={`msg ${msg.kind}`}>{msg.text}</div>}
 
+      <ClientUsagePanel/>
       <div className="grid4" style={{ marginBottom: 14 }}>
         <div className="stat">
           <div className="k">近 24 小时请求</div>
@@ -525,33 +544,45 @@ export default function StatsPage() {
               />
               <span>只看降级过</span>
             </label>
+            <label className="audit-field"><span>开始时间（本机时区）</span>
+              <input id="audit-from-time" type="datetime-local" value={fromTime} onChange={e => changeTimes(e.target.value, toTime)}/>
+            </label>
+            <label className="audit-field"><span>结束时间（本机时区）</span>
+              <input id="audit-to-time" type="datetime-local" value={toTime} onChange={e => changeTimes(fromTime, e.target.value)}/>
+            </label>
             <button
               id="audit-reset"
               className="ghost"
               disabled={refreshing}
-              onClick={() => setFilter({})}
+              onClick={() => { setFilter({}); setFromTime(""); setToTime(""); setTimeError(null); }}
             >
               重置筛选
             </button>
             <button
               id="audit-export-jsonl"
-              disabled={exporting || rows.length === 0}
+              disabled={exporting || rows.length === 0 || !!timeError}
               onClick={() => void exportAudit("jsonl")}
             >
               导出 JSONL
             </button>
             <button
               id="audit-export-csv"
-              disabled={exporting || rows.length === 0}
+              disabled={exporting || rows.length === 0 || !!timeError}
               onClick={() => void exportAudit("csv")}
             >
               导出 CSV
             </button>
           </div>
+          {timeError && <p role="alert" className="msg err">{timeError}</p>}
+          <div className="row" style={{ marginTop: 10 }}>
+            <button id="audit-prev" disabled={refreshing || pageOffset === 0 || !!timeError} onClick={() => setFilter(prev => ({ ...prev, offset: Math.max(0, pageOffset - 120) }))}>上一页</button>
+            <button id="audit-next" disabled={refreshing || !truncated || !!timeError} onClick={() => setFilter(prev => ({ ...prev, offset: pageOffset + 120 }))}>下一页</button>
+            <span role="status">当前 {rows.length ? `${formatNumber(pageOffset + 1)}–${formatNumber(pageOffset + rows.length)}` : "0"} 条 / 共 {formatNumber(total)} 条</span>
+          </div>
           <div className="sub" style={{ marginTop: 6, marginBottom: 0 }}>
             {/* 命中总数必须露出来：只看当前 120 条会让人以为「一共就这么点」。 */}
             命中 <strong>{formatNumber(total)}</strong> 条
-            {truncated && <>（当前显示前 {formatNumber(rows.length)} 条，请加筛选条件缩小范围）</>}
+            {truncated && <>（每页最多 120 条，可继续翻页）</>}
             。导出会按当前筛选条件写出**全部**命中记录（上限 100000 条）。
           </div>
         </div>

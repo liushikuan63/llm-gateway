@@ -33,6 +33,82 @@ fn known_stopped_vpn() -> Option<VpnDiagnostics> {
     })
 }
 
+#[tokio::test]
+async fn xray_proxy_ownership_tracks_the_matched_kernel_and_conflicts_are_unknown() {
+    use llm_gateway_lib::diagnostics::{collect_with_xray, ProxyMode, XrayDiagnostics};
+    let mut cfg = AppConfig {
+        http_proxy: Some("http://127.0.0.1:18000".into()),
+        ..Default::default()
+    };
+    let gateway = blank_gateway(cfg.clone()).await;
+    let vpn = Some(VpnDiagnostics {
+        running: false,
+        mixed_port: 19000,
+        has_error: false,
+    });
+    let xray = Some(XrayDiagnostics {
+        running: true,
+        http_port: 18000,
+        socks_port: 18001,
+    });
+    let report = collect_with_xray(&cfg, &gateway, vpn, xray).await;
+    assert_eq!(report.summary.proxy_mode, ProxyMode::ManagedXray);
+    assert_eq!(report.summary.vpn_running, Some(true));
+    assert_eq!(check(&report, "proxy"), DiagnosticStatus::Ok);
+    let stopped = collect_with_xray(
+        &cfg,
+        &gateway,
+        vpn,
+        Some(XrayDiagnostics {
+            running: false,
+            http_port: 18000,
+            socks_port: 18001,
+        }),
+    )
+    .await;
+    assert_eq!(check(&stopped, "proxy"), DiagnosticStatus::Error);
+    assert_eq!(stopped.summary.vpn_running, Some(false));
+    let conflict = collect_with_xray(
+        &cfg,
+        &gateway,
+        Some(VpnDiagnostics {
+            running: true,
+            mixed_port: 18000,
+            has_error: false,
+        }),
+        xray,
+    )
+    .await;
+    assert_eq!(check(&conflict, "proxy"), DiagnosticStatus::Unknown);
+    assert_eq!(conflict.summary.vpn_running, None);
+    let unknown = collect_with_xray(&cfg, &gateway, vpn, None).await;
+    assert_eq!(check(&unknown, "proxy"), DiagnosticStatus::Unknown);
+    assert_eq!(unknown.summary.vpn_running, None);
+    cfg.http_proxy = Some("socks5://127.0.0.1:18001".into());
+    let socks = collect_with_xray(&cfg, &gateway, vpn, xray).await;
+    assert_eq!(socks.summary.proxy_mode, ProxyMode::ManagedXray);
+    for scheme in ["socks5", "socks5h"] {
+        cfg.http_proxy = Some(format!("{scheme}://127.0.0.1:18001"));
+        let conflict = collect_with_xray(
+            &cfg,
+            &gateway,
+            Some(VpnDiagnostics {
+                running: true,
+                mixed_port: 18001,
+                has_error: false,
+            }),
+            Some(XrayDiagnostics {
+                running: false,
+                http_port: 18000,
+                socks_port: 18001,
+            }),
+        )
+        .await;
+        assert_eq!(check(&conflict, "proxy"), DiagnosticStatus::Unknown);
+        assert_eq!(conflict.summary.vpn_running, None);
+    }
+}
+
 fn check(report: &DiagnosticsReport, id: &str) -> DiagnosticStatus {
     report
         .checks

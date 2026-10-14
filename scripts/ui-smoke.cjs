@@ -51,7 +51,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     // 页面会白屏而测试全绿（CLAUDE.md 铁律 10 点名的正是这个坑）。
     cascade: { max_escalations: 0, min_confidence: 0.6 },
     cache: { enabled: false, capacity: 200, ttl_secs: 0 },
-    benefits: { enabled: false, auto_claim: false, auto_claim_after_hour: 10, accounts: [] },
+    benefits: { enabled: false, auto_claim: false, auto_claim_after_hour: 10, auto_claim_after_minute: 0, auto_claim_timezone: "local", accounts: [] },
     smart_routing: {
       enabled: true, classifier: "jev",
       jev: { base_url: "http://127.0.0.1:8009/v1/systemone", model: "rl-agent", timeout_ms: 1200, max_state_chars: 4000,
@@ -71,6 +71,12 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       ],
     },
   };
+  window.__fixtureBridges = [
+    { kind: "qoder", options: { port: 8790, cdp_port: 0, client_path: "" }, reachable: true, ready: true, managed: false, pid: null, models: ["auto"], runtime_ready: true, cli_path: "C:/fixture/qodercn.exe", error: null, model_call_verified: false },
+    { kind: "workbuddy", options: { port: 8791, cdp_port: 9224, client_path: "" }, reachable: true, ready: true, managed: false, pid: null, models: ["deepseek-v3"], runtime_ready: true, cli_path: null, error: null, model_call_verified: false },
+    { kind: "trae", options: { port: 8792, cdp_port: 9226, client_path: "" }, reachable: false, ready: false, managed: false, pid: null, models: [], runtime_ready: true, cli_path: null, error: "桥接未启动", model_call_verified: false },
+  ];
+  window.__fixtureXray = { settings: { http_port: 17891, socks_port: 17892 }, kernel_ready: true, profile_ready: false, running: false, pid: null, version: "v26.3.27", protocol: null, proxy_url: "http://127.0.0.1:17891" };
   window.__fixtureVpnStatus = {
     settings: { kernel_path: "", mixed_port: 17890, controller_port: 17909 },
     running: false, kernel_ready: false, profile_ready: false, pid: null, version: null,
@@ -97,12 +103,13 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     error: null,
   };
   window.__fixtureBenefitTokens = {};
+  window.__fixtureBenefitSessions = {};
   window.__fixtureBenefitRuns = [];
   window.__fixtureBenefitClaimed = {};
   window.__fixtureBenefitQueries = 0;
   const benefitOverview = () => {
     const config = window.__fixtureConfig.benefits;
-    return { enabled: config.enabled, auto_claim: config.auto_claim, auto_claim_after_hour: config.auto_claim_after_hour,
+    return { enabled: config.enabled, auto_claim: config.auto_claim, auto_claim_after_hour: config.auto_claim_after_hour, auto_claim_after_minute: config.auto_claim_after_minute, auto_claim_timezone: config.auto_claim_timezone,
       checked_at: "2026-10-10T03:00:00Z", accounts: config.accounts.map(account => {
         const hasToken = Boolean(window.__fixtureBenefitTokens[`${account.platform}:${account.id}`]);
         const query = config.enabled && account.enabled && hasToken;
@@ -111,6 +118,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         const claimed = Boolean(window.__fixtureBenefitClaimed[`${account.platform}:${account.id}`]);
         return { account_id: account.id, platform: account.platform, label: account.label, enabled: account.enabled,
           has_token: hasToken, token_masked: hasToken ? "********" : null, error,
+          session_account: query ? window.__fixtureBenefitSessions[`${account.platform}:${account.id}`]??null : null,
           capabilities: { query: true, manual_claim: true, auto_claim: true, scope: "活动赠送权益" },
           last_run: window.__fixtureBenefitRuns.find(run => run.account_id === account.id) ?? null,
           status: !query || error ? null : { platform: account.platform, claimable: !claimed, source: "Qoder 活动接口", warnings: ["活动状态以逐条结果为准。"], checked_at: "2026-10-10T03:00:00Z", campaigns: [
@@ -443,6 +451,133 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     invoke: async (cmd, args) => {
     window.__fixtureCalls.push(cmd);
     switch (cmd) {
+      case "qoder_job_status":
+      case "qoder_job_prepare":
+      case "qoder_job_refresh": {
+        const key = `${args.region}:${args.accountId}`;
+        if (cmd !== "qoder_job_status") {
+          if (window.__fixtureQdJobFailure) throw Error("synthetic model authentication failure");
+          (window.__fixtureQdJobs ??= {})[key] = true;
+        }
+        return { status: window.__fixtureQdJobs?.[key] ? "prepared" : window.__fixtureQdAccounts?.[key] ? "not_prepared" : "not_logged_in",
+          region: args.region, account_id: args.accountId, access_expires_at_ms: null, refresh_expires_at_ms: null,
+          can_refresh: !!window.__fixtureQdJobs?.[key], attempt_blocked: false, inference_verified: false };
+      }
+      case "register_qoder_provider": {
+        (window.__fixtureQdRegistrations ??= []).push({ region: args.region, account: args.accountId });
+        if (window.__fixtureQdRegisterHold) await new Promise(resolve => { window.__fixtureQdRegisterRelease = resolve; });
+        if (window.__fixtureQdRegisterFailure) throw Error("synthetic catalog failure");
+        return { provider_id: `fixture-${args.region}-${args.accountId}`, runtime_id: `fixture-runtime-${args.region}-${args.accountId}`,
+          model_count: args.region === "cn" ? 14 : 17, warnings: ["synthetic unknown cash price"] };
+      }
+      case "qoder_login_status":
+      case "qoder_login_refresh": {
+        const key = `${args.region}:${args.accountId}`;
+        if (cmd === "qoder_login_refresh" && window.__fixtureQdRefreshFailure) throw Error("synthetic refresh failure");
+        const ready = !!window.__fixtureQdAccounts?.[key];
+        return { status: ready ? "logged_in" : "not_logged_in", region: args.region, account_id: args.accountId,
+          identity: ready ? { display_name: `离线 ${args.region} ${args.accountId}`, masked_email: "f***@example.invalid", captured_at: null } : null,
+          can_refresh: ready, access_expires_at_ms: null, refresh_expires_at_ms: null, refresh_attempted: false };
+      }
+      case "qoder_login_start": {
+        const id = `offline-qoder-${(window.__fixtureQdStarts ??= []).length}`;
+        window.__fixtureQdStarts.push({ id, region: args.region, account: args.accountId });
+        (window.__fixtureQdPending ??= {})[id] = { region: args.region, account: args.accountId };
+        if (window.__fixtureQdStartHold) await new Promise(resolve => { window.__fixtureQdStartRelease = resolve; });
+        const url = new URL(`https://${args.region === "cn" ? "qoder.cn" : "qoder.com"}/device/selectAccounts`);
+        url.searchParams.set("challenge", "a".repeat(43)); url.searchParams.set("challenge_method", "S256");
+        url.searchParams.set("nonce", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        url.searchParams.set("machine_id", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        url.searchParams.set("client_id", "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa");
+        if (window.__fixtureQdBadUrl) url.hostname = "example.invalid";
+        return { login_id: id, region: args.region, authorization_url: url.href,
+          deadline_ms: Date.now() + (window.__fixtureQdDeadlineMs ?? 300000), server_ttl_seconds: null };
+      }
+      case "qoder_login_poll": {
+        const record = window.__fixtureQdPending?.[args.loginId];
+        if (!record || record.region !== args.region) throw Error("cancelled or wrong-region synthetic session");
+        if (window.__fixtureQdPollHold) await new Promise(resolve => { window.__fixtureQdPollRelease = resolve; });
+        if (window.__fixtureQdPollFailure) throw Error("synthetic polling failure");
+        const ready = !!window.__fixtureQdAuthorize;
+        if (ready) (window.__fixtureQdAccounts ??= {})[`${record.region}:${record.account}`] = true;
+        return { status: ready ? "logged_in" : "awaiting_authorization", region: record.region, account_id: record.account,
+          identity: ready ? { display_name: `离线 ${record.region} ${record.account}`, masked_email: "f***@example.invalid", captured_at: null } : null,
+          can_refresh: ready, access_expires_at_ms: null, refresh_expires_at_ms: null, refresh_attempted: false };
+      }
+      case "qoder_login_cancel": {
+        (window.__fixtureQdCancels ??= []).push({ id: args.loginId, region: args.region });
+        if (window.__fixtureQdCancelFailure) throw Error("synthetic cancel failure");
+        delete window.__fixtureQdPending?.[args.loginId]; return null;
+      }
+      case "trae_login_status":
+        return { status: "not_logged_in", account_id: args.accountId, identity: null, can_refresh: false,
+          access_expires_at_ms: null, refresh_expires_at_ms: null, refresh_attempted: false };
+      case "workbuddy_login_status":
+      case "workbuddy_login_refresh": {
+        const id = args.accountId;
+        const ready = cmd === "workbuddy_login_refresh" || !!window.__fixtureWbAccounts?.[id];
+        return { status: ready ? "authenticated" : "not_logged_in", account_id: id,
+          identity: ready ? { display_name: `离线账号 ${id}`, masked_email: null, captured_at: null } : null,
+          can_refresh: ready, access_expires_at_ms: null, refresh_expires_at_ms: null, refresh_attempted: false };
+      }
+      case "workbuddy_login_start": {
+        const account = args.accountId;
+        const id = `offline-login-${account}-${(window.__fixtureWbStarts ??= []).length}`;
+        window.__fixtureWbStarts.push({ id, account });
+        (window.__fixtureWbPending ??= {})[id] = account;
+        if (window.__fixtureWbStartHold) await new Promise(resolve => { window.__fixtureWbStartRelease = resolve; });
+        return { login_id: id, authorization_url: window.__fixtureWbBadUrl ? "https://example.invalid/authorize" : "https://www.workbuddy.ai/authorize?state=offline-fixture",
+          deadline_ms: Date.now() + (window.__fixtureWbDeadlineMs ?? 300000), server_ttl_seconds: null };
+      }
+      case "workbuddy_login_poll": {
+        const account = window.__fixtureWbPending?.[args.loginId];
+        if (!account) throw Error("cancelled synthetic session");
+        if (window.__fixtureWbPollHold) await new Promise(resolve => { window.__fixtureWbPollRelease = resolve; });
+        if (window.__fixtureWbPollFailure) throw Error("synthetic polling failure");
+        const ready = !!window.__fixtureWbAuthorize;
+        if (ready) (window.__fixtureWbAccounts ??= {})[account] = true;
+        return { status: ready ? "authenticated" : "awaiting_authorization", account_id: account,
+          identity: ready ? { display_name: `离线账号 ${account}`, masked_email: null, captured_at: null } : null,
+          can_refresh: ready, access_expires_at_ms: null, refresh_expires_at_ms: null, refresh_attempted: false };
+      }
+      case "workbuddy_login_cancel": {
+        (window.__fixtureWbCancels ??= []).push(args.loginId);
+        if (window.__fixtureWbCancelFailure) throw Error("synthetic cancel failure");
+        delete window.__fixtureWbPending?.[args.loginId]; return null;
+      }
+      case "register_workbuddy_provider": {
+        if (!window.__fixtureWbAccounts?.[args.accountId]) throw Error("synthetic account is not logged in");
+        if (window.__fixtureWbRegisterHold) await new Promise(resolve => { window.__fixtureWbRegisterRelease = resolve; });
+        return { provider_id: "offline-wb-provider", runtime_id: "offline-wb-runtime", model_count: 27, warnings: [] };
+      }
+      case "desktop_chat": {
+        (window.__fixtureChatInputs ??= []).push(structuredClone(args.input));
+        if (window.__fixtureChatHold) await new Promise(resolve => { window.__fixtureChatRelease = resolve; });
+        if (window.__fixtureChatFailure) throw new Error("HTTP 503：模拟上游不可用");
+        return { content: "收到，模型已接入。", reasoning: window.__fixtureChatReasoning ?? null, model: "fixture-model", routed_via: "workbuddy/fixture-model",
+          session_id: args.input.session_id, trace_id: "fixture-trace", fallback_attempts: 0, latency_ms: 27,
+          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }, cached: false };
+      }
+      case "export_desktop_chat": {
+        if (window.__fixtureChatExportFailure) throw new Error("模拟本地对话文件不可写");
+        (window.__fixtureChatExports ??= []).push(structuredClone(args));
+        return null;
+      }
+      case "register_client_bridge": {
+        const bridge = window.__fixtureBridges.find(b => b.kind === args.kind);
+        if (!bridge?.ready) throw new Error("客户端尚未就绪");
+        const note = `由客户端接入登记（${args.kind}）`;
+        const url = `http://127.0.0.1:${bridge.options.port}/v1`;
+        let p = window.__fixtureProviders.find(p =>
+          (new RegExp(`^p-client-${args.kind}-[0-9a-f]{32}$`, "i").test(p.id) || p.note === note) && p.base_url === url);
+        if (!p) {
+          p = { ...provider(`p-client-${args.kind}-${crypto.randomUUID().replaceAll("-", "")}`, `${args.kind} 桌面桥接`, "openai", url, []), note };
+          window.__fixtureProviders.push(p); window.__fixtureSaved.push(structuredClone(p));
+        }
+        for (const upstream of bridge.models) if (!p.models.some(m => m.upstream === upstream))
+          p.models.push(model(`${args.kind}/${upstream}`, 32768, null, { upstream, supports_tools: false }));
+        return p.id;
+      }
       case "list_providers":
         if (providerFailure) throw new Error("模拟供应商读取失败");
         if (window.__fixtureProviderHold) await new Promise(resolve => (window.__fixtureProviderPending ??= []).push(resolve));
@@ -467,6 +602,14 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         window.__fixtureBenefitTokenWrite = { accountId: args.accountId, length: args.token.length };
         return null;
       }
+      case "import_benefit_client_session": {
+        const account=window.__fixtureConfig.benefits.accounts.find(a=>a.id===args.accountId);
+        if(!account||!window.__fixtureConfig.benefits.enabled||!account.enabled)throw Error("账号未启用");
+        const identity={display_name:"离线会话账号",masked_email:"t***@fixture.invalid",identity_hash:"synthetic-id",captured_at:"2026-10-13T01:00:00Z"};
+        window.__fixtureBenefitTokens[`${account.platform}:${account.id}`]=true;
+        window.__fixtureBenefitSessions[`${account.platform}:${account.id}`]={identity,plan_name:"Test",quota:{total:100,used:20,remaining:80,unit:"Credits"},addon_quota:null,checked_at:"2026-10-13T01:00:00Z"};
+        return identity;
+      }
       case "clear_benefit_token": {
         const account = window.__fixtureConfig.benefits.accounts.find(account => account.id === args.accountId);
         if (!account) throw new Error("账号不存在");
@@ -485,8 +628,67 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         if (["granted", "replayed"].includes(mode)) window.__fixtureBenefitClaimed[`${account.platform}:${account.id}`] = true;
         return { run, outcome: !["granted", "replayed"].includes(mode) ? null : { platform: account.platform, campaign_id: "daily", campaign_key: "daily-20261010", status: "CLAIMED", replayed: mode === "replayed", granted: mode === "granted", amount: 100, kind: "CREDITS", claimed_at: "2026-10-10T03:01:00Z", expires_at: "2026-11-09T03:01:00Z", message: messages[mode] } };
       }
+      case "client_bridges_status":
+        if (window.__fixtureBridgeReadFailure) throw new Error("模拟客户端状态读取失败");
+        return structuredClone(window.__fixtureBridges);
+      case "register_qoder_cli": {
+        const existing = window.__fixtureProviders.find(p => p.id === "p-desktop-qoder");
+        if (!existing) {
+          window.__fixtureProviders.push({ ...provider("p-desktop-qoder", "Qoder 本机 CLI", "openai", "http://127.0.0.1:8790/v1", [model("qoder-cli-auto", 32768, null, { upstream: "auto", supports_tools: false, supports_stream: false })]), runtime_id: "desktop-qoder", note: "由客户端接入登记（qoder-cli）" });
+          (window.__fixtureAgentRuntimes ??= []).push({ id: "desktop-qoder", kind: "qoder-cn", label: "Qoder 本机 CLI", options: { executable: "C:/fixture/qodercn.exe" }, enabled: true, created_at: "2026-10-13T00:00:00Z", updated_at: "2026-10-13T00:00:00Z" });
+        }
+        if (window.__fixtureQoderReloadFailure) throw new Error("Qoder 登记已保存，但路由刷新失败");
+        return "p-desktop-qoder";
+      }
+      case "save_client_bridge_options": {
+        const target = window.__fixtureBridges.find(v => v.kind === args.kind);
+        if (!target || target.managed || !Number.isInteger(args.options.port) || args.options.port < 1 || args.options.port > 65535) throw new Error("接入设置无效");
+        target.options = structuredClone(args.options);
+        target.ready = false; target.reachable = false; target.error = "桥接未启动"; target.models = [];
+        return null;
+      }
+      case "start_client_bridge": {
+        const target = window.__fixtureBridges.find(v => v.kind === args.kind);
+        if (target.reachable && !target.managed) throw new Error("端口被外部进程占用");
+        target.managed = true; target.reachable = true; target.ready = true; target.pid = 54321;
+        target.models = ["trae-desktop"]; target.error = null;
+        return null;
+      }
+      case "stop_client_bridge": {
+        const target = window.__fixtureBridges.find(v => v.kind === args.kind);
+        if (target.managed) { target.managed = false; target.ready = false; target.reachable = false; target.pid = null; }
+        return null;
+      }
+      case "launch_bridge_client": return null;
+      case "xray_status": return structuredClone(window.__fixtureXray);
+      case "save_xray_settings": {
+        if (window.__fixtureXray.running || !args.settings.http_port || args.settings.http_port === args.settings.socks_port) throw new Error("Xray 设置无效");
+        const old = window.__fixtureXray.proxy_url;
+        window.__fixtureXray.settings = structuredClone(args.settings);
+        window.__fixtureXray.proxy_url = `http://127.0.0.1:${args.settings.http_port}`;
+        if (window.__fixtureConfig.http_proxy === old) window.__fixtureConfig.http_proxy = window.__fixtureXray.proxy_url;
+        return null;
+      }
+      case "import_xray_profile":
+        if (window.__fixtureXray.running || window.__fixtureXrayImportFailure) throw new Error("Xray 配置验证未通过");
+        window.__fixtureXray.profile_ready = true; window.__fixtureXray.protocol = "vless"; return null;
+      case "start_xray":
+        if (!window.__fixtureXray.profile_ready) throw new Error("请先导入配置");
+        window.__fixtureXray.running = true; window.__fixtureXray.pid = 12345; return null;
+      case "stop_xray": window.__fixtureXray.running = false; window.__fixtureXray.pid = null; return null;
+      case "use_xray_for_gateway":
+        if (args.enabled && !window.__fixtureXray.running) throw new Error("请先启动 Xray");
+        if (!args.enabled && window.__fixtureConfig.http_proxy !== window.__fixtureXray.proxy_url) throw new Error("其他代理已保留");
+        window.__fixtureConfig.http_proxy = args.enabled ? window.__fixtureXray.proxy_url : null;
+        return { config: structuredClone(window.__fixtureConfig), restart_required: false, restart_reasons: [] };
       case "vpn_status": return structuredClone(window.__fixtureVpnStatus);
-      case "external_vpn_status": return structuredClone(window.__fixtureExternalVpnStatus);
+      case "external_vpn_status": {
+        const snapshot = structuredClone(window.__fixtureExternalVpnStatus);
+        const plan = window.__fixtureExternalPlan?.shift();
+        if (plan?.hold) await new Promise(resolve => (window.__fixtureExternalPending ??= []).push(resolve));
+        if (plan?.error) throw new Error("模拟外部 VPN 探测失败");
+        return snapshot;
+      }
       case "vpn_kernel_info":
         if (window.__fixtureVpnKernelInfoFailure) throw new Error("模拟官方内核信息读取失败");
         return vpnKernelInfo();
@@ -711,6 +913,8 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         const auditRequest = { filter: structuredClone(f), completed: false };
         (window.__fixtureAuditRequests ??= []).push(auditRequest);
         let rows = structuredClone(window.__fixtureRequests);
+        if (typeof f.from_ts === "number") rows = rows.filter(r => r.ts >= f.from_ts);
+        if (typeof f.to_ts === "number") rows = rows.filter(r => r.ts <= f.to_ts);
         if (f.provider) rows = rows.filter(r => r.routed_provider === f.provider);
         if (f.model) rows = rows.filter(r => r.routed_model === f.model);
         if (f.only_errors) rows = rows.filter(r => r.error !== null);
@@ -770,7 +974,21 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
             : null,
         };
       }
-      case "plugin:dialog|save": return window.__fixtureSavePath !== undefined ? window.__fixtureSavePath : "C:/fixture/audit-export";
+      case "scan_client_usage": {
+        window.__fixtureClientScanCalls=(window.__fixtureClientScanCalls??0)+1;
+        if(window.__fixtureClientScanFailure)throw new Error("模拟客户端日志读取失败");
+        if(window.__fixtureClientScanHold)await new Promise(resolve=>{window.__fixtureClientScanRelease=resolve;});
+        window.__fixtureClientScanArgs=args;
+        const row={source:"codex",profile:"default",model:"fixture-model",provider:null,granularity:"request",day:"2026-10-13",requests:2,input_tokens:200,output_tokens:40,cache_read_tokens:60,cache_write_tokens:0,partial_fields:[],known_usage_records:2,unknown_usage_records:0,cache_hit_requests:1,cache_miss_requests:1,cache_unknown_requests:0,estimated_cost:0.000226,estimated_currency:"USD",estimate_note:null,price_reference:"fixture reference"};
+        const unknown={...row,source:"qoder",model:"auto",input_tokens:null,output_tokens:null,cache_read_tokens:null,cache_write_tokens:null,known_usage_records:0,unknown_usage_records:2,cache_hit_requests:0,cache_miss_requests:0,cache_unknown_requests:2,estimated_cost:null,estimated_currency:null,estimate_note:"price_missing",price_reference:null};
+        const dsh={...row,source:"dsh",profile:"stable",provider:"fixture-provider",model:"range-model",granularity:"daily_aggregate",day:"2026-10-12",requests:2,input_tokens:30,output_tokens:4,cache_read_tokens:20,estimated_cost:0.000020};
+        const daily=window.__fixtureClientScanEmpty?[]:[row,unknown,dsh,{...dsh,day:"2026-10-13",requests:3,input_tokens:70,output_tokens:6,cache_read_tokens:40,estimated_cost:0.000046}].filter(r=>r.day>=args.fromDay&&r.day<=args.toDay);
+        const summary=[];for(const r of daily){const old=summary.find(x=>x.source===r.source&&x.model===r.model&&x.profile===r.profile&&x.provider===r.provider);if(old){for(const k of ['requests','input_tokens','output_tokens','cache_read_tokens','cache_write_tokens','estimated_cost'])old[k]=old[k]===null||r[k]===null?null:old[k]+r[k];}else summary.push({...r,day:null,granularity:'range_total'});}
+        return {generated_at:new Date().toISOString(),from_day:args.fromDay,to_day:args.toDay,sources:[{source:"codex",profile:"default",status:"ok",files_scanned:1,records_scanned:5,skipped_records:0,bytes_read:200,notes:[]},{source:"qoder",profile:"default",status:"partial",files_scanned:1,records_scanned:2,skipped_records:0,bytes_read:100,notes:["qoder_input_contract_unknown"]}],rows:daily,summary_rows:summary,daily_rows:daily};
+      }
+      case "plugin:dialog|save":
+        if (window.__fixtureSaveHold) await new Promise(resolve => { window.__fixtureSaveRelease = resolve; });
+        return window.__fixtureSavePath !== undefined ? window.__fixtureSavePath : "C:/fixture/audit-export";
       case "plugin:opener|open_url": window.__fixtureOpenedOfficialUrl = args.url; return null;
       case "stats_overview":
         if (window.__fixtureStatsFailure) throw new Error("模拟统计概要读取失败");
@@ -844,13 +1062,30 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         return { healthy: true, base_url: "http://127.0.0.1:15721", routed_via: "openrouter/vendor/chat:free", latency_ms: 321, error: null };
       case "list_sessions": return structuredClone(window.__fixtureSessions);
       case "get_session_messages":
+        if (window.__fixtureSessionMessageHold) await new Promise(resolve => { window.__fixtureSessionMessageRelease = resolve; });
         await new Promise(resolve => setTimeout(resolve, args.id === "session-slow" ? 180 : 5));
         return args.id === "session-empty" ? [] : args.id === "session-fast" ? [message(10, "assistant", "这是快速切换后的正确会话内容。")] : structuredClone(window.__fixtureMessages);
+      case "get_session_messages_page": {
+        const id = args.id, after = args.afterId ?? 0;
+        (window.__fixtureSessionPageRequests ??= []).push({ id, after });
+        const rows = structuredClone(window.__fixtureSessionPages?.[id] ?? (id === "session-empty" ? [] : id === "session-fast" ? [message(10, "assistant", "这是快速切换后的正确会话内容。")] : window.__fixtureMessages));
+        if (window.__fixtureSessionPageHold?.id === id && window.__fixtureSessionPageHold.after === after) {
+          await new Promise(resolve => { window.__fixtureSessionPageRelease = resolve; });
+        }
+        if (window.__fixtureSessionMessageHold) await new Promise(resolve => { window.__fixtureSessionMessageRelease = resolve; });
+        if (window.__fixtureSessionPageFailure === after) throw new Error("模拟消息读取失败");
+        const available = rows.filter(row => row.id > after).sort((a, b) => a.id - b.id);
+        const pageRows = available.slice(0, args.limit ?? 500);
+        const hasMore = available.length > pageRows.length;
+        return { rows: pageRows, has_more: hasMore, next_cursor: hasMore ? pageRows.at(-1).id : null };
+      }
       case "compact_session": {
         const current = window.__fixtureSessions.find(item => item.id === args.id);
         current.compact_count++; current.summary = "手动压缩已完成，重要任务信息已保留。"; return "压缩完成";
       }
-      case "delete_session": window.__fixtureSessions = window.__fixtureSessions.filter(item => item.id !== args.id); return null;
+      case "delete_session":
+        if (window.__fixtureSessionDeleteFailure) throw new Error("模拟删除会话失败");
+        window.__fixtureSessions = window.__fixtureSessions.filter(item => item.id !== args.id); return null;
       case "apply_takeover": return [{ client: "Codex", path: "C:/fixture/.codex/config.toml", backup_path: "C:/fixture/.codex/config.toml.backup-test", status: "updated" }];
       case "get_unified_key": return { key: window.__fixtureConfig.unified_key, base_url: "http://127.0.0.1:15721", openai_endpoint: "http://127.0.0.1:15721/v1", anthropic_endpoint: "http://127.0.0.1:15721", ollama_endpoint: "http://127.0.0.1:15721" };
       case "rotate_unified_key": window.__fixtureConfig.unified_key = "fixture-rotated-only"; return window.__fixtureConfig.unified_key;
@@ -1136,8 +1371,10 @@ async function verifyAsyncPages(browser, errors) {
     window.__fixtureAuditPending = [];
     window.__fixtureStatsFailure = true;
   });
-  await pollPage.locator(".page-heading").getByRole("button", { name: "刷新", exact: true }).click();
+  // Let the accelerated polling timer start the held request. Clicking refresh here
+  // races the 80 ms timer, which can disable the button before Playwright dispatches.
   await pollPage.waitForFunction(() => window.__fixtureAuditPending.length >= 1);
+  assert(await pollPage.locator(".page-heading").getByRole("button").isDisabled());
   await pollPage.waitForTimeout(250);
   assert.equal(await pollPage.evaluate(() => window.__fixtureAuditPending.length), 1,
     "查询未结束时五秒轮询不能再启动同一筛选查询");
@@ -1164,6 +1401,598 @@ async function verifyAsyncPages(browser, errors) {
   await pollPage.locator(".msg.err").scrollIntoViewIfNeeded();
   await pollPage.screenshot({ path: path.join(output, "stats-export-error-retained.png"), fullPage: true });
   await pollContext.close();
+}
+
+async function verifyChatPage(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 } });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  page.on("pageerror", e => errors.push(`chat: ${e.message}`));
+  page.on("console", m => { if (m.type() === "error") errors.push(`chat: ${m.text()}`); });
+  await page.goto(baseUrl);
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  await page.evaluate(() => {
+    const ps = window.__fixtureProviders;
+    ps[0].models.push({ ...ps[0].models[0], alias: "disabled-fixture", enabled: false });
+    window.__fixtureExplain = [{ provider_id: ps[0].id, provider_name: ps[0].name, model: ps[0].models[0].alias,
+      upstream: "fixture-model", score: 0.75, eligible: true, ineligible_reason: null, breakdown: { factors: [], exact_match_bonus: 1, total: 0.75 } }];
+  });
+  await nav.getByRole("button", { name: "聊天测试", exact: true }).click();
+  const chat = page.getByTestId("chat-page");
+  await chat.locator("#chat-model:not(:disabled)").waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(c => c === "desktop_chat").length), 0, "opening chat does not spend model quota");
+  assert.equal(await chat.locator('option[value$="disabled-fixture"]').count(), 0);
+  await chat.locator(".chat-scores summary").click();
+  assert((await chat.innerText()).includes("0.7500"), "display backend score without recomputing it");
+  await chat.locator("#chat-prompt").fill("只回复收到 <img onerror=alert(1)>");
+  await page.evaluate(() => { window.__fixtureChatHold = true; });
+  await chat.getByRole("button", { name: "发送消息", exact: true }).click();
+  await page.waitForFunction(() => Boolean(window.__fixtureChatRelease));
+  assert(await chat.locator("#chat-model").isDisabled());
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureChatHold = false; window.__fixtureChatRelease(); });
+  await nav.getByRole("button", { name: "聊天测试", exact: true }).click();
+  await chat.getByText("收到，模型已接入。", { exact: true }).waitFor();
+  assert.equal(await chat.locator("img").count(), 0, "model and user text is rendered safely as text");
+  assert((await chat.innerText()).includes("降级 0 次"));
+  assert((await chat.innerText()).includes("输入 5 / 输出 2 tokens"));
+  await chat.locator("#chat-model:not(:disabled)").waitFor();
+  const explicit = await chat.locator("#chat-model option").nth(1).getAttribute("value");
+  await chat.locator("#chat-model").selectOption(explicit);
+  await chat.locator("#chat-prompt").fill("第二条");
+  await chat.locator("#chat-prompt").press("Control+Enter");
+  await page.waitForFunction(() => window.__fixtureChatInputs?.length === 2);
+  await chat.locator("#chat-prompt").filter({ hasText: "" }).waitFor();
+  await page.waitForFunction(() => document.querySelector("#chat-prompt").value === "");
+  const inputs = await page.evaluate(() => window.__fixtureChatInputs);
+  assert.equal(inputs[0].model, "auto"); assert.equal(inputs[1].model, explicit);
+  assert.equal(inputs[1].messages.length, 3); assert.equal(inputs[1].session_id, inputs[0].session_id);
+  await chat.getByRole("button", { name: "新建对话", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureChatFailure = true; window.__fixtureChatHold = true; });
+  await chat.locator("#chat-prompt").fill("失败时保留输入");
+  await chat.getByRole("button", { name: "发送消息", exact: true }).click();
+  await page.waitForFunction(() => Boolean(window.__fixtureChatRelease));
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureProviderHold = true; window.__fixtureProviderPending = []; });
+  await nav.getByRole("button", { name: "聊天测试", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureProviderPending.length > 0);
+  await page.evaluate(() => { window.__fixtureChatHold = false; window.__fixtureChatRelease(); });
+  await chat.getByRole("alert").filter({ hasText: "HTTP 503" }).waitFor();
+  await page.evaluate(() => {
+    window.__fixtureProviderHold = false;
+    window.__fixtureProviderPending.splice(0).forEach(resolve => resolve());
+  });
+  await chat.locator("#chat-model:not(:disabled)").waitFor();
+  assert((await chat.getByRole("alert").allTextContents()).some(text => text.includes("HTTP 503")),
+    "a delayed successful score refresh must not erase the failed chat request");
+  assert.equal(await chat.locator("#chat-prompt").inputValue(), "失败时保留输入");
+  assert.equal(await chat.locator(".chat-turn").count(), 0);
+  const third = await page.evaluate(() => window.__fixtureChatInputs[2]);
+  assert.notEqual(third.session_id, inputs[0].session_id);
+  await page.screenshot({ path: path.join(output, "chat-error.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureChatFailure = false; });
+  await chat.getByRole("button", { name: "发送消息", exact: true }).click();
+  await chat.getByText("收到，模型已接入。", { exact: true }).waitFor();
+  await page.screenshot({ path: path.join(output, "chat-desktop.png"), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: path.join(output, "chat-narrow.png"), fullPage: true });
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 2), "chat must fit narrow layouts");
+  await context.close();
+  const empty = await browser.newContext(); await empty.addInitScript(fixture, { empty: true });
+  const emptyPage = await empty.newPage(); await emptyPage.goto(baseUrl);
+  await emptyPage.getByRole("button", { name: "跳过引导", exact: true }).click();
+  await emptyPage.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "聊天测试", exact: true }).click();
+  await emptyPage.getByText("没有已启用的聊天模型", { exact: false }).waitFor();
+  assert(await emptyPage.getByRole("button", { name: "发送消息", exact: true }).isDisabled());
+  await emptyPage.screenshot({ path: path.join(output, "chat-empty.png"), fullPage: true });
+  await empty.close();
+}
+
+async function verifyUsageEnhancements(browser, errors) {
+  const context=await browser.newContext({viewport:{width:1440,height:1000}});
+  await context.addInitScript(fixture);
+  await context.addInitScript(()=>{
+    const seed=window.__fixtureRequests[0];
+    window.__fixtureRequests=Array.from({length:250},(_,i)=>({...seed,ts:Math.floor(new Date(i<125?'2026-10-13T08:00:00':'2026-10-12T08:00:00').getTime()/1000),requested_model:`row-${i}`}));
+  });
+  const page=await context.newPage();page.on('pageerror',e=>errors.push(String(e)));
+  await page.goto(baseUrl);const nav=page.getByRole('navigation',{name:'主导航'});
+  await nav.getByRole('button',{name:'用量与审计',exact:true}).click();
+  await page.getByText('当前 1–120 条 / 共 250 条',{exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>window.__fixtureClientScanCalls??0),0,'page entry does not scan local client logs');
+  await page.locator('#audit-next').click();await page.getByText('当前 121–240 条 / 共 250 条',{exact:true}).waitFor();
+  await page.locator('#audit-export-jsonl').click();
+  await page.waitForFunction(()=>window.__lastExport?.filter.offset===0);
+  assert.equal(await page.evaluate(()=>window.__lastExport.filter.limit),null,'export covers all filtered rows');
+  await page.locator('#audit-next').click();await page.getByText('当前 241–250 条 / 共 250 条',{exact:true}).waitFor();
+  assert(await page.locator('#audit-next').isDisabled());
+  await page.locator('#audit-from-time').fill('2026-10-13T00:00');await page.locator('#audit-to-time').fill('2026-10-13T23:59');
+  await page.getByText('当前 1–120 条 / 共 125 条',{exact:true}).waitFor();
+  const latest=await page.evaluate(()=>window.__fixtureAuditRequests.at(-1).filter);
+  assert.equal(latest.offset,0);assert.equal(latest.from_ts,Math.floor(new Date('2026-10-13T00:00').getTime()/1000));
+  await page.locator('#audit-from-time').fill('2026-10-14T00:00');await page.getByText(/开始时间不能晚于结束时间/).waitFor();assert(await page.locator('#audit-export-jsonl').isDisabled());
+  await page.locator('#audit-reset').click();await page.getByText('当前 1–120 条 / 共 250 条',{exact:true}).waitFor();
+  const panel=page.getByTestId('client-usage-panel');
+  await panel.locator('#client-usage-from').fill('2026-10-13');await panel.locator('#client-usage-to').fill('2026-10-13');
+  await page.evaluate(()=>{window.__fixtureClientScanHold=true;});await panel.locator('#client-usage-scan').click();
+  await page.waitForFunction(()=>Boolean(window.__fixtureClientScanRelease));assert(await panel.locator('#client-usage-scan').isDisabled());
+  await page.evaluate(()=>{window.__fixtureClientScanHold=false;window.__fixtureClientScanRelease();});
+  await panel.getByTestId('client-usage-table').locator('tbody tr').nth(1).waitFor();
+  assert.equal(await page.evaluate(()=>window.__fixtureClientScanCalls),1);
+  const qoder=panel.getByTestId('client-usage-table').locator('tbody tr').filter({hasText:'Qoder CLI'});assert((await qoder.innerText()).includes('未知'));assert((await qoder.innerText()).includes('2 条用量未报告'));
+  await page.evaluate(()=>{window.__fixtureClientScanFailure=true;});await panel.locator('#client-usage-scan').click();await panel.getByText(/读取客户端用量失败/).waitFor();assert.equal(await panel.locator('tbody tr').count(),3,'failed refresh preserves previous snapshot');
+  await page.evaluate(()=>{window.__fixtureClientScanFailure=false;window.__fixtureClientScanEmpty=true;});await panel.locator('#client-usage-scan').click();await panel.getByText(/所选范围没有可显示的用量记录/).waitFor();
+  await page.evaluate(()=>{window.__fixtureClientScanEmpty=false;});await panel.locator('#client-usage-scan').click();await panel.locator('tbody tr').nth(1).waitFor();
+  await panel.screenshot({path:path.join(output,'client-usage-known-unknown.png')});
+  await page.screenshot({path:path.join(output,'audit-pagination-time.png'),fullPage:true});
+  await page.setViewportSize({width:390,height:844});await panel.scrollIntoViewIfNeeded();
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),'usage panel must not overflow mobile viewport');
+  await panel.screenshot({path:path.join(output,'client-usage-narrow.png')});
+  await page.setViewportSize({width:1440,height:1000});
+  await panel.locator('#client-usage-from').fill('2026-10-12');await panel.locator('#client-usage-to').fill('2026-10-13');await panel.locator('#client-usage-scan').click();
+  const total=panel.getByTestId('client-usage-table').locator('tbody tr').filter({hasText:'range-model'});
+  await page.waitForFunction(()=>window.__fixtureClientScanArgs?.fromDay==='2026-10-12');
+  await total.getByText('5 次',{exact:false}).waitFor();assert.equal(await total.count(),1,'one range total per source/provider/model');
+  assert((await total.innerText()).includes('USD 0.000066'));
+  assert((await panel.getByTestId('client-usage-table').locator('thead').innerText()).includes('预计费用'));
+  assert(!(await panel.getByTestId('client-usage-table').locator('thead').innerText()).includes('命中 /'));
+  const chart=panel.getByTestId('client-usage-chart');await chart.getByLabel('曲线指标').selectOption('cost');
+  const ys=await chart.locator('circle').evaluateAll(es=>es.map(e=>Number(e.getAttribute('cy'))));
+  assert(Math.max(...ys)-Math.min(...ys)>10,'sub-dollar expense curves must scale to visible variation');
+  assert.equal(await panel.locator('details').getAttribute('open'),null,'technical details initially collapsed');
+  await chart.scrollIntoViewIfNeeded();await page.screenshot({path:path.join(output,'client-usage-range-cost-curve.png')});
+  await total.scrollIntoViewIfNeeded();await page.screenshot({path:path.join(output,'client-usage-range-totals.png')});
+  await chart.locator('circle[data-day="2026-10-12"]').first().focus();await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>window.__fixtureClientScanArgs?.toDay==='2026-10-12');
+  await panel.getByTestId('client-usage-period').getByText(/2026-10-12 至 2026-10-12/).waitFor();
+  assert.equal(await panel.getByTestId('client-usage-table').locator('tbody tr').count(),1,'point selection filters a single day');
+  assert((await total.innerText()).includes('USD 0.00002'));
+  await panel.getByLabel('用量排序').selectOption('source');
+  await panel.getByRole('button',{name:'近 30 天',exact:true}).click();
+  await page.waitForFunction(()=>window.__fixtureClientScanArgs?.fromDay!==window.__fixtureClientScanArgs?.toDay);
+  const shortcut=await page.evaluate(()=>window.__fixtureClientScanArgs);assert.equal((Date.parse(shortcut.toDay)-Date.parse(shortcut.fromDay))/86400000,29);
+  await panel.getByRole('button',{name:'今天',exact:true}).click();
+  await page.waitForFunction(()=>window.__fixtureClientScanArgs?.fromDay===window.__fixtureClientScanArgs?.toDay);
+  await panel.locator('summary').click();assert.notEqual(await panel.locator('details').getAttribute('open'),null);
+  await context.close();
+}
+
+async function verifyChatEnhancements(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  page.on("pageerror", e => errors.push(`chat-enhancements: ${e.message}`));
+  await page.goto(baseUrl);
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  await nav.getByRole("button", { name: "聊天测试", exact: true }).click();
+  const chat = page.getByTestId("chat-page"), prompt = chat.locator("#chat-prompt");
+  await chat.locator("#chat-model:not(:disabled)").waitFor();
+  await page.evaluate(() => { window.__fixtureChatReasoning = "第一轮独立推理证据"; });
+  await prompt.fill("第一轮");
+  await chat.getByRole("button", { name: "发送消息", exact: true }).click();
+  await chat.locator(".chat-turn.assistant").waitFor();
+  await chat.locator("#chat-model:not(:disabled)").waitFor();
+  await page.evaluate(() => { window.__fixtureChatReasoning = null; });
+  await prompt.fill("第二轮");
+  await prompt.press("Control+Enter");
+  await chat.locator(".chat-turn.assistant").nth(1).waitFor();
+  assert.equal(await chat.locator(".chat-meta").count(), 2, "second response must preserve the first response metadata");
+  await chat.locator(".chat-turn.assistant").first().getByText("推理内容", { exact: true }).click();
+  await chat.getByText("第一轮独立推理证据", { exact: true }).waitFor();
+  const inputs = await page.evaluate(() => window.__fixtureChatInputs);
+  assert(inputs[1].messages.every(m => Object.keys(m).sort().join(",") === "content,role"), "IPC must omit presentation metadata");
+  await page.screenshot({ path: path.join(output, "chat-metadata-preserved.png"), fullPage: true });
+
+  await page.evaluate(() => { window.__fixtureSavePath = "C:/fixture/chat.json"; });
+  await chat.getByRole("button", { name: "导出对话 JSON", exact: true }).click();
+  await chat.getByRole("status").filter({ hasText: "已导出" }).waitFor();
+  const exported = await page.evaluate(() => window.__fixtureChatExports[0]);
+  assert.equal(exported.dest, "C:/fixture/chat.json");
+  assert.equal(exported.transcript.turns.length, 4);
+  assert.equal(exported.transcript.turns[1].result.reasoning, "第一轮独立推理证据");
+  assert.equal(exported.transcript.turns[1].result.trace_id, "fixture-trace");
+  assert.equal(exported.transcript.turns[3].result.usage.total_tokens, 7);
+  assert.equal(exported.transcript.session_id, inputs[0].session_id);
+  assert.equal(await page.evaluate(() => window.__fixtureChatInputs.length), 2, "export must not send another model request");
+  await page.evaluate(() => { window.__fixtureSavePath = null; });
+  await chat.getByRole("button", { name: "导出对话 JSON", exact: true }).click();
+  await chat.getByRole("button", { name: "导出对话 JSON", exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureChatExports.length), 1, "cancel must not write a file");
+  assert.equal(await chat.getByRole("status").filter({ hasText: "已导出" }).count(), 0, "cancel must not retain a success message");
+  await page.evaluate(() => { window.__fixtureSavePath = "C:/fixture/chat.json"; window.__fixtureChatExportFailure = true; });
+  await chat.getByRole("button", { name: "导出对话 JSON", exact: true }).click();
+  await chat.getByRole("alert").filter({ hasText: "模拟本地对话文件不可写" }).waitFor();
+  assert.equal(await chat.locator(".chat-turn").count(), 4, "failed export preserves history");
+
+  // The selected conversation is snapshotted before the asynchronous save dialog.
+  await page.evaluate(() => { window.__fixtureChatExportFailure = false; window.__fixtureSaveHold = true; });
+  await chat.getByRole("button", { name: "导出对话 JSON", exact: true }).click();
+  await page.waitForFunction(() => Boolean(window.__fixtureSaveRelease));
+  await chat.getByRole("button", { name: "新建对话", exact: true }).click();
+  await nav.getByRole("button", { name: "供应商", exact: true }).click();
+  await page.evaluate(() => { window.__fixtureSaveHold = false; window.__fixtureSaveRelease(); });
+  await page.waitForFunction(() => window.__fixtureChatExports.length === 2);
+  const afterSwitch = await page.evaluate(() => window.__fixtureChatExports[1].transcript);
+  assert.deepEqual(afterSwitch.turns, exported.transcript.turns);
+  assert.equal(afterSwitch.session_id, exported.transcript.session_id);
+  await nav.getByRole("button", { name: "聊天测试", exact: true }).click();
+  await chat.locator("#chat-model:not(:disabled)").waitFor();
+  assert.equal(await chat.locator(".chat-turn").count(), 0, "export completion does not restore an old conversation");
+  await prompt.fill("中文输入尚在组合");
+  await prompt.dispatchEvent("compositionstart", { data: "中文" });
+  await prompt.dispatchEvent("keydown", { key: "Enter", ctrlKey: true, isComposing: true });
+  await prompt.dispatchEvent("keydown", { key: "Enter", ctrlKey: true, isComposing: false });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+  assert.equal(await page.evaluate(() => window.__fixtureChatInputs.length), 2, "composition must block both composing and legacy shortcut events");
+  await prompt.dispatchEvent("compositionend", { data: "中文" });
+  await prompt.dispatchEvent("keydown", { key: "Enter", ctrlKey: true, keyCode: 229 });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+  assert.equal(await page.evaluate(() => window.__fixtureChatInputs.length), 2, "IME keyCode 229 must not submit");
+  assert.equal(await prompt.inputValue(), "中文输入尚在组合");
+  await prompt.press("Control+Enter");
+  await chat.locator(".chat-turn.assistant").waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureChatInputs.length), 3, "normal shortcut still submits once after composition");
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 2));
+  await page.screenshot({ path: path.join(output, "chat-export-ime-narrow.png"), fullPage: true });
+  await context.close();
+}
+
+async function verifySessionPagination(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  page.on("pageerror", e => errors.push(`session-pagination: ${e.message}`));
+  page.on("dialog", dialog => dialog.accept());
+  await page.goto(baseUrl);
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "会话上下文", exact: true }).click();
+  await page.locator(".session-item").first().waitFor();
+  await page.evaluate(() => { window.__fixtureSessionMessageHold = true; window.__fixtureSessionDeleteFailure = true; });
+  await page.locator(".session-item").filter({ hasText: "通用网关长上下文" }).click();
+  await page.waitForFunction(() => Boolean(window.__fixtureSessionMessageRelease));
+  await page.getByRole("button", { name: "删除会话", exact: true }).click();
+  await page.getByRole("status").filter({ hasText: "模拟删除会话失败" }).waitFor();
+  await page.evaluate(() => { window.__fixtureSessionMessageHold = false; window.__fixtureSessionMessageRelease(); });
+  await page.locator(".session-message").nth(3).waitFor({ timeout: 5000 });
+  assert.equal(await page.getByText("正在加载消息时间线", { exact: true }).count(), 0, "delete failure must release the obsolete message load");
+  await page.evaluate(() => {
+    window.__fixtureSessionDeleteFailure = false;
+    const base = window.__fixtureMessages[0];
+    window.__fixtureSessionPages = { "session-slow": Array.from({ length: 501 }, (_, i) => ({ ...base, id: i + 1, session_id: "session-slow", content: `分页消息 ${i + 1}` })) };
+    window.__fixtureSessions[0].message_count = 501;
+  });
+  await page.locator(".session-item").filter({ hasText: "通用网关长上下文" }).click();
+  await page.locator(".session-message").nth(499).waitFor();
+  assert.equal(await page.locator(".session-message").count(), 500);
+  await page.evaluate(() => { window.__fixtureSessionPageFailure = 500; });
+  await page.getByRole("button", { name: "加载更多消息", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "模拟消息读取失败" }).waitFor();
+  assert.equal(await page.locator(".session-message").count(), 500, "failed later page preserves previous messages");
+  await page.evaluate(() => {
+    delete window.__fixtureSessionPageFailure;
+    window.__fixtureSessionPages["session-slow"].push({ ...window.__fixtureSessionPages["session-slow"][0], id: 502, content: "分页期间新消息 502" });
+  });
+  await page.getByRole("button", { name: "重试读取消息", exact: true }).click();
+  await page.getByText("分页期间新消息 502", { exact: true }).waitFor();
+  assert.equal(await page.locator(".session-message").count(), 502);
+  assert.equal(await page.getByRole("button", { name: "加载更多消息", exact: true }).count(), 0);
+  await page.getByText("已加载 502 条消息", { exact: true }).waitFor();
+  await page.screenshot({ path: path.join(output, "sessions-page-retry.png"), fullPage: true });
+
+  await page.locator(".session-item").filter({ hasText: "通用网关长上下文" }).click();
+  await page.locator(".session-message").nth(499).waitFor();
+  await page.evaluate(() => { window.__fixtureSessionPageHold = { id: "session-slow", after: 500 }; });
+  await page.getByRole("button", { name: "加载更多消息", exact: true }).click();
+  await page.waitForFunction(() => Boolean(window.__fixtureSessionPageRelease));
+  await page.locator(".session-item").filter({ hasText: "快速切换验证" }).click();
+  await page.getByText("这是快速切换后的正确会话内容。", { exact: true }).waitFor();
+  await page.evaluate(() => { window.__fixtureSessionPageHold = null; window.__fixtureSessionPageRelease(); });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+  assert.equal(await page.locator(".session-message").count(), 1, "late page must not append to a different conversation");
+  await page.evaluate(() => { window.__fixtureSessionPageFailure = 0; });
+  await page.locator(".session-item").filter({ hasText: "空会话" }).click();
+  await page.getByRole("alert").filter({ hasText: "模拟消息读取失败" }).waitFor();
+  await page.evaluate(() => { delete window.__fixtureSessionPageFailure; });
+  await page.getByRole("button", { name: "重试读取消息", exact: true }).click();
+  await page.getByText("该会话暂无可显示的消息", { exact: true }).waitFor();
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 2));
+  await page.screenshot({ path: path.join(output, "sessions-empty-recovered-narrow.png"), fullPage: true });
+  await context.close();
+}
+
+async function verifyQoderLogin(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  page.on("pageerror", error => errors.push(`qoder-login: ${error.message}`));
+  try {
+    await page.goto(baseUrl);
+    await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "客户端接入", exact: true }).click();
+    await page.locator(".boot-splash").waitFor({ state: "hidden" });
+    const global = page.getByTestId("qoder-login-global"), cn = page.getByTestId("qoder-login-cn");
+    const button = (section, name) => section.getByRole("button", { name, exact: true });
+    await page.waitForFunction(() => window.__fixtureCalls.filter(c => c === "qoder_login_status").length === 2);
+    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => /^(qoder_login_(start|poll|refresh)|qoder_job_(prepare|refresh)|register_qoder_provider)$/.test(c)), [], "entry only reads local status");
+    await global.getByLabel("本机账号名称").fill("非法账号");
+    assert(await button(global, "网页登录").isDisabled());
+    assert.equal(await global.getByLabel("本机账号名称").getAttribute("aria-invalid"), "true");
+    await global.getByLabel("本机账号名称").fill("qoder");
+    await global.getByLabel("本机账号名称").focus();
+    await page.keyboard.press("Tab");
+    assert(await button(global, "网页登录").evaluate(el => el === document.activeElement), "keyboard can reach login submit");
+    await page.keyboard.press("Enter");
+    await button(global, "打开官方授权网页").waitFor();
+    assert.equal(await page.evaluate(() => window.__fixtureOpenedOfficialUrl ?? null), null);
+    await button(global, "打开官方授权网页").click();
+    await page.waitForFunction(() => window.__fixtureOpenedOfficialUrl?.startsWith("https://qoder.com/device/selectAccounts?"));
+    await page.evaluate(() => { window.__fixtureQdAuthorize = true; });
+    await global.getByText("离线 global qoder", { exact: false }).waitFor();
+    assert.equal(await button(cn, "重新网页登录").count(), 0, "global login does not log in CN");
+    assert((await global.innerText()).includes("未知（官方未提供）"));
+    await global.screenshot({ path: path.join(output, "qoder-global-login-authenticated.png") });
+    await button(cn, "网页登录").click();
+    await button(cn, "打开官方授权网页").click();
+    await page.waitForFunction(() => window.__fixtureOpenedOfficialUrl?.startsWith("https://qoder.cn/device/selectAccounts?"));
+    await cn.getByText("离线 cn qoder", { exact: false }).waitFor();
+    assert(await button(cn, "接入账号模型").isDisabled());
+    await button(global, "准备模型认证").click();
+    await global.getByText("模型认证已准备并核验身份，可接入模型目录。未发送模型请求。", { exact: true }).waitFor();
+    assert(await button(cn, "接入账号模型").isDisabled(), "global job cannot authorize CN");
+    await button(global, "接入账号模型").focus();
+    await page.keyboard.press("Enter");
+    await global.getByText(/已接入 17 个模型/).waitFor();
+    await page.evaluate(() => { window.__fixtureQdJobFailure = true; });
+    await button(cn, "准备模型认证").click();
+    await cn.getByRole("alert").filter({ hasText: "不会自动重放" }).waitFor();
+    assert(await button(cn, "准备模型认证").isDisabled());
+    await page.evaluate(() => { window.__fixtureQdJobFailure = false; });
+    await button(cn, "检查登录状态").click();
+    await cn.getByText("本机保存的登录状态已更新；未发送账号或模型请求。", { exact: true }).waitFor();
+    await button(cn, "准备模型认证").click();
+    await cn.getByText("模型认证已准备并核验身份，可接入模型目录。未发送模型请求。", { exact: true }).waitFor();
+    await page.evaluate(() => { window.__fixtureQdRegisterFailure = true; });
+    await button(cn, "接入账号模型").click();
+    await cn.getByRole("alert").filter({ hasText: "已有配置保留" }).waitFor();
+    await page.evaluate(() => { window.__fixtureQdRegisterFailure = false; });
+    await button(cn, "接入账号模型").click();
+    await cn.getByText(/已接入 14 个模型/).waitFor();
+    await cn.screenshot({ path: path.join(output, "qoder-cn-model-registered.png") });
+    await button(cn, "刷新登录").click();
+    await cn.getByText("登录凭据已刷新并重新核验身份。", { exact: true }).waitFor();
+    await page.evaluate(() => { window.__fixtureQdRefreshFailure = true; });
+    await button(global, "刷新登录").click();
+    await global.getByRole("alert").filter({ hasText: "本次刷新不会重放" }).waitFor();
+    assert.equal(await button(global, "刷新登录").count(), 0, "failed refresh is disabled until saved status is checked");
+    await button(global, "检查登录状态").click();
+    await global.getByText("本机保存的登录状态已更新；未发送账号或模型请求。", { exact: true }).waitFor();
+    await page.evaluate(() => { window.__fixtureQdRegisterHold = true; });
+    await button(global, "接入账号模型").click();
+    await page.waitForFunction(() => typeof window.__fixtureQdRegisterRelease === "function");
+    await global.getByLabel("本机账号名称").fill("secondary");
+    await page.evaluate(() => { window.__fixtureQdRegisterHold = false; window.__fixtureQdRegisterRelease(); });
+    await global.getByText("未登录", { exact: true }).waitFor();
+    assert.equal(await global.getByText(/已接入 17 个模型/).count(), 0, "late registration cannot overwrite switched account");
+    await global.getByLabel("本机账号名称").fill("secondary");
+    await page.evaluate(() => { window.__fixtureQdStartHold = true; window.__fixtureQdAuthorize = false; });
+    await button(global, "网页登录").click();
+    await page.waitForFunction(() => typeof window.__fixtureQdStartRelease === "function");
+    await global.getByLabel("本机账号名称").fill("third");
+    await page.evaluate(() => { window.__fixtureQdStartHold = false; window.__fixtureQdStartRelease(); });
+    await page.waitForFunction(() => window.__fixtureQdCancels?.length > 0);
+    assert.equal(await button(global, "打开官方授权网页").count(), 0, "late start cannot reopen cancelled account");
+    await page.evaluate(() => { window.__fixtureQdPollFailure = true; });
+    await button(global, "网页登录").click();
+    await global.getByRole("alert").filter({ hasText: "已停止检查" }).waitFor();
+    const polls = await page.evaluate(() => window.__fixtureCalls.filter(c => c === "qoder_login_poll").length);
+    await page.waitForTimeout(2200);
+    assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(c => c === "qoder_login_poll").length), polls);
+    await page.evaluate(() => { window.__fixtureQdCancelFailure = true; });
+    await button(global, "取消登录").click();
+    await button(global, "重试取消").waitFor();
+    assert(await button(global, "网页登录").isDisabled());
+    await page.evaluate(() => { window.__fixtureQdCancelFailure = false; });
+    await button(global, "重试取消").click();
+    await global.getByText("已取消本次网页登录。需要时可重新登录。", { exact: true }).waitFor();
+    await page.evaluate(() => { window.__fixtureQdPollFailure = false; window.__fixtureQdPollHold = true; window.__fixtureQdDeadlineMs = 2400; });
+    await button(global, "网页登录").click();
+    await page.waitForFunction(() => typeof window.__fixtureQdPollRelease === "function");
+    await global.getByText("等待已结束", { exact: true }).waitFor();
+    await page.evaluate(() => { window.__fixtureQdPollHold = false; window.__fixtureQdAuthorize = true; window.__fixtureQdPollRelease(); });
+    await page.waitForTimeout(100);
+    assert.equal(await button(global, "重新网页登录").count(), 0);
+    await page.evaluate(() => { window.__fixtureQdDeadlineMs = 300000; window.__fixtureQdBadUrl = true; });
+    await button(global, "网页登录").click();
+    await global.getByRole("alert").filter({ hasText: "所选区域的 Qoder 官方 HTTPS" }).waitFor();
+    assert.equal(await button(global, "打开官方授权网页").count(), 0);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByRole("button", { name: "切换到深色主题", exact: true }).click();
+    await cn.screenshot({ path: path.join(output, "qoder-cn-login-narrow-dark.png") });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => /^(desktop_chat|test_provider|claim_benefit_now)$/.test(c)), []);
+    console.log("QODER_LOGIN_UI_OK: login and model registration; isolated fixtures, two regions, invalid account, authentication failure, catalog recovery, late registration, explicit open, keyboard, cancellation, deadline, responsive theme, zero model/claim");
+  } catch (error) {
+    await page.screenshot({ path: path.join(output, "qoder-login-failure.png"), fullPage: true });
+    throw error;
+  } finally { await context.close(); }
+}
+
+async function verifyWorkBuddyLogin(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 } });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  page.on("pageerror", e => errors.push(`workbuddy-login: ${e.message}`));
+  try {
+    await page.goto(baseUrl);
+    await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "客户端接入", exact: true }).click();
+    const login = page.getByTestId("workbuddy-login");
+    const account = login.getByLabel("本机账号名称");
+    const button = name => login.getByRole("button", { name, exact: true });
+    await page.waitForFunction(() => window.__fixtureCalls.includes("workbuddy_login_status"));
+    const forbidden = /^(workbuddy_login_start|workbuddy_login_poll|workbuddy_login_refresh|register_workbuddy_provider|qoder_job_prepare|qoder_job_refresh|register_qoder_provider|desktop_chat|test_provider|claim_benefit_now)$/;
+    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => forbidden.test(c)), [], "page entry must read only local status");
+    assert(await button("接入模型").isDisabled());
+    await button("网页登录").click();
+    await button("打开官方授权网页").waitFor();
+    assert.equal(await page.evaluate(() => window.__fixtureOpenedOfficialUrl ?? null), null, "browser authorization opens only on explicit click");
+    await button("打开官方授权网页").click();
+    await page.waitForFunction(() => window.__fixtureOpenedOfficialUrl?.startsWith("https://www.workbuddy.ai/"));
+    await page.evaluate(() => { window.__fixtureWbAuthorize = true; });
+    await button("重新网页登录").waitFor();
+    await login.getByText("离线账号 workbuddy", { exact: true }).waitFor();
+    assert((await login.innerText()).includes("未知（官方未提供）"));
+    await page.evaluate(() => { window.__fixtureWbRegisterHold = true; });
+    await button("接入模型").click();
+    await page.waitForFunction(() => typeof window.__fixtureWbRegisterRelease === "function");
+    assert(await button("正在接入…").isDisabled());
+    await page.evaluate(() => { window.__fixtureWbRegisterHold = false; window.__fixtureBridgeReadFailure = true; window.__fixtureWbRegisterRelease(); });
+    await login.getByText("已接入 27 个模型，请到供应商页查看。", { exact: true }).waitFor();
+    assert.equal((await page.evaluate(() => window.__fixtureCalls)).filter(c => c === "register_workbuddy_provider").length, 1);
+    await page.getByTestId("clients-page").locator(".msg.err").filter({hasText:"客户端状态读取失败"}).waitFor();
+    await page.evaluate(() => { window.__fixtureBridgeReadFailure = false; });
+    await button("刷新登录").click();
+    await login.getByText("登录已刷新。", { exact: true }).waitFor();
+    await login.screenshot({ path: path.join(output, "workbuddy-login-authenticated.png") });
+
+    // A start response arriving after account switching must be cancelled.
+    await page.evaluate(() => { window.__fixtureWbStartHold = true; window.__fixtureWbAuthorize = false; });
+    await button("重新网页登录").click();
+    await page.waitForFunction(() => typeof window.__fixtureWbStartRelease === "function");
+    await account.fill("secondary");
+    await page.evaluate(() => { window.__fixtureWbStartHold = false; window.__fixtureWbStartRelease(); });
+    await page.waitForFunction(() => (window.__fixtureWbCancels ?? []).length > 0);
+    await button("网页登录").waitFor();
+    assert(!(await login.innerText()).includes("离线账号 workbuddy"));
+
+    await page.evaluate(() => { window.__fixtureWbPollFailure = true; });
+    await button("网页登录").click();
+    await button("重试检查授权").waitFor();
+    const calls = await page.evaluate(() => window.__fixtureCalls.filter(c => c === "workbuddy_login_poll").length);
+    await page.waitForTimeout(1200);
+    assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(c => c === "workbuddy_login_poll").length), calls, "failed polling is not automatically retried");
+    await page.evaluate(() => { window.__fixtureWbCancelFailure = true; });
+    await button("取消登录").click();
+    await button("重试取消").waitFor();
+    assert(await button("网页登录").isDisabled());
+    await page.evaluate(() => { window.__fixtureWbCancelFailure = false; });
+    await button("重试取消").click();
+    await login.getByText("已取消本次网页登录。需要时可重新登录。", { exact: true }).waitFor();
+
+    await page.evaluate(() => { window.__fixtureWbPollFailure = false; window.__fixtureWbPollHold = true; window.__fixtureWbDeadlineMs = 1500; });
+    await button("网页登录").click();
+    await page.waitForFunction(() => typeof window.__fixtureWbPollRelease === "function");
+    await login.getByText("等待已结束", { exact: true }).waitFor();
+    await page.evaluate(() => { window.__fixtureWbPollHold = false; window.__fixtureWbAuthorize = true; window.__fixtureWbPollRelease(); });
+    await page.waitForTimeout(100);
+    assert.equal(await button("重新网页登录").count(), 0, "late successful poll cannot restore expired login");
+
+    await page.evaluate(() => { window.__fixtureWbBadUrl = true; window.__fixtureWbDeadlineMs = 300000; });
+    await button("网页登录").click();
+    await login.getByRole("alert").filter({ hasText: "仅允许打开 WorkBuddy 官方 HTTPS" }).waitFor();
+    assert.equal(await button("打开官方授权网页").count(), 0, "untrusted authorization target is not exposed");
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
+    await login.screenshot({ path: path.join(output, "workbuddy-login-narrow-dark.png") });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), "login must fit narrow viewport");
+    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => /^(desktop_chat|test_provider|claim_benefit_now)$/.test(c)), []);
+  } finally { await context.close(); }
+}
+
+async function verifyIntegratedRuntimes(browser, errors) {
+  const context = await browser.newContext({ viewport: { width: 1180, height: 900 }, reducedMotion: "reduce" });
+  await context.addInitScript(fixture);
+  const page = await context.newPage();
+  const consoleErrors = [];
+  page.on("pageerror", e => errors.push(`integrated-runtimes: ${e.message}`));
+  page.on("console", m => { if (m.type() === "error") consoleErrors.push(m.text()); });
+  page.on("dialog", d => d.accept());
+  await page.goto(baseUrl);
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  await nav.getByRole("button", { name: "客户端接入", exact: true }).click();
+  const clients = page.getByTestId("clients-page");
+  const wb = clients.getByRole("region", { name: "WorkBuddy 接入", exact: true });
+  const trae = clients.getByRole("region", { name: "Trae CN 接入", exact: true });
+  await wb.getByRole("button", { name: "接入网关", exact: true }).waitFor();
+  assert(await wb.getByRole("button", { name: "停止内置桥接", exact: true }).isDisabled(), "external process cannot be stopped");
+  assert(await wb.getByRole("button", { name: "启动内置桥接", exact: true }).isDisabled(), "occupied external port cannot be adopted");
+  await wb.getByRole("button", { name: "接入网关", exact: true }).click();
+  await clients.locator(".msg.ok").waitFor();
+  const count = await page.evaluate(() => window.__fixtureSaved.length);
+  await wb.getByRole("button", { name: "接入网关", exact: true }).click();
+  await page.waitForFunction(n => window.__fixtureCalls.filter(c => c === "list_providers").length >= n, 2);
+  await page.waitForFunction(() => !document.querySelector('[data-testid="clients-page"] button').disabled);
+  assert.equal(await page.evaluate(() => window.__fixtureSaved.length), count, "repeated registration preserves existing settings");
+  await page.evaluate(() => {
+    const p = window.__fixtureProviders.find(p => /^p-client-workbuddy-[0-9a-f]{32}$/i.test(p.id));
+    p.note = "用户自定义备注";
+    p.models[0].enabled = false;
+  });
+  await clients.getByRole("button", { name: "刷新客户端状态", exact: true }).click();
+  await wb.getByText(/供应商登记 1 家/).waitFor();
+  await wb.getByRole("button", { name: "接入网关", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="clients-page"] button').disabled);
+  assert.equal(await page.evaluate(() => window.__fixtureSaved.length), count, "edited notes must not duplicate bridge registration");
+  assert.equal(await page.evaluate(() => window.__fixtureProviders.find(p => /^p-client-workbuddy-[0-9a-f]{32}$/i.test(p.id)).models[0].enabled), false);
+  const qoder = clients.getByRole("region", { name: "Qoder 接入", exact: true });
+  await page.evaluate(() => { window.__fixtureQoderReloadFailure = true; });
+  await qoder.getByRole("button", { name: "接入 Qoder CLI", exact: true }).click();
+  await clients.getByRole("alert").waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureProviders.find(p => p.id === "p-desktop-qoder").enabled), true, "native atomic registration has no disabled half-state even if reload fails");
+  await page.evaluate(() => { window.__fixtureQoderReloadFailure = false; });
+  await qoder.getByRole("button", { name: "接入 Qoder CLI", exact: true }).click();
+  await clients.locator(".msg.ok").waitFor();
+  assert.equal(await page.evaluate(() => window.__fixtureProviders.filter(p => p.id === "p-desktop-qoder").length), 1);
+  assert.equal(await page.evaluate(() => window.__fixtureAgentRuntimes.filter(r => r.id === "desktop-qoder").length), 1);
+  assert.equal(await page.evaluate(() => window.__fixtureConfigUpdates?.length ?? 0), 0, "CLI registration must not enable unrelated Agent capabilities");
+  await trae.getByLabel("桥接端口", { exact: true }).fill("18892");
+  assert(await trae.getByRole("button", { name: "启动内置桥接", exact: true }).isDisabled(), "dirty port changes cannot silently launch");
+  await trae.getByRole("button", { name: "保存接入设置", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureBridges[2].options.port === 18892);
+  await trae.getByRole("button", { name: "启动内置桥接", exact: true }).click();
+  await trae.getByRole("button", { name: "停止内置桥接", exact: true }).waitFor({ state: "visible" });
+  await page.waitForFunction(() => window.__fixtureBridges[2].managed);
+  await trae.getByRole("button", { name: "停止内置桥接", exact: true }).click();
+  await page.waitForFunction(() => !window.__fixtureBridges[2].managed);
+  assert((await trae.innerText()).includes("trae-desktop"));
+  await page.screenshot({ path: path.join(output, "clients-integrated.png"), fullPage: true });
+  await page.evaluate(() => { window.__fixtureBridgeReadFailure = true; });
+  await clients.getByRole("button", { name: "刷新客户端状态", exact: true }).click();
+  await clients.getByRole("alert").waitFor();
+  assert.equal(await clients.getByRole("region", { name: /^(Qoder|WorkBuddy|Trae CN) 接入$/ }).count(), 0, "failed bridge reads clear stale bridge controls");
+  assert.equal(await clients.getByTestId("workbuddy-login").count(), 1, "independent login is not removed by a bridge status failure");
+  await page.evaluate(() => { window.__fixtureBridgeReadFailure = false; });
+  await clients.getByRole("button", { name: "刷新客户端状态", exact: true }).click();
+  await wb.waitFor();
+  for (const width of [900, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    const content = page.locator(".workspace-content");
+    assert(await content.evaluate(e => e.scrollWidth <= e.clientWidth + 1), `client page overflow at ${width}px`);
+    await page.screenshot({ path: path.join(output, `clients-${width}.png`), fullPage: true });
+  }
+  await page.setViewportSize({ width: 1180, height: 900 });
+  await nav.getByRole("button", { name: "VPN 与代理", exact: true }).click();
+  const panel = page.getByTestId("xray-panel");
+  await panel.waitFor();
+  assert(await panel.getByRole("button", { name: "启动 Xray", exact: true }).isDisabled(), "no config means no launch");
+  await page.evaluate(() => { window.__fixtureDialogPath = "C:/fixture/xray.json"; });
+  await panel.getByRole("button", { name: "导入 Xray JSON", exact: true }).click();
+  await panel.getByRole("status").waitFor();
+  await panel.getByRole("button", { name: "启动 Xray", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureXray.running);
+  await panel.getByRole("button", { name: "网关使用 Xray", exact: true }).click();
+  await panel.getByRole("button", { name: "取消网关使用 Xray", exact: true }).waitFor();
+  await panel.getByRole("button", { name: "停止 Xray", exact: true }).click();
+  await panel.getByRole("status").filter({ hasText: "网关仍保留此代理" }).waitFor();
+  await panel.getByRole("button", { name: "取消网关使用 Xray", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureConfig.http_proxy === null);
+  await page.screenshot({ path: path.join(output, "xray-integrated.png"), fullPage: true });
+  for (const width of [900, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    assert(await panel.evaluate(e => e.scrollWidth <= e.clientWidth + 1), `Xray panel overflow at ${width}px`);
+    await panel.screenshot({ path: path.join(output, `xray-${width}.png`) });
+  }
+  assert.deepEqual(consoleErrors, []);
+  await context.close();
 }
 
 async function verifyVpnPage(browser, errors) {
@@ -1199,9 +2028,25 @@ async function verifyVpnPage(browser, errors) {
     `上下行网速都应显示：实际=${externalText}`);
   assert(externalText.includes("只读"), "卡片必须写明对 mojie 只读，避免误会成会去改动客户端");
   assert.equal(
-    await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "external_vpn_status").length > 0),
-    true, "卡片必须真的调用 external_vpn_status，而不是渲染静态文案");
+    await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "external_vpn_status").length),
+    1, "首次进入页面只能探测一次，避免重复订阅请求");
   await page.screenshot({ path: path.join(output, "vpn-external.png"), fullPage: true, animations: "disabled" });
+
+  await page.evaluate(() => { window.__fixtureExternalPlan = [{ hold: true }]; window.__fixtureExternalPending = []; });
+  await page.getByRole("button", { name: "刷新状态", exact: true }).click();
+  await page.waitForFunction(() => window.__fixtureExternalPending.length === 1);
+  await page.getByRole("button", { name: "刷新状态", exact: true }).waitFor({ state: "visible" });
+  await page.evaluate(() => { window.__fixtureExternalVpnStatus.quota = "700.00 GB"; });
+  await page.getByRole("button", { name: "刷新状态", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('[data-testid="external-vpn"]')?.innerText.includes("700.00 GB"));
+  await page.evaluate(() => window.__fixtureExternalPending.splice(0).forEach(resolve => resolve()));
+  await page.waitForTimeout(100);
+  assert((await externalCard.innerText()).includes("700.00 GB"), "迟到的旧探测不得覆盖新的外部 VPN 状态");
+  await page.evaluate(() => { window.__fixtureExternalPlan = [{ error: true }]; });
+  await page.getByRole("button", { name: "刷新状态", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('[data-testid="external-vpn"]')?.innerText.includes("探测失败"));
+  assert(!(await externalCard.innerText()).includes("700.00 GB"), "探测失败不得留下旧额度或一直显示探测中");
+  await page.screenshot({ path: path.join(output, "vpn-external-error.png"), fullPage: true, animations: "disabled" });
 
   // 对照组：mojie 不可用时只在该卡片里给说明，不产生页面级报错。
   await page.evaluate(() => {
@@ -1556,13 +2401,32 @@ async function verifyBenefits(browser, errors) {
   await settled();
   assert.equal(await page.evaluate(() => window.__fixtureConfig.benefits.auto_claim), true);
   const beforeInvalidHour = await page.evaluate(() => window.__fixtureConfigUpdates.length);
-  await page.getByLabel("本地时间不早于", { exact: true }).fill("24");
+  await page.getByLabel("每日领取时间", { exact: true }).fill("");
   await page.getByRole("button", { name: "保存领取时间", exact: true }).click();
   assert.equal(await page.evaluate(() => window.__fixtureConfigUpdates.length), beforeInvalidHour);
-  await page.getByLabel("本地时间不早于", { exact: true }).fill("11");
+  await page.getByLabel("每日领取时间", { exact: true }).fill("12:05")
+  await page.getByLabel("领取时区", { exact: true }).selectOption("Asia/Shanghai");
   await page.getByRole("button", { name: "保存领取时间", exact: true }).click();
   await settled();
-  assert.equal(await page.evaluate(() => window.__fixtureConfig.benefits.auto_claim_after_hour), 11);
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.benefits.auto_claim_after_hour), 12);
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.benefits.auto_claim_after_minute), 5);
+  assert.equal(await page.evaluate(() => window.__fixtureConfig.benefits.auto_claim_timezone), "Asia/Shanghai");
+  await page.getByLabel('领取执行方式',{exact:true}).selectOption('windows_task');await settled();
+  assert.equal(await page.evaluate(()=>window.__fixtureConfig.benefits.scheduler_mode),'windows_task');
+  await addAccount("trae-cn-test", "Trae 签到账号", "trae_cn");
+  await page.getByLabel("Trae 签到账号每日领取时间", {exact:true}).fill("00:05");
+  await settled();
+  assert.equal(await page.evaluate(()=>window.__fixtureConfig.benefits.account_claim_times['trae-cn-test']), '00:05');
+  assert.equal(await page.evaluate(()=>window.__fixtureConfig.benefits.auto_claim_after_hour),12);
+  assert.equal(await page.getByLabel("国际活动账号每日领取时间",{exact:true}).inputValue(),"12:05");
+  await page.getByTestId("benefit-account-trae-cn-test").getByRole('button',{name:'使用默认时间',exact:true}).click();
+  await settled();
+  assert.equal(await page.getByLabel("Trae 签到账号每日领取时间",{exact:true}).inputValue(),"12:05");
+  await page.getByLabel("Trae 签到账号每日领取时间",{exact:true}).fill("00:05");
+  await settled();
+  await page.screenshot({path:path.join(output,"benefits-trae-independent-0005.png"),fullPage:true});
+  await international.getByRole('button',{name:'复用客户端登录',exact:true}).click();await settled();
+  assert((await international.innerText()).includes('离线会话账号'));assert((await international.innerText()).includes('20 / 100 Credits'));
   await page.screenshot({ path: path.join(output, "benefits-auto-settings.png"), fullPage: true });
   await page.getByRole("checkbox", { name: "每日自动领取", exact: true }).uncheck();
   await settled();
@@ -1587,7 +2451,7 @@ async function verifyBenefits(browser, errors) {
   await settled();
   assert.equal(await page.evaluate(() => window.__fixtureBenefitQueries), queriesWhenOff);
   await nav.getByRole("button", { name: "供应商", exact: true }).click();
-  await page.evaluate(() => { window.__fixtureBenefitPlans = [{ delayMs: 350, overview: { enabled: false, auto_claim: false, auto_claim_after_hour: 10, checked_at: "2026-10-10T01:00:00Z", accounts: [] } }, {}]; });
+  await page.evaluate(() => { window.__fixtureBenefitPlans = [{ delayMs: 350, overview: { enabled: false, auto_claim: false, auto_claim_after_hour: 10, auto_claim_after_minute: 0, auto_claim_timezone: "local", checked_at: "2026-10-10T01:00:00Z", accounts: [] } }, {}]; });
   await nav.getByRole("button", { name: "账号权益", exact: true }).click();
   await international.waitFor();
   await page.waitForTimeout(450);
@@ -1692,7 +2556,7 @@ async function verifyDiagnostics(browser, errors) {
   await page.getByRole("button", { name: "刷新诊断", exact: true }).click();
   await page.getByText("尚无检查结果，不能据此确认网关正常。", { exact: true }).waitFor();
   assert((await page.getByTestId("diagnostics-overall").innerText()).includes("未知"));
-  assert((await page.getByTestId("diagnostics-summary").innerText()).includes("VPN 内核状态未知"), "忙或无法读取的VPN状态不能假装停止");
+  assert((await page.getByTestId("diagnostics-summary").innerText()).includes("受管代理内核状态未知"), "忙或无法读取的受管状态不能假装停止");
   assert((await page.getByTestId("diagnostics-summary").innerText()).includes("代理归属未知"), "VPN状态未知时不能把显式代理断定为其他代理");
   assert(!(await page.getByTestId("diagnostics-summary").innerText()).includes("其他代理"));
   await page.waitForFunction(() => {
@@ -1777,10 +2641,24 @@ async function verifyDiagnostics(browser, errors) {
   await context.close();
 }
 
-(async () => {
+module.exports = { fixture };
+if (require.main === module) (async () => {
   fs.mkdirSync(output, { recursive: true });
   const browser = await chromium.launch({ headless: true, ...(process.env.LLMGW_BROWSER_CHANNEL ? { channel: process.env.LLMGW_BROWSER_CHANNEL } : {}) });
   try {
+    if (process.env.LLMGW_UI_FOCUS) {
+      const focus = process.env.LLMGW_UI_FOCUS, errors = [];
+      assert(["chat", "sessions", "usage", "qoder", "trae"].includes(focus), "unsupported UI focus");
+      if (focus === "chat") await verifyChatEnhancements(browser, errors);
+      if (focus === "sessions") await verifySessionPagination(browser, errors);
+      if (focus === "usage") await verifyUsageEnhancements(browser, errors);
+      if (focus === "qoder") await verifyQoderLogin(browser, errors);
+      if (focus === "trae") await require("./trae-login-ui.cjs").verifyTraeLogin(browser, baseUrl, output, errors);
+      assert.deepEqual(errors, []);
+      console.log(`UI_FOCUS_OK: ${focus}; screenshots=${output}`);
+      return;
+    }
+    await require("./trae-login-ui.cjs").verifyTraeLogin(browser, baseUrl, output, []);
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: "reduce" });
     await context.addInitScript(fixture);
     const page = await context.newPage();
@@ -1813,6 +2691,13 @@ async function verifyDiagnostics(browser, errors) {
     await verifyAsyncPages(browser, errors);
     await verifyVpnPage(browser, errors);
     await verifyVpnKernel(browser, errors);
+    await verifyWorkBuddyLogin(browser, errors);
+    await verifyQoderLogin(browser, errors);
+    await verifyIntegratedRuntimes(browser, errors);
+    await verifyChatPage(browser, errors);
+    await verifyChatEnhancements(browser, errors);
+    await verifySessionPagination(browser, errors);
+    await verifyUsageEnhancements(browser, errors);
     await verifyDiagnostics(browser, errors);
     await verifyBenefits(browser, errors);
 
@@ -2282,6 +3167,14 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     /* ------------------------------------------------------------------ */
     await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "能力与取舍", exact: true }).click();
     await page.locator(".capability-summary").waitFor({ timeout: 5000 });
+    const factsTable = page.getByTestId("capability-facts");
+    await factsTable.waitFor();
+    const factsSearch = factsTable.getByLabel("搜索模型事实", { exact: true });
+    await factsSearch.fill("vision-model");
+    assert.equal(await factsTable.locator("tbody tr").count(), 1, "事实表须按模型筛选");
+    assert((await factsTable.innerText()).includes("每 100 万"), "配置价格不依赖质量账本");
+    assert((await factsTable.innerText()).includes("未声明或不支持"), "旧布尔值不得伪称官方明确不支持");
+    await factsSearch.fill("");
     const capSummary = await page.locator(".capability-summary").innerText();
     assert(/2 个模型有能力数据/.test(capSummary), `汇总要给出模型总数：${capSummary}`);
     assert(/1 个存在冲突/.test(capSummary), `汇总要给出冲突数：${capSummary}`);
@@ -2363,8 +3256,9 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     }
     assert(firstText.includes("0.600"), `能力原始值要显示：${firstText}`);
     assert(firstText.includes("0.35"), `权重要显示：${firstText}`);
-    // 诚实性：没有数据的维度显示「数据不足」，说明列由**后端**给。
-    assert(firstText.includes("数据不足"), `缺数据的维度要说明：${firstText}`);
+    // 无样本与关闭的评分项分别解释，原说明继续来自后端。
+    assert(firstText.includes("缺少本项样本"), `缺样本的维度要说明：${firstText}`);
+    assert(firstText.includes("未参与评分"), `关闭的评分项须区分：${firstText}`);
     assert(firstText.includes("权重为 0，没有参与"), `权重为 0 的原因要写清：${firstText}`);
     assert(firstText.includes("不是 0 分"), `缺数据不等于 0 分：${firstText}`);
     // 不参与的候选必须标出来 —— 它的分数没有参与排序。

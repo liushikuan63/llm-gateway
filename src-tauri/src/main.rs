@@ -4,5 +4,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    if let Some(code) = llm_gateway_lib::benefit_task::try_headless() {
+        std::process::exit(code);
+    }
     llm_gateway_lib::run()
 }

@@ -252,7 +252,11 @@ async fn 关闭时同一请求发两次会调用上游两次() {
 
     let (first, second) = post_twice(&h.base_url, &body).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK, "第一次必须成功");
-    assert_eq!(second.status(), reqwest::StatusCode::OK, "关闭时第二次也必须成功");
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::OK,
+        "关闭时第二次也必须成功"
+    );
     assert_eq!(
         h.upstream.calls.load(Ordering::SeqCst),
         2,
@@ -276,7 +280,11 @@ async fn 观察模式下重复被计数但不拦截() {
 
     let (first, second) = post_twice(&h.base_url, &body).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK);
-    assert_eq!(second.status(), reqwest::StatusCode::OK, "观察模式不许改变响应");
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::OK,
+        "观察模式不许改变响应"
+    );
     assert_eq!(
         h.upstream.calls.load(Ordering::SeqCst),
         2,
@@ -428,10 +436,12 @@ async fn 观察模式的重复计数通过_gw_stats_可见() {
         after["dedup"]["duplicates"], 1,
         "重复发生后计数必须变成 1 —— 这是「网关是不是重复来源」的唯一证据"
     );
-    assert_eq!(after["dedup"]["observed"], 1, "观察模式下的重复计入 observed");
+    assert_eq!(
+        after["dedup"]["observed"], 1,
+        "观察模式下的重复计入 observed"
+    );
     assert_eq!(
         after["dedup"]["conflicts"], 0,
         "观察模式不许拒绝，更不许记成拒绝"
     );
 }
-

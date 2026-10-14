@@ -891,6 +891,130 @@ async fn responses_remote_compaction_v2_returns_one_compaction_item_and_round_tr
 }
 
 #[tokio::test]
+async fn remote_compaction_media_ineligible_candidates_do_not_change_efficiency_ranking() {
+    use llm_gateway_lib::config::RoutingStrategy;
+
+    for include_ineligible_audio in [false, true] {
+        let (capable_url, capable_state, capable_task) =
+            spawn_openai_upstream(OpenAiBehavior::Complete("capable summary")).await;
+        let (efficient_url, efficient_state, efficient_task) =
+            spawn_openai_upstream(OpenAiBehavior::Complete("efficient summary")).await;
+        let (ineligible_url, ineligible_state, ineligible_task) = spawn_anthropic_upstream().await;
+        let mut capable = provider("capable", capable_url, Dialect::OpenAI, 1);
+        let mut efficient = provider("efficient", efficient_url, Dialect::OpenAI, 1);
+        let mut ineligible = provider("ineligible-audio", ineligible_url, Dialect::Anthropic, 1);
+        capable.intelligence = 100;
+        efficient.intelligence = 10;
+        for p in [&mut capable, &mut efficient, &mut ineligible] {
+            p.models[0].supports_audio = true;
+            p.models[0].supports_tools = false;
+        }
+        // The advertised model flag passes the capability check, but Anthropic's
+        // wire protocol cannot carry audio. Its TPS must not enter normalization.
+        let mut providers = vec![capable, efficient];
+        if include_ineligible_audio {
+            providers.push(ineligible);
+        }
+        let db = db::Db::connect_in_memory().await.unwrap();
+        for p in &providers {
+            repo::upsert_provider(db.pool(), p).await.unwrap();
+        }
+        let mut config = AppConfig {
+            port: unused_loopback_port().await,
+            unified_key: "e2e-gateway-key".into(),
+            routing_strategy: RoutingStrategy::Balanced,
+            failover_enabled: false,
+            ..Default::default()
+        };
+        config.cost_routing.enabled = true;
+        config.cost_routing.cost_weight = 0.0;
+        config.cost_routing.efficiency_weight = 1.0;
+        config.cost_routing.min_efficiency_samples = 5;
+        let gateway = Arc::new(GatewayState::new(db.clone(), config.clone()));
+        gateway.reload_providers().await.unwrap();
+        for (id, tokens) in [
+            ("capable", 10),
+            ("efficient", 100),
+            ("ineligible-audio", 1_000),
+        ] {
+            gateway
+                .health
+                .record_success(id, "integration-model", 1_000);
+            for _ in 0..5 {
+                gateway
+                    .health
+                    .record_tps(id, "integration-model", tokens, 1_000);
+            }
+        }
+        let gateway_task = tokio::spawn(async move {
+            let _ = serve(gateway).await;
+        });
+        let base_url = format!("http://{}:{}", config.bind, config.port);
+        wait_for_gateway(&base_url).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{base_url}/v1/responses"))
+            .bearer_auth(&config.unified_key)
+            .json(&serde_json::json!({
+                "model": "auto",
+                "stream": true,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            { "type": "input_text", "text": "Summarize this audio context" },
+                            { "type": "input_audio", "input_audio": { "data": "AAAA", "format": "wav" } }
+                        ]
+                    },
+                    { "type": "compaction_trigger" }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        for task in [gateway_task, capable_task, efficient_task, ineligible_task] {
+            task.abort();
+        }
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let events = parse_sse_json(&body);
+        let items = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.done")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items.len(),
+            1,
+            "remote compaction must return one item: {body}"
+        );
+        assert_eq!(items[0]["item"]["type"], "compaction");
+        assert_eq!(ineligible_state.hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            efficient_state.hits.load(Ordering::SeqCst),
+            1,
+            "a media-ineligible candidate must not change normalization or the winner (present: {include_ineligible_audio}); capable hits: {}",
+            capable_state.hits.load(Ordering::SeqCst)
+        );
+        assert_eq!(capable_state.hits.load(Ordering::SeqCst), 0);
+        let upstream = efficient_state.requests.lock().unwrap()[0].clone();
+        assert!(
+            upstream["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["content"]
+                        .as_array()
+                        .is_some_and(|parts| parts.iter().any(|part| part["type"] == "input_audio"))
+                }),
+            "the eligible upstream must receive the audio context unchanged"
+        );
+    }
+}
+
+#[tokio::test]
 async fn responses_media_parts_survive_openai_conversion() {
     let (upstream_url, state, upstream_task) =
         spawn_openai_upstream(OpenAiBehavior::Complete("media reply")).await;
@@ -1696,4 +1820,77 @@ async fn multimodal_requests_route_only_to_capable_models() {
     gemini_task.abort();
     gateway_task2.abort();
     gateway_task3.abort();
+}
+
+#[tokio::test]
+async fn context_ineligible_candidates_do_not_disable_cost_routing() {
+    use llm_gateway_lib::config::{RoutingStrategy, SmartClassifier};
+    use llm_gateway_lib::domain::{Currency, ModelPrice};
+
+    for include_small_window in [false, true] {
+        let (cheap_url, cheap_state, cheap_task) =
+            spawn_openai_upstream(OpenAiBehavior::Complete("cheap reply")).await;
+        let (strong_url, strong_state, strong_task) =
+            spawn_openai_upstream(OpenAiBehavior::Complete("expensive reply")).await;
+        let (small_url, small_state, small_task) =
+            spawn_openai_upstream(OpenAiBehavior::Complete("must not be called")).await;
+        let mut cheap = provider("cheap", cheap_url, Dialect::OpenAI, 1);
+        let mut strong = provider("strong", strong_url, Dialect::OpenAI, 1);
+        let mut small = provider("small-window", small_url, Dialect::OpenAI, 1);
+        cheap.intelligence = 60;
+        strong.intelligence = 100;
+        small.intelligence = 100;
+        for (p, unit_price, currency, window) in [
+            (&mut cheap, 1.0, Currency::Usd, 128_000),
+            (&mut strong, 10.0, Currency::Usd, 128_000),
+            (&mut small, 0.01, Currency::Cny, 1_024),
+        ] {
+            p.models[0].context_window = window;
+            p.models[0].price = Some(ModelPrice {
+                prompt: unit_price,
+                completion: unit_price,
+                cache_read: None,
+                cache_creation: None,
+                currency,
+                tiers: Vec::new(),
+                rules: Vec::new(),
+                source: Default::default(),
+            });
+        }
+        let mut providers = vec![cheap, strong];
+        if include_small_window {
+            providers.push(small);
+        }
+        let (_db, cfg, gateway_task, base) = spawn_gateway_with(providers, |cfg| {
+            cfg.routing_strategy = RoutingStrategy::Smart;
+            cfg.smart_routing.enabled = true;
+            cfg.smart_routing.classifier = SmartClassifier::Heuristic;
+            cfg.cost_routing.enabled = true;
+            cfg.cost_routing.cost_weight = 1.0;
+        })
+        .await;
+        let mut request = openai_body("auto");
+        request["max_tokens"] = serde_json::json!(4_096);
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(&cfg.unified_key)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        for task in [gateway_task, cheap_task, strong_task, small_task] {
+            task.abort();
+        }
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(small_state.hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "cheap reply",
+            "an excluded CNY candidate must not suppress cost comparison between eligible USD candidates (small window present: {include_small_window})"
+        );
+        assert_eq!(cheap_state.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(strong_state.hits.load(Ordering::SeqCst), 0);
+    }
 }

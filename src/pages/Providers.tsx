@@ -38,14 +38,14 @@ function ProviderRuntimeBinding({ provider, runtimes, onClose, onSaved }: {
   const selected = runtimes.find(runtime => runtime.id === runtimeId);
   return <div className="modal-mask" onClick={event => { if (event.target === event.currentTarget && !working) onClose(); }}><div className="modal" role="dialog" aria-modal="true" aria-label="选择供应商上游">
     <h3>{provider.name} · 选择上游</h3>
-    <div className="sub">HTTP 直连使用供应商地址和 Key；账号型上游调用本机 CLI，使用 CLI 自己的登录态。修改绑定保留原地址、Key、模型和定价。</div>
+    <div className="sub">HTTP 直连使用供应商地址和 Key；账号上游使用绑定的独立登录或本机 CLI。修改绑定保留原地址、Key、模型和定价。</div>
     {error && <div className="msg err" role="alert">{error}</div>}
     <div className="field"><label htmlFor="provider-runtime-binding">上游来源</label><select id="provider-runtime-binding" value={runtimeId} disabled={working} onChange={event => setRuntimeId(event.target.value)}>
       <option value="">HTTP 直连（解除账号型绑定）</option>
       {runtimeId && !selected && <option value={runtimeId} disabled>{runtimeId}（运行时不存在）</option>}
       {runtimes.map(runtime => <option key={runtime.id} value={runtime.id} disabled={!runtime.enabled}>{runtime.label} · {runtime.kind}{runtime.enabled ? "" : "（已停用）"}</option>)}
     </select></div>
-    <div className="muted">账号型运行时请先在供应商页底部创建并自行登录；活动领取 Token 不用于模型调用。</div>
+    <div className="muted">WorkBuddy 国际版可在「客户端接入」网页登录并接入模型；CLI 运行时在本页底部管理。活动领取 Token 不用于模型调用。</div>
     <div className="row" style={{ justifyContent: "flex-end", marginTop: 16 }}><button disabled={working} onClick={onClose}>取消</button><button className="primary" disabled={working || runtimeId === (provider.runtime_id ?? "") || !!runtimeId && !selected?.enabled} onClick={() => void (async () => {
       setWorking(true); setError(null);
       try { await api.setProviderRuntime(provider.id, runtimeId || null); if (!mounted.current) return; await onSaved(); if (mounted.current) onClose(); }
@@ -93,7 +93,10 @@ function AgentRuntimes({ runtimes, adapters, onChanged, onError }: {
       const now = new Date().toISOString();
       await api.saveAgentRuntime({
         id: trimmed, kind, label: label.trim() || trimmed,
-        options: executable.trim() && supportsPath || modelAliases ? { ...(executable.trim() && supportsPath ? { executable: executable.trim() } : {}), ...(modelAliases ? { model_aliases: modelAliases } : {}) } : null,
+        options: (kind === "workbuddy-model" ? {
+          account_id: editing?.options?.account_id,
+          ...(modelAliases ? { model_aliases: modelAliases } : {}),
+        } : executable.trim() && supportsPath || modelAliases ? { ...(executable.trim() && supportsPath ? { executable: executable.trim() } : {}), ...(modelAliases ? { model_aliases: modelAliases } : {}) } : null),
         enabled: editing?.enabled ?? true, created_at: editing?.created_at ?? now, updated_at: now,
       });
       setId(""); setLabel(""); setExecutable(""); setAliases(""); setEditing(null);
@@ -111,7 +114,7 @@ function AgentRuntimes({ runtimes, adapters, onChanged, onError }: {
   return <details className="agent-runtimes">
     <summary>账号型上游运行时（{runtimes.length}）</summary>
     <p>
-      账号型上游的请求由本机 CLI 发出，登录由用户在对应 CLI 中自行完成，网关不读取第三方凭据文件。
+      账号型上游使用本软件保存的独立登录，或由本机 CLI 管理登录；网关不读取第三方凭据文件。
       已注册的 Codex、Qoder、Qoder 中国版、Claude Code、OpenCode 可在下拉中选择；实际可用性仍取决于本机安装、版本、登录与模型权限。
       供应商卡片上的「账号型上游」徽标指向这里的某一条。模型调用与「账号权益」中的活动 Token、赠送积分是两套独立能力。
     </p>
@@ -129,13 +132,14 @@ function AgentRuntimes({ runtimes, adapters, onChanged, onError }: {
       <input aria-label="运行时 id" placeholder="id（供应商引用它，唯一）" value={id} disabled={working || !!editing} onChange={(e) => setId(e.target.value)} />
       <input aria-label="运行时显示名" placeholder="显示名" value={label} disabled={working} onChange={(e) => setLabel(e.target.value)} />
       <select aria-label="运行时类型" value={kind} disabled={working} onChange={(e) => setKind(e.target.value)}>
+        {editing?.kind === "workbuddy-model" && <option value="workbuddy-model">WorkBuddy 独立登录直连</option>}
         {adapters.map(([value, text]) => <option value={value} key={value}>{text}（{value}）</option>)}
       </select>
       <button className="primary" disabled={working} onClick={() => void create()}>{editing ? "保存运行时" : "新建运行时"}</button>
       {editing && <button disabled={working} onClick={() => { setEditing(null); setId(""); setLabel(""); setExecutable(""); setAliases(""); }}>取消编辑</button>}
     </div>
     {supportsPath && <div className="field" style={{ marginTop: 12 }}><label>CLI 可执行文件路径（可选）</label><input aria-label="运行时可执行文件" value={executable} disabled={working} onChange={event => setExecutable(event.target.value)} placeholder="留空使用该 CLI 的默认命令；可填写已安装文件的路径" /></div>}
-    <div className="field" style={{ marginTop: 12 }}><label>模型别名映射（可选 JSON）</label><textarea aria-label="运行时模型别名" value={aliases} disabled={working} rows={3} onChange={event => setAliases(event.target.value)} placeholder={'{"网关模型名":"CLI模型名"}'} /><div className="muted">不接受自定义命令参数或环境变量；新适配器强制关闭工具。Trae / WorkBuddy 尚无本轮内置账号型适配器，也未适配自动签到。</div></div>
+    <div className="field" style={{ marginTop: 12 }}><label>模型别名映射（可选 JSON）</label><textarea aria-label="运行时模型别名" value={aliases} disabled={working} rows={3} onChange={event => setAliases(event.target.value)} placeholder={'{"网关模型名":"上游模型名"}'} /><div className="muted">WorkBuddy 直连保留账号绑定，支持目录明确声明的工具和图片能力；CLI 能力取决于各自适配器。模型别名不会改变登录账号。</div></div>
   </details>;
 }
 
@@ -294,6 +298,8 @@ export default function ProvidersPage() {
     // 用 `·` 而不是再套一对括号：`Codex（工作）（codex）` 两个括号连着读不断句。
     return hit ? `${hit.label} · ${hit.kind}` : `${id}（找不到这个运行时）`;
   };
+  const runtimeDescription = (id: string) => runtimes.find(r => r.id === id)?.kind === "workbuddy-model"
+    ? "使用独立登录账号直连官方模型接口" : "请求经本机 CLI 发出，不走上面的地址";
   const run = async (id: string, operation: () => Promise<unknown>, text: string) => {
     setBusy(id); setMessage(null);
     try { await operation(); if (await load(true)) setMessage({ kind: "ok", text }); }
@@ -453,7 +459,7 @@ export default function ProvidersPage() {
         const stateText = !p.enabled ? "已停用" : health ? HEALTH_LABEL[health] ?? health : "待测试";
         return <article className={`provider-card ${p.is_active ? "active" : ""}`} key={p.id}>
           <header><div className={`provider-avatar dialect-${p.dialect}`} aria-hidden="true">{p.name.slice(0, 2)}</div><div className="provider-card-name"><h3>{p.name}</h3><span>{DIALECT_LABEL[p.dialect]}</span></div>{p.is_active && <span className="tag primary-tag">主用</span>}<span className={`tag ${stateClass}`}>{stateText}</span></header>
-          <div className="provider-address mono" title={p.base_url}>{p.base_url}</div>{p.runtime_id ? <div className="provider-runtime"><span className="tag runtime-tag">账号型上游</span><span className="mono">{runtimeLabel(p.runtime_id)}</span><span className="muted">请求经本机 CLI 发出，不走上面的地址</span></div> : null}<div className="provider-secret"><span>API Key</span><span className="mono">{p.api_key_masked || "未设置"}</span></div>
+          <div className="provider-address mono" title={p.base_url}>{p.base_url}</div>{p.runtime_id ? <div className="provider-runtime"><span className="tag runtime-tag">账号型上游</span><span className="mono">{runtimeLabel(p.runtime_id)}</span><span className="muted">{runtimeDescription(p.runtime_id)}</span></div> : null}<div className="provider-secret"><span>API Key</span><span className="mono">{p.api_key_masked || "未设置"}</span></div>
           <div className="provider-model-preview"><div><span>可用映射</span><strong>{p.models.length}</strong></div><div className="provider-model-tags">{p.models.slice(0, 4).map(m => <span className="tag" key={m.alias} title={`${m.upstream} · ${formatContext(m.context_window)} tokens`}>{m.alias}</span>)}{p.models.length > 4 && <span className="tag">+{p.models.length - 4}</span>}{!p.models.length && <span className="muted">未配置模型映射</span>}</div></div>
           <div className="provider-meta"><span>{p.rpm_limit ? `${p.rpm_limit} RPM` : "RPM 不限"}</span><span>优先级 {p.priority}</span>{testResult?.id === p.id && <span className="test-latency">实测 {testResult.latency} ms</span>}</div>
           <footer><div className="row"><button className="ghost" disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), note: p.note ?? "" })}>配置</button><button className="ghost" disabled={busy !== null} onClick={() => void test(p)}>{busy === p.id ? "处理中…" : "测试连接"}</button><button className="ghost" disabled={busy !== null || !p.enabled || p.is_active} onClick={() => void run(p.id, () => api.setActive(p.id), `${p.name} 已设为主用`)}>{p.is_active ? "已主用" : "设为主用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void toggleEnabled(p)}>{p.enabled ? "停用" : "启用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void duplicate(p)} title="复制配置并落库，API Key 留空需自行填写">复制</button></div>

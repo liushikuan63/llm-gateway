@@ -397,31 +397,104 @@ fn command_for(path: &Path) -> tokio::process::Command {
 
 async fn run_spawn(
     mut command: tokio::process::Command,
-    display: &str,
+    _display: &str,
     args: &[&str],
     timeout: Duration,
 ) -> Result<(String, String), String> {
+    #[cfg(windows)]
+    let job = crate::cli_job::CliJob::new()?;
     command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     #[cfg(windows)]
     {
         // 后台运行不弹出控制台窗口。
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NO_WINDOW | 0x00000004); // CREATE_SUSPENDED: assign before any user code can spawn children.
     }
-    let child = command
-        .spawn()
-        .map_err(|e| format!("启动 {display} 失败：{e}"))?;
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| format!("{display} 执行超时（{} 秒）", timeout.as_secs()))?
-        .map_err(|e| format!("{display} 执行失败：{e}"))?;
+    struct OwnedCli(tokio::process::Child);
+    impl Drop for OwnedCli {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0.id() {
+                crate::proc_util::kill_tree_blocking(pid);
+            }
+        }
+    }
+    let mut owned = OwnedCli(
+        command
+            .spawn()
+            .map_err(|_| "启动 CLI 失败，请检查安装路径与权限".to_owned())?,
+    );
+    let child = &mut owned.0;
+    #[cfg(windows)]
+    job.assign_and_resume(child)?;
+    let stdout = child.stdout.take().ok_or("无法读取 CLI 标准输出")?;
+    let stderr = child.stderr.take().ok_or("无法读取 CLI 错误输出")?;
+    async fn capture(pipe: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>, String> {
+        use tokio::io::AsyncReadExt;
+        let mut out = vec![];
+        pipe.take(1024 * 1024 + 1)
+            .read_to_end(&mut out)
+            .await
+            .map_err(|_| "读取 CLI 输出失败")?;
+        if out.len() > 1024 * 1024 {
+            return Err("CLI 输出超过大小限制".into());
+        }
+        Ok(out)
+    }
+    let outcome = tokio::time::timeout(timeout, async {
+        let wait = async {
+            let status = child
+                .wait()
+                .await
+                .map_err(|_| "等待 CLI 退出失败".to_owned())?;
+            // A descendant can keep inherited output pipes open after the CLI root exits.
+            // Stop only the owned Job before waiting for EOF on those pipes.
+            #[cfg(windows)]
+            job.stop()?;
+            Ok(status)
+        };
+        tokio::try_join!(wait, capture(stdout), capture(stderr))
+    })
+    .await;
+    let (status, stdout, stderr) = match outcome {
+        Ok(Ok(out)) => out,
+        failure => {
+            #[cfg(windows)]
+            job.stop()?;
+            crate::proc_util::kill_tree(child).await;
+            let _ = child.wait().await;
+            return Err(match failure {
+                Err(_) => format!(
+                    "CLI 执行超时（{} 秒），已请求停止自有进程树",
+                    timeout.as_secs()
+                ),
+                Ok(Err(error)) => error,
+                _ => unreachable!(),
+            });
+        }
+    };
+    if !status.success() {
+        let lower = String::from_utf8_lossy(&stderr).to_ascii_lowercase();
+        let hint = if lower.contains("unauthorized")
+            || lower.contains("not logged")
+            || lower.contains("authentication")
+        {
+            "请检查 CLI 登录状态"
+        } else {
+            "请检查 CLI 权限、版本和网络状态"
+        };
+        return Err(format!(
+            "CLI 退出码 {}：{hint}",
+            status.code().unwrap_or(-1)
+        ));
+    }
     Ok((
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
     ))
 }
 
@@ -438,6 +511,28 @@ pub(crate) async fn run_path(
         timeout,
     )
     .await
+}
+
+#[cfg(all(test, windows))]
+mod inherited_output_regression {
+    #[tokio::test]
+    async fn exited_root_does_not_leave_descendant_holding_output_pipe() {
+        let directory = std::env::temp_dir().join(format!("llmgw-pipe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("parent.cjs");
+        std::fs::write(&script,"const {spawn}=require('node:child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit',windowsHide:true});c.unref();console.log('v0.1.0');process.exit(0);").unwrap();
+        let node =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/node/node.exe");
+        let result = super::run_path(
+            &node,
+            &[script.to_str().unwrap()],
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(result.0.contains("v0.1.0"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 /// 按 PATH 中的名字运行系统命令（如 tasklist / taskkill）。
@@ -570,6 +665,164 @@ fn resolve_npm() -> Option<PathBuf> {
 fn resolve_powershell() -> Option<PathBuf> {
     let path_env = std::env::var("PATH").unwrap_or_default();
     resolve_binary(&["powershell", "pwsh"], &path_env, &well_known_dirs())
+}
+
+#[cfg(all(test, windows))]
+mod execution_regressions {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+    #[tokio::test]
+    async fn parent_exiting_before_timeout_does_not_leave_inherited_pipe_child() {
+        let mut f = Fixture::new();
+        let ready = f.root.join("orphan.txt");
+        let path = ready.to_string_lossy().into_owned();
+        let binary = resolve_binary(
+            &["python"],
+            &std::env::var("PATH").unwrap_or_default(),
+            &well_known_dirs(),
+        )
+        .expect("existing Python fixture runtime must be available");
+        let parent = f.root.join("parent.py");
+        let child_script = f.root.join("child.py");
+        let release = f.root.join("release.txt");
+        let release_path = release.to_string_lossy().into_owned();
+        // Publish the readiness file only after the entire PID pair has been written.
+        std::fs::write(&child_script,"import sys,os,time,json\ntemporary=sys.argv[1]+'.tmp'\nwith open(temporary,'w') as f: json.dump([os.getpid(),os.getppid()],f)\nos.replace(temporary,sys.argv[1])\ntime.sleep(60)\n").unwrap();
+        std::fs::write(&parent,"import sys,os,time,subprocess\nsubprocess.Popen([sys.executable,sys.argv[1],sys.argv[2]],stdout=sys.stdout,stderr=sys.stderr)\nwhile not os.path.isfile(sys.argv[2]): time.sleep(0.01)\nwhile not os.path.isfile(sys.argv[3]): time.sleep(0.01)\nprint('completed',flush=True)\n").unwrap();
+        let parent = parent.to_string_lossy().into_owned();
+        let child_script = child_script.to_string_lossy().into_owned();
+        let task = tokio::spawn(async move {
+            run_path(
+                &binary,
+                &[&parent, &child_script, &path, &release_path],
+                Duration::from_secs(10),
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while !ready.is_file() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let ids: Vec<u32> = serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+        let child = ids[0];
+        f.pid = Some(child);
+        assert!(alive(child));
+        assert!(alive(ids[1]), "root stays alive until the test releases it");
+        std::fs::write(&release, "finish").unwrap();
+        while alive(ids[1]) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "parent must actually exit before timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            task.await.unwrap().unwrap().0.contains("completed"),
+            "successful root completion drains output without waiting for a timeout"
+        );
+        assert!(
+            !alive(child),
+            "parent has exited but its owned descendant must still be terminated"
+        );
+    }
+    struct Fixture {
+        root: PathBuf,
+        pid: Option<u32>,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("llmgw-cli-exec-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            Self { root, pid: None }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(pid) = self.pid {
+                crate::proc_util::kill_tree_blocking(pid);
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    fn alive(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    }
+    fn node() -> PathBuf {
+        crate::managed_runtime::verified_binary(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources"),
+            "node",
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn failed_exit_is_not_success_and_never_echoes_sensitive_output() {
+        let binary = node();
+        let result=run_path(&binary,&["-e","console.log('version 1.2.3 private-output');console.error('private-stderr');process.exit(7)"],Duration::from_secs(5)).await;
+        let error = result.expect_err("exit 7 must be failure even with a plausible version");
+        assert!(error.contains('7'));
+        assert!(!error.contains("private-output"));
+        assert!(!error.contains("private-stderr"));
+        assert_eq!(
+            run_path(
+                &binary,
+                &["-e", "console.log('version 1.2.3')"],
+                Duration::from_secs(5)
+            )
+            .await
+            .unwrap()
+            .0
+            .trim(),
+            "version 1.2.3"
+        );
+    }
+    async fn tree_case(cancel: bool) {
+        let mut f = Fixture::new();
+        let ready = f.root.join("ready.json");
+        let path = ready.to_string_lossy().into_owned();
+        let binary = node();
+        let task = tokio::spawn(async move {
+            run_path(&binary,&["-e","const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{windowsHide:true,stdio:'inherit'});require('fs').writeFileSync(process.argv[1],JSON.stringify([process.pid,c.pid]));setInterval(()=>{},1000)",&path],if cancel {Duration::from_secs(30)}else{Duration::from_secs(3)}).await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !ready.is_file() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owned tree must acknowledge startup"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let ids: Vec<u32> = serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+        f.pid = Some(ids[0]);
+        assert!(
+            alive(ids[0]) && alive(ids[1]),
+            "control: both parent and grandchild alive"
+        );
+        if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(task.await.unwrap().unwrap_err().contains("超时"));
+        }
+        assert!(
+            !alive(ids[0]) && !alive(ids[1]),
+            "timeout/cancellation must end only the owned tree"
+        );
+    }
+    #[tokio::test]
+    async fn timed_out_command_cleans_owned_parent_and_grandchild() {
+        tree_case(false).await;
+    }
+    #[tokio::test]
+    async fn cancelled_command_cleans_owned_parent_and_grandchild() {
+        tree_case(true).await;
+    }
 }
 
 #[cfg(test)]

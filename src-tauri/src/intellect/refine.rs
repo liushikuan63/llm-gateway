@@ -29,6 +29,7 @@ use crate::config::PromptRefineConfig;
 /// 改写调用的目标。`api_key` 已在调用方解密，本模块不再碰密钥存储。
 #[derive(Clone)]
 pub struct RefineTarget {
+    pub provider_id: String,
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
@@ -59,6 +60,7 @@ pub struct RefineOutcome {
     /// 采用文本长度
     pub final_chars: usize,
     pub model: Option<String>,
+    pub usage: Option<crate::domain::Usage>,
 }
 
 impl RefineOutcome {
@@ -71,6 +73,7 @@ impl RefineOutcome {
             original_chars,
             final_chars: original_chars,
             model,
+            usage: None,
         }
     }
 }
@@ -174,6 +177,7 @@ pub fn pick_target(
         .unwrap_or(&picked.model.upstream)
         .to_owned();
     Some(RefineTarget {
+        provider_id: picked.provider.id.clone(),
         base_url: picked.provider.base_url.clone(),
         api_key: None,
         model,
@@ -255,22 +259,27 @@ pub async fn refine(
             _ => request.bearer_auth(key),
         };
     }
-    // 内部再加一层：即使调用方忘了给外层套 timeout，这里也不会无限等。
+    // The request deadline covers both headers and the entire JSON body. The
+    // outer send guard alone stops timing as soon as response headers arrive.
     let timeout = Duration::from_millis(cfg.timeout_ms.clamp(200, 30_000));
 
-    let result = tokio::time::timeout(timeout, request.send()).await;
+    let result = tokio::time::timeout(timeout, request.timeout(timeout).send()).await;
     let response = match result {
         Err(_) => {
             return RefineOutcome::unchanged(
                 original,
-                format!("改写超时（{}ms）", cfg.timeout_ms),
+                format!("改写超时（{}ms）", timeout.as_millis()),
                 Some(target.model.clone()),
             )
         }
         Ok(Err(error)) => {
             return RefineOutcome::unchanged(
                 original,
-                format!("改写请求失败：{error}"),
+                if error.is_timeout() {
+                    format!("改写超时（{}ms）", timeout.as_millis())
+                } else {
+                    format!("改写请求失败：{error}")
+                },
                 Some(target.model.clone()),
             )
         }
@@ -289,7 +298,11 @@ pub async fn refine(
         Err(error) => {
             return RefineOutcome::unchanged(
                 original,
-                format!("改写响应不是合法 JSON：{error}"),
+                if error.is_timeout() {
+                    format!("改写超时（{}ms）", timeout.as_millis())
+                } else {
+                    format!("改写响应不是合法 JSON：{error}")
+                },
                 Some(target.model.clone()),
             )
         }
@@ -321,7 +334,7 @@ pub async fn refine(
             Some(target.model.clone()),
         );
     };
-    match accept(raw, &original, cfg) {
+    let mut outcome = match accept(raw, &original, cfg) {
         Ok(prompt) => {
             let final_chars = prompt.chars().count();
             RefineOutcome {
@@ -331,10 +344,19 @@ pub async fn refine(
                 original_chars: original.chars().count(),
                 final_chars,
                 model: Some(target.model.clone()),
+                usage: None,
             }
         }
         Err(reason) => RefineOutcome::unchanged(original, reason, Some(target.model.clone())),
-    }
+    };
+    outcome.usage = body.get("usage").filter(|u| u.is_object()).map(|u| {
+        if target.dialect == crate::domain::Dialect::Anthropic {
+            crate::domain::Usage::from_anthropic(u)
+        } else {
+            crate::domain::Usage::from_openai(u)
+        }
+    });
+    outcome
 }
 
 fn trim(base_url: &str) -> &str {

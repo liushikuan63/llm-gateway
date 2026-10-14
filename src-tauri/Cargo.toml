@@ -77,6 +77,8 @@ windows-sys = { version = "0.61", features = [
     # 特性名带下划线是 windows-sys 的惯例（对应模块 System::Registry）。
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

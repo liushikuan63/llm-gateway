@@ -55,6 +55,7 @@ button.session-item:disabled { opacity: 0.62; }
 .session-summary-meta { margin-top: 10px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .session-summary-meta code { color: var(--text-soft); }
 .session-loading { padding: 52px 20px; }
+.session-pagination { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
 
 .message-list { display: flex; flex-direction: column; gap: 12px; }
 .session-message { padding: 14px; background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 7px; }

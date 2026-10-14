@@ -158,6 +158,12 @@ pub struct GatewayState {
     pub adapters: Arc<crate::agent_upstream::AdapterRegistry>,
     /// 手动和自动奖励领取共享同一服务与持久幂等账本。
     pub benefits: Arc<crate::benefits::BenefitsCenter>,
+    pub(crate) workbuddy_auth: std::result::Result<crate::workbuddy_auth::WorkBuddyAuth, String>,
+    pub(crate) qoder_auth: std::result::Result<crate::qoder_auth::QoderAuth, String>,
+    pub(crate) trae_auth: std::result::Result<crate::trae_auth::TraeAuth, String>,
+    pub(crate) workbuddy:
+        std::result::Result<Arc<crate::proxy::workbuddy::WorkBuddyModelClient>, String>,
+    pub(crate) qoder: std::result::Result<Arc<crate::proxy::qoder::QoderModelClient>, String>,
     /// 任务卡二 B5 判据 5：**网关侧**的配额账本。
     ///
     /// 用 `parking_lot::Mutex` 而不是 `RwLock`：这个锁只在
@@ -173,7 +179,184 @@ pub struct GatewayState {
     pub agent_concurrency: Arc<parking_lot::Mutex<crate::agent_upstream::ConcurrencyGate>>,
 }
 
+fn account_effective_request(
+    provider: &Provider,
+    req: &ChatRequest,
+    model: &str,
+    platform: &str,
+) -> Result<ChatRequest> {
+    let mut effective = req.clone();
+    if let Some(overrides) = provider
+        .models
+        .iter()
+        .find(|m| m.upstream == model)
+        .and_then(|m| m.overrides.as_ref())
+    {
+        overrides.validate().map_err(GatewayError::Protocol)?;
+        if overrides
+            .extra_headers
+            .as_ref()
+            .is_some_and(|headers| !headers.is_empty())
+        {
+            return Err(GatewayError::Protocol(format!(
+                "{platform} 账号直连不接受自定义请求头，请清空此模型的额外请求头"
+            )));
+        }
+        if let Some(temperature) = overrides.temperature {
+            effective.temperature = Some(temperature);
+        }
+        if let Some(max_tokens) = overrides.max_tokens {
+            effective.max_tokens = Some(max_tokens);
+        }
+        if let Some(body) = overrides
+            .extra_body
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+        {
+            effective.extra.extend(body.clone());
+        }
+    }
+    Ok(effective)
+}
+
 impl GatewayState {
+    pub(crate) async fn call_chat_upstream(
+        &self,
+        provider: &Provider,
+        req: &ChatRequest,
+        model: &str,
+        timeout: Duration,
+        defaults: &crate::config::OllamaOptionsConfig,
+    ) -> Result<crate::domain::ChatResponse> {
+        let started = Instant::now();
+        let result = if let Some(runtime_id) = provider.runtime_id.as_deref() {
+            match crate::agent_upstream::runtime::resolve_chat_runtime(
+                self.db.pool(),
+                &self.adapters,
+                runtime_id,
+            )
+            .await
+            .map_err(|kind| GatewayError::CapabilityUnavailable { kind })?
+            {
+                crate::agent_upstream::runtime::ChatRuntime::WorkBuddy {
+                    account_id,
+                    aliases,
+                    ..
+                } => {
+                    let client = self
+                        .workbuddy
+                        .as_ref()
+                        .map_err(|e| GatewayError::Protocol(e.clone()))?;
+                    let effective = account_effective_request(provider, req, model, "WorkBuddy")?;
+                    let model = aliases.get(model).map(String::as_str).unwrap_or(model);
+                    client.call(&account_id, &effective, model, timeout).await
+                }
+                crate::agent_upstream::runtime::ChatRuntime::Qoder {
+                    region,
+                    account_id,
+                    aliases,
+                    ..
+                } => {
+                    let client = self
+                        .qoder
+                        .as_ref()
+                        .map_err(|e| GatewayError::Protocol(e.clone()))?;
+                    let effective = account_effective_request(provider, req, model, "Qoder")?;
+                    let model = aliases.get(model).map(String::as_str).unwrap_or(model);
+                    client
+                        .call(region, &account_id, &effective, model, timeout)
+                        .await
+                }
+                crate::agent_upstream::runtime::ChatRuntime::Agent(_) => {
+                    crate::agent_upstream::call_agent_with_runtime(
+                        self.db.pool(),
+                        &self.adapters,
+                        runtime_id,
+                        model,
+                        &req.messages,
+                        timeout.as_millis() as u64,
+                    )
+                    .await
+                }
+            }
+        } else {
+            self.upstream
+                .call(provider, req, model, timeout, defaults)
+                .await
+        };
+        if let Ok(response) = &result {
+            let elapsed = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            self.health.record_success(&provider.id, model, elapsed);
+            if let Some(usage) = &response.usage {
+                self.health
+                    .record_tps(&provider.id, model, usage.completion_tokens, elapsed);
+                self.limiter
+                    .record_tokens(&format!("{}::{model}", provider.id), usage.total_tokens);
+            }
+        }
+        result
+    }
+
+    async fn call_chat_upstream_stream(
+        &self,
+        provider: &Provider,
+        req: &ChatRequest,
+        model: &str,
+        timeout: Duration,
+        defaults: &crate::config::OllamaOptionsConfig,
+    ) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<UpstreamEvent>> + Send>>>
+    {
+        if let Some(id) = provider.runtime_id.as_deref() {
+            match crate::agent_upstream::runtime::resolve_chat_runtime(
+                self.db.pool(),
+                &self.adapters,
+                id,
+            )
+            .await
+            .map_err(|kind| GatewayError::CapabilityUnavailable { kind })?
+            {
+                crate::agent_upstream::runtime::ChatRuntime::WorkBuddy {
+                    account_id,
+                    aliases,
+                    ..
+                } => {
+                    let client = self
+                        .workbuddy
+                        .as_ref()
+                        .map_err(|e| GatewayError::Protocol(e.clone()))?;
+                    let effective = account_effective_request(provider, req, model, "WorkBuddy")?;
+                    let model = aliases.get(model).map(String::as_str).unwrap_or(model);
+                    return client
+                        .call_stream(&account_id, &effective, model, timeout)
+                        .await;
+                }
+                crate::agent_upstream::runtime::ChatRuntime::Qoder {
+                    region,
+                    account_id,
+                    aliases,
+                    ..
+                } => {
+                    let client = self
+                        .qoder
+                        .as_ref()
+                        .map_err(|e| GatewayError::Protocol(e.clone()))?;
+                    let effective = account_effective_request(provider, req, model, "Qoder")?;
+                    let model = aliases.get(model).map(String::as_str).unwrap_or(model);
+                    return client
+                        .call_stream(region, &account_id, &effective, model, timeout)
+                        .await;
+                }
+                _ => {
+                    return Err(GatewayError::CapabilityUnavailable {
+                        kind: "该账号运行时不支持流式聊天".into(),
+                    })
+                }
+            }
+        }
+        self.upstream
+            .call_stream(provider, req, model, timeout, defaults)
+            .await
+    }
     pub fn new(db: db::Db, cfg: AppConfig) -> Self {
         let health = Arc::new(HealthRegistry::new());
         let limiter = Arc::new(RateLimiter::new());
@@ -189,6 +372,22 @@ impl GatewayState {
         let upstream = Arc::new(UpstreamClient::new());
         upstream.set_proxy(cfg.http_proxy.as_deref());
         let benefits = Arc::new(crate::benefits::BenefitsCenter::new(db.pool().clone()));
+        let workbuddy_auth = crate::workbuddy_auth::WorkBuddyAuth::new(db.pool().clone(), None);
+        let qoder_auth = crate::qoder_auth::QoderAuth::new(db.pool().clone(), None);
+        let trae_auth =
+            crate::trae_auth::TraeAuth::new(db.pool().clone(), cfg.http_proxy.as_deref());
+        let workbuddy = workbuddy_auth
+            .clone()
+            .map(|auth| Arc::new(crate::proxy::workbuddy::WorkBuddyModelClient::new(auth)));
+        if let Ok(client) = &workbuddy {
+            client.set_proxy(cfg.http_proxy.as_deref());
+        }
+        let qoder = qoder_auth
+            .clone()
+            .map(|auth| Arc::new(crate::proxy::qoder::QoderModelClient::new(auth)));
+        if let Ok(client) = &qoder {
+            client.set_proxy(cfg.http_proxy.as_deref());
+        }
 
         Self {
             db,
@@ -199,6 +398,11 @@ impl GatewayState {
             router,
             upstream,
             benefits,
+            workbuddy_auth,
+            qoder_auth,
+            trae_auth,
+            workbuddy,
+            qoder,
             ctx,
             cache,
             dedup: Arc::new(DedupRegistry::new(cfg_dedup)),
@@ -287,6 +491,12 @@ impl GatewayState {
         let mut current = self.cfg.write();
         self.router.set_custom_rules(cfg.custom_rules.clone());
         self.upstream.set_proxy(cfg.http_proxy.as_deref());
+        if let Ok(client) = &self.workbuddy {
+            client.set_proxy(cfg.http_proxy.as_deref());
+        }
+        if let Ok(client) = &self.qoder {
+            client.set_proxy(cfg.http_proxy.as_deref());
+        }
         self.cache.reconfigure(&cfg.cache);
         // 去重配置热更新：条目里存的是「上一次的执行结果」，
         // 换了模式或窗口之后它们的可比性已经变了，清掉重来。
@@ -333,49 +543,59 @@ impl GatewayState {
 
     /// 后台任务：日志清理 + Provider 快照 + 定价自动刷新
     pub async fn background_loop(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(Duration::from_secs(300));
-        // 定价自动刷新按「天」节流：后台每 5 分钟醒一次，但只在距上次尝试超过
-        // 24 小时后才真正发起网络请求，避免频繁打扰公共目录。
-        let mut last_pricing_refresh: Option<std::time::Instant> = None;
-        loop {
-            tick.tick().await;
-            let cfg = self.cfg_snapshot();
-            if let Err(e) =
-                repo::purge_old_requests(self.db.pool(), cfg.analytics_retention_days as i64).await
-            {
-                tracing::warn!("清理请求日志失败: {e}");
-            }
-            if let Err(e) = self.reload_providers().await {
-                tracing::warn!("刷新 provider 失败: {e}");
-            }
-            if cfg.catalog_auto_update {
-                let due = last_pricing_refresh
-                    .map(|last| last.elapsed() >= Duration::from_secs(24 * 3600))
-                    .unwrap_or(true);
-                if due {
-                    // 失败也要等下一个周期再试，避免目录不可用时反复重试。
-                    last_pricing_refresh = Some(std::time::Instant::now());
-                    if let Err(error) = crate::pricing_refresh::refresh(&self, false).await {
-                        tracing::warn!("自动刷新定价失败: {error}");
-                    }
+        let housekeeping = async {
+            let mut tick = tokio::time::interval(Duration::from_secs(300));
+            // 定价自动刷新按「天」节流：后台每 5 分钟醒一次，但只在距上次尝试超过
+            // 24 小时后才真正发起网络请求，避免频繁打扰公共目录。
+            let mut last_pricing_refresh: Option<std::time::Instant> = None;
+            loop {
+                tick.tick().await;
+                let cfg = self.cfg_snapshot();
+                if let Err(e) =
+                    repo::purge_old_requests(self.db.pool(), cfg.analytics_retention_days as i64)
+                        .await
+                {
+                    tracing::warn!("清理请求日志失败: {e}");
                 }
-            } else {
-                last_pricing_refresh = None;
+                if let Err(e) = self.reload_providers().await {
+                    tracing::warn!("刷新 provider 失败: {e}");
+                }
+                if cfg.catalog_auto_update {
+                    let due = last_pricing_refresh
+                        .map(|last| last.elapsed() >= Duration::from_secs(24 * 3600))
+                        .unwrap_or(true);
+                    if due {
+                        // 失败也要等下一个周期再试，避免目录不可用时反复重试。
+                        last_pricing_refresh = Some(std::time::Instant::now());
+                        if let Err(error) = crate::pricing_refresh::refresh(&self, false).await {
+                            tracing::warn!("自动刷新定价失败: {error}");
+                        }
+                    }
+                } else {
+                    last_pricing_refresh = None;
+                }
             }
-            // 清理和定价刷新可能耗时；尚未开始的领取必须采用最新开关和代理。
-            let benefits_cfg = self.cfg_snapshot();
-            if let Err(error) = self
-                .benefits
-                .auto_tick(
-                    &benefits_cfg.benefits,
-                    benefits_cfg.http_proxy.as_deref(),
-                    chrono::Local::now(),
-                )
-                .await
-            {
-                tracing::warn!("账号权益自动领取失败: {error}");
+        };
+        let claims = async {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                // Independent minute checks use the latest switches and proxy.
+                let benefits_cfg = self.cfg_snapshot();
+                if let Err(error) = self
+                    .benefits
+                    .auto_tick(
+                        &benefits_cfg.benefits,
+                        benefits_cfg.http_proxy.as_deref(),
+                        chrono::Local::now(),
+                    )
+                    .await
+                {
+                    tracing::warn!("账号权益自动领取失败: {error}");
+                }
             }
-        }
+        };
+        tokio::join!(housekeeping, claims);
     }
 }
 
@@ -617,9 +837,24 @@ async fn auth(
             // 有窗口，并发请求可能同时观察到同一份「未超」的累计值，
             // 于是极小概率超支一次。真要严格就用 requests 自增 id 做乐观扣减，
             // 那要事务；本卡按卡片口径接受这个窗口。
-            let spent_rows = repo::sum_cost_by_currency_for_key(state.db.pool(), &key.id, since)
-                .await
-                .unwrap_or_default();
+            let spent_rows =
+                match repo::sum_cost_by_currency_for_key(state.db.pool(), &key.id, since).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        tracing::error!("预算账本读取失败，暂停受预算约束的请求: {error}");
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "暂时无法读取预算账本，请稍后重试或检查本机诊断",
+                                    "type": "server_error",
+                                    "code": "budget_unavailable",
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
             let used = crate::budget::spent_in_currency(&spent_rows, &key.budget_currency);
             if let crate::budget::GateDecision::BudgetExceeded {
                 used,
@@ -1355,9 +1590,10 @@ async fn passthrough_dispatch(
         1
     };
     let flag = AtomicFlag::new();
-    let chain = FailoverChain::new(&ranked, max_attempts, &flag);
+    let chain =
+        FailoverChain::new(&ranked, max_attempts, &flag).with_admission(state.router.clone());
     let chain = chain.with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
-    let upstream = state.upstream.clone();
+    let upstream_state = state.upstream.clone();
     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
     let body = Arc::new(body);
     let started = Instant::now();
@@ -1366,7 +1602,7 @@ async fn passthrough_dispatch(
         .run_with_auth_policy(
             &mut attempt_records,
             |provider, model| {
-                let upstream = upstream.clone();
+                let upstream = upstream_state.clone();
                 let body = body.clone();
                 async move {
                     upstream
@@ -1405,6 +1641,42 @@ async fn passthrough_dispatch(
                 .record_success(&outcome.provider_id, &outcome.model, latency as u32);
             let (prompt_tokens, completion_tokens, total_tokens) =
                 passthrough_usage(&outcome.value);
+            let priced_usage = match &outcome.value {
+                PassthroughResponse::Json(value) => value.get("usage").filter(|u| {
+                    u.get("prompt_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some()
+                        && u.get("completion_tokens")
+                            .map_or(true, |v| v.as_u64().is_some())
+                }),
+                PassthroughResponse::Bytes { .. } => None,
+            };
+            let price = ranked
+                .iter()
+                .find(|c| c.provider.id == outcome.provider_id)
+                .and_then(|c| {
+                    c.provider
+                        .models
+                        .iter()
+                        .find(|m| m.upstream == outcome.model)
+                })
+                .and_then(|m| m.price.as_ref());
+            let (audit_cost, audit_currency, audit_rate_label) = if let Some(usage) = priced_usage {
+                let read = usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0)
+                    .max(0);
+                price_charge(
+                    price,
+                    i64::from(prompt_tokens),
+                    i64::from(completion_tokens),
+                    read,
+                    0,
+                )
+            } else {
+                (None, None, None)
+            };
             // D3：记一次实测吞吐样本。放在拿到 usage 之后 ——
             // 没有 `completion_tokens` 就算不出 tok/s，
             // 而在这里编一个 0 会把 EWMA 拉向 0，
@@ -1427,7 +1699,7 @@ async fn passthrough_dispatch(
                 {
                     state
                         .router
-                        .consume(&provider.provider, model, total_tokens);
+                        .record_tokens(&provider.provider, model, total_tokens);
                 }
             }
 
@@ -1462,9 +1734,9 @@ async fn passthrough_dispatch(
                         completion_tokens: completion_tokens as i64,
                         fallback_attempts: fallback_count(attempts),
                         error: None,
-                        cost: None,
-                        currency: None,
-                        rate_label: None,
+                        cost: audit_cost,
+                        currency: audit_currency,
+                        rate_label: audit_rate_label.as_deref(),
                         estimated_prompt_tokens: None,
                         attempts_json: attempts_json.as_deref(),
                         route: Default::default(),
@@ -1575,13 +1847,15 @@ async fn dispatch_remote_compaction(
 
     let required = required_capabilities(&req);
     let media = crate::media::Media::of(&req);
+    let mut candidates = candidates;
+    // Unsendable candidates must not affect eligible models' normalization.
+    let media_rejections = filter_by_media_carry(&mut candidates, &media);
     let mut ranked = state.router.rank(candidates, &cfg, required, None);
-    let _media_rejections = filter_by_media_carry(&mut ranked, &media);
     if ranked.is_empty() {
         return error_response(&missing_capability_error(
             &required,
             &media,
-            &_media_rejections,
+            &media_rejections,
         ));
     }
     if let Some(active_id) = state.active.read().clone() {
@@ -1600,9 +1874,9 @@ async fn dispatch_remote_compaction(
         1
     };
     let flag = AtomicFlag::new();
-    let chain = FailoverChain::new(&ranked, max_attempts, &flag);
+    let chain =
+        FailoverChain::new(&ranked, max_attempts, &flag).with_admission(state.router.clone());
     let chain = chain.with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
-    let upstream = state.upstream.clone();
     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
     let upstream_req = Arc::new(ChatRequest {
         stream: false,
@@ -1614,12 +1888,12 @@ async fn dispatch_remote_compaction(
         .run_with_auth_policy(
             &mut attempt_records,
             |provider, model| {
-                let upstream = upstream.clone();
+                let state = state.clone();
                 let request = upstream_req.clone();
                 let defaults = cfg.ollama_options.clone();
                 async move {
-                    upstream
-                        .call(&provider, &request, &model, timeout, &defaults)
+                    state
+                        .call_chat_upstream(&provider, &request, &model, timeout, &defaults)
                         .await
                 }
             },
@@ -1652,35 +1926,34 @@ async fn dispatch_remote_compaction(
             }
 
             let latency = started.elapsed().as_millis() as u64;
-            state
-                .health
-                .record_success(&outcome.provider_id, &outcome.model, latency as u32);
-            if let Some(provider) = ranked
-                .iter()
-                .find(|candidate| candidate.provider.id == outcome.provider_id)
-            {
-                if let Some(model) = provider
-                    .provider
-                    .models
-                    .iter()
-                    .find(|model| model.upstream == outcome.model)
-                {
-                    state.router.consume(
-                        &provider.provider,
-                        model,
-                        outcome
-                            .value
-                            .usage
-                            .as_ref()
-                            .map(|usage| usage.total_tokens)
-                            .unwrap_or(0),
-                    );
-                }
-            }
 
             let response_id = format!("resp_compact_{}", uuid::Uuid::new_v4().simple());
             let item = compaction_item(&response_id, summary);
             let usage = outcome.value.usage.clone().unwrap_or_default();
+            let price = ranked
+                .iter()
+                .find(|c| c.provider.id == outcome.provider_id)
+                .and_then(|c| {
+                    c.provider
+                        .models
+                        .iter()
+                        .find(|m| m.upstream == outcome.model)
+                })
+                .and_then(|m| m.price.as_ref());
+            let (audit_cost, audit_currency, audit_rate_label) = outcome
+                .value
+                .usage
+                .as_ref()
+                .map(|u| {
+                    price_charge(
+                        price,
+                        i64::from(u.prompt_tokens),
+                        i64::from(u.completion_tokens),
+                        i64::from(u.cache_read_tokens),
+                        i64::from(u.cache_creation_tokens),
+                    )
+                })
+                .unwrap_or((None, None, None));
             let audit_state = state.clone();
             let audit_session_id = response_session_id.clone();
             let audit_client = client.clone();
@@ -1715,9 +1988,9 @@ async fn dispatch_remote_compaction(
                         completion_tokens,
                         fallback_attempts: fallback_count(attempts),
                         error: None,
-                        cost: None,
-                        currency: None,
-                        rate_label: None,
+                        cost: audit_cost,
+                        currency: audit_currency,
+                        rate_label: audit_rate_label.as_deref(),
                         estimated_prompt_tokens: None,
                         attempts_json: attempts_json.as_deref(),
                         route: Default::default(),
@@ -2417,21 +2690,26 @@ async fn run_prompt_refine(
     cfg: &AppConfig,
     user_text: &str,
 ) -> Option<crate::intellect::RefineOutcome> {
+    if user_text.trim().chars().count() < cfg.smart_routing.prompt_refine.min_chars {
+        return None;
+    }
     let providers = state.providers.read().clone();
     let required = crate::router::score::RequiredCapabilities::default();
-    let ranked = state.router.rank(
+    let mut ranked = state.router.rank(
         state.router.resolve("auto", &providers).ok()?,
         cfg,
         required,
         None,
     );
+    // The prompt rewriter currently supports only HTTP transports.
+    ranked.retain(|c| c.provider.runtime_id.is_none());
     let mut target =
         crate::intellect::refine::pick_target(&cfg.smart_routing.prompt_refine, &ranked)?;
     // 解密放在选目标之后：没选中就不用解密，避免白读一次密钥。
-    let provider = providers
+    let candidate = ranked
         .iter()
-        .find(|p| p.base_url == target.base_url && p.dialect == target.dialect);
-    let key = provider.and_then(|p| {
+        .find(|c| c.provider.id == target.provider_id)?;
+    let key = Some(&candidate.provider).and_then(|p| {
         if p.api_key_enc.trim().is_empty() {
             return None;
         }
@@ -2445,16 +2723,38 @@ async fn run_prompt_refine(
             return None;
         }
     };
-    Some(
-        crate::intellect::refine::refine(
-            &client,
-            &target,
-            target.api_key.clone(),
-            user_text,
-            &cfg.smart_routing.prompt_refine,
-        )
-        .await,
+    let mut reserved = candidate.clone();
+    reserved.model.upstream = target.model.clone();
+    if !state.router.try_reserve(&reserved) {
+        return None;
+    }
+    let started = Instant::now();
+    let outcome = crate::intellect::refine::refine(
+        &client,
+        &target,
+        target.api_key.clone(),
+        user_text,
+        &cfg.smart_routing.prompt_refine,
     )
+    .await;
+    if outcome.applied || outcome.usage.is_some() {
+        let elapsed = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        state
+            .health
+            .record_success(&candidate.provider.id, &target.model, elapsed);
+        if let Some(usage) = &outcome.usage {
+            state.health.record_tps(
+                &candidate.provider.id,
+                &target.model,
+                usage.completion_tokens,
+                elapsed,
+            );
+            state
+                .router
+                .record_tokens(&candidate.provider, &reserved.model, usage.total_tokens);
+        }
+    }
+    Some(outcome)
 }
 
 /// 把改写后的文本替换进**最后一条 user 消息**。
@@ -2561,6 +2861,7 @@ fn apply_route_headers(trace: &repo::RouteTrace, headers: &mut HeaderMap) {
 struct AnthropicStreamState {
     next_output_index: usize,
     active_text_index: Option<usize>,
+    active_thinking_index: Option<usize>,
     tools: BTreeMap<usize, AnthropicToolBlock>,
 }
 
@@ -2607,6 +2908,7 @@ impl AnthropicStreamState {
             Self {
                 next_output_index: 0,
                 active_text_index: None,
+                active_thinking_index: None,
                 tools: BTreeMap::new(),
             },
             start,
@@ -2614,7 +2916,8 @@ impl AnthropicStreamState {
     }
 
     fn text_delta(&mut self, text: &str) -> Vec<String> {
-        let mut output = self.close_tools();
+        let mut output = self.close_thinking();
+        output.extend(self.close_tools());
         let index = match self.active_text_index {
             Some(index) => index,
             None => {
@@ -2646,6 +2949,7 @@ impl AnthropicStreamState {
 
     fn tool_deltas(&mut self, calls: &serde_json::Value) -> Vec<String> {
         let mut output = self.close_text();
+        output.extend(self.close_thinking());
         for (position, call) in tool_call_values(calls).into_iter().enumerate() {
             let source_index = call
                 .get("index")
@@ -2721,6 +3025,7 @@ impl AnthropicStreamState {
 
     fn finish(&mut self) -> Vec<String> {
         let mut output = self.close_text();
+        output.extend(self.close_thinking());
         output.extend(self.close_tools());
         output
     }
@@ -2729,6 +3034,44 @@ impl AnthropicStreamState {
         let index = self.next_output_index;
         self.next_output_index += 1;
         index
+    }
+
+    fn reasoning_delta(&mut self, thinking: &str) -> Vec<String> {
+        let mut output = self.close_text();
+        output.extend(self.close_tools());
+        let index = match self.active_thinking_index {
+            Some(index) => index,
+            None => {
+                let index = self.allocate_output_index();
+                self.active_thinking_index = Some(index);
+                output.push(sse_event(
+                    Some("content_block_start"),
+                    serde_json::json!({
+                        "type": "content_block_start", "index": index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    })
+                    .to_string(),
+                ));
+                index
+            }
+        };
+        output.push(sse_event(
+            Some("content_block_delta"),
+            serde_json::json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "thinking_delta", "thinking": thinking},
+            })
+            .to_string(),
+        ));
+        output
+    }
+
+    fn close_thinking(&mut self) -> Vec<String> {
+        self.active_thinking_index
+            .take()
+            .map(anthropic_content_block_stop)
+            .into_iter()
+            .collect()
     }
 
     fn close_text(&mut self) -> Vec<String> {
@@ -2746,7 +3089,7 @@ impl AnthropicStreamState {
             .filter_map(|block| block.output_index)
             .collect();
         indexes.sort_unstable();
-        self.tools.clear();
+        self.tools.retain(|_, block| block.output_index.is_none());
         indexes
             .into_iter()
             .map(anthropic_content_block_stop)
@@ -2760,6 +3103,10 @@ struct ResponsesStreamState {
     response_id: String,
     next_output_index: usize,
     text: Option<ResponseTextBlock>,
+    reasoning: Option<ResponseTextBlock>,
+    refusal: Option<ResponseTextBlock>,
+    next_sequence_number: u64,
+    completed_output: Vec<serde_json::Value>,
     tools: BTreeMap<usize, ResponseToolBlock>,
 }
 
@@ -2784,12 +3131,17 @@ impl ResponsesStreamState {
             response_id: req_id.to_owned(),
             next_output_index: 0,
             text: None,
+            reasoning: None,
+            refusal: None,
+            next_sequence_number: 1,
+            completed_output: Vec::new(),
             tools: BTreeMap::new(),
         };
         let created = response_event(
             "response.created",
             serde_json::json!({
                 "type": "response.created",
+                "sequence_number": 0,
                 "response": {
                     "id": req_id,
                     "object": "response",
@@ -2852,7 +3204,7 @@ impl ResponsesStreamState {
                 "delta": delta,
             }),
         ));
-        output
+        self.number_events(output)
     }
 
     fn tool_deltas(&mut self, calls: &serde_json::Value) -> Vec<String> {
@@ -2954,11 +3306,17 @@ impl ResponsesStreamState {
                 ));
             }
         }
-        output
+        self.number_events(output)
     }
 
     fn finish(&mut self) -> Vec<String> {
         let mut output = Vec::new();
+        if let Some(reasoning) = self.reasoning.take() {
+            output.extend(Self::finish_auxiliary(reasoning, true));
+        }
+        if let Some(refusal) = self.refusal.take() {
+            output.extend(Self::finish_auxiliary(refusal, false));
+        }
         if let Some(text) = self.text.take() {
             output.push(response_event(
                 "response.output_text.done",
@@ -3036,7 +3394,159 @@ impl ResponsesStreamState {
                 }),
             ));
         }
+        let mut completed: Vec<(u64, serde_json::Value)> = output
+            .iter()
+            .filter_map(|event| {
+                let payload = Self::event_payload(event)?;
+                (payload["type"] == "response.output_item.done").then(|| {
+                    (
+                        payload["output_index"].as_u64().unwrap_or_default(),
+                        payload["item"].clone(),
+                    )
+                })
+            })
+            .collect();
+        completed.sort_by_key(|(index, _)| *index);
+        self.completed_output = completed.into_iter().map(|(_, item)| item).collect();
+        self.number_events(output)
+    }
+
+    fn auxiliary_delta(&mut self, delta: &str, is_reasoning: bool) -> Vec<String> {
+        let mut output = Vec::new();
+        let absent = if is_reasoning {
+            self.reasoning.is_none()
+        } else {
+            self.refusal.is_none()
+        };
+        if absent {
+            let output_index = self.allocate_output_index();
+            let item_id = format!(
+                "{}_{}",
+                if is_reasoning { "rs" } else { "msg_refusal" },
+                self.response_id
+            );
+            let item = if is_reasoning {
+                serde_json::json!({"id": item_id, "type": "reasoning", "summary": [], "content": []})
+            } else {
+                serde_json::json!({"id": item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []})
+            };
+            let part = if is_reasoning {
+                serde_json::json!({"type": "reasoning_text", "text": ""})
+            } else {
+                serde_json::json!({"type": "refusal", "refusal": ""})
+            };
+            output.push(response_event("response.output_item.added", serde_json::json!({
+                "type": "response.output_item.added", "output_index": output_index, "item": item,
+            })));
+            output.push(response_event("response.content_part.added", serde_json::json!({
+                "type": "response.content_part.added", "item_id": item_id, "output_index": output_index,
+                "content_index": 0, "part": part,
+            })));
+            let block = ResponseTextBlock {
+                output_index,
+                item_id,
+                text: String::new(),
+            };
+            if is_reasoning {
+                self.reasoning = Some(block);
+            } else {
+                self.refusal = Some(block);
+            }
+        }
+        let block = if is_reasoning {
+            self.reasoning.as_mut()
+        } else {
+            self.refusal.as_mut()
+        }
+        .expect("auxiliary block initialized");
+        block.text.push_str(delta);
+        let event = if is_reasoning {
+            "response.reasoning_text.delta"
+        } else {
+            "response.refusal.delta"
+        };
+        output.push(response_event(
+            event,
+            serde_json::json!({
+                "type": event, "item_id": block.item_id, "output_index": block.output_index,
+                "content_index": 0, "delta": delta,
+            }),
+        ));
+        self.number_events(output)
+    }
+
+    fn finish_auxiliary(block: ResponseTextBlock, is_reasoning: bool) -> Vec<String> {
+        let event = if is_reasoning {
+            "response.reasoning_text.done"
+        } else {
+            "response.refusal.done"
+        };
+        let mut done = serde_json::json!({
+            "type": event, "item_id": block.item_id, "output_index": block.output_index, "content_index": 0,
+        });
+        done[if is_reasoning { "text" } else { "refusal" }] = serde_json::json!(block.text);
+        let part = if is_reasoning {
+            serde_json::json!({"type": "reasoning_text", "text": block.text})
+        } else {
+            serde_json::json!({"type": "refusal", "refusal": block.text})
+        };
+        let item = if is_reasoning {
+            serde_json::json!({"id": block.item_id, "type": "reasoning", "summary": [], "content": [part.clone()]})
+        } else {
+            serde_json::json!({"id": block.item_id, "type": "message", "role": "assistant", "status": "completed", "content": [part.clone()]})
+        };
+        vec![
+            response_event(event, done),
+            response_event(
+                "response.content_part.done",
+                serde_json::json!({
+                    "type": "response.content_part.done", "item_id": block.item_id, "output_index": block.output_index,
+                    "content_index": 0, "part": part,
+                }),
+            ),
+            response_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "type": "response.output_item.done", "output_index": block.output_index, "item": item,
+                }),
+            ),
+        ]
+    }
+
+    fn event_payload(event: &str) -> Option<serde_json::Value> {
+        event
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .and_then(|data| serde_json::from_str(data).ok())
+    }
+
+    fn number_events(&mut self, output: Vec<String>) -> Vec<String> {
         output
+            .into_iter()
+            .map(|event| {
+                let Some(mut payload) = Self::event_payload(&event) else {
+                    return event;
+                };
+                payload["sequence_number"] = serde_json::json!(self.next_sequence_number);
+                self.next_sequence_number += 1;
+                let event_type = payload["type"].as_str().unwrap_or_default().to_owned();
+                response_event(&event_type, payload)
+            })
+            .collect()
+    }
+
+    fn completed_event(&mut self, model: &str, usage: &Usage) -> String {
+        let event = response_event(
+            "response.completed",
+            serde_json::json!({
+                "type": "response.completed", "response": {"id": self.response_id, "object": "response",
+                    "model": model, "status": "completed", "output": self.completed_output,
+                    "usage": responses_usage_json(usage)},
+            }),
+        );
+        self.number_events(vec![event])
+            .pop()
+            .expect("completion event")
     }
 
     fn allocate_output_index(&mut self) -> usize {
@@ -3194,7 +3704,7 @@ async fn dispatch(
     // 总开关关着时，虚拟模型名 `smart` 不产生任何效果——否则会出现
     // 「不分类、不搜索，但排序已经换成 Smart 权重」的半吊子状态。
     let smart_enabled = smart_mode_enabled(&cfg);
-    let candidates = match state.router.resolve_typed_with(
+    let mut candidates = match state.router.resolve_typed_with(
         &req.model,
         &providers,
         ModelType::Chat,
@@ -3203,6 +3713,41 @@ async fn dispatch(
         Ok(c) => c,
         Err(e) => return error_response(&e),
     };
+
+    if req.stream {
+        // Account adapters currently return a complete response; never send their
+        // placeholder HTTP address through the streaming transport.
+        let mut supported = Vec::new();
+        for candidate in candidates {
+            if !candidate.model.supports_stream {
+                continue;
+            }
+            let direct = match candidate.provider.runtime_id.as_deref() {
+                None => true,
+                Some(id) => matches!(
+                    crate::agent_upstream::runtime::resolve_chat_runtime(
+                        state.db.pool(),
+                        &state.adapters,
+                        id
+                    )
+                    .await,
+                    Ok(
+                        crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { .. }
+                            | crate::agent_upstream::runtime::ChatRuntime::Qoder { .. }
+                    )
+                ),
+            };
+            if direct {
+                supported.push(candidate);
+            }
+        }
+        candidates = supported;
+        if candidates.is_empty() {
+            return error_response(&GatewayError::CapabilityUnavailable {
+                kind: "流式输出；账号适配器请使用非流式聊天".into(),
+            });
+        }
+    }
 
     // 路由前按候选窗口扣除输出、工具 schema 和协议余量。先强制压缩可压缩的
     // 持久化历史，再在必要时按完整工具交换裁剪；仍放不下时明确报错，绝不把
@@ -3269,6 +3814,18 @@ async fn dispatch(
     // D3：长 prompt 型代价需要这个数，而它原本在**下面**才算出来，
     // 所以上提到 rank 之前。重复计算一次没有意义，直接用同一个值。
     let request_message_tokens = estimate_message_tokens(&req.messages);
+    // Normalize cost/throughput only among candidates that can serve this request.
+    // A later-excluded small-window or incompatible-dialect model must not change
+    // the ordering of the remaining models (including cross-currency comparability).
+    let media_rejections = filter_by_media_carry(&mut candidates, &media);
+    candidates.retain(|candidate| {
+        candidate_supports_context(
+            candidate,
+            request_message_tokens,
+            fixed_reserve,
+            &calibration,
+        )
+    });
     let mut ranked = state.router.rank_with_intent(
         candidates,
         &cfg,
@@ -3288,18 +3845,6 @@ async fn dispatch(
             requested_model: &req.model,
         }),
     );
-    // 方言承载过滤要看到被剔除前的候选，才能区分「模型没勾选能力」与
-    // 「该方言承载不了这种媒体」两种情况，给出可操作的错误。
-    let media_rejections = filter_by_media_carry(&mut ranked, &media);
-    ranked.retain(|candidate| {
-        candidate_supports_context(
-            candidate,
-            request_message_tokens,
-            fixed_reserve,
-            &calibration,
-        )
-    });
-
     if ranked.is_empty() {
         return error_response(&missing_capability_error(
             &required,
@@ -3387,7 +3932,11 @@ async fn dispatch(
 /// | 多模态（图/音/视频） | 同样的文字配不同的图是两回事，而图的内容不参与指纹 |
 /// | 会话 id 为空 | 无会话上下文时，两次相同提问无法区分「重试」与「用户又问一遍」 |
 /// | 请求体序列化失败 | 拿不到稳定指纹，判了也是错的 |
-fn dedup_fingerprint(state: &GatewayState, client: Option<&str>, req: &ChatRequest) -> Option<String> {
+fn dedup_fingerprint(
+    state: &GatewayState,
+    client: Option<&str>,
+    req: &ChatRequest,
+) -> Option<String> {
     let cfg = state.cfg_snapshot();
     if !crate::proxy::dedup::should_compute_fingerprint(&cfg.dedup) {
         return None;
@@ -3636,6 +4185,61 @@ fn schedule_compaction(state: Arc<GatewayState>, session_id: String) {
 /// 让 `send` 返回 `Err` 的话，`run_cascade` 会把整轮结束掉，
 /// 而失败之前已经发生过的那几跳的记录也就一起没了。
 type CascadeAttemptPayload = Result<AttemptOutcome<crate::domain::ChatResponse>>;
+
+type CallCharge = (
+    Option<Usage>,
+    Option<f64>,
+    Option<&'static str>,
+    Option<String>,
+    repo::UsageEntry,
+);
+#[derive(Default)]
+struct CallTotals {
+    prompt: i64,
+    completion: i64,
+    cost: Option<f64>,
+    currency: Option<&'static str>,
+    label: Option<String>,
+}
+fn call_totals(charges: &[CallCharge]) -> CallTotals {
+    let mut totals = CallTotals::default();
+    let mut known = !charges.is_empty();
+    let mut cost = 0.0;
+    for (usage, amount, currency, _, _) in charges {
+        if let Some(usage) = usage {
+            totals.prompt = totals.prompt.saturating_add(usage.prompt_tokens as i64);
+            totals.completion = totals
+                .completion
+                .saturating_add(usage.completion_tokens as i64);
+        } else {
+            known = false;
+        }
+        match (amount, currency) {
+            (Some(amount), Some(currency)) => {
+                if totals
+                    .currency
+                    .is_some_and(|previous| previous != *currency)
+                {
+                    known = false;
+                }
+                totals.currency = Some(currency);
+                cost += amount;
+            }
+            _ => known = false,
+        }
+    }
+    if known && cost.is_finite() {
+        totals.cost = Some(cost);
+        totals.label = if charges.len() == 1 {
+            charges[0].3.clone()
+        } else {
+            Some("级联各成功请求费用合计".into())
+        };
+    } else {
+        totals.currency = None;
+    }
+    totals
+}
 
 /// D4：级联发送闭包返回的 future。
 ///
@@ -3980,7 +4584,6 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         None
     };
 
-    let upstream = state.upstream.clone();
     let req_arc = Arc::new(req.clone());
 
     let health = state.health.clone();
@@ -3988,6 +4591,11 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     // 级联各跳的逐跳明细共用这一个收集器：不共享的话，
     // 「第一跳发给了便宜的模型、被升级掉了」这件事在审计里会消失。
     let records_sink: AttemptRecordSink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let charges_sink = Arc::new(parking_lot::Mutex::new(Vec::<CallCharge>::new()));
+    // 同一请求的级联升级仍须遵守前一跳确认的鉴权拒绝与免 Key 隔离。
+    let auth_isolation = Arc::new(parking_lot::Mutex::new(
+        crate::router::failover::AuthIsolation::default(),
+    ));
 
     // ===== D4：全仓唯一的发送路径 =====
     //
@@ -3996,8 +4604,12 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     // 不会出现「生产路径与用例跑的不是同一段代码」那种假验证。
     let cascade_run = {
         let question = last_user_text(&req);
-        crate::router::cascade::run_cascade(
-            &cfg.cascade,
+        crate::router::cascade::run_cascade_with_cursor(
+            &if cascade_on {
+                cfg.cascade
+            } else {
+                Default::default()
+            },
             CascadeRunRequest {
                 candidates: ranked.len(),
                 streaming: false,
@@ -4008,16 +4620,19 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 let state = Arc::clone(&state);
                 let ranked = ranked.clone();
                 let cfg = cfg.clone();
-                let upstream = upstream.clone();
                 let req_arc = Arc::clone(&req_arc);
                 let health = Arc::clone(&health);
                 let router = Arc::clone(&router);
                 let sink = Arc::clone(&records_sink);
+                let charges = Arc::clone(&charges_sink);
+                let auth_isolation = Arc::clone(&auth_isolation);
                 Box::pin(async move {
                     // `AtomicFlag` 只被流式路径 `set`，而这里是**非流式**入口；
                     // 每次尝试各起一个，等价于原来共享一个（它永远是 0）。
                     let flag = AtomicFlag::new();
-                    let chain = FailoverChain::new(&ranked[start..], max_attempts, &flag);
+                    let chain = FailoverChain::new(&ranked[start..], max_attempts, &flag)
+                        .with_admission(router.clone())
+                        .with_auth_isolation(auth_isolation);
                     let chain = chain
                         .with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
                     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
@@ -4026,40 +4641,16 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         .run_with_auth_policy(
                             &mut records,
                             |provider, model| {
-                                let up = upstream.clone();
+                                let state = state.clone();
                                 let r = Arc::clone(&req_arc);
                                 let defaults = state.cfg_snapshot().ollama_options;
-                                let adapters = state.adapters.clone();
-                                let runtime_pool = state.db.pool().clone();
                                 async move {
-                                    // ===== 任务卡二 A5：**唯一分派点** =====
-                                    //
-                                    // 这是全仓唯一一处「按 Provider 的上游形态选路径」的地方。
-                                    //
-                                    // 【模式隔离】`runtime_id` 为 `None`（默认，也是绝大多数
-                                    // Provider 的现状）时，这个 `if let` **落空后直接落到
-                                    // 原有那一行**，中间不经过任何新代码 —— 所以「老 Provider
-                                    // 的响应体逐字节不变」是**结构性保证**，
-                                    // 而不是「小心写出来的」。
-                                    //
-                                    // 放在**链的闭包里**而不是函数顶部：`ranked` 是一批候选，
-                                    // 「要发给谁」是链逐候选决定的。放在顶部就只能对
-                                    // `ranked[0]` 生效，那会**丢掉失败转移** ——
-                                    // 而那种缺陷只在首选真失败时才暴露。
-                                    // 放在这里还意味着账号型与 API 型 Provider 混在一批候选里
-                                    // 也能各自走对路。
-                                    if let Some(runtime_id) = provider.runtime_id.as_deref() {
-                                        return crate::agent_upstream::call_agent_with_runtime(
-                                            &runtime_pool,
-                                            &adapters,
-                                            runtime_id,
-                                            &model,
-                                            &r.messages,
-                                            timeout.as_millis() as u64,
+                                    // Shared account/HTTP dispatch and per-call sampling.
+                                    state
+                                        .call_chat_upstream(
+                                            &provider, &r, &model, timeout, &defaults,
                                         )
-                                        .await;
-                                    }
-                                    up.call(&provider, &r, &model, timeout, &defaults).await
+                                        .await
                                 }
                             },
                             |provider, model, err| {
@@ -4078,6 +4669,51 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         .await;
                     // 链要 `&mut Vec`，所以明细先落在本地，链跑完再并进共享 sink
                     // ——共享锁不能跨 await 持有。
+                    if let Ok(o) = &outcome {
+                        if let Some(record) = records.last_mut() {
+                            record.transport = o.value.transport.clone();
+                        }
+                        let price = ranked
+                            .iter()
+                            .find(|c| c.provider.id == o.provider_id && c.model.upstream == o.model)
+                            .and_then(|c| c.model.price.as_ref());
+                        let (cost, currency, label) = o
+                            .value
+                            .usage
+                            .as_ref()
+                            .map(|u| {
+                                price_charge(
+                                    price,
+                                    u.prompt_tokens as i64,
+                                    u.completion_tokens as i64,
+                                    u.cache_read_tokens as i64,
+                                    u.cache_creation_tokens as i64,
+                                )
+                            })
+                            .unwrap_or((None, None, None));
+                        let entry = repo::UsageEntry {
+                            provider_id: o.provider_id.clone(),
+                            model: o.model.clone(),
+                            prompt_tokens: o
+                                .value
+                                .usage
+                                .as_ref()
+                                .map(|u| u.prompt_tokens as i64)
+                                .unwrap_or(0),
+                            completion_tokens: o
+                                .value
+                                .usage
+                                .as_ref()
+                                .map(|u| u.completion_tokens as i64)
+                                .unwrap_or(0),
+                            cost,
+                            currency: currency.map(str::to_owned),
+                            errors: 0,
+                        };
+                        charges
+                            .lock()
+                            .push((o.value.usage.clone(), cost, currency, label, entry));
+                    }
                     sink.lock().append(&mut records);
                     Ok::<_, GatewayError>(outcome)
                 })
@@ -4099,12 +4735,26 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     }
                 })
             },
+            |payload: &CascadeAttemptPayload, start| {
+                payload
+                    .as_ref()
+                    .ok()
+                    .and_then(|o| {
+                        ranked.iter().position(|c| {
+                            c.provider.id == o.provider_id && c.model.upstream == o.model
+                        })
+                    })
+                    .unwrap_or(start)
+            },
         )
         .await
     };
 
     // 各次尝试的逐跳明细都在这个 sink 里（级联升级过的前几跳也在）。
-    let mut attempt_records: Vec<AttemptRecord> = std::mem::take(&mut *records_sink.lock());
+    let attempt_records: Vec<AttemptRecord> = std::mem::take(&mut *records_sink.lock());
+    let charges = call_totals(&charges_sink.lock());
+    let mut call_usage: Vec<repo::UsageEntry> =
+        charges_sink.lock().iter().map(|c| c.4.clone()).collect();
     let mut cascade_stop: Option<CascadeStop> = None;
     let mut cascade_attempts = 0usize;
     let outcome: Result<AttemptOutcome<crate::domain::ChatResponse>> = match cascade_run {
@@ -4140,32 +4790,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     match outcome {
         Ok(o) => {
             let latency = started.elapsed().as_millis() as u64;
-            // 任务卡二 A6 判据 1：把适配器如实回报的**传输**回填进逐跳明细。
-            //
-            // 【为什么在这里回填，而不是在 `AttemptRecord::success` 里传】
-            // 失败转移链对响应类型是**泛型**的（`run_with_auth_policy<T>`），
-            // 链内部读不到 `ChatResponse.transport`；硬加 trait 约束会把
-            // 泛型复杂度传染给每个调用方。而这里 `o.value` 是有具体类型的。
-            //
-            // 回填**最后一条**是准确的：`o` 就是链最后成功的那一跳。
-            // 普通 API 上游的 `transport` 是 `None`，回填等于没改。
-            if let Some(last) = attempt_records.last_mut() {
-                last.transport = o.value.transport.clone();
-            }
-            health.record_success(&o.provider_id, &o.model, latency as u32);
-            if let Some(p) = ranked.iter().find(|c| c.provider.id == o.provider_id) {
-                if let Some(m) = p.provider.models.iter().find(|m| m.upstream == o.model) {
-                    router.consume(
-                        &p.provider,
-                        m,
-                        o.value.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0),
-                    );
-                }
-            }
-
             // 上下文和粘性是下一次同会话请求的前置条件，必须在 HTTP 成功响应
             // 之前完成；仅审计日志允许异步，避免紧随其后的请求读到旧历史。
-            let (pt, ct, cache_read, cache_creation) = o
+            let (pt, ct, _cache_read, _cache_creation) = o
                 .value
                 .usage
                 .as_ref()
@@ -4178,11 +4805,6 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     )
                 })
                 .unwrap_or((0, 0, 0, 0));
-            // D3：流式路径的实测吞吐。**与上一个记账点（非流式）同一口径** ——
-            // 流式的 usage 往往在最后一个 chunk 才出现，所以必须等到
-            // `o.value.usage` 拿到之后再记，不能挪到 `record_success` 旁边。
-            // `record_tps` 自己会拒绝 0 token（多数流式中间帧没有 usage）。
-            health.record_tps(&o.provider_id, &o.model, ct, latency as u32);
             let pid = o.provider_id.clone();
             let mid = o.model.clone();
             let assistant = Message {
@@ -4243,18 +4865,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             let audit_client = client.clone();
             let audit_pid = pid.clone();
             let audit_mid = mid.clone();
-            let audit_fallback_attempts = fallback_count(o.attempts);
-            let audit_price = ranked
-                .iter()
-                .find(|c| c.provider.id == pid && c.model.upstream == mid)
-                .and_then(|c| c.model.price.as_ref());
-            let (audit_cost, audit_currency, audit_rate_label) = price_charge(
-                audit_price,
-                pt as i64,
-                ct as i64,
-                cache_read as i64,
-                cache_creation as i64,
-            );
+            let audit_fallback_attempts = fallback_count(attempt_records.len());
+            let (audit_cost, audit_currency, audit_rate_label) =
+                (charges.cost, charges.currency, charges.label.clone());
             let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
             // traceId 要被三个地方用：响应头（借用）、审计落库（移进 spawn）、
             // 以及每一条降级明细。先克隆一份，后面都用它。
@@ -4277,7 +4890,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             // 先克隆一份给 spawn，原值留给响应头。
             let audit_trace_id = trace_id.clone();
             tokio::spawn(async move {
-                let _ = repo::log_request(
+                let _ = repo::log_request_with_usage(
                     audit_state.db.pool(),
                     repo::RequestLog {
                         session_id: Some(&audit_session_id),
@@ -4293,8 +4906,8 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         routed_model: Some(&audit_mid),
                         status: Some(200),
                         latency_ms: latency as i64,
-                        prompt_tokens: pt as i64,
-                        completion_tokens: ct as i64,
+                        prompt_tokens: charges.prompt,
+                        completion_tokens: charges.completion,
                         fallback_attempts: audit_fallback_attempts,
                         error: None,
                         cost: audit_cost,
@@ -4304,6 +4917,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         attempts_json: audit_attempts.as_deref(),
                         route: audit_route,
                     },
+                    &call_usage,
                 )
                 .await;
             });
@@ -4316,7 +4930,10 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 "x-routed-via",
                 parse_header(&format!("{}/{}", o.provider_id, o.model)),
             );
-            h.insert("x-fallback-attempts", parse_header(&o.attempts.to_string()));
+            h.insert(
+                "x-fallback-attempts",
+                parse_header(&attempt_records.len().to_string()),
+            );
             h.insert("x-session-id", parse_header(&response_session_id));
             // B4：traceId **永远**回给客户端，即使 OTLP 导出关着。
             // 否则「导不出」会退化成「查不到」——排查时手里一个可追的标识都没有。
@@ -4378,6 +4995,15 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             resp
         }
         Err(e) => {
+            call_usage.push(repo::UsageEntry {
+                provider_id: "unknown".into(),
+                model: req.model.clone(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cost: None,
+                currency: None,
+                errors: 1,
+            });
             let st = state.clone();
             let sid = session_id.clone();
             let kind = classify(&e);
@@ -4391,7 +5017,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             let audit_trace_id = trace_id.clone();
             let audit_attempts = attempts_json_traced(&attempt_records, Some(&audit_trace_id));
             tokio::spawn(async move {
-                let _ = repo::log_request(
+                let _ = repo::log_request_with_usage(
                     st.db.pool(),
                     repo::RequestLog {
                         session_id: Some(&sid),
@@ -4408,17 +5034,18 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         routed_model: None,
                         status: Some(status),
                         latency_ms: started.elapsed().as_millis() as i64,
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
+                        prompt_tokens: charges.prompt,
+                        completion_tokens: charges.completion,
                         fallback_attempts: audit_fallback_attempts,
                         error: Some(kind),
-                        cost: None,
-                        currency: None,
-                        rate_label: None,
+                        cost: charges.cost,
+                        currency: charges.currency,
+                        rate_label: charges.label.as_deref(),
                         estimated_prompt_tokens: None,
                         attempts_json: audit_attempts.as_deref(),
                         route: Default::default(),
                     },
+                    &call_usage,
                 )
                 .await;
             });
@@ -4428,6 +5055,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 }
 
 struct PreparedUpstreamStream {
+    started: Instant,
     stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<UpstreamEvent>> + Send>>,
     first_event: UpstreamEvent,
     initial_usage: Option<Usage>,
@@ -4476,8 +5104,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     // X-Routed-Via / X-Fallback-Attempts 反映实际结果，同时仍能在未输出前降级。
     let flag = AtomicFlag::new();
     let chain = FailoverChain::new(&ranked, max_attempts, &flag)
+        .with_admission(state.router.clone())
         .with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
-    let upstream = state.upstream.clone();
+    let upstream = state.clone();
     let request = Arc::new(req.clone());
     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
     let defaults = cfg.ollama_options.clone();
@@ -4492,8 +5121,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 let request = request.clone();
                 let defaults = defaults.clone();
                 async move {
+                    let started = Instant::now();
                     let mut stream = upstream
-                        .call_stream(&provider, &request, &model, timeout, &defaults)
+                        .call_chat_upstream_stream(&provider, &request, &model, timeout, &defaults)
                         .await?;
                     let mut initial_usage = None;
                     let mut initial_finish_reason = None;
@@ -4510,6 +5140,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                             }
                             Some(Ok(first_event)) => {
                                 return Ok(PreparedUpstreamStream {
+                                    started,
                                     stream,
                                     first_event,
                                     initial_usage,
@@ -4540,42 +5171,49 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         )
         .await;
     let attempts = attempt_records.len();
-    let (candidate, mut upstream_stream, first_event, initial_usage, initial_finish_reason) =
-        match selected {
-            Ok(outcome) => {
-                let candidate = ranked
-                    .iter()
-                    .find(|candidate| {
-                        candidate.provider.id == outcome.provider_id
-                            && candidate.model.upstream == outcome.model
-                    })
-                    .expect("降级链返回的供应商和模型来自同一份候选快照")
-                    .clone();
-                let prepared = outcome.value;
-                (
-                    candidate,
-                    prepared.stream,
-                    prepared.first_event,
-                    prepared.initial_usage,
-                    prepared.initial_finish_reason,
-                )
-            }
-            Err(error) => {
-                spawn_failed_stream_audit(
-                    state,
-                    FailedStreamAudit {
-                        session_id: &session_id,
-                        requested_model: &req.model,
-                        client: client.as_deref(),
-                        attempts,
-                        started,
-                        error: &error,
-                        records: &attempt_records,
-                    },
-                );
-                return error_response(&error);
-            }
-        };
+    let (
+        candidate,
+        mut upstream_stream,
+        first_event,
+        initial_usage,
+        initial_finish_reason,
+        winning_started,
+    ) = match selected {
+        Ok(outcome) => {
+            let candidate = ranked
+                .iter()
+                .find(|candidate| {
+                    candidate.provider.id == outcome.provider_id
+                        && candidate.model.upstream == outcome.model
+                })
+                .expect("降级链返回的供应商和模型来自同一份候选快照")
+                .clone();
+            let prepared = outcome.value;
+            (
+                candidate,
+                prepared.stream,
+                prepared.first_event,
+                prepared.initial_usage,
+                prepared.initial_finish_reason,
+                prepared.started,
+            )
+        }
+        Err(error) => {
+            spawn_failed_stream_audit(
+                state,
+                FailedStreamAudit {
+                    session_id: &session_id,
+                    requested_model: &req.model,
+                    client: client.as_deref(),
+                    attempts,
+                    started,
+                    error: &error,
+                    records: &attempt_records,
+                },
+            );
+            return error_response(&error);
+        }
+    };
 
     let provider_id = candidate.provider.id.clone();
     let model = candidate.model.upstream.clone();
@@ -4591,6 +5229,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
     let s = stream! {
         let mut full = String::new();
+        let mut refusal_seen = false;
         let mut streamed_tool_call_deltas = Vec::new();
         let mut usage = initial_usage;
         let mut final_finish_reason = initial_finish_reason;
@@ -4655,6 +5294,45 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         }
                     }
                 }
+                Some(Ok(UpstreamEvent::ReasoningDelta(text))) => {
+                    match exit {
+                        Exit::Anthropic => {
+                            for encoded in anthropic_stream.as_mut().expect("Anthropic stream state").reasoning_delta(&text) {
+                                yield Ok::<String, std::convert::Infallible>(encoded);
+                            }
+                        }
+                        Exit::Responses => {
+                            for encoded in responses_stream.as_mut().expect("Responses stream state").auxiliary_delta(&text, true) {
+                                yield Ok::<String, std::convert::Infallible>(encoded);
+                            }
+                        }
+                        Exit::OpenAI | Exit::Ollama | Exit::Gemini => {
+                            let include_role = exit == Exit::OpenAI && !openai_role_sent;
+                            if include_role { openai_role_sent = true; }
+                            yield Ok::<String, std::convert::Infallible>(encode_auxiliary_delta(&req_id, &model, &text, include_role, true, exit));
+                        }
+                    }
+                }
+                Some(Ok(UpstreamEvent::RefusalDelta(text))) => {
+                    refusal_seen = true;
+                    match exit {
+                        Exit::Anthropic => {
+                            for encoded in anthropic_stream.as_mut().expect("Anthropic stream state").text_delta(&text) {
+                                yield Ok::<String, std::convert::Infallible>(encoded);
+                            }
+                        }
+                        Exit::Responses => {
+                            for encoded in responses_stream.as_mut().expect("Responses stream state").auxiliary_delta(&text, false) {
+                                yield Ok::<String, std::convert::Infallible>(encoded);
+                            }
+                        }
+                        Exit::OpenAI | Exit::Ollama | Exit::Gemini => {
+                            let include_role = exit == Exit::OpenAI && !openai_role_sent;
+                            if include_role { openai_role_sent = true; }
+                            yield Ok::<String, std::convert::Infallible>(encode_auxiliary_delta(&req_id, &model, &text, include_role, false, exit));
+                        }
+                    }
+                }
                 Some(Ok(UpstreamEvent::ToolCalls(tool_calls))) => {
                     merge_tool_call_deltas(&mut streamed_tool_call_deltas, &tool_calls);
                     match exit {
@@ -4676,13 +5354,16 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                                 yield Ok::<String, std::convert::Infallible>(encoded);
                             }
                         }
-                        Exit::OpenAI | Exit::Ollama | Exit::Gemini => {
+                        Exit::OpenAI => {
                             let include_openai_role = exit == Exit::OpenAI && !openai_role_sent;
                             if include_openai_role {
                                 openai_role_sent = true;
                             }
                             yield Ok::<String, std::convert::Infallible>(encode_tool_delta(&req_id, &model, &tool_calls, include_openai_role, exit));
                         }
+                        // Native tool arguments are objects; wait until all JSON
+                        // fragments and the final tool name have been assembled.
+                        Exit::Ollama | Exit::Gemini => {}
                     }
                 }
                 Some(Ok(UpstreamEvent::Finish { finish_reason: upstream_finish_reason })) => {
@@ -4794,12 +5475,12 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             stream_state.health.as_ref(),
             &provider_id,
             &model,
-            latency as u32,
+            winning_started.elapsed().as_millis().min(u32::MAX as u128) as u32,
             completion_tokens,
         );
         stream_state
             .router
-            .consume(&candidate.provider, &candidate.model, total_tokens);
+            .record_tokens(&candidate.provider, &candidate.model, total_tokens);
 
         let assistant = Message {
             role: Role::Assistant,
@@ -4845,19 +5526,23 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 yield Ok::<String, std::convert::Infallible>(encoded);
             }
         }
+        if matches!(exit, Exit::Ollama | Exit::Gemini) && !streamed_tool_call_deltas.is_empty() {
+            yield Ok::<String, std::convert::Infallible>(encode_tool_delta(&req_id, &model, &serde_json::Value::Array(streamed_tool_call_deltas.clone()), false, exit));
+        }
         if let Some(stream) = responses_stream.as_mut() {
             for encoded in stream.finish() {
                 yield Ok::<String, std::convert::Infallible>(encoded);
             }
         }
 
-        yield Ok::<String, std::convert::Infallible>(encode_done(
-            &req_id,
-            &model,
-            final_finish_reason.as_deref(),
-            &final_usage,
-            exit,
-        ));
+        if let Some(stream) = responses_stream.as_mut() {
+            yield Ok::<String, std::convert::Infallible>(stream.completed_event(&model, &final_usage));
+        } else {
+            let finish = if refusal_seen && matches!(exit, Exit::Anthropic | Exit::Ollama) { Some("refusal") }
+                else if refusal_seen && exit == Exit::Gemini { Some("content_filter") }
+                else { final_finish_reason.as_deref() };
+            yield Ok::<String, std::convert::Infallible>(encode_done(&req_id, &model, finish, &final_usage, exit));
+        }
         if let Some(end) = encode_stream_end(&req_id, exit) {
             yield Ok::<String, std::convert::Infallible>(end);
         }
@@ -4967,6 +5652,12 @@ fn merge_usage(current: &mut Option<Usage>, next: Usage) {
     usage.completion_tokens = usage.completion_tokens.max(next.completion_tokens);
     usage.cache_read_tokens = usage.cache_read_tokens.max(next.cache_read_tokens);
     usage.cache_creation_tokens = usage.cache_creation_tokens.max(next.cache_creation_tokens);
+    if let Some(tokens) = next.reasoning_tokens {
+        usage.reasoning_tokens = Some(usage.reasoning_tokens.unwrap_or(0).max(tokens));
+    }
+    if next.credit.is_some() {
+        usage.credit = next.credit;
+    }
     usage.total_tokens = usage
         .total_tokens
         .max(next.total_tokens)
@@ -5251,6 +5942,12 @@ fn responses_usage_json(usage: &Usage) -> serde_json::Value {
         }
         usage_json["input_tokens_details"] = serde_json::Value::Object(details);
     }
+    if let Some(tokens) = usage.reasoning_tokens {
+        usage_json["output_tokens_details"] = serde_json::json!({"reasoning_tokens": tokens});
+    }
+    if let Some(credit) = usage.credit {
+        usage_json["credit"] = serde_json::json!(credit);
+    }
     usage_json
 }
 
@@ -5267,6 +5964,12 @@ fn encode_response(
         Exit::Gemini => crate::protocol::gemini_inbound::from_internal_response(resp),
         Exit::Responses => {
             let mut output = Vec::new();
+            if let Some(reasoning) = &resp.reasoning_content {
+                output.push(
+                    serde_json::json!({"id": format!("rs_{}", resp.id), "type": "reasoning",
+                    "summary": [], "content": [{"type": "reasoning_text", "text": reasoning}]}),
+                );
+            }
             let has_tool_calls = resp
                 .tool_calls
                 .as_ref()
@@ -5275,13 +5978,24 @@ fn encode_response(
 
             // Responses 将文本消息和 function call 表示为两种 output item。不能只
             // 编码文本，否则非流式工具调用会在协议出口被静默丢弃，调用方也无法续轮。
-            if !resp.content.is_empty() || !has_tool_calls {
+            if !resp.content.is_empty()
+                || resp.refusal.is_some()
+                || (!has_tool_calls && resp.reasoning_content.is_none())
+            {
+                let mut content = Vec::new();
+                if !resp.content.is_empty() || resp.refusal.is_none() {
+                    content
+                        .push(serde_json::json!({ "type": "output_text", "text": resp.content }));
+                }
+                if let Some(refusal) = &resp.refusal {
+                    content.push(serde_json::json!({"type": "refusal", "refusal": refusal}));
+                }
                 output.push(serde_json::json!({
                     "id": format!("msg_{}", resp.id),
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [{ "type": "output_text", "text": resp.content }],
+                    "content": content,
                 }));
             }
             if let Some(tool_calls) = &resp.tool_calls {
@@ -5356,6 +6070,52 @@ fn encode_delta(
         Exit::Gemini => crate::protocol::gemini_inbound::sse_frame(
             &crate::protocol::gemini_inbound::sse_delta_chunk(text, model),
         ),
+    }
+}
+
+// Only supplier-provided auxiliary output reaches this encoder. It is never
+// appended to the persisted assistant text or audit content.
+fn encode_auxiliary_delta(
+    req_id: &str,
+    model: &str,
+    text: &str,
+    include_role: bool,
+    is_reasoning: bool,
+    exit: Exit,
+) -> String {
+    match exit {
+        Exit::OpenAI => {
+            let mut delta = serde_json::json!({});
+            delta[if is_reasoning {
+                "reasoning_content"
+            } else {
+                "refusal"
+            }] = serde_json::json!(text);
+            if include_role {
+                delta["role"] = serde_json::json!("assistant");
+            }
+            sse_event(
+                None,
+                crate::protocol::openai::sse_chunk(req_id, model, &delta, None),
+            )
+        }
+        Exit::Ollama => {
+            let mut message = serde_json::json!({"role": "assistant", "content": if is_reasoning { "" } else { text }});
+            message[if is_reasoning { "thinking" } else { "refusal" }] = serde_json::json!(text);
+            ndjson_line(&serde_json::json!({"model": model, "message": message, "done": false}))
+        }
+        Exit::Gemini => {
+            let mut chunk = crate::protocol::gemini_inbound::sse_delta_chunk(text, model);
+            if is_reasoning {
+                chunk["candidates"][0]["content"]["parts"][0]["thought"] = serde_json::json!(true);
+            } else {
+                chunk["candidates"][0]["refusal"] = serde_json::json!(text);
+            }
+            crate::protocol::gemini_inbound::sse_frame(&chunk)
+        }
+        Exit::Anthropic | Exit::Responses => {
+            unreachable!("stateful outputs use their lifecycle encoders")
+        }
     }
 }
 
@@ -5453,15 +6213,18 @@ fn encode_tool_delta(
             }
             encoded
         }
-        Exit::Ollama => ndjson_line(&serde_json::json!({
-            "model": model,
-            "message": {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": tc,
-            },
-            "done": false,
-        })),
+        Exit::Ollama => {
+            let values: Vec<_> = tool_call_values(tc).into_iter().cloned().collect();
+            ndjson_line(&serde_json::json!({
+                "model": model,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": crate::protocol::ollama::tool_calls_to_ollama(&crate::protocol::convert::tool_calls_from_openai(&values).unwrap_or_default()),
+                },
+                "done": false,
+            }))
+        }
         // C2：Gemini 用 `functionCall` part 表示工具调用，
         // 与 OpenAI 的 `tool_calls[].function` 不是一种形状。
         Exit::Gemini => {
@@ -5486,7 +6249,7 @@ fn encode_tool_delta(
                         "candidates": [{
                             "content": {
                                 "role": "model",
-                                "parts": [{"functionCall": {"name": name, "args": args}}],
+                                "parts": [{"functionCall": {"id":call.get("id"),"name": name, "args": args}}],
                             },
                             "index": 0,
                         }],
@@ -5507,21 +6270,28 @@ fn encode_done(
     exit: Exit,
 ) -> String {
     match exit {
-        Exit::OpenAI => sse_event(
-            None,
-            crate::protocol::openai::sse_chunk(
+        Exit::OpenAI => {
+            let chunk = crate::protocol::openai::sse_chunk(
                 req_id,
                 model,
                 &serde_json::json!({}),
                 Some(finish.unwrap_or("stop")),
-            ),
-        ),
+            );
+            if usage.reasoning_tokens.is_some() || usage.credit.is_some() {
+                let mut chunk: serde_json::Value =
+                    serde_json::from_str(&chunk).expect("OpenAI chunk JSON");
+                chunk["usage"] = crate::protocol::openai::usage_json(usage);
+                sse_event(None, chunk.to_string())
+            } else {
+                sse_event(None, chunk)
+            }
+        }
         Exit::Anthropic => sse_event(
             Some("message_delta"),
             serde_json::json!({
                 "type": "message_delta",
                 "delta": { "stop_reason": map_stop_reason(finish), "stop_sequence": null },
-                "usage": { "output_tokens": usage.completion_tokens },
+                "usage": anthropic_final_usage(usage),
             })
             .to_string(),
         ),
@@ -5535,11 +6305,7 @@ fn encode_done(
                 "index": 0,
             }],
             "modelVersion": model,
-            "usageMetadata": {
-                "promptTokenCount": usage.prompt_tokens,
-                "candidatesTokenCount": usage.completion_tokens,
-                "totalTokenCount": usage.total_tokens,
-            },
+            "usageMetadata": crate::protocol::gemini_inbound::usage_metadata(usage),
         })),
         Exit::Responses => sse_event(
             Some("response.completed"),
@@ -5551,24 +6317,360 @@ fn encode_done(
                     "model": model,
                     "status": "completed",
                     "output": [],
-                    "usage": {
-                        "input_tokens": usage.prompt_tokens,
-                        "output_tokens": usage.completion_tokens,
-                        "total_tokens": usage.total_tokens,
-                        "input_tokens_details": {
-                            "cached_tokens": usage.cache_read_tokens,
-                            "cache_write_tokens": usage.cache_creation_tokens,
-                        },
-                    },
+                    "usage": responses_usage_json(usage),
                 },
             })
             .to_string(),
         ),
-        Exit::Ollama => ndjson_line(&serde_json::json!({
-            "model": model,
-            "message": { "role": "assistant", "content": "" },
-            "done": true,
-        })),
+        Exit::Ollama => {
+            let mut out = serde_json::json!({"model": model, "message": {"role": "assistant", "content": ""}, "done": true});
+            if finish == Some("refusal") {
+                out["done_reason"] = serde_json::json!("refusal");
+            }
+            if let Some(tokens) = usage.reasoning_tokens {
+                out["reasoning_tokens"] = serde_json::json!(tokens);
+            }
+            if let Some(credit) = usage.credit {
+                out["credit"] = serde_json::json!(credit);
+            }
+            ndjson_line(&out)
+        }
+    }
+}
+
+fn anthropic_final_usage(usage: &Usage) -> serde_json::Value {
+    let mut out = serde_json::json!({"output_tokens": usage.completion_tokens});
+    if let Some(tokens) = usage.reasoning_tokens {
+        out["reasoning_tokens"] = serde_json::json!(tokens);
+    }
+    if let Some(credit) = usage.credit {
+        out["credit"] = serde_json::json!(credit);
+    }
+    out
+}
+
+#[cfg(test)]
+mod auxiliary_output_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn response(reasoning: Option<&str>, refusal: Option<&str>) -> crate::domain::ChatResponse {
+        let mut response = crate::protocol::convert::openai_response_to_internal(&json!({
+            "id": "r", "model": "m", "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}]
+        }));
+        response.reasoning_content = reasoning.map(str::to_owned);
+        response.refusal = refusal.map(str::to_owned);
+        response.usage = Some(Usage {
+            reasoning_tokens: Some(0),
+            credit: Some(0.0),
+            ..Default::default()
+        });
+        response
+    }
+
+    fn payload(event: &str) -> Value {
+        ResponsesStreamState::event_payload(event).expect("SSE JSON payload")
+    }
+
+    #[test]
+    fn five_nonstream_outputs_preserve_auxiliary_fields_and_zero_usage() {
+        let response = response(Some("provided thought"), Some("cannot comply"));
+        let oa = encode_response(&response, "m", Exit::OpenAI);
+        assert_eq!(
+            oa["choices"][0]["message"]["reasoning_content"],
+            "provided thought"
+        );
+        assert_eq!(oa["choices"][0]["message"]["refusal"], "cannot comply");
+        assert_eq!(
+            oa["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            0
+        );
+        assert_eq!(oa["usage"]["credit"], 0.0);
+        let an = encode_response(&response, "m", Exit::Anthropic);
+        assert_eq!(
+            an["content"][0],
+            json!({"type":"thinking", "thinking":"provided thought"})
+        );
+        assert!(an["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["text"] == "cannot comply"));
+        assert_eq!(an["stop_reason"], "refusal");
+        assert!(an["content"][0].get("signature").is_none());
+        assert_eq!(an["usage"]["reasoning_tokens"], 0);
+        assert_eq!(an["usage"]["credit"], 0.0);
+        let gm = encode_response(&response, "m", Exit::Gemini);
+        assert_eq!(
+            gm["candidates"][0]["content"]["parts"][0],
+            json!({"text":"provided thought", "thought":true})
+        );
+        assert_eq!(gm["candidates"][0]["finishReason"], "SAFETY");
+        assert_eq!(gm["usageMetadata"]["thoughtsTokenCount"], 0);
+        assert_eq!(gm["usageMetadata"]["credit"], 0.0);
+        let ol = encode_response(&response, "m", Exit::Ollama);
+        assert_eq!(ol["message"]["thinking"], "provided thought");
+        assert_eq!(ol["message"]["content"], "answercannot comply");
+        assert_eq!(ol["done_reason"], "refusal");
+        assert_eq!(ol["reasoning_tokens"], 0);
+        assert_eq!(ol["credit"], 0.0);
+        let rs = encode_response(&response, "m", Exit::Responses);
+        assert_eq!(rs["output"][0]["type"], "reasoning");
+        assert_eq!(rs["output"][0]["summary"], json!([]));
+        assert_eq!(
+            rs["output"][0]["content"][0],
+            json!({"type":"reasoning_text", "text":"provided thought"})
+        );
+        assert_eq!(
+            rs["output"][1]["content"][1],
+            json!({"type":"refusal", "refusal":"cannot comply"})
+        );
+        assert_eq!(rs["usage"]["output_tokens_details"]["reasoning_tokens"], 0);
+        assert_eq!(rs["usage"]["credit"], 0.0);
+    }
+
+    #[test]
+    fn absent_auxiliary_fields_preserve_plain_outputs() {
+        let mut response = response(None, None);
+        response.usage = Some(Usage::default());
+        for exit in [
+            Exit::OpenAI,
+            Exit::Anthropic,
+            Exit::Gemini,
+            Exit::Ollama,
+            Exit::Responses,
+        ] {
+            let output = encode_response(&response, "m", exit).to_string();
+            for forbidden in [
+                "reasoning_content",
+                "thinking",
+                "refusal",
+                "reasoning_text",
+                "thought",
+                "reasoning_tokens",
+                "credit",
+            ] {
+                assert!(
+                    !output.contains(forbidden),
+                    "unexpected {forbidden}: {output}"
+                );
+            }
+            assert!(output.contains("answer"));
+        }
+    }
+
+    #[test]
+    fn refusal_only_is_visible_with_native_terminal_reason() {
+        let mut response = response(None, Some("cannot comply"));
+        response.content.clear();
+        let an = encode_response(&response, "m", Exit::Anthropic);
+        assert_eq!(an["content"][0]["text"], "cannot comply");
+        assert_eq!(an["stop_reason"], "refusal");
+        let gm = encode_response(&response, "m", Exit::Gemini);
+        assert_eq!(
+            gm["candidates"][0]["content"]["parts"][0]["text"],
+            "cannot comply"
+        );
+        assert_eq!(gm["candidates"][0]["finishReason"], "SAFETY");
+        let ol = encode_response(&response, "m", Exit::Ollama);
+        assert_eq!(ol["message"]["content"], "cannot comply");
+        assert_eq!(ol["done_reason"], "refusal");
+        let rs = encode_response(&response, "m", Exit::Responses);
+        assert_eq!(
+            rs["output"][0]["content"],
+            json!([{"type":"refusal", "refusal":"cannot comply"}])
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_blocks_start_delta_stop_without_signature() {
+        let (mut stream, _) = AnthropicStreamState::new("r", "m", None);
+        let mut events = stream.reasoning_delta("one");
+        events.extend(stream.reasoning_delta("two"));
+        events.extend(stream.text_delta("answer"));
+        events.extend(stream.reasoning_delta("three"));
+        events.extend(stream.finish());
+        let events: Vec<Value> = events.iter().map(|e| payload(e)).collect();
+        assert_eq!(
+            events
+                .iter()
+                .map(|v| v["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop"
+            ]
+        );
+        assert_eq!(events[0]["content_block"]["type"], "thinking");
+        assert_eq!(
+            events[1]["delta"],
+            json!({"type":"thinking_delta", "thinking":"one"})
+        );
+        assert_eq!(events[3]["index"], 0);
+        assert_eq!(events[4]["index"], 1);
+        assert_eq!(events[7]["index"], 2);
+        assert!(!serde_json::to_string(&events)
+            .unwrap()
+            .contains("signature"));
+        assert!(stream.finish().is_empty());
+    }
+
+    #[test]
+    fn responses_auxiliary_lifecycles_have_stable_ids_and_monotonic_sequence() {
+        let (mut stream, created) = ResponsesStreamState::new("r", "m");
+        let mut events = vec![created];
+        events.extend(stream.auxiliary_delta("think ", true));
+        events.extend(stream.auxiliary_delta("more", true));
+        events.extend(stream.text_delta("answer"));
+        events.extend(stream.auxiliary_delta("cannot ", false));
+        events.extend(stream.auxiliary_delta("comply", false));
+        events.extend(stream.finish());
+        events.push(stream.completed_event(
+            "m",
+            &Usage {
+                reasoning_tokens: Some(0),
+                credit: Some(0.0),
+                ..Default::default()
+            },
+        ));
+        let events: Vec<Value> = events.iter().map(|e| payload(e)).collect();
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["sequence_number"], index as u64);
+        }
+        for (kind, id, output_index, text_field, text) in [
+            ("reasoning_text", "rs_r", 0, "text", "think more"),
+            ("refusal", "msg_refusal_r", 2, "refusal", "cannot comply"),
+        ] {
+            let delta_type = format!("response.{kind}.delta");
+            let done_type = format!("response.{kind}.done");
+            let deltas: Vec<_> = events.iter().filter(|v| v["type"] == delta_type).collect();
+            assert_eq!(deltas.len(), 2);
+            for delta in deltas {
+                assert_eq!(delta["item_id"], id);
+                assert_eq!(delta["output_index"], output_index);
+                assert_eq!(delta["content_index"], 0);
+            }
+            let done = events.iter().find(|v| v["type"] == done_type).unwrap();
+            assert_eq!(done[text_field], text);
+            assert_eq!(done["item_id"], id);
+            assert_eq!(done["output_index"], output_index);
+            for event_type in ["response.content_part.added", "response.content_part.done"] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|v| v["type"] == event_type && v["item_id"] == id)
+                        .count(),
+                    1
+                );
+            }
+        }
+        let completed = events.last().unwrap();
+        assert_eq!(completed["response"]["output"].as_array().unwrap().len(), 3);
+        assert_eq!(completed["response"]["output"][0]["type"], "reasoning");
+        assert_eq!(
+            completed["response"]["output"][2]["content"][0]["refusal"],
+            "cannot comply"
+        );
+        assert_eq!(
+            completed["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            0
+        );
+        assert_eq!(completed["response"]["usage"]["credit"], 0.0);
+    }
+
+    #[test]
+    fn stateless_stream_auxiliary_fields_and_terminal_usage_are_preserved() {
+        let usage = Usage {
+            reasoning_tokens: Some(0),
+            credit: Some(0.0),
+            ..Default::default()
+        };
+        let oa = payload(&encode_auxiliary_delta(
+            "r",
+            "m",
+            "think",
+            true,
+            true,
+            Exit::OpenAI,
+        ));
+        assert_eq!(
+            oa["choices"][0]["delta"],
+            json!({"role":"assistant", "reasoning_content":"think"})
+        );
+        let oa = payload(&encode_auxiliary_delta(
+            "r",
+            "m",
+            "no",
+            false,
+            false,
+            Exit::OpenAI,
+        ));
+        assert_eq!(oa["choices"][0]["delta"], json!({"refusal":"no"}));
+        let gm = payload(&encode_auxiliary_delta(
+            "r",
+            "m",
+            "think",
+            false,
+            true,
+            Exit::Gemini,
+        ));
+        assert_eq!(
+            gm["candidates"][0]["content"]["parts"][0],
+            json!({"thought":true,"text":"think"})
+        );
+        let ol: Value = serde_json::from_str(&encode_auxiliary_delta(
+            "r",
+            "m",
+            "think",
+            false,
+            true,
+            Exit::Ollama,
+        ))
+        .unwrap();
+        assert_eq!(ol["message"]["thinking"], "think");
+        assert_eq!(ol["message"]["content"], "");
+        assert_eq!(
+            payload(&encode_done(
+                "r",
+                "m",
+                Some("refusal"),
+                &usage,
+                Exit::Anthropic
+            ))["delta"]["stop_reason"],
+            "refusal"
+        );
+        assert_eq!(
+            payload(&encode_done(
+                "r",
+                "m",
+                Some("content_filter"),
+                &usage,
+                Exit::Gemini
+            ))["candidates"][0]["finishReason"],
+            "SAFETY"
+        );
+        let done = payload(&encode_done("r", "m", Some("stop"), &usage, Exit::OpenAI));
+        assert_eq!(
+            done["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            0
+        );
+        assert_eq!(done["usage"]["credit"], 0.0);
+        let plain = payload(&encode_done(
+            "r",
+            "m",
+            Some("stop"),
+            &Usage::default(),
+            Exit::OpenAI,
+        ));
+        assert!(plain.get("usage").is_none());
     }
 }
 
@@ -5674,6 +6776,7 @@ fn response_function_arguments_delta(item_id: &str, output_index: usize, delta: 
 
 fn map_stop_reason(finish: Option<&str>) -> &'static str {
     match finish {
+        Some("refusal") => "refusal",
         Some("tool_calls") => "tool_use",
         Some("length") => "max_tokens",
         _ => "end_turn",
@@ -5776,8 +6879,7 @@ impl GatewayState {
         let ranked = self.router.rank(candidates, &cfg, Default::default(), None);
 
         let flag = AtomicFlag::new();
-        let chain = FailoverChain::new(&ranked, 2, &flag);
-        let up = self.upstream.clone();
+        let chain = FailoverChain::new(&ranked, 2, &flag).with_admission(self.router.clone());
         let timeout = Duration::from_secs(60);
         let r = Arc::new(req);
         let defaults = self.cfg_snapshot().ollama_options;
@@ -5788,10 +6890,12 @@ impl GatewayState {
             .run(
                 &mut records,
                 |p, m| {
-                    let up = up.clone();
                     let r = r.clone();
                     let defaults = defaults.clone();
-                    async move { up.call(&p, &r, &m, timeout, &defaults).await }
+                    async move {
+                        self.call_chat_upstream(&p, &r, &m, timeout, &defaults)
+                            .await
+                    }
                 },
                 |p, m, e| self.health.record_failure(&p.id, m, e),
             )

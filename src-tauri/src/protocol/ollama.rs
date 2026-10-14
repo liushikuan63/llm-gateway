@@ -187,6 +187,15 @@ pub fn from_ollama_response(v: &serde_json::Value) -> ChatResponse {
             None
         },
         usage: Some(usage_from_ollama(v)),
+        reasoning_content: msg
+            .get("thinking")
+            .or_else(|| v.get("thinking"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        refusal: msg
+            .get("refusal")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
     }
 }
 
@@ -213,19 +222,35 @@ pub fn tool_calls_to_ollama(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> {
 /// 返回的 function call 不会在 `/api/chat` 出口被丢弃。
 pub fn ollama_response(resp: &ChatResponse, model: &str) -> serde_json::Value {
     let mut message = json!({ "role": "assistant", "content": resp.content });
+    if let Some(reasoning) = &resp.reasoning_content {
+        message["thinking"] = json!(reasoning);
+    }
+    if let Some(refusal) = &resp.refusal {
+        message["refusal"] = json!(refusal);
+    }
+    if let Some(refusal) = &resp.refusal {
+        message["content"] = json!(format!("{}{refusal}", resp.content));
+    }
     if let Some(tool_calls) = &resp.tool_calls {
         message["tool_calls"] = json!(tool_calls_to_ollama(tool_calls));
     }
     let usage = resp.usage.clone().unwrap_or_default();
-    json!({
+    let mut out = json!({
         "model": model,
         "created_at": chrono::Utc::now().to_rfc3339(),
         "message": message,
         "done": true,
-        "done_reason": if resp.finish_reason.as_deref() == Some("tool_calls") { "tool_calls" } else { "stop" },
+        "done_reason": if resp.refusal.is_some() { "refusal" } else if resp.finish_reason.as_deref() == Some("tool_calls") { "tool_calls" } else { "stop" },
         "prompt_eval_count": usage.prompt_tokens,
         "eval_count": usage.completion_tokens,
-    })
+    });
+    if let Some(tokens) = usage.reasoning_tokens {
+        out["reasoning_tokens"] = json!(tokens);
+    }
+    if let Some(credit) = usage.credit {
+        out["credit"] = json!(credit);
+    }
+    out
 }
 
 fn copy_option(target: &mut serde_json::Value, key: &str, value: Option<&serde_json::Value>) {
@@ -313,5 +338,33 @@ fn usage_from_ollama(value: &serde_json::Value) -> Usage {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
         cache_creation_tokens: 0,
+        credit: value.get("credit").and_then(serde_json::Value::as_f64),
+        reasoning_tokens: value
+            .get("reasoning_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .map(|tokens| tokens as u32),
+    }
+}
+
+#[cfg(test)]
+mod auxiliary_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn thinking_refusal_and_zero_usage_are_preserved_without_contaminating_content() {
+        let r = from_ollama_response(
+            &json!({"message":{"content":"answer","thinking":"provided","refusal":"no"},
+            "reasoning_tokens":0,"credit":0}),
+        );
+        assert_eq!(r.content, "answer");
+        assert_eq!(r.reasoning_content.as_deref(), Some("provided"));
+        assert_eq!(r.refusal.as_deref(), Some("no"));
+        let u = r.usage.unwrap();
+        assert_eq!(u.reasoning_tokens, Some(0));
+        assert_eq!(u.credit, Some(0.0));
+        let plain = from_ollama_response(&json!({"message":{"content":"answer"}}));
+        assert_eq!(plain.content, "answer");
+        assert_eq!(plain.reasoning_content, None);
+        assert_eq!(plain.refusal, None);
     }
 }

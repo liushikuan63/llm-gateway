@@ -560,6 +560,34 @@ async fn 起上游(内容: &'static str) -> (String, Arc<AtomicUsize>, JoinHandl
     (format!("http://{address}/v1"), hits, task)
 }
 
+async fn failing_upstream(
+    status: StatusCode,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>, JoinHandle<()>) {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = calls.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<serde_json::Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock()
+                    .unwrap()
+                    .push(body["model"].as_str().unwrap().to_owned());
+                (
+                    status,
+                    Json(serde_json::json!({"error":{"message":"controlled upstream failure"}})),
+                )
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{address}/v1"), calls, task)
+}
+
 /// 一个只回固定判定的决策端点，并数自己被调用了几次。
 ///
 /// **响应形状照抄真实 edgeJev**（见 `tests/intellect.rs` 的
@@ -715,6 +743,329 @@ async fn 发一句(base_url: &str, key: &str) -> (StatusCode, serde_json::Value)
     let status = response.status();
     let body = response.json().await.unwrap_or(serde_json::Value::Null);
     (status, body)
+}
+
+/// **卡片点名的计数型判据**：低置信度 ⇒ 上游被调用 **N+1** 次。
+#[tokio::test]
+async fn enabled_cascade_policy_does_not_run_in_balanced_mode() {
+    let (a, hits_a, _ta) = 起上游("first").await;
+    let (b, hits_b, _tb) = 起上游("second").await;
+    let (jev, hits_jev, _tj) = 起决策端点("inadequate", 0.9).await;
+    let (_db, cfg, _task, base) = 起网关(
+        vec![供应商("first", a, 0.1, 90), 供应商("second", b, 10.0, 10)],
+        |cfg| {
+            cfg.routing_strategy = RoutingStrategy::Balanced;
+            cfg.cascade = CascadePolicy {
+                max_escalations: 1,
+                min_confidence: 0.6,
+            };
+            cfg.smart_routing.enabled = false;
+            cfg.smart_routing.jev.base_url = jev;
+        },
+    )
+    .await;
+    let (status, body) = 发一句(&base, &cfg.unified_key).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        hits_a.load(Ordering::SeqCst) + hits_b.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        hits_jev.load(Ordering::SeqCst),
+        0,
+        "Balanced must never read cascade confidence"
+    );
+}
+
+#[tokio::test]
+async fn cascade_cursor_advances_from_actual_fallback_winner() {
+    use llm_gateway_lib::router::cascade::run_cascade_with_cursor;
+    let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = starts.clone();
+    let result = run_cascade_with_cursor(
+        &CascadePolicy {
+            max_escalations: 3,
+            min_confidence: 0.6,
+        },
+        CascadeRunRequest {
+            candidates: 3,
+            streaming: false,
+        },
+        move |start| {
+            calls.lock().unwrap().push(start);
+            async move { Ok(if start == 0 { 1usize } else { start }) }
+        },
+        |_value| async { ConfidenceReading::available(0.1) },
+        |winner, _| *winner,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *starts.lock().unwrap(),
+        vec![0, 2],
+        "fallback winner at index 1 advances to 2 and never repeats it"
+    );
+    assert_eq!(result.value, 2);
+    assert_eq!(result.stop, CascadeStop::Exhausted);
+}
+
+#[tokio::test]
+async fn cascade_preserves_keyless_exclusion_after_auth_failover() {
+    for failure in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::UNAUTHORIZED] {
+        let (failed, failed_calls, tf) = failing_upstream(failure).await;
+        let (cheap, cheap_hits, tc) = 起上游("cheap").await;
+        let (keyless, keyless_hits, tk) = 起上游("keyless").await;
+        let (strong, strong_hits, ts) = 起上游("strong").await;
+        let (jev, confidence_hits, tj) = 起决策端点("inadequate", 0.9).await;
+        let mut keyless_provider = 供应商("keyless", keyless, 1.0, 60);
+        keyless_provider.api_key_enc.clear();
+        let (_db, cfg, gateway, base) = 起网关(
+            vec![
+                供应商("failed", failed, 0.01, 60),
+                供应商("cheap", cheap, 0.1, 60),
+                keyless_provider,
+                供应商("strong", strong, 10.0, 60),
+            ],
+            |cfg| {
+                cfg.routing_strategy = RoutingStrategy::Cascade;
+                cfg.cascade = CascadePolicy {
+                    max_escalations: 1,
+                    min_confidence: 0.6,
+                };
+                cfg.auth_failure.mode = llm_gateway_lib::config::AuthFailureMode::Skip;
+                cfg.auth_failure.confirm_retries = 1;
+                cfg.smart_routing.enabled = false;
+                cfg.smart_routing.jev.base_url = jev;
+            },
+        )
+        .await;
+        let (status, body) = 发一句(&base, &cfg.unified_key).await;
+        for task in [gateway, tf, tc, tk, ts, tj] {
+            task.abort();
+        }
+        let refused = failure == StatusCode::UNAUTHORIZED;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            failed_calls.lock().unwrap().len(),
+            if refused { 2 } else { 1 }
+        );
+        assert_eq!(cheap_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(confidence_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            keyless_hits.load(Ordering::SeqCst),
+            if refused { 0 } else { 1 },
+            "a new cascade chain must retain the earlier authentication boundary"
+        );
+        assert_eq!(
+            strong_hits.load(Ordering::SeqCst),
+            if refused { 1 } else { 0 }
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            if refused { "strong" } else { "keyless" }
+        );
+    }
+}
+
+#[tokio::test]
+async fn cascade_does_not_retry_confirmed_provider_after_escalation() {
+    for failure in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::UNAUTHORIZED] {
+        let (failed, failed_calls, tf) = failing_upstream(failure).await;
+        let (cheap, cheap_hits, tc) = 起上游("cheap").await;
+        let (strong, strong_hits, ts) = 起上游("strong").await;
+        let (jev, confidence_hits, tj) = 起决策端点("inadequate", 0.9).await;
+        let mut failed_provider = 供应商("failed", failed, 0.01, 60);
+        let mut later_model = failed_provider.models[0].clone();
+        later_model.alias = "premium-model".into();
+        later_model.upstream = "premium-model".into();
+        later_model.price.as_mut().unwrap().prompt = 1.0;
+        failed_provider.models.push(later_model);
+        let (_db, cfg, gateway, base) = 起网关(
+            vec![
+                failed_provider,
+                供应商("cheap", cheap, 0.1, 60),
+                供应商("strong", strong, 10.0, 60),
+            ],
+            |cfg| {
+                cfg.routing_strategy = RoutingStrategy::Cascade;
+                cfg.cascade = CascadePolicy {
+                    max_escalations: 1,
+                    min_confidence: 0.6,
+                };
+                cfg.auth_failure.mode = llm_gateway_lib::config::AuthFailureMode::Skip;
+                cfg.auth_failure.confirm_retries = 1;
+                cfg.smart_routing.enabled = false;
+                cfg.smart_routing.jev.base_url = jev;
+            },
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(&cfg.unified_key)
+            .json(&serde_json::json!({
+                "model": "auto",
+                "messages": [{ "role": "user", "content": "test cascade isolation" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        for task in [gateway, tf, tc, ts, tj] {
+            task.abort();
+        }
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "strong");
+        assert_eq!(cheap_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(strong_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(confidence_hits.load(Ordering::SeqCst), 2);
+        let expected_models = if failure == StatusCode::UNAUTHORIZED {
+            vec!["integration-model", "integration-model"]
+        } else {
+            vec!["integration-model", "premium-model"]
+        };
+        assert_eq!(
+            *failed_calls.lock().unwrap(),
+            expected_models,
+            "confirmed provider refusal applies to subsequent cascade chains too"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cascade_failover_settles_every_success_and_reports_total_actual_cost() {
+    let mut servers = Vec::new();
+    let mut providers = Vec::new();
+    let mut hits = Vec::new();
+    for (id, price, status, delay) in [
+        ("failed", 0.01, 500u16, 220),
+        ("cheap", 0.1, 200, 40),
+        ("strong", 2.0, 200, 40),
+    ] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        let app=Router::new().route("/v1/chat/completions",post(move || {let counter=counter.clone();async move {
+            counter.fetch_add(1,Ordering::SeqCst);tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            (StatusCode::from_u16(status).unwrap(),Json(serde_json::json!({"id":"accounting","choices":[{"index":0,"message":{"role":"assistant","content":id},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}})))
+        }}));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        providers.push(供应商(id, url, price, 60));
+        hits.push(count);
+    }
+    let (jev, _confidence_hits, tj) = 起决策端点("inadequate", 0.9).await;
+    let db = db::Db::connect_in_memory().await.unwrap();
+    for p in &providers {
+        repo::upsert_provider(db.pool(), p).await.unwrap();
+    }
+    let mut cfg = AppConfig {
+        port: 未占用端口().await,
+        routing_strategy: RoutingStrategy::Cascade,
+        ..Default::default()
+    };
+    cfg.cascade = CascadePolicy {
+        max_escalations: 3,
+        min_confidence: 0.6,
+    };
+    cfg.smart_routing.enabled = false;
+    cfg.smart_routing.jev.base_url = jev;
+    let gateway = Arc::new(GatewayState::new(db.clone(), cfg.clone()));
+    gateway.reload_providers().await.unwrap();
+    let server = tokio::spawn(serve(gateway.clone()));
+    let base = format!("http://127.0.0.1:{}", cfg.port);
+    等网关起来(&base).await;
+    let response=reqwest::Client::new().post(format!("{base}/v1/chat/completions")).bearer_auth(&cfg.unified_key)
+        .json(&serde_json::json!({"model":"auto","messages":[{"role":"user","content":"test accounting"}]})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-fallback-attempts"], "3");
+    let session = response.headers()["x-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "strong"
+    );
+    assert_eq!(
+        hits.iter()
+            .map(|h| h.load(Ordering::SeqCst))
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1],
+        "winner cursor never repeats cheap"
+    );
+    for p in &providers[1..] {
+        let h = gateway.health.get(&p.id, &p.models[0].upstream);
+        assert_eq!(h.tps_samples, 1);
+        assert!(
+            h.avg_latency_ms >= 25 && h.avg_latency_ms < 200,
+            "sample only each successful upstream hop: {}",
+            h.avg_latency_ms
+        );
+    }
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        if n == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let tokens: (i64, i64, i64, f64) = sqlx::query_as(
+        "SELECT prompt_tokens,completion_tokens,fallback_attempts,cost FROM requests",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!((tokens.0, tokens.1, tokens.2), (10, 6, 2));
+    assert!(
+        (tokens.3 - 8.0 * 2.1 / 1_000_000.0).abs() < 1e-10,
+        "sum the two successful billed replies"
+    );
+    let daily:Vec<(String,i64,i64,f64)>=sqlx::query_as("SELECT provider_id,prompt_tokens,completion_tokens,cost FROM usage_daily ORDER BY provider_id").fetch_all(db.pool()).await.unwrap();
+    assert_eq!(daily.len(), 2);
+    assert_eq!(
+        (&daily[0].0, daily[0].1, daily[0].2),
+        (&"cheap".to_string(), 5, 3)
+    );
+    assert_eq!(
+        (&daily[1].0, daily[1].1, daily[1].2),
+        (&"strong".to_string(), 5, 3)
+    );
+    assert!((daily[0].3 - 8.0 * 0.1 / 1_000_000.0).abs() < 1e-10);
+    assert!((daily[1].3 - 8.0 * 2.0 / 1_000_000.0).abs() < 1e-10);
+    let assistant_tokens: i64 = sqlx::query_scalar(
+        "SELECT completion_tokens FROM session_messages WHERE session_id=? AND role='assistant'",
+    )
+    .bind(&session)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        assistant_tokens, 3,
+        "final reply tokens must not include discarded cheap reply"
+    );
+    let messages: Vec<String> = sqlx::query_scalar(
+        "SELECT content FROM session_messages WHERE session_id=? AND role='assistant'",
+    )
+    .bind(session)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        messages,
+        vec!["strong"],
+        "discarded cheap answer never pollutes conversation"
+    );
+    server.abort();
+    tj.abort();
+    for t in servers {
+        t.abort();
+    }
 }
 
 /// **卡片点名的计数型判据**：低置信度 ⇒ 上游被调用 **N+1** 次。

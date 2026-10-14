@@ -1,0 +1,69 @@
+{
+  "synthetic_only": true,
+  "oracle_wasm_sha256": "6419471effa631519def7797d76d7ede38b9fcfa9a83c2148c8ef5d43355b43d",
+  "synthetic_raw": "{\"uid\":\"fixture-account\",\"security_oauth_token\":\"fixture-token-not-real\",\"organization_id\":\"fixture-org\",\"organization_tags\":[\"fixture-tag\"],\"data_policy_agreed\":false}",
+  "runtime": {
+    "encrypt_user_info": "FHoJIPH7juxvyGDYLNChYZm20QhFTql1not43A+KwgwQZ0zMvbCXVC5LY8bRYB7wwEzHB6kYS+rtykRKP12xfE0Z1ZMDgq5oifmFWZw1bb9wP0Uwjr9w2o9xL90dTft539X4wHiebU/kmm5z5d0OSig2epgANQ1D7a4M8kRYjkIw9GpPgGiFAwYz520tc1Cc2aIhZc83TaWqdgvx/QhAL/3sJTWZBmAPGNW1xFcEVGg=",
+    "key": "nKeC6jJtXTWF4TpnVNnxMT/6jY0gBZfCPfjQaKbIi0lS+j2REWVXO5f6BzlvfEvHCrC+UY7rBMZfYs/C72KNYVIH2HLAR8E1yPDAGvV2xViMw029bXcMVa9ib0vyaM4IEu7HJlNHzUXTJOvEBB4YUAyxTCysQ/oYct/JIpRNg7I="
+  },
+  "requests": [
+    {
+      "endpoint": "https://api2.qoder.sh",
+      "url": "https://api2.qoder.sh/algo/api/v2/model/list?Encode=1",
+      "headers": {
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "Authorization": "Bearer COSY.eyJ2ZXJzaW9uIjoidjEiLCJyZXF1ZXN0SWQiOiIxMDBmMGUwZC0wYzBiLTRhMDktODgwNy0wNjA1MDQwMzAyMDEiLCJpbmZvIjoiRkhvSklQSDdqdXh2eUdEWUxOQ2hZWm0yMFFoRlRxbDFub3Q0M0ErS3dnd1FaMHpNdmJDWFZDNUxZOGJSWUI3d3dFekhCNmtZUytydHlrUktQMTJ4ZkUwWjFaTURncTVvaWZtRldadzFiYjl3UDBVd2pyOXcybzl4TDkwZFRmdDUzOVg0d0hpZWJVL2ttbTV6NWQwT1NpZzJlcGdBTlExRDdhNE04a1JZamtJdzlHcFBnR2lGQXdZejUyMHRjMUNjMmFJaFpjODNUYVdxZGd2eC9RaEFMLzNzSlRXWkJtQVBHTlcxeEZjRVZHZz0iLCJjb3N5VmVyc2lvbiI6IjEuMC41MSIsImlkZVZlcnNpb24iOiIifQ==.43a1b4aea91b7993c77e0fdb1adad24e",
+        "Content-Type": "application/json",
+        "Cosy-Business-Product": "cli",
+        "Cosy-Business-Type": "agent",
+        "Cosy-ClientIp": "11111111-1111-4111-8111-111111111111",
+        "Cosy-ClientType": "5",
+        "Cosy-Data-Policy": "disagree",
+        "Cosy-Date": "1700000000",
+        "Cosy-Key": "nKeC6jJtXTWF4TpnVNnxMT/6jY0gBZfCPfjQaKbIi0lS+j2REWVXO5f6BzlvfEvHCrC+UY7rBMZfYs/C72KNYVIH2HLAR8E1yPDAGvV2xViMw029bXcMVa9ib0vyaM4IEu7HJlNHzUXTJOvEBB4YUAyxTCysQ/oYct/JIpRNg7I=",
+        "Cosy-MachineId": "11111111-1111-4111-8111-111111111111",
+        "Cosy-MachineToken": "11111111-1111-4111-8111-111111111111",
+        "Cosy-MachineType": "5",
+        "Cosy-Organization-Id": "fixture-org",
+        "Cosy-Organization-Tags": "fixture-tag",
+        "Cosy-Scene": "assistant",
+        "Cosy-User": "fixture-account",
+        "Cosy-Version": "1.0.51",
+        "Login-Version": "v2"
+      },
+      "signed_path_excludes_query": true,
+      "canonical_signature_matches": true
+    },
+    {
+      "endpoint": "https://gateway.qoder.com.cn",
+      "url": "https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1",
+      "headers": {
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "Authorization": "Bearer COSY.eyJ2ZXJzaW9uIjoidjEiLCJyZXF1ZXN0SWQiOiIyMDFmMWUxZC0xYzFiLTRhMTktOTgxNy0xNjE1MTQxMzEyMTEiLCJpbmZvIjoiRkhvSklQSDdqdXh2eUdEWUxOQ2hZWm0yMFFoRlRxbDFub3Q0M0ErS3dnd1FaMHpNdmJDWFZDNUxZOGJSWUI3d3dFekhCNmtZUytydHlrUktQMTJ4ZkUwWjFaTURncTVvaWZtRldadzFiYjl3UDBVd2pyOXcybzl4TDkwZFRmdDUzOVg0d0hpZWJVL2ttbTV6NWQwT1NpZzJlcGdBTlExRDdhNE04a1JZamtJdzlHcFBnR2lGQXdZejUyMHRjMUNjMmFJaFpjODNUYVdxZGd2eC9RaEFMLzNzSlRXWkJtQVBHTlcxeEZjRVZHZz0iLCJjb3N5VmVyc2lvbiI6IjEuMC41MSIsImlkZVZlcnNpb24iOiIifQ==.41febf278be870ab01ef0bbcf377071a",
+        "Content-Type": "application/json",
+        "Cosy-Business-Product": "cli",
+        "Cosy-Business-Type": "agent",
+        "Cosy-ClientIp": "11111111-1111-4111-8111-111111111111",
+        "Cosy-ClientType": "5",
+        "Cosy-Data-Policy": "disagree",
+        "Cosy-Date": "1700000000",
+        "Cosy-Key": "nKeC6jJtXTWF4TpnVNnxMT/6jY0gBZfCPfjQaKbIi0lS+j2REWVXO5f6BzlvfEvHCrC+UY7rBMZfYs/C72KNYVIH2HLAR8E1yPDAGvV2xViMw029bXcMVa9ib0vyaM4IEu7HJlNHzUXTJOvEBB4YUAyxTCysQ/oYct/JIpRNg7I=",
+        "Cosy-MachineId": "11111111-1111-4111-8111-111111111111",
+        "Cosy-MachineToken": "11111111-1111-4111-8111-111111111111",
+        "Cosy-MachineType": "5",
+        "Cosy-Organization-Id": "fixture-org",
+        "Cosy-Organization-Tags": "fixture-tag",
+        "Cosy-Scene": "assistant",
+        "Cosy-User": "fixture-account",
+        "Cosy-Version": "1.0.51",
+        "Login-Version": "v2"
+      },
+      "signed_path_excludes_query": true,
+      "canonical_signature_matches": true
+    }
+  ],
+  "encodedResponse": "OscZLEnr*GoKOukKt#xp*l*KbNHFh#Sz*eF.WSWzDSf*GoKzPxjfuHgQx(QiuSa*l*GLzBMO*KRmYKtu(CLuZV*lLtXBOtLm,ByBOD)mZC.NOatu",
+  "responseRaw": "{\"models\":[{\"key\":\"fixture-model\",\"display_name\":\"合成模型\",\"format\":\"openai\"}]}"
+}

@@ -51,11 +51,14 @@ export default function SessionsPage() {
   const [query, setQuery] = useState("");
   const [listLoading, setListLoading] = useState(false);
   const [messageLoadingId, setMessageLoadingId] = useState<string | null>(null);
+  const [nextCursor, setNextCursor] = useState<number | null>(null);
+  const [messageError, setMessageError] = useState<string | null>(null);
   const [operation, setOperation] = useState<Operation>(null);
   const [msg, setMsg] = useState<Notice | null>(null);
   const sessionLoadRef = useRef(0);
   const messageLoadRef = useRef(0);
   const currentIdRef = useRef<string | null>(null);
+  const pageInFlight = useRef(false);
 
   const load = async () => {
     const requestId = ++sessionLoadRef.current;
@@ -71,6 +74,9 @@ export default function SessionsPage() {
         setCurrentId(null);
         setMessages([]);
         setMessageLoadingId(null);
+        setNextCursor(null);
+        setMessageError(null);
+        pageInFlight.current = false;
       }
     } catch (error) {
       if (requestId === sessionLoadRef.current) {
@@ -83,25 +89,43 @@ export default function SessionsPage() {
 
   useEffect(() => {
     void load();
+    return () => { sessionLoadRef.current++; messageLoadRef.current++; };
   }, []);
 
-  const open = async (id: string) => {
+  const readPage = async (id: string, afterId: number | null) => {
     const requestId = ++messageLoadRef.current;
+    pageInFlight.current = true;
+    setMessageLoadingId(id);
+    setMessageError(null);
+    try {
+      const next = await api.getSessionMessagesPage(id, afterId);
+      if (requestId !== messageLoadRef.current || currentIdRef.current !== id) return;
+      setMessages(previous => afterId === null ? next.rows : [
+        ...previous, ...next.rows.filter(row => !previous.some(existing => existing.id === row.id)),
+      ]);
+      setNextCursor(next.has_more ? next.next_cursor : null);
+    } catch (error) {
+      if (requestId !== messageLoadRef.current) return;
+      setMessageError(`加载消息失败：${errorText(error)}`);
+    } finally {
+      if (requestId === messageLoadRef.current) {
+        pageInFlight.current = false;
+        setMessageLoadingId(null);
+      }
+    }
+  };
+
+  const open = async (id: string) => {
     currentIdRef.current = id;
     setCurrentId(id);
     setMessages([]);
-    setMessageLoadingId(id);
-    try {
-      const next = await api.getSessionMessages(id);
-      if (requestId !== messageLoadRef.current) return;
-      setMessages(next);
-    } catch (error) {
-      if (requestId !== messageLoadRef.current) return;
-      setMessages([]);
-      setMsg({ kind: "err", text: `加载消息失败：${errorText(error)}` });
-    } finally {
-      if (requestId === messageLoadRef.current) setMessageLoadingId(null);
-    }
+    setNextCursor(null);
+    await readPage(id, null);
+  };
+
+  const loadMore = () => {
+    if (!currentId || operation || pageInFlight.current) return;
+    void readPage(currentId, messages.length ? nextCursor : null);
   };
 
   const session = sessions.find((item) => item.id === currentId);
@@ -142,10 +166,15 @@ export default function SessionsPage() {
       setCurrentId(null);
       setMessages([]);
       setMessageLoadingId(null);
+      setNextCursor(null);
+      setMessageError(null);
+      pageInFlight.current = false;
       await load();
       setMsg({ kind: "ok", text: "会话已删除" });
     } catch (error) {
       setMsg({ kind: "err", text: `删除会话失败：${errorText(error)}` });
+      // Deletion invalidates pending reads; on failure issue a fresh read instead of leaving their spinner behind.
+      await open(targetId);
     } finally {
       setOperation(null);
     }
@@ -156,7 +185,7 @@ export default function SessionsPage() {
       <div className="spread page-heading sessions-heading">
         <div>
           <h2>会话上下文</h2>
-          <div className="sub">会话、路由与压缩摘要保留在本机数据库中；此处按时间线阅读完整上下文。</div>
+          <div className="sub">会话、路由与压缩摘要保留在本机数据库中；消息按时间线分页读取，可加载后续上下文。</div>
         </div>
         <button type="button" className="ghost" onClick={() => void load()} disabled={listLoading || operation !== null}>
           {listLoading ? "刷新中" : "刷新会话"}
@@ -170,7 +199,7 @@ export default function SessionsPage() {
           <div className="session-list-header">
             <div>
               <strong>最近会话</strong>
-              <span>{sessions.length} 个持久化会话</span>
+              <span>最近 {sessions.length} 个会话{sessions.length >= 100 ? "（最多 100 个）" : ""}</span>
             </div>
             <Icon name="sessions" size={18} />
           </div>
@@ -270,9 +299,10 @@ export default function SessionsPage() {
                 </section>
               )}
 
-              {loadingMessages ? (
+              {messageError && <div className="msg err" role="alert">{messageError}</div>}
+              {loadingMessages && messages.length === 0 ? (
                 <div className="empty session-loading">正在加载消息时间线</div>
-              ) : messages.length === 0 ? (
+              ) : messages.length === 0 && !messageError ? (
                 <div className="empty session-loading">该会话暂无可显示的消息</div>
               ) : (
                 <div className="message-list" aria-label="消息时间线">
@@ -312,6 +342,12 @@ export default function SessionsPage() {
                   ))}
                 </div>
               )}
+              <div className="session-pagination">
+                <span className="muted" role="status">已加载 {messages.length} 条消息</span>
+                {messageError
+                  ? <button type="button" disabled={operation !== null || loadingMessages} onClick={loadMore}>重试读取消息</button>
+                  : nextCursor !== null && <button type="button" disabled={operation !== null || loadingMessages} onClick={loadMore}>{loadingMessages ? "加载中…" : "加载更多消息"}</button>}
+              </div>
             </>
           )}
         </section>

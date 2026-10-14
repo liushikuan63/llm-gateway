@@ -52,6 +52,7 @@ pub struct CurrencyCount {
 pub enum ProxyMode {
     None,
     ManagedVpn,
+    ManagedXray,
     External,
     Invalid,
 }
@@ -95,6 +96,116 @@ pub struct VpnDiagnostics {
     pub running: bool,
     pub mixed_port: u16,
     pub has_error: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct XrayDiagnostics {
+    pub running: bool,
+    pub http_port: u16,
+    pub socks_port: u16,
+}
+
+pub async fn collect_with_xray(
+    cfg: &AppConfig,
+    gateway: &GatewayState,
+    vpn: Option<VpnDiagnostics>,
+    xray: Option<XrayDiagnostics>,
+) -> DiagnosticsReport {
+    let mut report = collect(cfg, gateway, vpn).await;
+    report.summary.vpn_running = match (vpn, xray) {
+        (Some(v), Some(x)) => Some(v.running || x.running),
+        _ => None,
+    };
+    if let Ok(Some(proxy)) = crate::outbound::validate_proxy(cfg.http_proxy.as_deref()) {
+        let url = reqwest::Url::parse(&proxy).ok();
+        let xmatch = xray.is_some_and(|x| {
+            url.as_ref().is_some_and(|u| {
+                u.host_str() == Some("127.0.0.1")
+                    && match u.scheme() {
+                        "http" => u.port_or_known_default() == Some(x.http_port),
+                        "socks5" | "socks5h" => u.port_or_known_default() == Some(x.socks_port),
+                        _ => false,
+                    }
+            })
+        });
+        let vmatch = vpn.is_some_and(|v| {
+            url.as_ref().is_some_and(|u| {
+                u.host_str() == Some("127.0.0.1")
+                    && matches!(u.scheme(), "http" | "socks5" | "socks5h")
+                    && u.port_or_known_default() == Some(v.mixed_port)
+            })
+        });
+        let replacement = if vpn.is_none() || xray.is_none() || (xmatch && vmatch) {
+            report.summary.proxy_mode = ProxyMode::External;
+            report.summary.vpn_running = None;
+            Some(DiagnosticCheck::new(
+                "proxy",
+                DiagnosticStatus::Unknown,
+                "出站代理",
+                "受管内核快照不完整或端口归属冲突，无法确认代理归属；未连接代理或更改配置。",
+            ))
+        } else if xmatch {
+            let running = xray.is_some_and(|x| x.running);
+            report.summary.proxy_mode = ProxyMode::ManagedXray;
+            report.summary.vpn_running = Some(running);
+            Some(DiagnosticCheck::new(
+                "proxy",
+                if running {
+                    DiagnosticStatus::Ok
+                } else {
+                    DiagnosticStatus::Error
+                },
+                "出站代理",
+                if running {
+                    "网关已绑定受管 Xray，且该内核运行中；未验证公网出口或节点连通性。"
+                } else {
+                    "网关已绑定受管 Xray，但该内核未运行；未修改代理绑定。"
+                },
+            ))
+        } else if vmatch {
+            report.summary.proxy_mode = ProxyMode::ManagedVpn;
+            report.summary.vpn_running = vpn.map(|v| v.running);
+            Some(DiagnosticCheck::new(
+                "proxy",
+                if vpn.is_some_and(|v| v.running) {
+                    DiagnosticStatus::Ok
+                } else {
+                    DiagnosticStatus::Error
+                },
+                "出站代理",
+                if vpn.is_some_and(|v| v.running) {
+                    "网关已绑定受管 Mihomo，且该内核运行中；未验证公网出口或节点连通性。"
+                } else {
+                    "网关已绑定受管 Mihomo，但该内核未运行；未修改代理绑定。"
+                },
+            ))
+        } else {
+            None
+        };
+        if let Some(check) = replacement {
+            if let Some(current) = report.checks.iter_mut().find(|c| c.id == "proxy") {
+                *current = check;
+            }
+        }
+    }
+    report.checks.push(DiagnosticCheck::new(
+        "xray",
+        if xray.is_some() {
+            DiagnosticStatus::Ok
+        } else {
+            DiagnosticStatus::Unknown
+        },
+        "受管 Xray",
+        match xray {
+            Some(x) if x.running => {
+                "受管 Xray 运行中；仅轮询持有进程句柄，未回收进程、读取节点凭据或探测网络。"
+            }
+            Some(_) => "受管 Xray 未运行；未启动内核或读取节点配置。",
+            None => "受管 Xray 快照暂不可用；未等待运行时锁或调用有副作用的状态刷新。",
+        },
+    ));
+    report.overall = overall_status(&report.checks);
+    report
 }
 
 /// Read local snapshots and database rows only. All failures become fixed, non-sensitive text.

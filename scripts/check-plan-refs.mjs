@@ -30,6 +30,9 @@ const QUIET = process.argv.includes('--quiet');
 const DOCS = [
   'docs/_FACTS-后续完善方案.md',
   'docs/VibeCoding任务卡-后续完善方案.md',
+  'docs/VibeCoding任务卡-全项目完善-20261013.md',
+  'docs/VibeCoding任务卡-能力评价与使用数据.md',
+  'docs/持续目标与任务索引.md',
   'docs/VibeCoding任务卡-运行时一致性与VPN集成.md',
   'docs/VibeCoding任务卡-账号权益与签到.md',
   'docs/VibeCoding任务卡-账号型上游包装.md',

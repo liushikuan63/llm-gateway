@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Local, Timelike, Utc};
+use chrono::{DateTime, Local, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +24,7 @@ const TOKEN_MASK: &str = "********";
 pub enum ClaimPlatform {
     Qoder,
     QoderCn,
+    TraeCn,
 }
 
 impl ClaimPlatform {
@@ -31,6 +32,7 @@ impl ClaimPlatform {
         match self {
             Self::Qoder => "qoder",
             Self::QoderCn => "qoder_cn",
+            Self::TraeCn => "trae_cn",
         }
     }
 
@@ -38,6 +40,7 @@ impl ClaimPlatform {
         match self {
             Self::Qoder => "Qoder 国际版",
             Self::QoderCn => "Qoder 国内版",
+            Self::TraeCn => "Trae 中国版",
         }
     }
 
@@ -45,6 +48,7 @@ impl ClaimPlatform {
         match self {
             Self::Qoder => "openapi.qoder.sh",
             Self::QoderCn => "openapi.qoder.com.cn",
+            Self::TraeCn => "api.trae.cn",
         }
     }
 
@@ -52,12 +56,13 @@ impl ClaimPlatform {
         match key {
             "qoder" => Some(Self::Qoder),
             "qoder_cn" => Some(Self::QoderCn),
+            "trae_cn" => Some(Self::TraeCn),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 2] {
-        [Self::Qoder, Self::QoderCn]
+    pub fn all() -> [Self; 3] {
+        [Self::Qoder, Self::QoderCn, Self::TraeCn]
     }
 }
 
@@ -216,6 +221,10 @@ pub struct BenefitAccountView {
     pub last_run: Option<BenefitRunRecord>,
     pub error: Option<String>,
     pub capabilities: BenefitCapabilities,
+    #[serde(default)]
+    pub session_account: Option<crate::client_session::SessionAccountView>,
+    #[serde(default)]
+    pub session_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,6 +232,8 @@ pub struct BenefitOverview {
     pub enabled: bool,
     pub auto_claim: bool,
     pub auto_claim_after_hour: u32,
+    pub auto_claim_after_minute: u32,
+    pub auto_claim_timezone: String,
     pub checked_at: String,
     pub accounts: Vec<BenefitAccountView>,
 }
@@ -335,7 +346,11 @@ pub fn parse_status(platform: ClaimPlatform, value: &Value) -> Result<BenefitSta
         platform,
         claimable,
         campaigns,
-        source: format!("https://{}/sash/api/v1/me/campaigns", platform.host()),
+        source: if platform == ClaimPlatform::TraeCn {
+            "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status".into()
+        } else {
+            format!("https://{}/sash/api/v1/me/campaigns", platform.host())
+        },
         warnings,
         checked_at: Utc::now().to_rfc3339(),
     })
@@ -411,6 +426,14 @@ pub trait BenefitTransport: Send + Sync {
         proxy: Option<&str>,
         campaign_id: Option<&str>,
     ) -> Result<Value, String>;
+    async fn session_account(
+        &self,
+        _platform: ClaimPlatform,
+        _token: &str,
+        _proxy: Option<&str>,
+    ) -> Result<Option<crate::client_session::SessionAccountView>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Default)]
@@ -421,6 +444,18 @@ pub struct HttpBenefitTransport {
 
 #[async_trait]
 impl BenefitTransport for HttpBenefitTransport {
+    async fn session_account(
+        &self,
+        platform: ClaimPlatform,
+        token: &str,
+        proxy: Option<&str>,
+    ) -> Result<Option<crate::client_session::SessionAccountView>, String> {
+        #[cfg(test)]
+        if self.mock_endpoint.is_some() {
+            return Ok(None);
+        }
+        crate::client_session::account_view(platform, token, proxy).await
+    }
     async fn request(
         &self,
         platform: ClaimPlatform,
@@ -428,12 +463,20 @@ impl BenefitTransport for HttpBenefitTransport {
         proxy: Option<&str>,
         campaign_id: Option<&str>,
     ) -> Result<Value, String> {
-        ensure_token(token)?;
+        if platform == ClaimPlatform::TraeCn {
+            return crate::trae_benefits::request(token, proxy, campaign_id).await;
+        }
+        if token.trim_start().starts_with('{') {
+            crate::client_session::SessionCredential::parse(token, platform)?;
+        } else {
+            ensure_token(token)?;
+        }
         if let Some(id) = campaign_id {
             identifier(Some(&Value::String(id.to_string())))
                 .ok_or_else(|| "领取活动标识格式无效".to_string())?;
         }
         let builder = reqwest::Client::builder()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(6))
             .timeout(REQUEST_TIMEOUT);
@@ -456,11 +499,8 @@ impl BenefitTransport for HttpBenefitTransport {
             Some(id) => client.post(format!("{base}/{id}/claim")),
             None => client.get(base),
         };
-        let mut authorization = reqwest::header::HeaderValue::from_str(&auth_value(token))
-            .map_err(|_| "访问 token 不是合法的 Authorization 值".to_string())?;
-        authorization.set_sensitive(true);
         let response = request
-            .header(reqwest::header::AUTHORIZATION, authorization)
+            .headers(crate::client_session::request_headers(token, platform)?)
             .header(reqwest::header::HOST, platform.host())
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
@@ -490,11 +530,7 @@ impl BenefitTransport for HttpBenefitTransport {
             return Err("平台权益响应不是合法 JSON".into());
         }
         // A reflected Authorization value must never turn into an activity ID or other DTO field.
-        let bare = token
-            .trim()
-            .split_once(' ')
-            .map_or(token.trim(), |(_, value)| value);
-        if !bare.is_empty() && String::from_utf8_lossy(&bytes).contains(bare) {
+        if crate::client_session::contains_credential(&bytes, token, platform) {
             return Err("平台权益响应包含敏感凭据，已拒绝展示".into());
         }
         Ok(value)
@@ -589,6 +625,25 @@ impl BenefitsCenter {
         Ok(())
     }
 
+    pub async fn set_session(
+        &self,
+        cfg: &BenefitsConfig,
+        account_id: &str,
+        session: &crate::client_session::SessionCredential,
+    ) -> Result<(), String> {
+        let account = account(cfg, account_id)?;
+        let platform = ClaimPlatform::parse(&account.platform).ok_or("权益平台尚未适配")?;
+        session.validate(platform)?;
+        let raw = serde_json::to_string(session).map_err(|_| "登录上下文格式无效")?;
+        crate::client_session::SessionCredential::parse(&raw, platform)?;
+        let encrypted = crypto::encrypt(&raw).map_err(|_| "无法加密登录上下文")?;
+        repo::set_secret(&self.pool, &secret_name(account), &encrypted)
+            .await
+            .map_err(|_| "无法保存加密登录上下文")?;
+        self.windows.lock().remove(&account_key(account));
+        Ok(())
+    }
+
     pub async fn clear_token(&self, cfg: &BenefitsConfig, account_id: &str) -> Result<(), String> {
         let account = account(cfg, account_id)?;
         repo::delete_secret(&self.pool, &secret_name(account))
@@ -596,6 +651,23 @@ impl BenefitsCenter {
             .map_err(|_| "无法删除权益 token".to_string())?;
         self.windows.lock().remove(&account_key(account));
         Ok(())
+    }
+
+    pub(crate) async fn session_for_native(
+        &self,
+        cfg: &BenefitsConfig,
+        account_id: &str,
+    ) -> Result<crate::client_session::SessionCredential, String> {
+        let account = account(cfg, account_id)?;
+        if !cfg.enabled || !account.enabled || account.platform != "trae_cn" {
+            return Err("Trae 权益账号未启用".into());
+        }
+        let encrypted = repo::get_secret(&self.pool, &secret_name(account))
+            .await
+            .map_err(|_| "无法读取加密登录")?
+            .ok_or("请先复用 Trae 客户端登录")?;
+        let raw = crypto::decrypt(&encrypted).map_err(|_| "无法解密登录，请重新导入")?;
+        crate::client_session::SessionCredential::parse(&raw, ClaimPlatform::TraeCn)
     }
 
     pub async fn runs(
@@ -626,8 +698,8 @@ impl BenefitsCenter {
             let last_run = self.runs(Some(&account.id), 1).await?.into_iter().next();
             let (status, error) = if !cfg.enabled || !account.enabled {
                 (None, None)
-            } else if let Some(encrypted) = encrypted {
-                match crypto::decrypt(&encrypted) {
+            } else if let Some(encrypted) = encrypted.as_ref() {
+                match crypto::decrypt(encrypted) {
                     Ok(token) => {
                         match status_with(self.transport.as_ref(), account, &token, proxy).await {
                             Ok(status) => (Some(status), None),
@@ -639,12 +711,49 @@ impl BenefitsCenter {
             } else {
                 (None, Some("请先手工设置该账号的访问 token".into()))
             };
+            let (session_account, session_error) = if status.is_some() {
+                if let Some(raw) = encrypted
+                    .as_ref()
+                    .and_then(|secret| crypto::decrypt(secret).ok())
+                {
+                    match self
+                        .transport
+                        .session_account(
+                            ClaimPlatform::parse(&account.platform).expect("validated platform"),
+                            &raw,
+                            proxy,
+                        )
+                        .await
+                    {
+                        Ok(view) => (view, None),
+                        Err(_) => (
+                            None,
+                            Some("账号资料读取失败，请刷新或重新复用客户端登录".into()),
+                        ),
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+            let trae_direct = account.platform == "trae_cn"
+                && encrypted
+                    .as_ref()
+                    .and_then(|secret| crypto::decrypt(secret).ok())
+                    .and_then(|raw| {
+                        crate::client_session::SessionCredential::parse(&raw, ClaimPlatform::TraeCn)
+                            .ok()
+                    })
+                    .is_some_and(|session| session.has_trae_device_context());
             accounts.push(BenefitAccountView {
                 account_id: account.id.clone(),
                 platform: account.platform.clone(),
                 label: account.label.clone(),
                 enabled: account.enabled,
                 has_token,
+                session_account,
+                session_error,
                 token_masked: has_token.then(|| TOKEN_MASK.into()),
                 status,
                 last_run,
@@ -653,7 +762,14 @@ impl BenefitsCenter {
                     query: true,
                     manual_claim: true,
                     auto_claim: true,
-                    scope: "已适配活动权益；不代表账号总余额，Trae 暂无已确认接口".into(),
+                    scope: if trae_direct {
+                        "完整登录上下文每日直连签到；无需运行客户端；积分不代表总余额".into()
+                    } else if account.platform == "trae_cn" {
+                        "原生客户端每日签到；后台临时启动，不使用 HTTP 桥接；积分不代表总余额"
+                            .into()
+                    } else {
+                        "已适配活动赠送权益；不代表账号总余额".into()
+                    },
                 },
             });
         }
@@ -661,6 +777,8 @@ impl BenefitsCenter {
             enabled: cfg.enabled,
             auto_claim: cfg.auto_claim,
             auto_claim_after_hour: cfg.auto_claim_after_hour,
+            auto_claim_after_minute: cfg.auto_claim_after_minute,
+            auto_claim_timezone: cfg.auto_claim_timezone.clone(),
             checked_at: Utc::now().to_rfc3339(),
             accounts,
         })
@@ -698,7 +816,7 @@ impl BenefitsCenter {
         if !cfg.enabled || !account.enabled {
             return Err("权益中心或该账号未启用；未发起网络请求".into());
         }
-        if !manual && (!cfg.auto_claim || now.hour() < cfg.auto_claim_after_hour) {
+        if !manual && (!cfg.auto_claim || !cfg.account_is_due(account_id, now)) {
             return Err("自动领取未启用或尚未到开始时间；未发起网络请求".into());
         }
         let key = account_key(&account);
@@ -759,11 +877,15 @@ impl BenefitsCenter {
         now: DateTime<Local>,
     ) -> Result<Vec<BenefitClaimResult>, String> {
         validate(cfg)?;
-        if !cfg.enabled || !cfg.auto_claim || now.hour() < cfg.auto_claim_after_hour {
+        if !cfg.enabled || !cfg.auto_claim || cfg.scheduler_mode == "windows_task" {
             return Ok(Vec::new());
         }
         let mut results = Vec::new();
-        for account in cfg.accounts.iter().filter(|account| account.enabled) {
+        for account in cfg
+            .accounts
+            .iter()
+            .filter(|account| account.enabled && cfg.account_is_due(&account.id, now))
+        {
             results.push(self.claim_at(cfg, proxy, &account.id, false, now).await?);
         }
         Ok(results)
@@ -814,6 +936,17 @@ fn safe_transport_error(error: &str) -> String {
         "平台未确认活动已领取",
         "领取响应缺少 replayed 标志，无法确认是否发放",
         "平台领取接口不存在（HTTP 404），请核对适配器版本",
+        "Trae 原生账号绑定缺失，请重新复用客户端登录",
+        "Trae 直连领取被平台拒绝；未自动重发",
+        "Trae 直连领取未获同日状态确认；未自动重发",
+        "Trae 直连领取数量未获确认；未自动重发",
+        "Trae 原生签到接口不可用；请检查客户端登录和后台连接，未自动重发",
+        "Trae 原生响应超过安全上限",
+        "Trae 原生签到未返回可验证结果",
+        "Trae 原生签到返回重复结果",
+        "Trae 原生签到响应格式无效",
+        "Trae 原生签到结果缺少重放标志",
+        "Trae 原生签到确认条件未满足",
         "平台请求过于频繁（HTTP 429），请稍后重试",
     ];
     if MESSAGES.contains(&error) {

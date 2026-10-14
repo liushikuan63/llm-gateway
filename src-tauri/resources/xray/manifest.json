@@ -1,0 +1,7 @@
+{
+  "version": "v26.3.27",
+  "entry": "xray.exe",
+  "sha256": "15c2d007954ac53ba69b80ec91242786b3c0b71d52649165b4ca1d5cc96ef8f1",
+  "source": "https://github.com/XTLS/Xray-core/releases/tag/v26.3.27",
+  "source_code": "https://github.com/XTLS/Xray-core/tree/v26.3.27"
+}

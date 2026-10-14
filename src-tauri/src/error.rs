@@ -4,6 +4,13 @@ pub type Result<T> = std::result::Result<T, GatewayError>;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
+    /// Account requests with an explicit single-attempt contract must not enter
+    /// auth confirmation, failover or cascade replay after dispatch.
+    #[error("{source}")]
+    NoReplay {
+        #[source]
+        source: Box<GatewayError>,
+    },
     #[error("未授权：网关 Key 无效 ({0})")]
     Unauthorized(String),
 
@@ -44,9 +51,25 @@ pub enum GatewayError {
 }
 
 impl GatewayError {
+    pub fn no_replay(self) -> Self {
+        match self {
+            value @ Self::NoReplay { .. } => value,
+            source => Self::NoReplay {
+                source: Box::new(source),
+            },
+        }
+    }
+    pub fn upstream_status(&self) -> Option<u16> {
+        match self {
+            Self::Upstream { status, .. } => Some(*status),
+            Self::NoReplay { source } => source.upstream_status(),
+            _ => None,
+        }
+    }
     /// 判定该错误是否值得触发降级（换下一个 provider 重试）
     pub fn retryable(&self) -> bool {
         match self {
+            GatewayError::NoReplay { .. } => false,
             GatewayError::Upstream { status, .. } => {
                 // 这个列表筛的是「换一家**还有没有戏**」，不是「错误严不严重」。
                 //
@@ -90,6 +113,7 @@ impl GatewayError {
     pub fn http_status(&self) -> axum::http::StatusCode {
         use axum::http::StatusCode;
         match self {
+            GatewayError::NoReplay { source } => source.http_status(),
             GatewayError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             GatewayError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             GatewayError::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
@@ -108,6 +132,7 @@ impl GatewayError {
     /// 因此只在本地 tracing 日志中保留，绝不能原样回显给远程调用方。
     pub fn public_message(&self) -> String {
         match self {
+            GatewayError::NoReplay { source } => source.public_message(),
             GatewayError::Upstream {
                 provider,
                 model,
@@ -121,6 +146,9 @@ impl GatewayError {
 
     /// 转成 OpenAI 兼容错误体
     pub fn to_openai_error(&self) -> serde_json::Value {
+        if let Self::NoReplay { source } = self {
+            return source.to_openai_error();
+        }
         serde_json::json!({
             "error": {
                 "message": self.public_message(),
@@ -134,5 +162,57 @@ impl GatewayError {
                 "code": null
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod no_replay_tests {
+    use super::*;
+    #[test]
+    fn single_attempt_preserves_status_classification_and_masks_the_upstream_body() {
+        for status in [401, 403, 429, 502] {
+            let original = GatewayError::Upstream {
+                provider: "Qoder".into(),
+                model: "synthetic".into(),
+                status,
+                body: "synthetic-private-error".into(),
+            };
+            if status == 401 {
+                assert!(crate::router::failover::is_fatal_auth(&original));
+            }
+            let protected = original.no_replay();
+            assert_eq!(protected.http_status().as_u16(), status);
+            assert_eq!(protected.upstream_status(), Some(status));
+            assert!(!protected.retryable());
+            assert!(!crate::router::failover::is_fatal_auth(&protected));
+            assert!(!protected
+                .public_message()
+                .contains("synthetic-private-error"));
+            assert!(!protected
+                .to_openai_error()
+                .to_string()
+                .contains("synthetic-private-error"));
+            assert_eq!(
+                crate::router::failover::classify(&protected),
+                if status <= 403 {
+                    "auth_failed"
+                } else if status == 429 {
+                    "rate_limited"
+                } else {
+                    "upstream_5xx"
+                }
+            );
+        }
+    }
+    #[test]
+    fn timeout_and_repeated_wrapping_preserve_the_error_contract_without_replay() {
+        let error = GatewayError::Timeout("synthetic timeout".into())
+            .no_replay()
+            .no_replay();
+        assert_eq!(error.http_status().as_u16(), 504);
+        assert!(!error.retryable());
+        assert_eq!(error.to_openai_error()["error"]["type"], "server_error");
+        assert_eq!(crate::router::failover::classify(&error), "timeout");
+        assert!(error.upstream_status().is_none());
     }
 }

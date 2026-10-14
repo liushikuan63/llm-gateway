@@ -1,0 +1,7 @@
+{
+  "version": "v24.19.0",
+  "entry": "node.exe",
+  "sha256": "3602f2bb1a10f2cbab4c36886218a33c1ab3db87290e73b033c46c77147d0237",
+  "source": "https://nodejs.org/dist/v24.19.0/",
+  "source_code": "https://github.com/nodejs/node/tree/v24.19.0"
+}

@@ -25,7 +25,7 @@ export function checkScriptSyntax(directory) {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     const directory = fileURLToPath(new URL(".", import.meta.url));
-    console.log(`SCRIPT_SYNTAX_VERIFIED: ${checkScriptSyntax(directory)} scripts`);
+    console.log(`SCRIPT_SYNTAX_VERIFIED: ${checkScriptSyntax(directory)+checkScriptSyntax(resolve(directory,"qoder-rewards"))+checkScriptSyntax(resolve(directory,"qoder-protocol"))+checkScriptSyntax(resolve(directory,"trae-protocol"))} scripts`);
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

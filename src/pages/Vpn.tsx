@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, AppConfig, ExternalVpnStatus, VpnKernelInfo, VpnProxy, VpnSettings, VpnStatus } from "../api";
+import XrayPanel from "./XrayPanel";
 
 type Message = { kind: "ok" | "err"; text: string };
 const DEFAULT_SETTINGS: VpnSettings = { kernel_path: "", mixed_port: 17890, controller_port: 17909 };
@@ -32,6 +33,7 @@ export default function VpnPage() {
   const [kernelInfoError, setKernelInfoError] = useState<string | null>(null);
   // 外部 VPN（魔戒 mojie）只读快照。null = 还在探测；探测失败也拿得到结构体（带 error）。
   const [external, setExternal] = useState<ExternalVpnStatus | null>(null);
+  const [externalError, setExternalError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
@@ -41,6 +43,8 @@ export default function VpnPage() {
   const dirty = useRef(false);
   const operationVersion = useRef(0);
   const operationInFlight = useRef(false);
+  const externalVersion = useRef(0);
+  const externalRequest = useRef<Promise<ExternalVpnStatus> | null>(null);
 
   /**
    * 单独探一次外部 VPN（mojie）。
@@ -48,17 +52,29 @@ export default function VpnPage() {
    * 故意**不放进 load 的 Promise.allSettled**：它会发一次订阅请求（最长 12 秒），
    * 混进主流程会拖慢整页；而且它失败只该影响这张卡片，不该让"读取 VPN 状态失败"弹出来。
    */
-  const loadExternal = async () => {
+  const loadExternal = async (refresh = false) => {
+    const requestVersion = ++externalVersion.current;
+    const current = () => mounted.current && externalVersion.current === requestVersion;
+    const request = refresh || externalRequest.current === null
+      ? api.externalVpnStatus() : externalRequest.current;
+    externalRequest.current = request;
+    if (current()) setExternalError(null);
     try {
-      const next = await api.externalVpnStatus();
-      if (mounted.current) setExternal(next);
+      const next = await request;
+      if (current()) setExternal(next);
     } catch {
-      if (mounted.current) setExternal(null);
+      if (current()) {
+        setExternal(null);
+        setExternalError("外部 VPN 探测失败，请刷新状态后重试。");
+      }
+    } finally {
+      if (externalRequest.current === request) externalRequest.current = null;
     }
   };
 
-  const load = async (propagateError = false) => {
+  const load = async (propagateError = false, refreshExternal = true) => {
     if (!mounted.current) return false;
+    void loadExternal(refreshExternal);
     const requestVersion = ++version.current;
     const current = () => mounted.current && version.current === requestVersion;
     setLoading(true);
@@ -99,20 +115,17 @@ export default function VpnPage() {
       return false;
     } finally {
       if (current()) setLoading(false);
-      // 每次 load 都顺带刷新外部 VPN：否则"刷新状态"按钮不会更新那张卡片
-      // （UI 冒烟抓到过这个缺陷：夹具换了数据，卡片还停在旧值）。
-      void loadExternal();
     }
   };
 
   useEffect(() => {
     mounted.current = true;
-    void load();
-    void loadExternal();
+    void load(false, false);
     return () => {
       mounted.current = false;
       version.current++;
       operationVersion.current++;
+      externalVersion.current++;
       operationInFlight.current = false;
       if (subscription.current) subscription.current.value = "";
     };
@@ -255,10 +268,11 @@ export default function VpnPage() {
       <div className="spread">
         <strong>外部 VPN（魔戒 mojie）</strong>
         <span className={`tag ${external?.available ? "ok" : ""}`}>
-          {external === null ? "探测中…" : external.available ? "已接入" : "未探测到"}
+          {externalError ? "探测失败" : external === null ? "探测中…" : external.available ? "已接入" : "未探测到"}
         </span>
       </div>
-      {external === null && <div className="sub" role="status">正在探测外部 VPN…</div>}
+      {externalError && <div className="sub" role="status">{externalError}</div>}
+      {external === null && !externalError && <div className="sub" role="status">正在探测外部 VPN…</div>}
       {external !== null && !external.available && (
         <div className="sub">{errorText(external.error ?? "未探测到 mojie 客户端")}</div>
       )}
@@ -357,5 +371,6 @@ export default function VpnPage() {
               : <span className="mono breakable">{proxy.now ?? "无需手动选择"}</span>}
           </div>)}</div>}
     </div>
+    <XrayPanel config={config} onConfigChange={() => load(false, false)} />
   </div>;
 }

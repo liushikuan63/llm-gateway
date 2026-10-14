@@ -12,6 +12,9 @@
 | --- | --- |
 | 硬约束、执行纪律、模式隔离红线 | [`CLAUDE.md`](CLAUDE.md) |
 | 当前批次要做什么 | [`docs/VibeCoding任务卡-后续完善方案.md`](docs/VibeCoding任务卡-后续完善方案.md) |
+| 所有待完成与可优化任务的持续目标 | [`docs/持续目标与任务索引.md`](docs/持续目标与任务索引.md) |
+| 本轮整体检查与顺序补充 | [`docs/VibeCoding任务卡-全项目完善-20261013.md`](docs/VibeCoding任务卡-全项目完善-20261013.md) |
+| 能力维度与使用数据后续补充 | [`docs/VibeCoding任务卡-能力评价与使用数据.md`](docs/VibeCoding任务卡-能力评价与使用数据.md) |
 | 运行时优化与内置 VPN 增量任务 | [`docs/VibeCoding任务卡-运行时一致性与VPN集成.md`](docs/VibeCoding任务卡-运行时一致性与VPN集成.md) |
 | 账号权益、活动与奖励领取 | [`docs/VibeCoding任务卡-账号权益与签到.md`](docs/VibeCoding任务卡-账号权益与签到.md) |
 | 客户端接入能力与运行时配置 | [`docs/VibeCoding任务卡-账号型上游包装.md`](docs/VibeCoding任务卡-账号型上游包装.md) |

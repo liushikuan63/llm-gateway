@@ -3,7 +3,7 @@ import { api, clockToMinutes, Currency, DIALECT_LABEL, DiscoveredModel, formatPr
 import { DEFAULT_CONTEXT_WINDOW, emptyModel, errorText, formatContext, PRESETS, ProviderForm } from "./providerPresets";
 
 type Source = "provider" | "default" | "manual" | "saved";
-type DraftModel = ModelRef & { rowId: number; source: Source };
+type DraftModel = ModelRef & { rowId: number; source: Source; originalModel?: ModelRef };
 const SOURCE_LABEL: Record<Source, string> = { provider: "上游提供", default: "默认值 · 待确认", manual: "手动设置", saved: "已保存" };
 const MODEL_TYPE_LABEL: Record<ModelType, string> = {
   chat: "聊天",
@@ -54,7 +54,7 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
 }) {
   const nextRow = useRef(0);
   const [form, setForm] = useState(initial);
-  const [models, setModels] = useState<DraftModel[]>(() => initial.models.map(m => ({ ...m, rowId: nextRow.current++, source: "saved" })));
+  const [models, setModels] = useState<DraftModel[]>(() => initial.models.map(m => ({ ...m, originalModel: m, rowId: nextRow.current++, source: "saved" })));
   const [priceDrafts, setPriceDrafts] = useState<Record<number, PriceDraft>>(() => Object.fromEntries(models.map(m => [m.rowId, draftFromPrice(m.price)])));
   const [overrideDrafts, setOverrideDrafts] = useState<Record<number, OverridesDraft>>(() => Object.fromEntries(models.map(m => [m.rowId, draftFromOverrides(m.overrides)])));
   const [preset, setPreset] = useState("");
@@ -100,7 +100,16 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
   };
   const patchModel = (id: number, patch: Partial<DraftModel>) => {
     dirty.current = true;
-    setModels(previous => previous.map(m => m.rowId === id ? { ...m, ...patch } : m));
+    setModels(previous => previous.map(m => {
+      if (m.rowId !== id) return m;
+      const next = { ...m, ...patch };
+      if (next.upstream.trim() !== m.upstream.trim() || next.upstream_path !== m.upstream_path || next.model_type !== m.model_type) {
+        const original = m.originalModel;
+        const restored = original && next.upstream.trim() === original.upstream.trim() && next.upstream_path === original.upstream_path && next.model_type === original.model_type;
+        next.capabilities = restored ? original.capabilities : null;
+      }
+      return next;
+    }));
   };
   const patchPrice = (id: number, patch: Partial<PriceDraft>) => {
     dirty.current = true;
@@ -197,8 +206,8 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
       supports_tools: m.supports_tools ?? false, supports_vision: m.supports_vision ?? false,
       // 目录给出的模态能力直接带入；未识别时保持 false，由用户按官方说明确认。
       supports_audio: m.supports_audio ?? false, supports_video: m.supports_video ?? false,
-      // 目录不提供思维链信息，一律按「不确定 → 不支持」处理。
-      supports_thinking: false,
+      // 仅采用目录明确给出的思考能力，缺失保持保守值并由用户确认。
+      supports_thinking: m.supports_thinking ?? false,
       supports_stream: m.supports_stream ?? true, price: m.price,
       // 目录只提供价格，不提供覆盖配置：新添加的模型从「无覆盖」开始。
       overrides: null, local: null,
@@ -358,7 +367,7 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
       if (price && "error" in price) { setMessage({ kind: "err", text: price.error }); return; }
       const overrides = resolveOverrides(m);
       if (overrides && "error" in overrides) { setMessage({ kind: "err", text: overrides.error }); return; }
-      const { rowId: _rowId, source: _source, ...rest } = m;
+      const { rowId: _rowId, source: _source, originalModel: _originalModel, ...rest } = m;
       resolved.push({ ...rest, alias: m.alias.trim(), upstream: m.upstream.trim(), price, overrides });
     }
     setSaving(true); setMessage(null);
@@ -413,7 +422,7 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
               <div className="grid2"><div className="field"><label htmlFor={`upstream-${m.rowId}`}>上游模型 ID</label><input id={`upstream-${m.rowId}`} disabled={busy} value={m.upstream} placeholder="例如 deepseek-chat" onChange={e => patchModel(m.rowId, { upstream: e.target.value, source: "manual" })} /></div><div className="field"><label htmlFor={`model-type-${m.rowId}`}>模型类型</label><select id={`model-type-${m.rowId}`} disabled={busy} value={m.model_type} onChange={e => patchModel(m.rowId, { model_type: e.target.value as ModelType })}><option value="chat">聊天 / Responses</option><option value="embedding">Embedding</option><option value="image">文生图</option><option value="speech">语音合成 TTS</option></select></div><div className="field"><label htmlFor={`alias-${m.rowId}`}>对外别名</label><input id={`alias-${m.rowId}`} disabled={busy} value={m.alias} placeholder="客户端使用的模型名" onChange={e => patchModel(m.rowId, { alias: e.target.value })} /></div></div>
               <div className="field"><label htmlFor={`upstream-path-${m.rowId}`}>上游请求路径 <span className="muted">· 可选</span></label><input id={`upstream-path-${m.rowId}`} disabled={busy} spellCheck={false} value={m.upstream_path ?? ""} placeholder={m.model_type === "embedding" ? "/v1/embeddings" : m.model_type === "image" ? "/v1/images/generations" : m.model_type === "speech" ? "/v1/audio/speech" : "/v1/chat/completions"} onChange={e => patchModel(m.rowId, { upstream_path: e.target.value.trim() ? e.target.value : null })} /><small>从域名根开始填写；留空使用协议默认路径。支持 <code>{"{model}"}</code> 占位符。</small></div>
               <div className="context-line"><div className="field"><label htmlFor={`context-${m.rowId}`}>上下文长度（tokens）</label><input id={`context-${m.rowId}`} type="number" min={1} max={2147483647} disabled={busy} value={m.context_window} onChange={e => patchModel(m.rowId, { context_window: Number(e.target.value), source: "manual" })} /></div><span className={`context-source ${m.source === "default" ? "unverified" : ""}`}>{SOURCE_LABEL[m.source]}</span>{catalog?.find(item => item.id === m.upstream)?.context_source === "provider" && <button className="ghost" disabled={busy} onClick={() => { const remote = catalog.find(item => item.id === m.upstream)!; patchModel(m.rowId, { context_window: remote.context_window, source: "provider" }); }}>采用上游长度</button>}</div>
-              <div className="model-capabilities">{([['supports_tools', '工具调用'], ['supports_vision', '图像输入'], ['supports_audio', '音频输入'], ['supports_video', '视频输入'], ['supports_stream', '流式响应']] as const).map(([key, label]) => <label key={key}><input type="checkbox" checked={m[key]} disabled={busy} onChange={e => patchModel(m.rowId, { [key]: e.target.checked })} />{label}</label>)}</div>
+              <div className="model-capabilities">{([['supports_tools', '工具调用'], ['supports_thinking', '思考 / 推理'], ['supports_vision', '图像输入'], ['supports_audio', '音频输入'], ['supports_video', '视频输入'], ['supports_stream', '流式响应']] as const).map(([key, label]) => <label key={key}><input type="checkbox" checked={m[key]} disabled={busy} onChange={e => patchModel(m.rowId, { [key]: e.target.checked })} />{label}</label>)}</div>
               {(() => {
                 const draft = priceDrafts[m.rowId] ?? draftFromPrice(m.price);
                 const filled = draft.prompt.trim() !== "" || draft.completion.trim() !== "";

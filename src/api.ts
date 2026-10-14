@@ -1,5 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export interface ClientUsageRow {
+  source: string; profile: string; model: string; provider: string | null;
+  granularity: "request" | "daily_aggregate" | "cumulative_delta" | "range_total"; day: string | null; requests: number | null;
+  input_tokens: number | null; output_tokens: number | null; cache_read_tokens: number | null; cache_write_tokens: number | null;
+  partial_fields: string[]; known_usage_records: number; unknown_usage_records: number;
+  cache_hit_requests: number | null; cache_miss_requests: number | null; cache_unknown_requests: number | null;
+  estimated_cost: number | null; estimated_currency: string | null; estimate_note: string | null; price_reference: string | null;
+}
+export interface ClientUsageReport {
+  generated_at: string; from_day: string; to_day: string;
+  sources: { source: string; profile: string; status: string; files_scanned: number; records_scanned: number; skipped_records: number; bytes_read: number; notes: string[] }[];
+  rows: ClientUsageRow[];
+  summary_rows?: ClientUsageRow[];
+  daily_rows?: ClientUsageRow[];
+}
+export const scanClientUsage = (fromDay: string, toDay: string) => invoke<ClientUsageReport>("scan_client_usage", { fromDay, toDay });
+
 export type Dialect = "openai" | "anthropic" | "gemini" | "ollama" | "responses";
 export type Currency = "usd" | "cny";
 export type ModelType = "chat" | "embedding" | "image" | "speech";
@@ -75,6 +92,12 @@ export interface ModelRef {
   overrides: ModelOverrides | null;
   // 本地模型来源元数据；云端模型为 null。
   local: LocalMeta | null;
+  capabilities?: {
+    coding?: number | null; reasoning?: number | null;
+    knowledge?: number | null; math?: number | null;
+    source?: "catalog" | "community" | "manual" | "measured";
+    updated_at?: string | null;
+  } | null;
 }
 
 export interface LocalMeta {
@@ -170,7 +193,38 @@ export interface AppConfig {
   benefits: BenefitsConfig;
 }
 
-export type BenefitPlatform = "qoder" | "qoder_cn";
+export type BenefitPlatform = "qoder" | "qoder_cn" | "trae_cn";
+export type QoderRegion = "global" | "cn";
+export interface QoderLoginStart {
+  login_id: string; region: QoderRegion; authorization_url: string; deadline_ms: number; server_ttl_seconds: number | null;
+}
+export interface QoderLoginStatus {
+  status: "logged_in" | "not_logged_in" | "awaiting_authorization" | "expired";
+  region: QoderRegion; account_id: string;
+  identity: WorkBuddyLoginStatus["identity"];
+  can_refresh: boolean; access_expires_at_ms: number | null; refresh_expires_at_ms: number | null; refresh_attempted: boolean;
+}
+export interface QoderJobStatus {
+  status: "not_logged_in" | "not_prepared" | "stale" | "expired" | "verification_required" | "prepared";
+  region: QoderRegion; account_id: string;
+  access_expires_at_ms: number | null; refresh_expires_at_ms: number | null;
+  can_refresh: boolean; attempt_blocked: boolean; inference_verified: boolean;
+}
+export interface WorkBuddyLoginStart {
+  login_id: string; authorization_url: string; deadline_ms: number; server_ttl_seconds: number | null;
+}
+export interface TraeLoginStart {
+  login_id: string; authorization_url: string; deadline_ms: number;
+}
+export interface TraeLoginStatus extends Omit<WorkBuddyLoginStatus, "status"> {
+  status: "authenticated" | "not_logged_in" | "awaiting_authorization" | "access_expired" | "expired" | "cancelled" | "authorization_failed_no_retry";
+}
+export interface WorkBuddyLoginStatus {
+  status: "authenticated" | "not_logged_in" | "awaiting_authorization" | "access_expired";
+  account_id: string;
+  identity: { display_name: string | null; masked_email: string | null; identity_hash: string | null; captured_at: string | null } | null;
+  can_refresh: boolean; access_expires_at_ms: number | null; refresh_expires_at_ms: number | null; refresh_attempted: boolean;
+}
 export interface BenefitAccount {
   id: string;
   platform: BenefitPlatform;
@@ -181,6 +235,10 @@ export interface BenefitsConfig {
   enabled: boolean;
   auto_claim: boolean;
   auto_claim_after_hour: number;
+  auto_claim_after_minute: number;
+  auto_claim_timezone: "local" | "Asia/Shanghai";
+  scheduler_mode?: "app" | "windows_task";
+  account_claim_times?: Record<string, string>;
   accounts: BenefitAccount[];
 }
 export interface BenefitCampaign {
@@ -221,6 +279,8 @@ export interface BenefitAccountView {
   label: string;
   enabled: boolean;
   has_token: boolean;
+  session_account?: { identity: { display_name: string | null; masked_email: string | null; identity_hash: string | null; captured_at: string | null }; plan_name: string | null; quota: {total:number|null;used:number|null;remaining:number|null;unit:string|null}|null; addon_quota: {total:number|null;used:number|null;remaining:number|null;unit:string|null}|null; checked_at:string } | null;
+  session_error?: string | null;
   token_masked: string | null;
   status: BenefitStatus | null;
   last_run: BenefitRunRecord | null;
@@ -231,6 +291,8 @@ export interface BenefitOverview {
   enabled: boolean;
   auto_claim: boolean;
   auto_claim_after_hour: number;
+  auto_claim_after_minute: number;
+  auto_claim_timezone: "local" | "Asia/Shanghai";
   checked_at: string;
   accounts: BenefitAccountView[];
 }
@@ -361,7 +423,7 @@ export interface DiagnosticsSummary {
   budgeted_keys: number;
   budget_currency_counts: { currency: string; count: number }[];
   vpn_running: boolean | null;
-  proxy_mode: "none" | "managed_vpn" | "external" | "invalid";
+  proxy_mode: "none" | "managed_vpn" | "managed_xray" | "external" | "invalid";
 }
 
 export interface DiagnosticsReport {
@@ -655,6 +717,7 @@ export interface DiscoveredModel {
   supports_audio: boolean | null;
   supports_video: boolean | null;
   supports_stream: boolean | null;
+  supports_thinking?: boolean | null;
   is_free: boolean | null;
   price: ModelPrice | null;
 }
@@ -1217,7 +1280,55 @@ export interface PetAsset {
   spritesheet_data_url: string;
 }
 
+export interface BridgeOptions { port: number; cdp_port: number; client_path: string }
+export interface BridgeStatus {
+  kind: string; options: BridgeOptions; reachable: boolean; ready: boolean; managed: boolean;
+  pid: number | null; models: string[]; runtime_ready: boolean; cli_path: string | null;
+  error: string | null; model_call_verified: boolean;
+}
+export interface XraySettings { http_port: number; socks_port: number }
+export interface XrayStatus {
+  settings: XraySettings; kernel_ready: boolean; profile_ready: boolean; running: boolean;
+  pid: number | null; version: string; protocol: string | null; proxy_url: string;
+}
+
 export const api = {
+  traeLoginStart: (accountId: string, consentToRegisterKey: boolean) => invoke<TraeLoginStart>("trae_login_start", { accountId, consentToRegisterKey }),
+  traeLoginStatus: (accountId: string) => invoke<TraeLoginStatus>("trae_login_status", { accountId }),
+  traeLoginPoll: (accountId: string, loginId: string) => invoke<TraeLoginStatus>("trae_login_poll", { accountId, loginId }),
+  traeLoginCancel: (accountId: string, loginId: string) => invoke<void>("trae_login_cancel", { accountId, loginId }),
+  traeLoginRefresh: (accountId: string) => invoke<TraeLoginStatus>("trae_login_refresh", { accountId }),
+  traeLoginCancelRefresh: (accountId: string) => invoke<void>("trae_login_cancel_refresh", { accountId }),
+  workbuddyLoginStart: (accountId: string) => invoke<WorkBuddyLoginStart>("workbuddy_login_start", { accountId }),
+  qoderLoginStart: (region: QoderRegion, accountId: string) => invoke<QoderLoginStart>("qoder_login_start", { region, accountId }),
+  qoderLoginPoll: (region: QoderRegion, loginId: string) => invoke<QoderLoginStatus>("qoder_login_poll", { region, loginId }),
+  qoderLoginCancel: (region: QoderRegion, loginId: string) => invoke<void>("qoder_login_cancel", { region, loginId }),
+  qoderLoginStatus: (region: QoderRegion, accountId: string) => invoke<QoderLoginStatus>("qoder_login_status", { region, accountId }),
+  qoderLoginRefresh: (region: QoderRegion, accountId: string) => invoke<QoderLoginStatus>("qoder_login_refresh", { region, accountId }),
+  qoderJobStatus: (region: QoderRegion, accountId: string) => invoke<QoderJobStatus>("qoder_job_status", { region, accountId }),
+  qoderJobPrepare: (region: QoderRegion, accountId: string) => invoke<QoderJobStatus>("qoder_job_prepare", { region, accountId }),
+  qoderJobRefresh: (region: QoderRegion, accountId: string) => invoke<QoderJobStatus>("qoder_job_refresh", { region, accountId }),
+  registerQoderProvider: (region: QoderRegion, accountId: string) => invoke<{provider_id:string;runtime_id:string;model_count:number;warnings:string[]}>("register_qoder_provider", { region, accountId }),
+  workbuddyLoginPoll: (loginId: string) => invoke<WorkBuddyLoginStatus>("workbuddy_login_poll", { loginId }),
+  workbuddyLoginCancel: (loginId: string) => invoke<void>("workbuddy_login_cancel", { loginId }),
+  workbuddyLoginStatus: (accountId: string) => invoke<WorkBuddyLoginStatus>("workbuddy_login_status", { accountId }),
+  workbuddyLoginRefresh: (accountId: string) => invoke<WorkBuddyLoginStatus>("workbuddy_login_refresh", { accountId }),
+  registerWorkBuddyProvider: (accountId: string) => invoke<{provider_id:string;runtime_id:string;model_count:number;warnings:string[]}>("register_workbuddy_provider", { accountId }),
+  registerClientBridge: (kind: string) => invoke<string>("register_client_bridge", { kind }),
+  desktopChat: (input: DesktopChatInput) => invoke<DesktopChatResult>("desktop_chat", { input }),
+  exportDesktopChat: (dest: string, transcript: DesktopChatTranscript) => invoke<void>("export_desktop_chat", { dest, transcript }),
+  clientBridgesStatus: () => invoke<BridgeStatus[]>("client_bridges_status"),
+  registerQoderCli: () => invoke<string>("register_qoder_cli"),
+  saveClientBridgeOptions: (kind: string, options: BridgeOptions) => invoke<void>("save_client_bridge_options", { kind, options }),
+  startClientBridge: (kind: string) => invoke<void>("start_client_bridge", { kind }),
+  stopClientBridge: (kind: string) => invoke<void>("stop_client_bridge", { kind }),
+  launchBridgeClient: (kind: string) => invoke<void>("launch_bridge_client", { kind }),
+  xrayStatus: () => invoke<XrayStatus>("xray_status"),
+  saveXraySettings: (settings: XraySettings) => invoke<void>("save_xray_settings", { settings }),
+  importXrayProfile: (path: string) => invoke<void>("import_xray_profile", { path }),
+  startXray: () => invoke<void>("start_xray"),
+  stopXray: () => invoke<void>("stop_xray"),
+  useXrayForGateway: (enabled: boolean) => invoke<ConfigUpdateResult>("use_xray_for_gateway", { enabled }),
   vpnStatus: () => invoke<VpnStatus>("vpn_status"),
   externalVpnStatus: () => invoke<ExternalVpnStatus>("external_vpn_status"),
   vpnKernelInfo: () => invoke<VpnKernelInfo>("vpn_kernel_info"),
@@ -1261,6 +1372,8 @@ export const api = {
 
   listSessions: () => invoke<Session[]>("list_sessions", { limit: 100 }),
   getSessionMessages: (id: string) => invoke<SessionMessage[]>("get_session_messages", { id }),
+  getSessionMessagesPage: (id: string, afterId: number | null = null, limit = 500) =>
+    invoke<SessionMessagesPage>("get_session_messages_page", { id, afterId, limit }),
   deleteSession: (id: string) => invoke<void>("delete_session", { id }),
   compactSession: (id: string) => invoke<string>("compact_session", { id }),
 
@@ -1333,6 +1446,7 @@ export const api = {
   listAgentRuntimes: () => invoke<AgentRuntime[]>("list_agent_runtimes"),
 
   benefitsOverview: () => invoke<BenefitOverview>("benefits_overview"),
+  importBenefitClientSession: (accountId:string) => invoke<{display_name:string|null;masked_email:string|null}>("import_benefit_client_session",{accountId}),
   claimBenefitNow: (accountId: string) => invoke<BenefitClaimResult>("claim_benefit_now", { accountId }),
   setBenefitToken: (accountId: string, token: string) => invoke<void>("set_benefit_token", { accountId, token }),
   clearBenefitToken: (accountId: string) => invoke<void>("clear_benefit_token", { accountId }),
@@ -1445,6 +1559,26 @@ export const api = {
     invoke<CalibrationReport>("calibrate_classifier", { samples }),
   calibrateDefaultSamples: () => invoke<CalibrationReport>("calibrate_default_samples"),
 };
+
+export interface DesktopChatMessage { role: "system" | "user" | "assistant"; content: string }
+export interface DesktopChatTranscript {
+  schema_version: number;
+  session_id: string;
+  exported_at: string;
+  turns: Array<DesktopChatMessage & { result?: DesktopChatResult }>;
+}
+export interface SessionMessagesPage {
+  rows: SessionMessage[];
+  has_more: boolean;
+  next_cursor: number | null;
+}
+export interface DesktopChatInput { model: string; messages: DesktopChatMessage[]; session_id: string; max_tokens: number }
+export interface DesktopChatResult {
+  content: string; reasoning: string | null; model: string; routed_via: string | null;
+  session_id: string; trace_id: string | null; fallback_attempts: number; latency_ms: number;
+  usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | null;
+  cached: boolean;
+}
 
 export const TASK_CLASS_LABEL: Record<TaskClass, string> = {
   simple: "简单任务",

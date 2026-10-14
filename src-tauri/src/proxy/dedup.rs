@@ -225,10 +225,7 @@ impl Verdict {
 
     /// 这次判定是否构成「重复」。
     pub fn is_duplicate(self) -> bool {
-        matches!(
-            self,
-            Verdict::Conflict | Verdict::ObservedDuplicate
-        )
+        matches!(self, Verdict::Conflict | Verdict::ObservedDuplicate)
     }
 
     /// 写进 `X-Dedup` 头或日志的码。**只有真做过判定才给头**：关闭时一个头都不加。
@@ -445,7 +442,10 @@ impl DedupRegistry {
         // 拿到许可后再看条目状态：只有仔细判定才作数。
         enum Existing {
             Fresh,
-            Duplicate { count: u64, outcome: Option<DedupOutcome> },
+            Duplicate {
+                count: u64,
+                outcome: Option<DedupOutcome>,
+            },
             Expired,
         }
         let existing = {
@@ -698,7 +698,10 @@ mod tests {
         let registry = DedupRegistry::new(cfg(DedupMode::Enforce, 0));
         // window_secs = 0 ⇒ `should_compute_fingerprint` 为 false，判定整个关闭。
         assert!(!should_compute_fingerprint(&registry.config()));
-        assert!(matches!(registry.begin(Some("fp-5")).await, DedupDecision::Off));
+        assert!(matches!(
+            registry.begin(Some("fp-5")).await,
+            DedupDecision::Off
+        ));
         assert_eq!(registry.stats().duplicates, 0);
     }
 
@@ -728,7 +731,10 @@ mod tests {
             client: Some("key-2"),
             ..base
         };
-        assert_ne!(request_fingerprint(&base), request_fingerprint(&other_client));
+        assert_ne!(
+            request_fingerprint(&base),
+            request_fingerprint(&other_client)
+        );
 
         let anonymous = FingerprintInput {
             client: None,

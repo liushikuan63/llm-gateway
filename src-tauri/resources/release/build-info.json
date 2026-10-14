@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "version": "0.2.1",
+  "head": "9fe371308435c4a78d23d8374b9e2ffb9197827b",
+  "dirty": true,
+  "built_at": "2026-10-14T14:37:38.786Z",
+  "source_inputs_sha256": "ba291891899d82636213ceaee9efdcb8ec36a03118cdd858d3f73f78ed3b65f1",
+  "source_files": 233,
+  "runtimes": {
+    "node": "v24.19.0",
+    "xray": "v26.3.27",
+    "mihomo": "v1.19.32"
+  }
+}

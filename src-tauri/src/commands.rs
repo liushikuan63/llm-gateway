@@ -18,7 +18,607 @@ use crate::model_catalog;
 use crate::proxy::server::GatewayState;
 use crate::AppState;
 
+fn qoder_login_service(state: &AppState) -> Result<crate::qoder_auth::QoderAuth, String> {
+    state
+        .gateway
+        .qoder_auth
+        .as_ref()
+        .map_err(Clone::clone)?
+        .with_proxy(state.config.read().http_proxy.as_deref())
+}
+
+fn trae_login_service(state: &AppState) -> Result<crate::trae_auth::TraeAuth, String> {
+    let service = state
+        .gateway
+        .trae_auth
+        .as_ref()
+        .map_err(Clone::clone)?
+        .clone();
+    service.set_proxy(state.config.read().http_proxy.as_deref());
+    Ok(service)
+}
+
+#[tauri::command]
+pub async fn trae_login_start(
+    state: State<'_, AppState>,
+    account_id: String,
+    consent_to_register_key: bool,
+) -> Result<crate::trae_auth::LoginStart, String> {
+    if !consent_to_register_key {
+        return Err("Trae首次独立登录需要明确同意设备公钥登记；尚未发起登录".into());
+    }
+    let config = state.config.read().benefits.clone();
+    let session = state
+        .gateway
+        .benefits
+        .session_for_native(&config, &account_id)
+        .await?;
+    trae_login_service(&state)?
+        .start(&account_id, &session, true)
+        .await
+}
+
+#[tauri::command]
+pub async fn trae_login_status(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::trae_auth::LoginStatus, String> {
+    trae_login_service(&state)?.status(&account_id).await
+}
+
+#[tauri::command]
+pub async fn trae_login_poll(
+    state: State<'_, AppState>,
+    account_id: String,
+    login_id: String,
+) -> Result<crate::trae_auth::LoginStatus, String> {
+    trae_login_service(&state)?
+        .poll(&account_id, &login_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn trae_login_cancel(
+    state: State<'_, AppState>,
+    account_id: String,
+    login_id: String,
+) -> Result<(), String> {
+    trae_login_service(&state)?
+        .cancel(&account_id, &login_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn trae_login_refresh(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::trae_auth::LoginStatus, String> {
+    trae_login_service(&state)?.refresh(&account_id).await
+}
+
+#[tauri::command]
+pub async fn trae_login_cancel_refresh(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<(), String> {
+    trae_login_service(&state)?
+        .cancel_refresh(&account_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn qoder_login_start(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<crate::qoder_auth::LoginStart, String> {
+    qoder_login_service(&state)?
+        .start(region, &account_id)
+        .await
+}
+#[tauri::command]
+pub async fn qoder_login_poll(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    login_id: String,
+) -> Result<crate::qoder_auth::LoginStatus, String> {
+    qoder_login_service(&state)?.poll(region, &login_id).await
+}
+#[tauri::command]
+pub async fn qoder_login_cancel(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    login_id: String,
+) -> Result<(), String> {
+    qoder_login_service(&state)?.cancel(region, &login_id).await
+}
+#[tauri::command]
+pub async fn qoder_login_status(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<crate::qoder_auth::LoginStatus, String> {
+    qoder_login_service(&state)?
+        .session_status(region, &account_id)
+        .await
+}
+#[tauri::command]
+pub async fn qoder_login_refresh(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<crate::qoder_auth::LoginStatus, String> {
+    qoder_login_service(&state)?
+        .refresh(region, &account_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn qoder_job_status(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<crate::qoder_auth::JobStatus, String> {
+    qoder_login_service(&state)?
+        .job_status(region, &account_id)
+        .await
+}
+#[tauri::command]
+pub async fn qoder_model_catalog(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<Vec<crate::qoder_auth::CatalogModel>, String> {
+    qoder_login_service(&state)?
+        .model_catalog(region, &account_id)
+        .await
+}
+#[tauri::command]
+pub async fn qoder_job_prepare(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<crate::qoder_auth::JobStatus, String> {
+    qoder_login_service(&state)?
+        .job_prepare(region, &account_id)
+        .await
+}
+#[tauri::command]
+pub async fn qoder_job_refresh(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<crate::qoder_auth::JobStatus, String> {
+    qoder_login_service(&state)?
+        .job_refresh(region, &account_id)
+        .await
+}
+#[tauri::command]
+pub async fn qoder_job_cancel(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<(), String> {
+    qoder_login_service(&state)?
+        .job_cancel(region, &account_id)
+        .await
+}
+
+fn workbuddy_login_service(
+    state: &AppState,
+) -> Result<crate::workbuddy_auth::WorkBuddyAuth, String> {
+    state
+        .gateway
+        .workbuddy_auth
+        .as_ref()
+        .map_err(Clone::clone)?
+        .with_proxy(state.config.read().http_proxy.as_deref())
+}
+
+#[tauri::command]
+pub async fn workbuddy_login_start(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::workbuddy_auth::LoginStart, String> {
+    workbuddy_login_service(&state)?.start(&account_id).await
+}
+#[tauri::command]
+pub async fn workbuddy_login_poll(
+    state: State<'_, AppState>,
+    login_id: String,
+) -> Result<crate::workbuddy_auth::LoginStatus, String> {
+    workbuddy_login_service(&state)?.poll(&login_id).await
+}
+#[tauri::command]
+pub async fn workbuddy_login_cancel(
+    state: State<'_, AppState>,
+    login_id: String,
+) -> Result<(), String> {
+    workbuddy_login_service(&state)?.cancel(&login_id).await
+}
+#[tauri::command]
+pub async fn workbuddy_login_status(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::workbuddy_auth::LoginStatus, String> {
+    workbuddy_login_service(&state)?
+        .session_status(&account_id)
+        .await
+}
+#[tauri::command]
+pub async fn workbuddy_login_refresh(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::workbuddy_auth::LoginStatus, String> {
+    workbuddy_login_service(&state)?.refresh(&account_id).await
+}
+
+#[derive(Serialize)]
+pub struct WorkBuddyRegistration {
+    provider_id: String,
+    runtime_id: String,
+    model_count: usize,
+    warnings: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn register_qoder_provider(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<WorkBuddyRegistration, String> {
+    let catalog = state
+        .gateway
+        .qoder
+        .as_ref()
+        .map_err(Clone::clone)?
+        .discover_models(region, &account_id)
+        .await?;
+    if catalog.models.is_empty() {
+        return Err("该区域和账号尚未返回可接入的模型".into());
+    }
+    let suffix = sha256_hex(&format!("{region:?}:{account_id}"));
+    let runtime_id = format!("qoder-model-{}", &suffix[..16]);
+    let provider_id = format!("qoder-direct-{}", &suffix[..16]);
+    let label = format!(
+        "{} · {account_id}",
+        if region == crate::qoder_auth::Region::Cn {
+            "Qoder CN"
+        } else {
+            "Qoder"
+        }
+    );
+    let mut runtime = crate::domain::AgentRuntime::new(&runtime_id, "qoder-model", &label);
+    runtime.options = Some(serde_json::json!({"region":region,"account_id":account_id}));
+    let now = chrono::Utc::now();
+    let provider = Provider {
+        id: provider_id.clone(),
+        name: label,
+        dialect: Dialect::OpenAI,
+        base_url: region.model_origin().into(),
+        api_key_enc: String::new(),
+        enabled: true,
+        priority: 100,
+        rpm_limit: 0,
+        intelligence: 50,
+        note: Some("独立账号直连；目录声明与真实模型验收分开，积分倍率不代表现金价格".into()),
+        runtime_id: Some(runtime_id.clone()),
+        created_at: now,
+        updated_at: now,
+        models: catalog
+            .models
+            .into_iter()
+            .map(|model| ModelRef {
+                alias: model.id.clone(),
+                upstream: model.id,
+                context_window: model.context_window,
+                supports_tools: model.supports_tools.unwrap_or(false),
+                supports_vision: model.supports_vision.unwrap_or(false),
+                supports_audio: false,
+                supports_video: false,
+                supports_thinking: model.supports_thinking.unwrap_or(false),
+                supports_stream: true,
+                model_type: crate::domain::ModelType::Chat,
+                upstream_path: None,
+                price: model.price,
+                overrides: None,
+                local: None,
+                enabled: true,
+                capabilities: None,
+            })
+            .collect(),
+    };
+    let saved = repo::register_qoder_provider(state.db.pool(), &provider, &runtime, region)
+        .await
+        .map_err(|_| "无法完整保存Qoder接入；已有记录冲突或存储失败，原配置保留")?;
+    state.gateway.cache.invalidate_all();
+    state
+        .gateway
+        .reload_providers()
+        .await
+        .map_err(|_| "接入已保存，但路由刷新失败，请刷新供应商")?;
+    Ok(WorkBuddyRegistration {
+        provider_id,
+        runtime_id,
+        model_count: saved.models.len(),
+        warnings: catalog.warnings,
+    })
+}
+
+#[tauri::command]
+pub async fn register_workbuddy_provider(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<WorkBuddyRegistration, String> {
+    let client = state.gateway.workbuddy.as_ref().map_err(Clone::clone)?;
+    // Explicit catalog discovery; no model completion or test prompt is sent.
+    let catalog = client.discover_models(&account_id).await?;
+    if catalog.models.is_empty() {
+        return Err("该账号暂未返回可接入的模型".into());
+    }
+    let suffix = sha256_hex(&account_id);
+    let runtime_id = format!("workbuddy-model-{}", &suffix[..16]);
+    let provider_id = format!("workbuddy-direct-{}", &suffix[..16]);
+    let mut runtime = crate::domain::AgentRuntime::new(
+        &runtime_id,
+        "workbuddy-model",
+        format!("WorkBuddy · {account_id}"),
+    );
+    runtime.options = Some(serde_json::json!({"account_id":account_id}));
+    let now = chrono::Utc::now();
+    let provider = Provider {
+        id: provider_id.clone(),
+        name: format!("WorkBuddy · {account_id}"),
+        dialect: Dialect::OpenAI,
+        base_url: crate::workbuddy_auth::WorkBuddyAuth::issuer().into(),
+        api_key_enc: String::new(),
+        enabled: true,
+        priority: 100,
+        rpm_limit: 0,
+        intelligence: 50,
+        note: Some("独立账号直连；模型目录能力来自供应商声明，未配置价格时花费未知".into()),
+        runtime_id: Some(runtime_id.clone()),
+        created_at: now,
+        updated_at: now,
+        models: catalog
+            .models
+            .into_iter()
+            .map(|model| ModelRef {
+                alias: model.id.clone(),
+                upstream: model.id,
+                context_window: model.context_window,
+                supports_tools: model.supports_tools.unwrap_or(false),
+                supports_vision: model.supports_vision.unwrap_or(false),
+                supports_audio: model.supports_audio.unwrap_or(false),
+                supports_video: model.supports_video.unwrap_or(false),
+                supports_thinking: model.supports_thinking.unwrap_or(false),
+                supports_stream: model.supports_stream.unwrap_or(false),
+                model_type: model.model_type.unwrap_or_default(),
+                upstream_path: None,
+                price: model.price,
+                overrides: None,
+                local: None,
+                enabled: true,
+                capabilities: None,
+            })
+            .collect(),
+    };
+    let saved = repo::register_workbuddy_provider(state.db.pool(), &provider, &runtime)
+        .await
+        .map_err(|_| {
+            "无法完整保存 WorkBuddy 接入；已有同名记录冲突或存储失败，请检查供应商与运行时"
+                .to_string()
+        })?;
+    state.gateway.cache.invalidate_all();
+    state
+        .gateway
+        .reload_providers()
+        .await
+        .map_err(|_| "接入已保存，但刷新路由失败；请重新刷新供应商".to_string())?;
+    Ok(WorkBuddyRegistration {
+        provider_id,
+        runtime_id,
+        model_count: saved.models.len(),
+        warnings: catalog.warnings,
+    })
+}
+
+#[tauri::command]
+pub async fn client_bridges_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::client_bridges::BridgeStatus>, String> {
+    state.bridges.list().await
+}
+#[tauri::command]
+pub async fn register_client_bridge(
+    state: State<'_, AppState>,
+    kind: String,
+) -> Result<String, String> {
+    let _gate = state.client_commands.lock().await;
+    let status = state.bridges.status(&kind).await?;
+    if !status.ready {
+        return Err("客户端尚未就绪，请核对登录和桥接状态".into());
+    }
+    let id =
+        repo::register_desktop_bridge(state.db.pool(), &kind, status.options.port, &status.models)
+            .await
+            .map_err(|_| "登记失败，原有配置保留；请在供应商页核对".to_string())?;
+    state
+        .gateway
+        .reload_providers()
+        .await
+        .map_err(|_| "登记已保存，但路由刷新失败；请重试".to_string())?;
+    Ok(id)
+}
+#[tauri::command]
+pub async fn register_qoder_cli(state: State<'_, AppState>) -> Result<String, String> {
+    let _gate = state.client_commands.lock().await;
+    let status = state.bridges.status("qoder").await?;
+    let executable = status
+        .cli_path
+        .ok_or_else(|| "未检测到 Qoder CLI，请先安装并登录".to_string())?;
+    let id = repo::register_desktop_qoder(
+        state.db.pool(),
+        &executable,
+        &format!("http://127.0.0.1:{}/v1", status.options.port),
+    )
+    .await
+    .map_err(|_| "Qoder 登记失败或存在配置冲突；现有配置保留，请在供应商页核对".to_string())?;
+    state.gateway.reload_providers().await.map_err(|_| {
+        "Qoder 登记已保存，但路由刷新失败；重试会保留现有设置并重新刷新".to_string()
+    })?;
+    Ok(id)
+}
+#[tauri::command]
+pub async fn save_client_bridge_options(
+    state: State<'_, AppState>,
+    kind: String,
+    options: crate::client_bridges::BridgeOptions,
+) -> Result<(), String> {
+    let _gate = state.client_commands.lock().await;
+    let previous = state.bridges.options(&kind)?;
+    let mut transaction = state
+        .db
+        .pool()
+        .begin()
+        .await
+        .map_err(|_| "无法保存客户端设置：数据库暂不可用".to_string())?;
+    repo::migrate_desktop_bridge_port(&mut transaction, &kind, previous.port, options.port)
+        .await
+        .map_err(|_| "桥接地址联动失败，原设置保留".to_string())?;
+    state.bridges.save_options(&kind, options).await?;
+    if transaction.commit().await.is_err() {
+        if state.bridges.save_options(&kind, previous).await.is_err() {
+            return Err("桥接地址保存失败，设置回退失败；请核对桥接端口和供应商地址".into());
+        }
+        return Err("桥接地址保存失败，已恢复原客户端设置".into());
+    }
+    state
+        .gateway
+        .reload_providers()
+        .await
+        .map_err(|_| "客户端设置已保存，但路由刷新失败；请重试保存".to_string())
+}
+#[tauri::command]
+pub async fn start_client_bridge(state: State<'_, AppState>, kind: String) -> Result<(), String> {
+    let _gate = state.client_commands.lock().await;
+    state.bridges.start(&kind).await
+}
+#[tauri::command]
+pub async fn stop_client_bridge(state: State<'_, AppState>, kind: String) -> Result<(), String> {
+    let _gate = state.client_commands.lock().await;
+    state.bridges.stop(&kind).await
+}
+#[tauri::command]
+pub async fn launch_bridge_client(state: State<'_, AppState>, kind: String) -> Result<(), String> {
+    let _gate = state.client_commands.lock().await;
+    state.bridges.launch_client(&kind).await
+}
+#[tauri::command]
+pub async fn xray_status(
+    state: State<'_, AppState>,
+) -> Result<crate::vpn_xray::XrayStatus, String> {
+    Ok(state.xray.status())
+}
+#[tauri::command]
+pub async fn save_xray_settings(
+    state: State<'_, AppState>,
+    settings: crate::vpn_xray::XraySettings,
+) -> Result<(), String> {
+    let _gate = state.vpn_commands.lock().await;
+    let previous = state.xray.status();
+    let next_proxy = format!("http://127.0.0.1:{}", settings.http_port);
+    state.xray.save_settings(settings).await?;
+    if commit_config(
+        &state,
+        ConfigCommit::ProxyRebind {
+            previous: &previous.proxy_url,
+            next: &next_proxy,
+        },
+    )
+    .is_err()
+    {
+        let manager = state.xray.clone();
+        if manager.save_settings(previous.settings).await.is_err() {
+            return Err("代理联动保存失败，请核对 Xray 端口与网关代理设置".into());
+        }
+        return Err("代理联动保存失败，已恢复原 Xray 设置".into());
+    }
+    Ok(())
+}
+#[tauri::command]
+pub async fn import_xray_profile(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let _gate = state.vpn_commands.lock().await;
+    state.xray.import_profile(std::path::Path::new(&path)).await
+}
+#[tauri::command]
+pub async fn start_xray(state: State<'_, AppState>) -> Result<(), String> {
+    let _gate = state.vpn_commands.lock().await;
+    state.xray.start().await
+}
+#[tauri::command]
+pub async fn stop_xray(state: State<'_, AppState>) -> Result<(), String> {
+    let _gate = state.vpn_commands.lock().await;
+    state.xray.stop().await
+}
+#[tauri::command]
+pub async fn use_xray_for_gateway(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<ConfigUpdateResult, String> {
+    let _gate = state.vpn_commands.lock().await;
+    let status = state.xray.status();
+    if enabled && !status.running {
+        return Err("请先启动 Xray 再应用为网关代理".into());
+    }
+    let cfg = commit_config(
+        &state,
+        ConfigCommit::ProxySet {
+            managed: &status.proxy_url,
+            enabled,
+        },
+    )?;
+    Ok(ConfigUpdateResult {
+        config: cfg,
+        restart_required: false,
+        restart_reasons: vec![],
+    })
+}
+
 /* ---------------------------- 账号权益与奖励 ---------------------------- */
+
+#[tauri::command]
+pub async fn import_benefit_client_session(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::client_session::AccountSnapshot, String> {
+    let _gate = state.client_commands.lock().await;
+    let cfg = state.config.read().clone();
+    if !cfg.benefits.enabled {
+        return Err("请先启用账号权益".into());
+    }
+    let account = cfg
+        .benefits
+        .accounts
+        .iter()
+        .find(|a| a.id == account_id && a.enabled)
+        .ok_or("权益账号不存在或未启用")?;
+    let platform =
+        crate::benefits::ClaimPlatform::parse(&account.platform).ok_or("权益平台尚未适配")?;
+    let session =
+        crate::benefit_login::capture(platform, &crate::benefit_login::resource_root()?).await?;
+    // Revalidate current configuration after the potentially long client launch.
+    let cfg = state.config.read().clone();
+    if !cfg.benefits.enabled {
+        return Err("权益中心已关闭，未保存登录".into());
+    }
+    state
+        .gateway
+        .benefits
+        .set_session(&cfg.benefits, &account_id, &session)
+        .await?;
+    Ok(session.snapshot)
+}
 
 #[tauri::command]
 pub async fn benefits_overview(
@@ -87,6 +687,44 @@ pub async fn benefit_runs(
 
 /* ------------------------------- Provider ------------------------------- */
 
+/// Snapshot known client logs only; no arbitrary path, background watcher or credential access.
+#[tauri::command]
+pub async fn scan_client_usage(
+    state: State<'_, AppState>,
+    from_day: String,
+    to_day: String,
+) -> Result<crate::client_usage::ClientUsageReport, String> {
+    static SCAN: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let home = dirs::home_dir().ok_or("无法定位本机用户目录")?;
+    let providers = repo::list_providers(state.db.pool())
+        .await
+        .map_err(|_| "无法读取本机参考价格")?;
+    let prices: Vec<_> = providers
+        .iter()
+        .flat_map(|p| {
+            p.models.iter().filter_map(|m| {
+                m.price
+                    .clone()
+                    .map(|price| crate::client_usage::UsagePriceReference {
+                        provider: p.name.clone(),
+                        models: vec![m.alias.clone(), m.upstream.clone()],
+                        price,
+                    })
+            })
+        })
+        .collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = SCAN
+            .try_lock()
+            .ok_or("已有本地用量扫描正在执行，请稍后重试")?;
+        let mut report = crate::client_usage::scan_from_home(&home, &from_day, &to_day)?;
+        crate::client_usage::apply_reference_prices(&mut report, &prices);
+        Ok(report)
+    })
+    .await
+    .map_err(|_| "本地用量扫描未能完成".to_owned())?
+}
+
 /// 显式绑定或解除账号上游；普通供应商保存继续保留已有绑定。
 #[tauri::command]
 pub async fn set_provider_runtime(
@@ -102,7 +740,35 @@ pub async fn set_provider_runtime(
         if !runtime.enabled {
             return Err("该账号运行时已停用，不能建立新绑定".into());
         }
-        crate::agent_upstream::resolve_runtime(state.db.pool(), &state.adapters, id).await?;
+        let resolved = crate::agent_upstream::runtime::resolve_chat_runtime(
+            state.db.pool(),
+            &state.adapters,
+            id,
+        )
+        .await?;
+        let official = match resolved {
+            crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { .. } => {
+                Some(("WorkBuddy", crate::workbuddy_auth::WorkBuddyAuth::issuer()))
+            }
+            crate::agent_upstream::runtime::ChatRuntime::Qoder { region, .. } => {
+                Some(("Qoder", region.model_origin()))
+            }
+            _ => None,
+        };
+        if let Some((platform, origin)) = official {
+            let provider = repo::list_providers(state.db.pool())
+                .await
+                .map_err(|_| "无法读取供应商")?
+                .into_iter()
+                .find(|p| p.id == provider_id)
+                .ok_or("供应商不存在")?;
+            if provider.dialect != Dialect::OpenAI
+                || !provider.api_key_enc.is_empty()
+                || provider.base_url.trim_end_matches('/') != origin
+            {
+                return Err(format!("{platform} 独立账号请先在客户端接入页接入模型；绑定需使用官方地址、OpenAI 协议和空 API Key"));
+            }
+        }
     }
     if !repo::set_provider_runtime(state.db.pool(), &provider_id, runtime_id.as_deref())
         .await
@@ -236,6 +902,55 @@ pub async fn discover_provider_models(
     };
     let proxy_url = state.config.read().http_proxy.clone();
 
+    if let Some(id) = saved_provider
+        .as_ref()
+        .and_then(|provider| provider.runtime_id.as_deref())
+    {
+        let runtime = crate::agent_upstream::runtime::resolve_chat_runtime(
+            state.db.pool(),
+            &state.adapters,
+            id,
+        )
+        .await?;
+        if let crate::agent_upstream::runtime::ChatRuntime::Qoder {
+            region,
+            ref account_id,
+            ..
+        } = runtime
+        {
+            if !input.api_key.is_empty()
+                || input.dialect != Dialect::OpenAI
+                || model_catalog::normalize_base_url(input.dialect, &input.base_url)?
+                    != region.model_origin()
+            {
+                return Err("Qoder 账号目录使用所属区域的官方地址和本软件已登录账号，请保留官方地址并清空 API Key".into());
+            }
+            return state
+                .gateway
+                .qoder
+                .as_ref()
+                .map_err(Clone::clone)?
+                .discover_models(region, account_id)
+                .await;
+        }
+        if let crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { account_id, .. } = runtime {
+            if !input.api_key.is_empty()
+                || input.dialect != Dialect::OpenAI
+                || model_catalog::normalize_base_url(input.dialect, &input.base_url)?
+                    != crate::workbuddy_auth::WorkBuddyAuth::issuer()
+            {
+                return Err("WorkBuddy 账号目录使用官方地址和本软件已登录账号，请保留官方地址并清空 API Key".into());
+            }
+            return state
+                .gateway
+                .workbuddy
+                .as_ref()
+                .map_err(Clone::clone)?
+                .discover_models(&account_id)
+                .await;
+        }
+    }
+
     model_catalog::discover(&input, saved_provider.as_ref(), proxy_url.as_deref()).await
 }
 
@@ -248,6 +963,39 @@ pub async fn upsert_provider(
     // Ollama/vLLM 与 RFC1918 LAN 服务仍可用 HTTP。完整接口 URL 会在此收敛为
     // 可由转发器安全追加路径的基础地址。
     let base_url = model_catalog::normalize_base_url(input.dialect, &input.base_url)?;
+    if let Some(id) = &input.id {
+        if let Some(runtime_id) = repo::list_providers(state.db.pool())
+            .await
+            .map_err(|_| "无法读取供应商")?
+            .into_iter()
+            .find(|p| &p.id == id)
+            .and_then(|p| p.runtime_id)
+        {
+            let runtime = repo::get_agent_runtime(state.db.pool(), &runtime_id)
+                .await
+                .map_err(|_| "无法读取账号绑定")?;
+            // The fixed target remains part of the binding while it is disabled.
+            let official = match runtime.as_ref().map(|r| r.kind.as_str()) {
+                Some("workbuddy-model") => Some(crate::workbuddy_auth::WorkBuddyAuth::issuer()),
+                Some("qoder-model") => Some(
+                    crate::agent_upstream::runtime::qoder_options(
+                        runtime.as_ref().and_then(|r| r.options.as_ref()),
+                    )?
+                    .0
+                    .model_origin(),
+                ),
+                _ => None,
+            };
+            if let Some(origin) = official {
+                if input.dialect != Dialect::OpenAI
+                    || base_url != origin
+                    || !input.api_key.is_empty()
+                {
+                    return Err("独立账号使用官方地址、OpenAI 协议和空 API Key；修改接入方式前请先解除账号绑定".into());
+                }
+            }
+        }
+    }
     let enc = if input.api_key.trim().is_empty() {
         // 未填密钥只允许在协议和规范化基础地址均未改变时保留。否则旧 Key
         // 可能被无意转发给另一个服务端，必须要求用户重新确认并提交。
@@ -397,8 +1145,7 @@ pub async fn test_provider(
     let defaults = state.config.read().clone().ollama_options;
     let res = state
         .gateway
-        .upstream
-        .call(
+        .call_chat_upstream(
             &p,
             &req,
             &model,
@@ -436,6 +1183,8 @@ pub struct ConfigUpdateResult {
 enum ConfigCommit<'a> {
     Save(&'a AppConfig),
     RotateKey,
+    ProxyRebind { previous: &'a str, next: &'a str },
+    ProxySet { managed: &'a str, enabled: bool },
 }
 
 /// 无 await 的配置提交临界区；锁序始终是 AppState.config -> GatewayState.cfg。
@@ -457,6 +1206,30 @@ fn commit_config_with(
         ConfigCommit::RotateKey => {
             let mut next = current.clone();
             next.unified_key = crypto::new_unified_key();
+            next
+        }
+        ConfigCommit::ProxyRebind {
+            previous,
+            next: endpoint,
+        } => {
+            let mut next = current.clone();
+            next.http_proxy = crate::outbound::rebind_managed_proxy(
+                current.http_proxy.as_deref(),
+                previous,
+                endpoint,
+            )?;
+            next
+        }
+        ConfigCommit::ProxySet { managed, enabled } => {
+            let mut next = current.clone();
+            let proxy = crate::outbound::validate_proxy(Some(managed))?;
+            if enabled {
+                next.http_proxy = proxy;
+            } else if crate::outbound::validate_proxy(current.http_proxy.as_deref())? == proxy {
+                next.http_proxy = None;
+            } else {
+                return Err("网关当前使用其他代理，已保留其配置".into());
+            }
             next
         }
     };
@@ -482,6 +1255,73 @@ mod config_commit_tests {
     use parking_lot::RwLock;
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
+
+    #[test]
+    fn proxy_patch_preserves_latest_changes_and_only_rebinds_its_own_proxy() {
+        let config = RwLock::new(AppConfig::default());
+        config.write().cache.capacity = 777;
+        config.write().http_proxy = Some("http://127.0.0.1:19999/".into());
+        let preserved = commit_config_with(
+            &config,
+            ConfigCommit::ProxyRebind {
+                previous: "http://127.0.0.1:17891",
+                next: "http://127.0.0.1:18891",
+            },
+            |_| Ok(()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(preserved.cache.capacity, 777);
+        assert_eq!(
+            preserved.http_proxy.as_deref(),
+            Some("http://127.0.0.1:19999/")
+        );
+        config.write().http_proxy = Some("http://127.0.0.1:17891/".into());
+        let rebound = commit_config_with(
+            &config,
+            ConfigCommit::ProxyRebind {
+                previous: "http://127.0.0.1:17891",
+                next: "http://127.0.0.1:18891",
+            },
+            |_| Ok(()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(rebound.cache.capacity, 777);
+        assert_eq!(
+            rebound.http_proxy.as_deref(),
+            Some("http://127.0.0.1:18891/")
+        );
+        assert!(commit_config_with(
+            &config,
+            ConfigCommit::ProxySet {
+                managed: "http://127.0.0.1:17891",
+                enabled: false
+            },
+            |_| Ok(()),
+            |_| {}
+        )
+        .is_err());
+        assert_eq!(config.read().http_proxy, rebound.http_proxy);
+    }
+
+    #[test]
+    fn failed_proxy_persistence_keeps_both_config_and_runtime_unchanged() {
+        let config = RwLock::new(AppConfig::default());
+        let published = Cell::new(false);
+        assert!(commit_config_with(
+            &config,
+            ConfigCommit::ProxySet {
+                managed: "http://127.0.0.1:17891",
+                enabled: true
+            },
+            |_| Err("fixture save failure".into()),
+            |_| published.set(true)
+        )
+        .is_err());
+        assert!(config.read().http_proxy.is_none());
+        assert!(!published.get());
+    }
 
     struct TempConfig(PathBuf);
 
@@ -660,7 +1500,13 @@ async fn local_diagnostics(state: &AppState) -> crate::diagnostics::DiagnosticsR
             mixed_port: snapshot.mixed_port,
             has_error: snapshot.has_error,
         });
-    crate::diagnostics::collect(&cfg, &state.gateway, vpn).await
+    crate::diagnostics::collect_with_xray(
+        &cfg,
+        &state.gateway,
+        vpn,
+        state.xray.diagnostics_snapshot(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -790,7 +1636,31 @@ pub async fn update_config(
         return Err("启用远程 HTTPS 反代模式前，必须先创建并启用至少一个独立访问 Key".into());
     }
     let restart_reasons = listener_restart_reasons(&previous, &cfg);
-    let cfg = commit_config(&state, ConfigCommit::Save(&cfg))?;
+    let scheduler_change = previous.benefits != cfg.benefits
+        && (previous.benefits.scheduler_mode == "windows_task"
+            || cfg.benefits.scheduler_mode == "windows_task");
+    if scheduler_change {
+        crate::benefit_task::register(
+            &cfg.benefits,
+            &crate::config::app_data_dir(),
+            &crate::benefit_login::resource_root()?,
+        )
+        .await?;
+    }
+    let cfg = match commit_config(&state, ConfigCommit::Save(&cfg)) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            if scheduler_change {
+                let _ = crate::benefit_task::register(
+                    &previous.benefits,
+                    &crate::config::app_data_dir(),
+                    &crate::benefit_login::resource_root()?,
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
     Ok(ConfigUpdateResult {
         config: cfg,
         restart_required: !restart_reasons.is_empty(),
@@ -804,6 +1674,139 @@ pub async fn list_models(state: State<'_, AppState>) -> Result<Vec<PublicModel>,
         .await
         .map_err(|e| e.to_string())?;
     Ok(crate::router::Router::public_models(&providers))
+}
+
+#[tauri::command]
+pub async fn desktop_chat(
+    state: State<'_, AppState>,
+    input: crate::desktop_chat::ChatInput,
+) -> Result<crate::desktop_chat::ChatResult, String> {
+    let cfg = state.gateway.cfg_snapshot();
+    let listener = state
+        .gateway
+        .listener_snapshot()
+        .ok_or_else(|| "网关尚未开始监听，请在诊断页检查启动状态".to_string())?;
+    crate::desktop_chat::send(&cfg, listener.bound_addr, input).await
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DesktopChatExportTurn {
+    pub role: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<crate::desktop_chat::ChatResult>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DesktopChatExport {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub exported_at: String,
+    pub turns: Vec<DesktopChatExportTurn>,
+}
+
+/// Writes the caller-selected conversation snapshot locally; no config, credentials or model calls.
+#[tauri::command]
+pub async fn export_desktop_chat(
+    dest: String,
+    transcript: DesktopChatExport,
+) -> Result<(), String> {
+    let path = std::path::Path::new(&dest);
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err("请选择有效的绝对导出文件路径".into());
+    }
+    if transcript.schema_version != 1
+        || uuid::Uuid::parse_str(&transcript.session_id).is_err()
+        || chrono::DateTime::parse_from_rfc3339(&transcript.exported_at).is_err()
+        || transcript.turns.is_empty()
+        || transcript.turns.len() > 128
+        || transcript
+            .turns
+            .iter()
+            .any(|turn| !matches!(turn.role.as_str(), "system" | "user" | "assistant"))
+    {
+        return Err("对话导出内容无效".into());
+    }
+    let mut bytes = serde_json::to_vec_pretty(&transcript).map_err(|e| e.to_string())?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("对话导出超过 16 MiB，请减少当前会话内容".into());
+    }
+    bytes.push(b'\n');
+    std::fs::write(path, bytes).map_err(|e| format!("写对话导出文件失败：{e}"))
+}
+
+#[cfg(test)]
+mod desktop_chat_export_tests {
+    use super::*;
+
+    fn transcript() -> DesktopChatExport {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "session_id": uuid::Uuid::new_v4().to_string(),
+            "exported_at": "2026-10-13T04:00:00Z",
+            "turns": [
+                {"role":"user","content":"本地导出测试"},
+                {"role":"assistant","content":"答复", "result": {
+                    "content":"答复", "reasoning":"保留推理", "model":"m", "routed_via":"p/m",
+                    "session_id":"result-session", "trace_id":"trace-1", "fallback_attempts":1,
+                    "latency_ms":25, "usage":{"prompt_tokens":5,"completion_tokens":7}, "cached":false
+                }}
+            ]
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn export_writes_utf8_snapshot_with_metadata_to_selected_file() {
+        let path = std::env::temp_dir().join(format!(
+            "llmgw-chat-export-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let data = transcript();
+        let expected = serde_json::to_value(&data).unwrap();
+        export_desktop_chat(path.to_string_lossy().into_owned(), data)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual["turns"][1]["result"]["reasoning"], "保留推理");
+        assert_eq!(
+            actual["turns"][1]["result"]["usage"]["completion_tokens"],
+            7
+        );
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_rejects_invalid_snapshot_before_touching_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "llmgw-chat-export-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"existing user file").unwrap();
+        let mut data = transcript();
+        data.schema_version = 9;
+        assert!(
+            export_desktop_chat(path.to_string_lossy().into_owned(), data)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing user file");
+        assert!(export_desktop_chat("relative.json".into(), transcript())
+            .await
+            .is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_surfaces_destination_write_failure() {
+        let directory = std::env::temp_dir();
+        assert!(
+            export_desktop_chat(directory.to_string_lossy().into_owned(), transcript())
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[tauri::command]
@@ -1102,40 +2105,23 @@ pub async fn get_session_messages(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<SessionMessage>, String> {
-    // 管理页需要审计完整历史，而 recent_messages 是给转发链路重建上下文用的，
-    // 会有意过滤 compacted 消息；两者不能复用。
-    let rows = sqlx::query(
-        r#"SELECT id, session_id, role, content, tool_calls, tool_call_id, name,
-                  routed_provider, routed_model,
-                  compacted, prompt_tokens, completion_tokens, created_at
-           FROM session_messages
-           WHERE session_id = ?
-           ORDER BY id ASC
-           LIMIT 500"#,
-    )
-    .bind(id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(|e| e.to_string())?;
+    // Keep the legacy array response for existing consumers; the management UI uses the additive page command.
+    repo::session_messages_page(state.db.pool(), &id, None, 500)
+        .await
+        .map(|page| page.rows)
+        .map_err(|e| e.to_string())
+}
 
-    Ok(rows
-        .iter()
-        .map(|r| SessionMessage {
-            id: r.get("id"),
-            session_id: r.get("session_id"),
-            role: r.get("role"),
-            content: r.get("content"),
-            tool_calls: r.get("tool_calls"),
-            tool_call_id: r.get("tool_call_id"),
-            name: r.get("name"),
-            routed_provider: r.get("routed_provider"),
-            routed_model: r.get("routed_model"),
-            compacted: r.get::<i64, _>("compacted") == 1,
-            prompt_tokens: r.get("prompt_tokens"),
-            completion_tokens: r.get("completion_tokens"),
-            created_at: r.get("created_at"),
-        })
-        .collect())
+#[tauri::command]
+pub async fn get_session_messages_page(
+    state: State<'_, AppState>,
+    id: String,
+    after_id: Option<i64>,
+    limit: Option<i64>,
+) -> Result<repo::SessionMessagesPage, String> {
+    repo::session_messages_page(state.db.pool(), &id, after_id, limit.unwrap_or(500))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1907,7 +2893,11 @@ pub async fn save_agent_runtime(
     state: State<'_, AppState>,
     runtime: crate::domain::AgentRuntime,
 ) -> Result<(), String> {
-    if state.adapters.get(runtime.kind.trim()).is_none() {
+    if runtime.kind == "workbuddy-model" {
+        crate::agent_upstream::runtime::workbuddy_options(runtime.options.as_ref())?;
+    } else if runtime.kind == "qoder-model" {
+        crate::agent_upstream::runtime::qoder_options(runtime.options.as_ref())?;
+    } else if state.adapters.get(runtime.kind.trim()).is_none() {
         // 错误里带上「有哪些可用的」—— 只说「不认识」用户还得自己去翻
         return Err(format!(
             "未知账号运行时类型：{}（可用的有：{}）",

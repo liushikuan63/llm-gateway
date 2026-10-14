@@ -4,3 +4,6 @@
 
 # Preserve the upstream license bytes checked by the pinned Mihomo manifest.
 /src-tauri/resources/mihomo/LICENSE -text
+
+# Preserve the bundled upstream Node license, including its original indentation.
+/src-tauri/resources/node/LICENSE -text -whitespace

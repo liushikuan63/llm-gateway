@@ -227,6 +227,12 @@ pub fn chat_completion_response(
     if let Some(tool_calls) = &resp.tool_calls {
         msg["tool_calls"] = json!(crate::protocol::convert::tool_calls_to_openai(tool_calls));
     }
+    if let Some(reasoning) = &resp.reasoning_content {
+        msg["reasoning_content"] = json!(reasoning);
+    }
+    if let Some(refusal) = &resp.refusal {
+        msg["refusal"] = json!(refusal);
+    }
     json!({
         "id": response_id,
         "object": "chat.completion",
@@ -256,6 +262,12 @@ pub fn usage_json(u: &Usage) -> serde_json::Value {
             details.insert("cache_write_tokens".into(), json!(u.cache_creation_tokens));
         }
         usage["prompt_tokens_details"] = serde_json::Value::Object(details);
+    }
+    if let Some(tokens) = u.reasoning_tokens {
+        usage["completion_tokens_details"] = json!({"reasoning_tokens":tokens});
+    }
+    if let Some(credit) = u.credit {
+        usage["credit"] = json!(credit);
     }
     usage
 }

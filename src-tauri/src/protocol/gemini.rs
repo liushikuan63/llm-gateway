@@ -251,6 +251,7 @@ pub fn from_gemini_response(v: &serde_json::Value) -> ChatResponse {
         .unwrap_or_default();
     let text = parts
         .iter()
+        .filter(|part| part.get("thought").and_then(serde_json::Value::as_bool) != Some(true))
         .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
         .collect::<Vec<_>>()
         .join("");
@@ -293,6 +294,19 @@ pub fn from_gemini_response(v: &serde_json::Value) -> ChatResponse {
             },
         ),
         usage: Some(crate::domain::Usage::from_gemini(&u)),
+        reasoning_content: parts
+            .iter()
+            .filter(|part| part.get("thought").and_then(serde_json::Value::as_bool) == Some(true))
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .fold(None, |acc: Option<String>, text| {
+                let mut acc = acc.unwrap_or_default();
+                acc.push_str(text);
+                Some(acc)
+            }),
+        refusal: cand
+            .get("refusal")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
     }
 }
 
@@ -306,9 +320,36 @@ pub fn extract_stream_text(v: &serde_json::Value) -> String {
         .map(|parts| {
             parts
                 .iter()
+                .filter(|part| {
+                    part.get("thought").and_then(serde_json::Value::as_bool) != Some(true)
+                })
                 .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
                 .join("")
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod auxiliary_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn thought_parts_are_separate_from_visible_answer_and_usage_zero_is_preserved() {
+        let v = json!({"candidates":[{"content":{"parts":[
+            {"text":"provided","thought":true},{"text":"answer"}
+        ]}}],"usageMetadata":{"thoughtsTokenCount":0,"credit":0}});
+        let r = from_gemini_response(&v);
+        assert_eq!(r.content, "answer");
+        assert_eq!(r.reasoning_content.as_deref(), Some("provided"));
+        assert_eq!(extract_stream_text(&v), "answer");
+        assert_eq!(r.usage.as_ref().unwrap().reasoning_tokens, Some(0));
+        assert_eq!(r.usage.as_ref().unwrap().credit, Some(0.0));
+        let plain = from_gemini_response(
+            &json!({"candidates":[{"content":{"parts":[{"text":"answer"}]}}]}),
+        );
+        assert_eq!(plain.content, "answer");
+        assert_eq!(plain.reasoning_content, None);
+        assert_eq!(plain.refusal, None);
+    }
 }

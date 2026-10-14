@@ -281,6 +281,8 @@ fn openai_tool_calls_round_trip_with_type_not_internal_kind() {
                 total_tokens: 3,
                 ..Default::default()
             }),
+            reasoning_content: None,
+            refusal: None,
         },
     );
     assert_eq!(

@@ -9,7 +9,9 @@
 //!  2) 429 与 401 要区别对待：429 进冷却（会自愈），401 标记 Invalid（要人来处理）。
 //!  3) 每次降级都记进 X-Fallback-Attempts 响应头，排查时一眼看到底换了几家。
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -79,10 +81,7 @@ impl AttemptRecord {
             provider_id: provider.id.clone(),
             provider: provider.name.clone(),
             model: model.to_owned(),
-            status: match error {
-                GatewayError::Upstream { status, .. } => Some(*status),
-                _ => None,
-            },
+            status: error.upstream_status(),
             reason: Some(truncate_reason(&error.to_string(), classify(error))),
             latency_ms,
             ok: false,
@@ -162,6 +161,13 @@ fn truncate_reason(message: &str, kind: &str) -> String {
     format!("{head}…")
 }
 
+/// Authentication boundaries belong to the whole request, including later cascade steps.
+#[derive(Default)]
+pub struct AuthIsolation {
+    no_keyless_fallback: bool,
+    refused: HashSet<String>,
+}
+
 /// 执行上下文：每个候选尝试一次，返回 Err 则换下一个
 pub struct FailoverChain<'a> {
     candidates: &'a [Candidate],
@@ -172,6 +178,8 @@ pub struct FailoverChain<'a> {
     auth_mode: AuthFailureMode,
     /// 判定「真实不可用」之前的独立复测次数。
     auth_confirm_retries: u32,
+    admission: Option<Arc<crate::router::Router>>,
+    auth_isolation: Option<Arc<parking_lot::Mutex<AuthIsolation>>>,
 }
 
 /// 轻量标志位：流式写出前向代理层汇报
@@ -207,6 +215,8 @@ impl<'a> FailoverChain<'a> {
             stream_started,
             auth_mode: AuthFailureMode::Strict,
             auth_confirm_retries: 0,
+            admission: None,
+            auth_isolation: None,
         }
     }
 
@@ -215,6 +225,26 @@ impl<'a> FailoverChain<'a> {
         self.auth_mode = mode;
         self.auth_confirm_retries = confirm_retries.min(3);
         self
+    }
+
+    pub fn with_admission(mut self, router: Arc<crate::router::Router>) -> Self {
+        self.admission = Some(router);
+        self
+    }
+
+    /// Share only between chains handling the same request; separate requests stay independent.
+    pub fn with_auth_isolation(
+        mut self,
+        isolation: Arc<parking_lot::Mutex<AuthIsolation>>,
+    ) -> Self {
+        self.auth_isolation = Some(isolation);
+        self
+    }
+
+    fn admitted(&self, candidate: &Candidate) -> bool {
+        self.admission
+            .as_ref()
+            .map_or(true, |r| r.try_reserve(candidate))
     }
 
     /// 逐个候选尝试。`f` 拿到 (provider, model)，返回业务结果。
@@ -264,9 +294,19 @@ impl<'a> FailoverChain<'a> {
         // 一旦发生过鉴权失败，后续候选**不得落到免 Key 后端**（本地 Ollama、
         // 无鉴权的自建服务）。硬约束「401 不回落」：不能因为上游拒了 Key 就
         // 悄悄换一家不需要凭据的服务——那既可能泄露上下文，也让错误更难追。
-        let mut no_keyless_fallback = false;
+        let isolation = self.auth_isolation.clone().unwrap_or_default();
 
         for c in self.candidates {
+            let (refused, no_keyless_fallback) = {
+                let auth = isolation.lock();
+                (
+                    auth.refused.contains(&c.provider.id),
+                    auth.no_keyless_fallback,
+                )
+            };
+            if refused {
+                continue;
+            }
             // 确认复测也占用尝试预算；按候选数量 take 会在复测之后继续多发一次。
             if attempts >= limit {
                 break;
@@ -277,6 +317,10 @@ impl<'a> FailoverChain<'a> {
                     c.provider.name,
                     c.model.upstream
                 );
+                continue;
+            }
+            // Only actual sends consume the attempt budget or affect upstream health.
+            if !self.admitted(c) {
                 continue;
             }
             attempts += 1;
@@ -329,9 +373,15 @@ impl<'a> FailoverChain<'a> {
                         }
                         // 即使复测结果变成 429 等暂态故障，先前的鉴权拒绝也不能
                         // 成为发送到免 Key 服务的理由。
-                        no_keyless_fallback = true;
+                        isolation.lock().no_keyless_fallback = true;
                         match self
-                            .confirm_auth_failure(c, &mut f, records, &mut attempts)
+                            .confirm_auth_failure(
+                                c,
+                                &mut f,
+                                records,
+                                &mut attempts,
+                                &mut on_failure,
+                            )
                             .await
                         {
                             ConfirmOutcome::Recovered(v) => {
@@ -345,6 +395,7 @@ impl<'a> FailoverChain<'a> {
                                 });
                             }
                             ConfirmOutcome::StillRefused => {
+                                isolation.lock().refused.insert(c.provider.id.clone());
                                 // 已确认不可用：上层按策略把这家供应商自动停用，这里换下一家继续。
                                 on_auth_confirmed(&c.provider, &e);
                                 last_err = Some(e);
@@ -372,19 +423,24 @@ impl<'a> FailoverChain<'a> {
     ///
     /// 复测复用同一个闭包 `f`，因此发的是**同一个请求**，不是另造探针：
     /// 探针成功只能证明「探针能过」，证明不了「这个请求能过」。
-    async fn confirm_auth_failure<T, F, Fut>(
+    async fn confirm_auth_failure<T, F, Fut, E>(
         &self,
         c: &Candidate,
         f: &mut F,
         records: &mut Vec<AttemptRecord>,
         attempts: &mut usize,
+        on_failure: &mut E,
     ) -> ConfirmOutcome<T>
     where
         F: FnMut(Provider, String) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
+        E: FnMut(&Provider, &str, &GatewayError),
     {
         for _ in 0..self.auth_confirm_retries {
             if *attempts >= self.max_attempts {
+                return ConfirmOutcome::Undecidable(None);
+            }
+            if !self.admitted(c) {
                 return ConfirmOutcome::Undecidable(None);
             }
             *attempts += 1;
@@ -406,6 +462,7 @@ impl<'a> FailoverChain<'a> {
                         &e,
                         started.elapsed().as_millis() as u64,
                     ));
+                    on_failure(&c.provider, &c.model.upstream, &e);
                     if !fatal {
                         return ConfirmOutcome::Undecidable(Some(e));
                     }
@@ -428,6 +485,7 @@ enum ConfirmOutcome<T> {
 /// 把一次失败归类成人类可读的原因，写进请求日志的 error 字段
 pub fn classify(err: &GatewayError) -> &'static str {
     match err {
+        GatewayError::NoReplay { source } => classify(source),
         GatewayError::Upstream { status, .. } => match *status {
             401 | 403 => "auth_failed",
             408 => "timeout",

@@ -5,23 +5,32 @@ pub mod boot;
 pub mod agent_upstream;
 // 子进程工具：A6/A7 与 C1（MCP）共用同一份「杀进程树」实现。
 pub mod benefit_config;
+pub mod benefit_login;
+pub mod benefit_task;
 pub mod benefits;
 pub mod budget;
 pub mod bundle;
 pub mod cache;
 pub mod capability;
+#[cfg(windows)]
+mod cli_job;
 pub mod cli_tools;
+pub mod client_bridges;
+pub mod client_session;
+pub mod client_usage;
 mod commands;
 pub mod config;
 pub mod context;
 pub mod crypto;
 pub mod db;
+pub mod desktop_chat;
 pub mod diagnostics;
 pub mod domain;
 pub mod error;
 pub mod intellect;
 pub mod local_models;
 pub mod log_rotate;
+pub mod managed_runtime;
 pub mod mcp;
 pub mod media;
 pub mod model_catalog;
@@ -34,14 +43,19 @@ pub mod proc_util;
 pub mod protocol;
 pub mod provider_quota;
 pub mod proxy;
+pub mod qoder_auth;
 pub mod router;
 pub mod search;
 pub mod stale_models;
 pub mod telemetry;
 pub mod trace;
+pub mod trae_auth;
+pub mod trae_benefits;
 pub mod vpn;
 pub mod vpn_external;
 pub mod vpn_install;
+pub mod vpn_xray;
+pub mod workbuddy_auth;
 
 use crate::config::AppConfig;
 use crate::proxy::server::GatewayState;
@@ -63,6 +77,10 @@ pub struct AppState {
     /// 每个请求各造一份没有意义。A6/A7 加真适配器时也在这里注册一次。
     pub adapters: Arc<crate::agent_upstream::AdapterRegistry>,
     pub vpn: Arc<crate::vpn::VpnManager>,
+    pub bridges: Arc<crate::client_bridges::BridgeManager>,
+    pub xray: Arc<crate::vpn_xray::XrayManager>,
+    pub vpn_commands: tokio::sync::Mutex<()>,
+    pub client_commands: tokio::sync::Mutex<()>,
 }
 
 /// 在事件循环启动后异步完成后端初始化，避免阻塞首帧渲染。
@@ -151,6 +169,16 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
         Ok(archive) => vpn::VpnManager::with_bundled_archive(vpn_root, archive),
         Err(_) => vpn::VpnManager::new(vpn_root),
     };
+    let resources = app
+        .path()
+        .resolve("resources", tauri::path::BaseDirectory::Resource)
+        .unwrap_or_else(|_| std::path::PathBuf::from("resources"));
+    let bridges = crate::client_bridges::BridgeManager::new(
+        config::app_data_dir().join("client-bridges"),
+        resources.clone(),
+    );
+    let xray =
+        crate::vpn_xray::XrayManager::new(config::app_data_dir().join("vpn-xray"), resources);
     app.manage(AppState {
         db,
         config: Arc::new(parking_lot::RwLock::new(cfg)),
@@ -158,6 +186,10 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
         // A5：内置假适配器 + A6/A7 的真适配器 + B8 的外部插件（上面刚加载）。
         adapters,
         vpn: Arc::new(vpn_manager),
+        bridges: Arc::new(bridges),
+        xray: Arc::new(xray),
+        vpn_commands: tokio::sync::Mutex::new(()),
+        client_commands: tokio::sync::Mutex::new(()),
     });
 
     let gw = gateway.clone();
@@ -310,7 +342,43 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::trae_login_start,
+            commands::trae_login_status,
+            commands::trae_login_poll,
+            commands::trae_login_cancel,
+            commands::trae_login_refresh,
+            commands::trae_login_cancel_refresh,
+            commands::workbuddy_login_start,
+            commands::qoder_login_start,
+            commands::qoder_login_poll,
+            commands::qoder_login_cancel,
+            commands::qoder_login_status,
+            commands::qoder_login_refresh,
+            commands::qoder_job_status,
+            commands::qoder_model_catalog,
+            commands::qoder_job_prepare,
+            commands::qoder_job_refresh,
+            commands::qoder_job_cancel,
+            commands::workbuddy_login_poll,
+            commands::workbuddy_login_cancel,
+            commands::workbuddy_login_status,
+            commands::workbuddy_login_refresh,
+            commands::register_workbuddy_provider,
+            commands::register_qoder_provider,
+            commands::client_bridges_status,
+            commands::register_qoder_cli,
+            commands::save_client_bridge_options,
+            commands::start_client_bridge,
+            commands::stop_client_bridge,
+            commands::launch_bridge_client,
+            commands::xray_status,
+            commands::save_xray_settings,
+            commands::import_xray_profile,
+            commands::start_xray,
+            commands::stop_xray,
+            commands::use_xray_for_gateway,
             commands::benefits_overview,
+            commands::import_benefit_client_session,
             commands::claim_benefit_now,
             commands::set_benefit_token,
             commands::clear_benefit_token,
@@ -342,6 +410,10 @@ pub fn run() {
             commands::get_config,
             commands::update_config,
             commands::list_models,
+            commands::register_client_bridge,
+            commands::desktop_chat,
+            commands::export_desktop_chat,
+            commands::scan_client_usage,
             commands::get_unified_key,
             commands::rotate_unified_key,
             commands::list_remote_access_keys,
@@ -350,6 +422,7 @@ pub fn run() {
             commands::delete_remote_access_key,
             commands::list_sessions,
             commands::get_session_messages,
+            commands::get_session_messages_page,
             commands::delete_session,
             commands::compact_session,
             commands::list_snapshots,
@@ -421,6 +494,8 @@ pub fn run() {
             if matches!(&event, tauri::RunEvent::Exit) {
                 if let Some(state) = app.try_state::<AppState>() {
                     state.vpn.shutdown_blocking();
+                    state.bridges.shutdown_blocking();
+                    state.xray.shutdown_blocking();
                 }
             }
             if let tauri::RunEvent::WindowEvent {

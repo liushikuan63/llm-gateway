@@ -12,6 +12,56 @@ use llm_gateway_lib::vpn_external::{
 use std::fs;
 use std::path::PathBuf;
 
+async fn bounded_controller_case(oversized_json: bool) {
+    use axum::{body::Body, response::IntoResponse, routing::get, Json, Router};
+    use serde_json::json;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let held = |count: usize| {
+        Body::from_stream(futures_util::stream::StreamExt::chain(
+            futures_util::stream::once(async move {
+                Ok::<_, std::convert::Infallible>(vec![b'x'; count])
+            }),
+            futures_util::stream::pending::<Result<Vec<u8>, std::convert::Infallible>>(),
+        ))
+    };
+    let app=Router::new().route("/proxies",get(move||async move {if oversized_json {held(4*1024*1024+1).into_response()}else{Json(json!({"proxies":{"GLOBAL":{"type":"Selector","now":"n"},"n":{"type":"socks"}}})).into_response()}}))
+        .route("/version",get(||async{Json(json!({"version":"fixture"}))}))
+        .route("/traffic",get(move||async move{held(65537)}));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let d = Directory::new();
+    let cfg = d.file("config.yaml", &format!("external-controller: {address}\n"));
+    let app = d.file("app.json", "{}");
+    let started = std::time::Instant::now();
+    let result = llm_gateway_lib::vpn_external::probe_with(cfg, app).await;
+    task.abort();
+    if oversized_json {
+        assert!(!result.available);
+        assert!(
+            result.error.unwrap_or_default().contains("过大"),
+            "oversize must reject before EOF/timeout"
+        );
+    } else {
+        assert!(result.available);
+        assert_eq!(result.up_kbps, None);
+        assert_eq!(result.down_kbps, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "invalid traffic must stop promptly at size limit"
+        );
+    }
+}
+#[tokio::test]
+async fn streaming_json_is_rejected_at_limit_before_connection_ends() {
+    bounded_controller_case(true).await;
+}
+#[tokio::test]
+async fn oversized_unfinished_traffic_does_not_wait_or_break_valid_controller() {
+    bounded_controller_case(false).await;
+}
+
 struct Directory(PathBuf);
 
 impl Directory {
@@ -54,7 +104,10 @@ fn parses_external_controller() {
 #[test]
 fn rejects_missing_or_empty_controller() {
     // 对照组 1：没有这一行。
-    assert_eq!(parse_external_controller("mixed-port: 1\nmode: Rule\n"), None);
+    assert_eq!(
+        parse_external_controller("mixed-port: 1\nmode: Rule\n"),
+        None
+    );
     // 对照组 2：有键但值为空。
     assert_eq!(parse_external_controller("external-controller:\n"), None);
     // 对照组 3：只有空白值。
@@ -93,6 +146,81 @@ fn loopback_authority_judgement() {
     assert!(!is_loopback_authority("127.0.0.1"));
     assert!(!is_loopback_authority("127.0.0.1:"));
     assert!(!is_loopback_authority("127.0.0.1:abc"));
+}
+
+#[test]
+fn controller_requires_valid_port_and_accepts_yaml_comments() {
+    for value in ["127.0.0.1:0", "127.0.0.1:65536", "::1:8080"] {
+        assert!(!is_loopback_authority(value), "invalid authority: {value}");
+    }
+    assert_eq!(
+        parse_external_controller("external-controller: '127.0.0.1:9090' # local API\n").as_deref(),
+        Some("127.0.0.1:9090")
+    );
+}
+
+#[test]
+fn subscription_link_decodes_json_escapes_and_rejects_credentials() {
+    assert_eq!(
+        parse_sub_link(
+            r#"{"subLink":"https:\/\/subscription.invalid\/api?key=a\u0026b"} trailing"#
+        )
+        .as_deref(),
+        Some("https://subscription.invalid/api?key=a&b")
+    );
+    assert!(parse_sub_link(r#"{"subLink":"https://user:pass@subscription.invalid/"}"#).is_none());
+}
+
+#[tokio::test]
+async fn probe_resolves_selector_to_real_node_and_unknown_delay() {
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/proxies",
+            get(|| async {
+                Json(json!({"proxies": {
+                    "GLOBAL": {"type":"Selector","now":"MoJie"},
+                    "MoJie": {"type":"Selector","now":"auto"},
+                    "auto": {"type":"URLTest","now":"node-b"},
+                    "node-a": {"type":"Hysteria2","history":[{"delay":0}]},
+                    "node-b": {"type":"Hysteria2","history":[{"delay":321}]}
+                }}))
+            }),
+        )
+        .route(
+            "/version",
+            get(|| async { Json(json!({"version":"fixture"})) }),
+        )
+        .route(
+            "/traffic",
+            get(|| async { "{\"up\":1024,\"down\":2048}\n" }),
+        );
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = Directory::new();
+    let cfg = dir.file("config.yaml", &format!("external-controller: {address}\n"));
+    let config_before = fs::read(&cfg).unwrap();
+    let app_cfg = dir.file("config.json", "{}");
+    let status = llm_gateway_lib::vpn_external::probe_with(cfg.clone(), app_cfg).await;
+    task.abort();
+    assert!(status.available, "{:?}", status.error);
+    assert_eq!(status.current.as_deref(), Some("node-b"));
+    assert_eq!(status.delay_ms, Some(321));
+    assert_eq!(status.nodes.len(), 2, "groups are not physical nodes");
+    assert_eq!(status.nodes[0].name, "node-b");
+    assert_eq!(
+        status.nodes[1].delay_ms, None,
+        "zero means failed/unknown delay"
+    );
+    assert_eq!(status.up_kbps, Some(1.0));
+    assert_eq!(status.down_kbps, Some(2.0));
+    assert_eq!(
+        fs::read(cfg).unwrap(),
+        config_before,
+        "probe stays read-only"
+    );
 }
 
 // ── 伪装节点名里的额度 / 到期 ──────────────────────────────────────────────
@@ -191,7 +319,10 @@ fn sub_link_absent_or_invalid() {
     // 对照组：没有 subLink、空值、非 http 协议，都必须返回 None。
     assert_eq!(parse_sub_link("{\"first\": false}"), None);
     assert_eq!(parse_sub_link("{\"subLink\": \"\"}"), None);
-    assert_eq!(parse_sub_link("{\"subLink\": \"file:///etc/passwd\"}"), None);
+    assert_eq!(
+        parse_sub_link("{\"subLink\": \"file:///etc/passwd\"}"),
+        None
+    );
 }
 
 // ── probe_with：缺失配置时必须给出可读原因而不是 panic ────────────────────
@@ -221,4 +352,34 @@ async fn probe_without_controller_reports_reason() {
         .as_deref()
         .unwrap_or_default()
         .contains("external-controller"));
+}
+
+#[tokio::test]
+#[ignore = "requires LLMGW_TEST_EXTERNAL_MOJIE_CONFIG; local controller reads only, no subscription or model traffic"]
+async fn live_mojie_controller_readonly_acceptance() {
+    let path = PathBuf::from(
+        std::env::var("LLMGW_TEST_EXTERNAL_MOJIE_CONFIG").expect("explicit config path required"),
+    );
+    let before = fs::read(&path).unwrap();
+    let dir = Directory::new();
+    // A missing app-config disables subscription fetching and avoids reading credentials.
+    let status =
+        llm_gateway_lib::vpn_external::probe_with(path.clone(), dir.0.join("missing.json")).await;
+    assert!(
+        status.available,
+        "controller unavailable: {:?}",
+        status.error
+    );
+    assert!(status.kernel.is_some(), "version endpoint must be readable");
+    assert!(!status.nodes.is_empty(), "real nodes must be present");
+    assert!(
+        status.up_kbps.is_some() && status.down_kbps.is_some(),
+        "traffic sample must be readable"
+    );
+    assert_eq!(
+        fs::read(path).unwrap(),
+        before,
+        "external configuration must stay unchanged"
+    );
+    println!("LIVE_MOJIE_READONLY_OK nodes={} current_resolved={} traffic_sample=true subscription_requests=0", status.nodes.len(), status.current.is_some());
 }

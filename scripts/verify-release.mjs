@@ -154,4 +154,25 @@ if (readFileSync(requireFile(`${resourcePrefix}LLM-Gateway-LICENSE.txt`), "utf8"
 if (!sourceNotice.includes(manifest.source_archive) || !sourceNotice.includes(manifest.source_url)) {
   fail("Mihomo source notice must identify the included source and upstream URL");
 }
-console.log("release configuration verified (pinned Mihomo archive, source and license)");
+const runtimeCode = readFileSync(resolve(tauriRoot, "src/managed_runtime.rs"), "utf8");
+for (const runtime of ["node", "xray"]) {
+  const prefix = `resources/${runtime}/`;
+  if (!config.bundle?.resources?.includes(`${prefix}*`)) fail(`${runtime} offline runtime must be bundled`);
+  const metadata = JSON.parse(readFileSync(requireFile(`${prefix}manifest.json`), "utf8"));
+  if (!/^[a-z]+\.exe$/.test(metadata.entry) || !/^[a-f0-9]{64}$/.test(metadata.sha256)) fail(`${runtime} manifest is not pinned`);
+  const digest = createHash("sha256").update(readFileSync(requireFile(`${prefix}${metadata.entry}`))).digest("hex");
+  if (digest !== metadata.sha256 || !runtimeCode.includes(metadata.sha256)) fail(`${runtime} bundle and runtime checksums differ`);
+  requireFile(`${prefix}LICENSE`);
+  const notice = readFileSync(requireFile(`${prefix}SOURCE.txt`), "utf8");
+  if (!notice.includes(metadata.source) || !notice.includes(metadata.source_code)) fail(`${runtime} source notice is incomplete`);
+}
+for (const [directory, files] of [["qoder-protocol", ["cosy.cjs", "inference.cjs", "worker.cjs"]], ["trae-protocol", ["crypto.cjs", "worker.cjs"]]]) {
+  const prefix = `resources/${directory}/`;
+  if (!config.bundle?.resources?.includes(`${prefix}*`)) fail(`${directory} private protocol must be bundled`);
+  for (const name of files) {
+    const bundled = readFileSync(requireFile(`${prefix}${name}`));
+    const source = readFileSync(resolve(projectRoot, "scripts", directory, name));
+    if (!bundled.equals(source)) fail(`${directory}/${name} differs from current source`);
+  }
+}
+console.log("release configuration verified (pinned Mihomo, Node and Xray; private protocols, offline runtimes, source and licenses)");

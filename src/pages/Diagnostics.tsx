@@ -8,7 +8,7 @@ const STATUS = {
   error: { label: "异常", className: "err" },
   unknown: { label: "未知", className: "" },
 };
-const PROXY_MODES = { none: "未使用代理", managed_vpn: "受管 VPN 代理", external: "其他代理", invalid: "代理配置无效" };
+const PROXY_MODES = { none: "未使用代理", managed_vpn: "受管 Mihomo 代理", managed_xray: "受管 Xray 代理", external: "其他代理", invalid: "代理配置无效" };
 
 function statusInfo(status: string) {
   return STATUS[status as keyof typeof STATUS] ?? STATUS.unknown;
@@ -111,7 +111,7 @@ export default function DiagnosticsPage() {
             <div className="field"><label>供应商与模型</label><div>{summary.providers_total} 个供应商 · {summary.providers_enabled} 个启用 · {summary.providers_disabled} 个停用</div><div className="muted">{summary.models_enabled} 个启用模型</div></div>
             <div className="field"><label>精确响应缓存</label><div>{summary.cache_enabled ? "已启用" : "已关闭"} · 容量 {summary.cache_capacity}</div><div className="muted">有效期：{summary.cache_ttl_secs === 0 ? "不过期" : `${summary.cache_ttl_secs} 秒`} · 存储 {summary.cache_entries} 条（含待清理条目）</div><div className="muted">命中 {summary.cache_hits} · 未命中 {summary.cache_misses}</div></div>
             <div className="field"><label>远程访问与预算</label><div>{summary.remote_keys_enabled} 个启用 Key · 其中 {summary.budgeted_keys} 个已设预算</div><div className="muted">{budgetCounts.length === 0 ? "尚无预算币种" : budgetCounts.map(item => `${item.currency === "unknown" ? "未知币种" : item.currency.toUpperCase()}：${item.count} 个`).join(" · ")}</div></div>
-            <div className="field"><label>网关代理出口</label><div>{summary.proxy_mode === "external" && summary.vpn_running === null ? "代理归属未知" : PROXY_MODES[summary.proxy_mode] ?? "状态未知"}</div><div className="muted">VPN 内核{summary.vpn_running === null ? "状态未知" : summary.vpn_running ? "运行中" : "已停止"}</div></div>
+            <div className="field"><label>网关代理出口</label><div>{summary.proxy_mode === "external" && summary.vpn_running === null ? "代理归属未知" : PROXY_MODES[summary.proxy_mode] ?? "状态未知"}</div><div className="muted">受管代理内核{summary.vpn_running === null ? "状态未知" : summary.vpn_running ? "运行中" : "已停止"}</div></div>
           </div>
         </div>}
         <div className="card" data-testid="diagnostics-checks">

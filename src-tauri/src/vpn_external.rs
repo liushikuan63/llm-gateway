@@ -82,18 +82,20 @@ pub fn parse_sub_link(app_config: &str) -> Option<String> {
     let rest = &app_config[idx + "\"subLink\"".len()..];
     let colon = rest.find(':')?;
     let after = rest[colon + 1..].trim_start();
-    let quote = after.chars().next()?;
-    if quote != '"' {
+    let url = serde_json::Deserializer::from_str(after)
+        .into_iter::<String>()
+        .next()?
+        .ok()?;
+    let parsed = Url::parse(url.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
         return None;
     }
-    let body = &after[1..];
-    let end = body.find('"')?;
-    let url = body[..end].trim();
-    if url.starts_with("http://") || url.starts_with("https://") {
-        Some(url.to_string())
-    } else {
-        None
-    }
+    Some(parsed.to_string())
 }
 
 /// 单个外部节点（只保留界面需要的字段）。
@@ -178,7 +180,12 @@ pub fn parse_external_controller(yaml: &str) -> Option<String> {
             Some(rest) => rest.trim(),
             None => continue,
         };
-        let value = rest.trim_matches('"').trim_matches('\'').trim();
+        let value = rest
+            .split('#')
+            .next()?
+            .trim()
+            .trim_matches(['"', '\''])
+            .trim();
         if value.is_empty() {
             continue;
         }
@@ -195,14 +202,16 @@ pub fn parse_external_controller(yaml: &str) -> Option<String> {
 pub fn is_loopback_authority(value: &str) -> bool {
     let host = match value.rsplit_once(':') {
         Some((host, port)) => {
-            if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+            if !port.chars().all(|c| c.is_ascii_digit())
+                || !matches!(port.parse::<u16>(), Ok(1..=65535))
+            {
                 return false;
             }
             host
         }
         None => return false,
     };
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
 }
 
 /// 从伪装节点名里提取额度，例如「剩余流量：712.08 GB」→ `712.08 GB`。
@@ -249,7 +258,11 @@ fn probe_client() -> Result<Client, String> {
         .map_err(|_| "无法初始化外部 VPN 探测客户端".to_string())
 }
 
-async fn get_json(client: &Client, base: &Url, segments: &[&str]) -> Result<serde_json::Value, String> {
+async fn get_json(
+    client: &Client,
+    base: &Url,
+    segments: &[&str],
+) -> Result<serde_json::Value, String> {
     let mut url = base.clone();
     url.path_segments_mut()
         .map_err(|_| "外部 VPN 地址无效".to_string())?
@@ -261,15 +274,23 @@ async fn get_json(client: &Client, base: &Url, segments: &[&str]) -> Result<serd
         .await
         .map_err(|_| "连不上外部 VPN 控制器".to_string())?;
     if !response.status().is_success() {
-        return Err(format!("外部 VPN 控制器返回 HTTP {}", response.status().as_u16()));
+        return Err(format!(
+            "外部 VPN 控制器返回 HTTP {}",
+            response.status().as_u16()
+        ));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| "读外部 VPN 响应失败".to_string())?;
-    // 与 vpn.rs 同样的思路限制体积：节点很多时也不过几十 KB，超过 4MB 视为异常。
-    if bytes.len() > 4 * 1024 * 1024 {
+    const LIMIT: usize = 4 * 1024 * 1024;
+    if response.content_length().is_some_and(|n| n > LIMIT as u64) {
         return Err("外部 VPN 响应过大".to_string());
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "读外部 VPN 响应失败".to_owned())?;
+        if chunk.len() > LIMIT.saturating_sub(bytes.len()) {
+            return Err("外部 VPN 响应过大".into());
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| "外部 VPN 返回了无效 JSON".to_string())
 }
@@ -290,15 +311,23 @@ async fn sample_traffic(client: &Client, base: &Url) -> Option<(f64, f64)> {
     }
     let mut buffer = String::new();
     let mut stream = response.bytes_stream();
-    // 最多读 8 个 chunk 或 4 秒，避免代理空闲时把界面拖住。
+    // At most 64 KiB and one absolute four-second read window; chunk boundaries are arbitrary.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     while tokio::time::Instant::now() < deadline {
         // timeout 后是 Result<Option<Result<Bytes, Error>>, Elapsed>：三层都要拆开。
         // 超时、流结束、传输出错三种情况都直接返回 None（网速采样失败不该让整个查询失败）。
-        let chunk = match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+        let chunk = match tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + Duration::from_secs(2)),
+            stream.next(),
+        )
+        .await
+        {
             Ok(Some(Ok(chunk))) => chunk,
             _ => return None,
         };
+        if chunk.len() > (64 * 1024usize).saturating_sub(buffer.len()) {
+            return None;
+        }
         let text = String::from_utf8_lossy(&chunk);
         buffer.push_str(&text);
         while let Some(pos) = buffer.find('\n') {
@@ -412,6 +441,28 @@ pub async fn probe_with(config_path: PathBuf, app_config_path: PathBuf) -> Exter
                 return status;
             };
             let mut nodes = Vec::new();
+            // Prefer mojie's selector; GLOBAL often points to another group.
+            let mut selected = entries
+                .get("MoJie")
+                .or_else(|| entries.get("GLOBAL"))
+                .and_then(|entry| entry.get("now"))
+                .and_then(serde_json::Value::as_str);
+            let mut visited = std::collections::HashSet::new();
+            while let Some(name) = selected {
+                if !visited.insert(name) {
+                    selected = None;
+                    break;
+                }
+                let Some(entry) = entries.get(name) else {
+                    selected = None;
+                    break;
+                };
+                match entry.get("now").and_then(serde_json::Value::as_str) {
+                    Some(next) => selected = Some(next),
+                    None => break,
+                }
+            }
+            status.current = selected.map(str::to_owned);
             for (name, entry) in entries {
                 if status.quota.is_none() {
                     status.quota = extract_quota(name);
@@ -419,21 +470,17 @@ pub async fn probe_with(config_path: PathBuf, app_config_path: PathBuf) -> Exter
                 if status.expire.is_none() {
                     status.expire = extract_expire(name);
                 }
-                if name == "MoJie" || name == "GLOBAL" {
-                    if status.current.is_none() {
-                        status.current = entry
-                            .get("now")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned);
-                    }
-                }
                 let kind = entry
                     .get("type")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
                 // 伪装节点（额度/到期）不作为可测节点展示。
-                if extract_quota(name).is_some() || extract_expire(name).is_some() {
+                if extract_quota(name).is_some()
+                    || extract_expire(name).is_some()
+                    || entry.get("now").is_some()
+                    || matches!(kind.as_str(), "Direct" | "Reject" | "RejectDrop")
+                {
                     continue;
                 }
                 let delay_ms = entry
@@ -441,7 +488,8 @@ pub async fn probe_with(config_path: PathBuf, app_config_path: PathBuf) -> Exter
                     .and_then(serde_json::Value::as_array)
                     .and_then(|history| history.last())
                     .and_then(|last| last.get("delay"))
-                    .and_then(serde_json::Value::as_i64);
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|delay| *delay > 0);
                 nodes.push(ExternalVpnNode {
                     name: name.clone(),
                     kind,
@@ -478,7 +526,7 @@ pub async fn probe_with(config_path: PathBuf, app_config_path: PathBuf) -> Exter
             .map(str::to_owned);
     }
     // 额度优先用订阅头（FlClash / v2rayN 的做法）：比 mojie 伪装节点名里的快照新。
-    // 实测同一时刻：伪节点名 712.08 GB，订阅头算出 728.79 GB。
+    // 剩余值必须同时扣除 upload 和 download，不能只减 download。
     if let Some(usage) = fetch_subscription_usage(&app_config_path).await {
         if let Some(remaining) = usage.remaining_bytes() {
             status.quota = Some(format_gb(remaining));

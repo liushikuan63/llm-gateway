@@ -17,6 +17,8 @@
 //! 这不是理论：2026-10-07 实测 `codex exec --json` 会**静默挂住**
 //! （90 秒零输出且不结束），所以超时杀树是这条路径上**必然触发**的分支。
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::Stdio;
 
 use tokio::process::Child;
@@ -53,6 +55,7 @@ pub fn kill_tree_blocking(pid: u32) {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("taskkill")
+            .creation_flags(0x08000000)
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -71,6 +74,7 @@ pub fn kill_tree_blocking(pid: u32) {
 #[cfg(windows)]
 async fn taskkill(pid: u32) -> bool {
     tokio::process::Command::new("taskkill")
+        .creation_flags(0x08000000)
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -90,6 +90,8 @@ impl AgentReply {
             // 报全 0 会让审计与预算模块以为「这次没花钱」，
             // 而那是把「未知」当成了「零」。
             usage: None,
+            reasoning_content: None,
+            refusal: None,
         }
     }
 }

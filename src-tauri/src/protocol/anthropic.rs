@@ -260,8 +260,14 @@ fn extract_tool_use(v: &serde_json::Value) -> Option<Vec<crate::domain::ToolCall
 /// 内部统一响应 -> Anthropic 响应体
 pub fn messages_response(resp: &ChatResponse, model: &str) -> serde_json::Value {
     let mut content = Vec::new();
+    if let Some(thinking) = &resp.reasoning_content {
+        content.push(json!({ "type": "thinking", "thinking": thinking }));
+    }
     if !resp.content.is_empty() {
         content.push(json!({ "type": "text", "text": resp.content }));
+    }
+    if let Some(refusal) = &resp.refusal {
+        content.push(json!({ "type": "text", "text": refusal }));
     }
     if let Some(tcs) = &resp.tool_calls {
         for tc in tcs {
@@ -279,9 +285,10 @@ pub fn messages_response(resp: &ChatResponse, model: &str) -> serde_json::Value 
         content.push(json!({ "type": "text", "text": "" }));
     }
 
-    let stop_reason = match resp.finish_reason.as_deref() {
-        Some("tool_calls") => "tool_use",
-        Some("length") => "max_tokens",
+    let stop_reason = match (resp.refusal.is_some(), resp.finish_reason.as_deref()) {
+        (true, _) => "refusal",
+        (_, Some("tool_calls")) => "tool_use",
+        (_, Some("length")) => "max_tokens",
         _ => "end_turn",
     };
     let u = resp.usage.clone().unwrap_or_default();
@@ -295,8 +302,14 @@ pub fn messages_response(resp: &ChatResponse, model: &str) -> serde_json::Value 
     if u.cache_creation_tokens > 0 {
         usage["cache_creation_input_tokens"] = json!(u.cache_creation_tokens);
     }
+    if let Some(tokens) = u.reasoning_tokens {
+        usage["reasoning_tokens"] = json!(tokens);
+    }
+    if let Some(credit) = u.credit {
+        usage["credit"] = json!(credit);
+    }
 
-    json!({
+    let mut output = json!({
         "id": resp.id,
         "type": "message",
         "role": "assistant",
@@ -305,7 +318,11 @@ pub fn messages_response(resp: &ChatResponse, model: &str) -> serde_json::Value 
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": usage,
-    })
+    });
+    if let Some(refusal) = &resp.refusal {
+        output["refusal"] = json!(refusal);
+    }
+    output
 }
 
 /// Anthropic 上游响应 -> 内部统一响应
@@ -317,10 +334,25 @@ pub fn anthropic_to_internal(v: &serde_json::Value) -> crate::domain::ChatRespon
         .unwrap_or_default();
 
     let mut text = String::new();
+    let mut reasoning = None::<String>;
+    let mut refusal = v
+        .get("refusal")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     let mut tool_calls: Vec<crate::domain::ToolCall> = Vec::new();
 
     for b in content {
         match b.get("type").and_then(|t| t.as_str()) {
+            Some("thinking") => {
+                if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
+                    reasoning.get_or_insert_with(String::new).push_str(t);
+                }
+            }
+            Some("refusal") => {
+                if let Some(t) = b.get("refusal").and_then(|t| t.as_str()) {
+                    refusal.get_or_insert_with(String::new).push_str(t);
+                }
+            }
             Some("text") => {
                 if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                     text.push_str(t);
@@ -348,6 +380,13 @@ pub fn anthropic_to_internal(v: &serde_json::Value) -> crate::domain::ChatRespon
     }
 
     let u = v.get("usage").cloned().unwrap_or(json!({}));
+    if v.get("stop_reason").and_then(serde_json::Value::as_str) == Some("refusal") {
+        if refusal.is_none() && !text.is_empty() {
+            refusal = Some(std::mem::take(&mut text));
+        } else {
+            text.clear();
+        }
+    }
 
     crate::domain::ChatResponse {
         // 普通 API 上游没有「传输」这个概念（A6 判据 1 只对账号型上游有意义）。
@@ -375,6 +414,8 @@ pub fn anthropic_to_internal(v: &serde_json::Value) -> crate::domain::ChatRespon
             None => None,
         },
         usage: Some(crate::domain::Usage::from_anthropic(&u)),
+        reasoning_content: reasoning,
+        refusal,
     }
 }
 
@@ -543,4 +584,29 @@ fn tool_result_to_anthropic_message(message: &Message) -> serde_json::Value {
             "content": content,
         }]
     })
+}
+
+#[cfg(test)]
+mod auxiliary_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn thinking_and_native_refusal_are_separate_and_no_signature_is_fabricated() {
+        let r = anthropic_to_internal(&json!({"content":[
+            {"type":"thinking","thinking":"provided","signature":"supplier-signature"},
+            {"type":"text","text":"cannot comply"}
+        ],"stop_reason":"refusal","usage":{"reasoning_tokens":0,"credit":0}}));
+        assert_eq!(r.content, "");
+        assert_eq!(r.reasoning_content.as_deref(), Some("provided"));
+        assert_eq!(r.refusal.as_deref(), Some("cannot comply"));
+        assert_eq!(r.usage.as_ref().unwrap().reasoning_tokens, Some(0));
+        assert_eq!(r.usage.as_ref().unwrap().credit, Some(0.0));
+        let out = messages_response(&r, "m");
+        assert!(out["content"][0].get("signature").is_none());
+        assert_eq!(out["content"][1]["text"], "cannot comply");
+        let plain = anthropic_to_internal(&json!({"content":[{"type":"text","text":"answer"}]}));
+        assert_eq!(plain.content, "answer");
+        assert_eq!(plain.reasoning_content, None);
+        assert_eq!(plain.refusal, None);
+    }
 }

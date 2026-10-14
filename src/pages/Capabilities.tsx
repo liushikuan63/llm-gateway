@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, CandidateExplanation, CapabilitySet, ParetoView } from "../api";
+import { api, CandidateExplanation, CapabilitySet, formatPricePerMillion, ParetoView, ProviderView } from "../api";
 import { errorText } from "./providerPresets";
 import "./capabilities.css";
 
@@ -72,26 +72,29 @@ export default function CapabilitiesPage() {
   const [explainModel, setExplainModel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [providers, setProviders] = useState<ProviderView[] | null>(null);
+  const [query, setQuery] = useState("");
+  const [factsPage, setFactsPage] = useState(1);
 
   const load = async (model = explainModel) => {
     setBusy(true);
     setError(null);
     try {
-      const [raw, view, ranking] = await Promise.all([
-        api.exportCapabilities(),
+      const [raw, view, ranking, facts] = await Promise.allSettled([
+        api.exportCapabilities().then(value => JSON.parse(value) as Record<string, CapabilitySet>),
         api.capabilityPareto(),
         api.explainRouting(model.trim() || undefined),
+        api.listProviders(),
       ]);
-      setLedger(JSON.parse(raw) as Record<string, CapabilitySet>);
-      setPareto(view);
-      setExplain(ranking);
+      if (raw.status === "fulfilled") setLedger(raw.value);
+      if (view.status === "fulfilled") setPareto(view.value);
+      if (ranking.status === "fulfilled") setExplain(ranking.value);
+      if (facts.status === "fulfilled") setProviders(facts.value);
+      const failures = [raw, view, ranking, facts].flatMap((result, index) =>
+        result.status === "rejected" ? [`${["质量来源", "比较", "路由解释", "模型事实"][index]}：${errorText(result.reason)}`] : []);
+      if (failures.length) setError(`${failures.join("；")}。其他结果仍可查看；失败区域如有旧内容，保留上次成功读取的结果。`);
     } catch (cause) {
-      // 读不到就明确报出来，并且**不留半张表** —— 空表看起来像「没有冲突」，
-      // 而那与「读失败」是完全相反的结论。
       setError(errorText(cause));
-      setLedger({});
-      setPareto(null);
-      setExplain(null);
     } finally {
       setBusy(false);
     }
@@ -105,18 +108,55 @@ export default function CapabilitiesPage() {
   const withData = entries.filter((entry) => entry.rows.length > 0);
   const conflicting = withData.filter((entry) => entry.rows.some((row) => row.conflict));
   const agreeing = withData.length - conflicting.length;
+  const facts = (providers ?? []).flatMap(provider => provider.models.map(model => ({
+    provider, model, rows: rowsOf(ledger?.[`${provider.id}/${model.alias}`]),
+  }))).filter(({ provider, model }) => `${provider.name} ${model.alias} ${model.upstream}`.toLowerCase().includes(query.trim().toLowerCase()));
+  const pageCount = Math.max(1, Math.ceil(facts.length / 20));
+  const currentPage = Math.min(factsPage, pageCount);
+  const visibleFacts = facts.slice((currentPage - 1) * 20, currentPage * 20);
 
   return (
     <div className="page capabilities-page">
       <header className="page-heading">
         <div>
           <h2>能力与取舍</h2>
-          <p>同一个模型的同一项能力，不同来源可能给出不同数值。这里把冲突摊开，说明谁赢了、为什么。</p>
+          <p>先看价格、声明能力和数据覆盖，再比较路由依据与质量来源。</p>
         </div>
         <button type="button" disabled={busy} onClick={() => void load()}>重新读取</button>
       </header>
 
-      {error && <div className="capability-error" role="alert">读取能力账本失败：{error}</div>}
+      {error && <div className="capability-error" role="alert">部分数据读取失败：{error}</div>}
+
+      {providers !== null && <section className="capability-facts" data-testid="capability-facts" aria-labelledby="capability-facts-title">
+        <div className="facts-heading"><div><h3 id="capability-facts-title">模型事实与覆盖</h3><p className="capability-hint">价格来自当前配置；声明支持不等于账号已实测。未列为支持的能力可能尚未确认，也可能不支持。没有质量数据时显示默认回退说明。</p></div>
+          <label>搜索模型事实<input value={query} onChange={event => { setQuery(event.target.value); setFactsPage(1); }} placeholder="模型、上游名或供应商" /></label>
+        </div>
+        <div className="facts-table-scroll" tabIndex={0} role="region" aria-label="模型事实表格，可横向滚动"><table className="facts-table">
+          <thead><tr><th>模型 / 供应商</th><th>价格与来源</th><th>上下文 / 用途</th><th>已配置支持</th><th>质量覆盖</th></tr></thead>
+          <tbody>{visibleFacts.map(({ provider, model, rows }) => {
+            const declared = [[model.supports_tools, "工具"], [model.supports_thinking, "思考"], [model.supports_vision, "图像"], [model.supports_audio, "音频"], [model.supports_video, "视频"], [model.supports_stream, "流式"]] as const;
+            const supported = declared.filter(([value]) => value).map(([, label]) => label);
+            const unknown = declared.filter(([value]) => !value).map(([, label]) => label);
+            const covered = rows.filter(row => DIMENSION_LABEL[row.dimension]).length;
+            const configuredQuality = Object.keys(DIMENSION_LABEL).filter(dimension => {
+              const value = model.capabilities?.[dimension as "coding" | "reasoning" | "knowledge" | "math"];
+              return typeof value === "number" && Number.isFinite(value);
+            });
+            const price = model.price;
+            return <tr key={`${provider.id}/${model.alias}`}>
+              <td><strong>{model.alias}</strong><small>{provider.name}{!provider.enabled || !model.enabled ? " · 已停用" : ""}</small>{model.alias !== model.upstream && <small>上游：{model.upstream}</small>}</td>
+              <td>{price ? <><span>{formatPricePerMillion(price)}</span><small>{price.currency.toUpperCase()} · {price.source === "manual" ? "手工配置" : "目录参考价"}</small><small>缓存读 / 写：{price.cache_read ?? price.prompt} / {price.cache_creation ?? price.prompt} 每 100 万</small>{(price.tiers.length > 0 || price.rules.length > 0) && <small>含分档 / 时段条件，实际费用按请求计算</small>}<small>来源时间尚未记录</small></> : <span className="missing">未配置价格；费用未知</span>}</td>
+              <td>{model.context_window.toLocaleString()} tokens<small>{{ chat: "聊天", embedding: "Embedding", image: "图像生成", speech: "语音合成" }[model.model_type]}</small><small>配置值，未自动探测</small></td>
+              <td><span>{supported.join("、") || "暂无声明"}</span>{unknown.length > 0 && <small>未声明或不支持：{unknown.join("、")}</small>}</td>
+              <td>{ledger === null ? <span className="missing">质量来源尚未读取</span> : <><span>{covered} / 4 质量维度有来源</span><small>{covered > 0 ? rows.filter(row => DIMENSION_LABEL[row.dimension]).map(row => DIMENSION_LABEL[row.dimension]).join("、") : configuredQuality.length > 0 ? `${configuredQuality.length} / 4 维度有配置分值，无多来源账本` : `供应商默认回退 ${provider.intelligence}/100，非质量实测`}</small></>}{model.capabilities?.updated_at && <small>质量记录时间：{model.capabilities.updated_at}</small>}<small>延迟 / 任务匹配 / 效率：持续补充使用样本</small></td>
+            </tr>;
+          })}</tbody>
+        </table></div>
+        {facts.length === 0 && <p className="capability-hint"><span>{query ? "没有符合筛选条件的模型。" : "尚未配置模型，请先在供应商页接入。"}</span>{query && <button type="button" onClick={() => { setQuery(""); setFactsPage(1); }}>清空筛选</button>}</p>}
+        <div className="facts-pagination"><span>{facts.length} 个模型</span><span>第 {currentPage} / {pageCount} 页</span>
+          <button type="button" disabled={currentPage <= 1} onClick={() => setFactsPage(currentPage - 1)}>上一页</button><button type="button" disabled={currentPage >= pageCount} onClick={() => setFactsPage(currentPage + 1)}>下一页</button>
+        </div>
+      </section>}
 
       {/* D5：打分分解。卡片原话——「现有界面只显示排序结果，用户无法判断
           路由器在想什么，这正是『改了权重排序变了但没人知道为什么』的根源」。 */}
@@ -156,7 +196,7 @@ export default function CapabilitiesPage() {
                   {item.breakdown.factors.map((f) => (
                     <tr key={f.name}>
                       <td>{FACTOR_LABEL[f.name] ?? f.name}</td>
-                      <td>{f.raw === null ? <span className="missing">数据不足</span> : f.raw.toFixed(3)}</td>
+                      <td>{f.raw === null ? <span className="missing">{f.weight === 0 ? "未参与评分" : f.name === "cost" ? "无可比价格" : "缺少本项样本"}</span> : f.raw.toFixed(3)}</td>
                       <td>{f.weight.toFixed(2)}</td>
                       <td>{f.contribution.toFixed(4)}</td>
                       <td className="muted">{f.reason}</td>
@@ -232,14 +272,14 @@ export default function CapabilitiesPage() {
 
       {ledger !== null && withData.length === 0 && !error && (
         <div className="capability-empty">
-          <strong>数据不足</strong>
+          <strong>尚无质量来源账本</strong>
           <p>
-            本机还没有任何模型的能力数据。目录来源目前只给出模态布尔（能不能看图、能不能调工具），
-            质量维度（代码 / 推理 / 知识 / 数学）需要手工填写或在「供应商」里导入一份能力集。
+            已有价格、上下文和声明能力仍在上方展示。质量维度（代码 / 推理 / 知识 / 数学）需要有来源的评测或手工标定，
+            可在「供应商」里导入能力集；成功返回本身不代表任务质量。
           </p>
           <p>
-            在补上数据之前，路由不会用这些维度比较模型 —— 它宁可回落供应商级的能力分，
-            也不会拿一个猜出来的数字排序。
+            没有质量分的模型使用供应商默认能力分；已有配置分值仍可参与路由。
+            来源账本用于说明分值由谁提供，不替代价格或声明能力。
           </p>
         </div>
       )}

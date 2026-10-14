@@ -52,6 +52,10 @@ pub struct GeminiInboundRequest {
     pub system_instruction: Option<GeminiContent>,
     #[serde(default, rename = "generationConfig")]
     pub generation_config: Option<GenerationConfig>,
+    #[serde(default)]
+    pub tools: Option<Value>,
+    #[serde(default, rename = "toolConfig")]
+    pub tool_config: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -66,6 +70,12 @@ pub struct GeminiContent {
 pub struct GeminiPart {
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub thought: bool,
+    #[serde(default, rename = "functionCall")]
+    pub function_call: Option<Value>,
+    #[serde(default, rename = "functionResponse")]
+    pub function_response: Option<Value>,
     #[serde(default, rename = "inlineData")]
     pub inline_data: Option<InlineData>,
     /// 远程文件引用（`fileData.fileUri`）。Gemini 原生支持 YouTube / GCS，
@@ -161,14 +171,88 @@ pub fn to_internal(
         }
     }
 
-    for content in &req.contents {
+    let mut pending_calls: Vec<(String, String)> = Vec::new();
+    for (content_index, content) in req.contents.iter().enumerate() {
         let role = match content.role.as_deref().unwrap_or("user") {
             "model" | "assistant" => Role::Assistant,
             "system" => Role::System,
             _ => Role::User,
         };
         let mut parts: Vec<Part> = Vec::new();
-        for part in &content.parts {
+        let mut tool_calls = Vec::new();
+        let mut tool_results = Vec::new();
+        for (part_index, part) in content.parts.iter().enumerate() {
+            if part.thought {
+                continue;
+            }
+            if let Some(call) = &part.function_call {
+                if role != Role::Assistant {
+                    return Err(tool_conversion_error("functionCall 必须属于 model 消息"));
+                }
+                let name = call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| tool_conversion_error("functionCall 缺少名称"))?;
+                let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                if !args.is_object() {
+                    return Err(tool_conversion_error("functionCall args 必须为对象"));
+                }
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("gemini_call_{content_index}_{part_index}"));
+                pending_calls.push((id.clone(), name.into()));
+                tool_calls.push(crate::domain::ToolCall {
+                    id,
+                    kind: "function".into(),
+                    function: crate::domain::FunctionCall {
+                        name: name.into(),
+                        arguments: args.to_string(),
+                    },
+                });
+            }
+            if let Some(result) = &part.function_response {
+                if role == Role::Assistant {
+                    return Err(tool_conversion_error("functionResponse 必须属于 user 消息"));
+                }
+                let name = result
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| tool_conversion_error("functionResponse 缺少名称"))?;
+                let id = result
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                let index = pending_calls
+                    .iter()
+                    .position(|(candidate, call_name)| {
+                        call_name == name && id.map_or(true, |id| candidate == id)
+                    })
+                    .ok_or_else(|| tool_conversion_error("functionResponse 没有匹配的历史调用"))?;
+                let (id, _) = pending_calls.remove(index);
+                let response = result
+                    .get("response")
+                    .filter(|value| value.is_object())
+                    .ok_or_else(|| tool_conversion_error("functionResponse response 必须为对象"))?;
+                if result
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| !parts.is_empty())
+                {
+                    return Err(tool_conversion_error("此上游暂不支持多模态工具结果"));
+                }
+                tool_results.push(Message {
+                    role: Role::Tool,
+                    content: Content::Text(response.to_string()),
+                    tool_calls: None,
+                    tool_call_id: Some(id),
+                    name: Some(name.into()),
+                });
+            }
             if let Some(text) = &part.text {
                 if !text.is_empty() {
                     parts.push(Part::Text { text: text.clone() });
@@ -210,6 +294,7 @@ pub fn to_internal(
             }
         }
 
+        let has_parts = !parts.is_empty();
         let content_value = if parts.is_empty() {
             Content::Text(String::new())
         } else if parts.len() == 1 {
@@ -222,16 +307,22 @@ pub fn to_internal(
             Content::Parts(parts)
         };
 
+        if !tool_results.is_empty() && !has_parts && tool_calls.is_empty() {
+            messages.extend(tool_results);
+            continue;
+        }
         messages.push(Message {
             role,
             content: content_value,
-            tool_calls: None,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             tool_call_id: None,
             name: None,
         });
+        messages.extend(tool_results);
     }
 
     let cfg = req.generation_config.clone().unwrap_or_default();
+    let (tools, tool_choice) = convert_tools(req.tools.as_ref(), req.tool_config.as_ref())?;
     Ok(ChatRequest {
         model: model_from_path.to_string(),
         messages,
@@ -241,11 +332,92 @@ pub fn to_internal(
         stop: cfg.stop_sequences,
         stream,
         // `ChatRequest` 没有 `Default`，剩下的字段逐个给。
-        tools: None,
-        tool_choice: None,
+        tools,
+        tool_choice,
         thinking: None,
         extra: serde_json::Map::new(),
     })
+}
+
+fn tool_conversion_error(message: &str) -> GatewayError {
+    GatewayError::Protocol(format!("Gemini 工具请求无效：{message}"))
+}
+
+fn convert_tools(
+    tools: Option<&Value>,
+    config: Option<&Value>,
+) -> Result<(Option<Value>, Option<Value>), GatewayError> {
+    let mut converted = Vec::new();
+    if let Some(tools) = tools {
+        for group in tools
+            .as_array()
+            .ok_or_else(|| tool_conversion_error("tools 必须为数组"))?
+        {
+            let declarations = group
+                .get("functionDeclarations")
+                .and_then(Value::as_array)
+                .ok_or_else(|| tool_conversion_error("此上游只支持 functionDeclarations 工具"))?;
+            if group
+                .as_object()
+                .is_some_and(|object| object.keys().any(|key| key != "functionDeclarations"))
+            {
+                return Err(tool_conversion_error("内置执行工具不能转换到此上游"));
+            }
+            for declaration in declarations {
+                let name = declaration
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| tool_conversion_error("工具缺少名称"))?;
+                let parameters = declaration
+                    .get("parameters")
+                    .or_else(|| declaration.get("parametersJsonSchema"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+                if !parameters.is_object() {
+                    return Err(tool_conversion_error("工具 parameters 必须为对象"));
+                }
+                let mut function = json!({"name":name,"parameters":parameters});
+                if let Some(description) = declaration.get("description") {
+                    function["description"] = description.clone();
+                }
+                converted.push(json!({"type":"function","function":function}));
+            }
+        }
+    }
+    let calling = config.and_then(|config| config.get("functionCallingConfig"));
+    let choice = if let Some(calling) = calling {
+        if let Some(names) = calling.get("allowedFunctionNames") {
+            let names = names
+                .as_array()
+                .ok_or_else(|| tool_conversion_error("allowedFunctionNames 必须为数组"))?;
+            if names.iter().any(|value| value.as_str().is_none()) {
+                return Err(tool_conversion_error("工具名称必须为字符串"));
+            }
+            converted.retain(|tool| names.iter().any(|name| name == &tool["function"]["name"]));
+            if converted.is_empty() && !names.is_empty() {
+                return Err(tool_conversion_error("限定的工具没有声明"));
+            }
+        }
+        Some(
+            match calling
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("AUTO")
+            {
+                "AUTO" | "MODE_UNSPECIFIED" => json!("auto"),
+                "NONE" => json!("none"),
+                "ANY" => json!("required"),
+                _ => return Err(tool_conversion_error("暂不支持此工具调用模式")),
+            },
+        )
+    } else {
+        None
+    };
+    Ok((
+        (!converted.is_empty()).then_some(Value::Array(converted)),
+        choice,
+    ))
 }
 
 /// 从内部响应拼出 **Gemini 原生**的回复体。
@@ -254,14 +426,20 @@ pub fn to_internal(
 /// 客户端的解析器按同名形状读，返回错形状会得到「响应为空」而不是报错。
 pub fn from_internal_response(resp: &ChatResponse) -> Value {
     let mut parts: Vec<Value> = Vec::new();
+    if let Some(reasoning) = &resp.reasoning_content {
+        parts.push(json!({"text": reasoning, "thought": true}));
+    }
     if !resp.content.is_empty() {
         parts.push(json!({"text": resp.content}));
+    }
+    if let Some(refusal) = &resp.refusal {
+        parts.push(json!({"text": refusal}));
     }
     for call in resp.tool_calls.iter().flatten() {
         let args: Value = serde_json::from_str(&call.function.arguments)
             .unwrap_or_else(|_| json!({"_raw": call.function.arguments}));
         parts.push(json!({
-            "functionCall": {"name": call.function.name, "args": args}
+            "functionCall": {"id":call.id,"name": call.function.name, "args": args}
         }));
     }
     if parts.is_empty() {
@@ -273,7 +451,7 @@ pub fn from_internal_response(resp: &ChatResponse) -> Value {
     let mut out = json!({
         "candidates": [{
             "content": {"role": "model", "parts": parts},
-            "finishReason": gemini_finish_reason(resp.finish_reason.as_deref()),
+            "finishReason": if resp.refusal.is_some() { "SAFETY" } else { gemini_finish_reason(resp.finish_reason.as_deref()) },
             "index": 0,
         }],
         "modelVersion": resp.model,
@@ -281,15 +459,25 @@ pub fn from_internal_response(resp: &ChatResponse) -> Value {
     if let Some(usage) = &resp.usage {
         out["usageMetadata"] = usage_metadata(usage);
     }
+    if let Some(refusal) = &resp.refusal {
+        out["candidates"][0]["refusal"] = json!(refusal);
+    }
     out
 }
 
-fn usage_metadata(usage: &Usage) -> Value {
-    json!({
+pub(crate) fn usage_metadata(usage: &Usage) -> Value {
+    let mut out = json!({
         "promptTokenCount": usage.prompt_tokens,
         "candidatesTokenCount": usage.completion_tokens,
         "totalTokenCount": usage.total_tokens,
-    })
+    });
+    if let Some(tokens) = usage.reasoning_tokens {
+        out["thoughtsTokenCount"] = json!(tokens);
+    }
+    if let Some(credit) = usage.credit {
+        out["credit"] = json!(credit);
+    }
+    out
 }
 
 /// 内部 finish_reason → Gemini 的枚举名。
@@ -415,6 +603,60 @@ pub fn parse_model_action(path_model: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn function_declarations_and_history_keep_matching_call_ids() {
+        let input:GeminiInboundRequest=serde_json::from_value(json!({"contents":[
+            {"role":"user","parts":[{"text":"call lookup"}]},
+            {"role":"model","parts":[{"functionCall":{"id":"original-id","name":"lookup","args":{"q":"foo"}}}]},
+            {"role":"user","parts":[{"functionResponse":{"id":"original-id","name":"lookup","response":{"result":"found"}}}]}
+        ],"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}]}],
+        "toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["lookup"]}}})).unwrap();
+        let request = to_internal("m", &input, true).unwrap();
+        assert_eq!(
+            request.tools.as_ref().unwrap()[0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(request.tool_choice, Some(json!("required")));
+        assert_eq!(request.messages.len(), 3);
+        let call = &request.messages[1].tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.id, "original-id");
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.function.arguments).unwrap(),
+            json!({"q":"foo"})
+        );
+        assert_eq!(request.messages[2].role, Role::Tool);
+        assert_eq!(
+            request.messages[2].tool_call_id.as_deref(),
+            Some("original-id")
+        );
+        let mut wrong = input.clone();
+        wrong.contents[2].parts[0]
+            .function_response
+            .as_mut()
+            .unwrap()["id"] = json!("other-id");
+        assert!(to_internal("m", &wrong, true).is_err());
+        let plain: GeminiInboundRequest = serde_json::from_value(
+            json!({"contents":[{"role":"user","parts":[{"text":"hello"}]}]}),
+        )
+        .unwrap();
+        let plain = to_internal("m", &plain, false).unwrap();
+        assert!(plain.tools.is_none() && plain.tool_choice.is_none());
+    }
+
+    #[test]
+    fn unsupported_builtin_tools_and_malformed_responses_are_explicit_errors() {
+        for tools in [
+            json!([{"googleSearch":{}}]),
+            json!([{"functionDeclarations":[{"name":"bad","parameters":[]}]}]),
+        ] {
+            let input: GeminiInboundRequest = serde_json::from_value(
+                json!({"contents":[{"role":"user","parts":[{"text":"hello"}]}],"tools":tools}),
+            )
+            .unwrap();
+            assert!(to_internal("m", &input, false).is_err());
+        }
+    }
 
     fn parse(body: &str) -> GeminiInboundRequest {
         serde_json::from_str(body).expect("解析入站请求")
@@ -583,7 +825,11 @@ mod tests {
                 total_tokens: 10,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                credit: None,
+                reasoning_tokens: None,
             }),
+            reasoning_content: None,
+            refusal: None,
         }
     }
 

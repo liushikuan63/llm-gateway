@@ -28,15 +28,15 @@ pub struct Quota {
 
 #[derive(Debug, Default)]
 struct Window {
-    /// (时间戳秒, tokens) —— 保留 24h 内的事件，超出弹出
-    events: Vec<(i64, u32)>,
+    /// (timestamp, requests, tokens); token settlement does not count another request.
+    events: Vec<(i64, u32, u32)>,
 }
 
 impl Window {
     fn prune(&mut self, now: i64) {
         let cutoff = now - 86_400;
         // events 按时间递增，找第一个存活位置
-        let pos = self.events.partition_point(|(ts, _)| *ts < cutoff);
+        let pos = self.events.partition_point(|(ts, _, _)| *ts < cutoff);
         if pos > 0 {
             self.events.drain(..pos);
         }
@@ -45,11 +45,11 @@ impl Window {
     fn sum_since(&self, since: i64, count_tokens: bool) -> u32 {
         let mut n = 0u32;
         // 倒序累加，近期事件在尾部
-        for (ts, tk) in self.events.iter().rev() {
+        for (ts, requests, tk) in self.events.iter().rev() {
             if *ts < since {
                 break;
             }
-            n += if count_tokens { *tk } else { 1 };
+            n = n.saturating_add(if count_tokens { *tk } else { *requests });
         }
         n
     }
@@ -106,7 +106,18 @@ impl RateLimiter {
         let w = self.inner.entry(key.to_string()).or_default();
         let mut w = w.lock();
         w.prune(t);
-        w.events.push((t, tokens));
+        w.events.push((t, 1, tokens));
+    }
+
+    pub fn record_tokens(&self, key: &str, tokens: u32) {
+        if tokens == 0 {
+            return;
+        }
+        let t = now();
+        let w = self.inner.entry(key.to_string()).or_default();
+        let mut w = w.lock();
+        w.prune(t);
+        w.events.push((t, 0, tokens));
     }
 
     /// 在同一临界区内检查并占用额度。
@@ -132,7 +143,7 @@ impl RateLimiter {
             return false;
         }
 
-        w.events.push((t, tokens));
+        w.events.push((t, 1, tokens));
         true
     }
 
@@ -177,11 +188,9 @@ impl RateLimiter {
         w.prune(t);
         let request_events = quota.rpm.max(quota.rpd).max(1);
         let token_budget = quota.tpm.max(quota.tpd);
-        // 按时间递增写入，保证 sum_since 的倒序扫描可以提前停止。
-        for offset in (0..request_events).rev() {
-            let tokens = if offset == 0 { token_budget } else { 0 };
-            w.events.push((t - offset as i64, tokens));
-        }
+        // Exhaustion happened now, not one second earlier per request. A single
+        // counted event fills large RPM/RPD quotas and keeps timestamp ordering.
+        w.events.push((t, request_events, token_budget));
     }
 
     pub fn reset(&self, key: &str) {

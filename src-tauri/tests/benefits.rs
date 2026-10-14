@@ -33,6 +33,10 @@ fn cfg() -> BenefitsConfig {
         enabled: true,
         auto_claim: false,
         auto_claim_after_hour: 10,
+        auto_claim_after_minute: 0,
+        auto_claim_timezone: "local".into(),
+        scheduler_mode: "app".into(),
+        account_claim_times: Default::default(),
         accounts: vec![BenefitAccount {
             id: "intl".into(),
             platform: "qoder".into(),
@@ -40,6 +44,182 @@ fn cfg() -> BenefitsConfig {
             enabled: true,
         }],
     }
+}
+
+#[test]
+fn individual_times_preserve_qoder_default_and_reject_invalid_overrides() {
+    let mut settings = cfg();
+    settings.auto_claim_after_hour = 12;
+    settings.auto_claim_after_minute = 5;
+    settings.auto_claim_timezone = "Asia/Shanghai".into();
+    settings.accounts.push(BenefitAccount {
+        id: "early".into(),
+        platform: "qoder_cn".into(),
+        label: "early".into(),
+        enabled: true,
+    });
+    settings
+        .account_claim_times
+        .insert("early".into(), "00:05".into());
+    let at = |time: &str| {
+        DateTime::parse_from_rfc3339(time)
+            .unwrap()
+            .with_timezone(&Local)
+    };
+    assert!(!settings.account_is_due("early", at("2026-10-14T00:04:59+08:00")));
+    assert!(settings.account_is_due("early", at("2026-10-14T00:05:00+08:00")));
+    assert!(!settings.account_is_due("intl", at("2026-10-14T00:05:00+08:00")));
+    assert!(!settings.account_is_due("intl", at("2026-10-14T12:04:59+08:00")));
+    assert!(settings.account_is_due("intl", at("2026-10-14T12:05:00+08:00")));
+    assert_eq!(settings.trigger_minutes(), vec![5, 725]);
+    settings.validate().unwrap();
+    for time in ["24:00", "00:60", "0:05", "00:05:00", "xx:yy"] {
+        settings
+            .account_claim_times
+            .insert("early".into(), time.into());
+        assert!(settings.validate().is_err());
+    }
+    settings.account_claim_times.clear();
+    settings
+        .account_claim_times
+        .insert("missing".into(), "00:05".into());
+    assert!(settings.validate().is_err());
+    let legacy: BenefitsConfig =
+        toml::from_str("auto_claim_after_hour = 12\nauto_claim_after_minute = 5").unwrap();
+    assert!(legacy.account_claim_times.is_empty());
+}
+
+#[tokio::test]
+async fn external_daily_owner_skips_app_tick_and_reserves_one_execution() {
+    let now = Local::now();
+    let (_db, center, mock) = setup(now).await;
+    let mut config = cfg();
+    config.auto_claim = true;
+    config.scheduler_mode = "windows_task".into();
+    config.auto_claim_after_hour = 0;
+    assert!(center
+        .auto_tick(&config, None, now)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(mock.gets.load(Ordering::SeqCst), 0);
+    let root = std::env::temp_dir().join(format!("llmgw-benefit-test-{}", uuid::Uuid::new_v4()));
+    let mut app = llm_gateway_lib::config::AppConfig {
+        benefits: config,
+        ..Default::default()
+    };
+    let result = llm_gateway_lib::benefit_task::execute_once(&app, &center, &root)
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    let second = llm_gateway_lib::benefit_task::execute_once(&app, &center, &root)
+        .await
+        .unwrap();
+    assert_eq!(second["claims"][0]["status"], "receipt_exists_no_retry");
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    app.benefits.enabled = false;
+    let count = mock.gets.load(Ordering::SeqCst);
+    assert_eq!(
+        llm_gateway_lib::benefit_task::execute_once(&app, &center, &root)
+            .await
+            .unwrap()["status"],
+        "disabled_or_not_due"
+    );
+    assert_eq!(mock.gets.load(Ordering::SeqCst), count);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn session_is_encrypted_and_platform_mismatch_preserves_previous_secret() {
+    let now = Local::now();
+    let (db, center, _) = setup(now).await;
+    let raw=json!({"schema_version":1,"platform":"qoder","headers":{"authorization":"Bearer synthetic-session-secret"}}).to_string();
+    let session =
+        llm_gateway_lib::client_session::SessionCredential::parse(&raw, ClaimPlatform::Qoder)
+            .unwrap();
+    center.set_session(&cfg(), "intl", &session).await.unwrap();
+    let encrypted = repo::get_secret(db.pool(), "benefit:qoder:intl:token")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!encrypted.contains("synthetic-session-secret"));
+    assert!(crypto::decrypt(&encrypted)
+        .unwrap()
+        .contains("synthetic-session-secret"));
+    let mut bad = session;
+    bad.platform = ClaimPlatform::QoderCn;
+    assert!(center.set_session(&cfg(), "intl", &bad).await.is_err());
+    assert_eq!(
+        repo::get_secret(db.pool(), "benefit:qoder:intl:token")
+            .await
+            .unwrap()
+            .unwrap(),
+        encrypted
+    );
+}
+
+#[tokio::test]
+async fn a_failed_account_does_not_block_the_other_and_uncertain_receipts_are_not_retried() {
+    struct FirstFails(Arc<Mock>);
+    #[async_trait]
+    impl BenefitTransport for FirstFails {
+        async fn request(
+            &self,
+            platform: ClaimPlatform,
+            token: &str,
+            proxy: Option<&str>,
+            campaign_id: Option<&str>,
+        ) -> Result<Value, String> {
+            if platform == ClaimPlatform::Qoder {
+                return Err("offline auth failure".into());
+            }
+            self.0.request(platform, token, proxy, campaign_id).await
+        }
+    }
+    init_crypto();
+    let now = Local::now();
+    let db = Db::connect_in_memory().await.unwrap();
+    let mock = Mock::new(now);
+    let center =
+        BenefitsCenter::with_transport(db.pool().clone(), Arc::new(FirstFails(mock.clone())));
+    let mut config = cfg();
+    config.auto_claim = true;
+    config.scheduler_mode = "windows_task".into();
+    config.auto_claim_after_hour = 0;
+    config.accounts.push(BenefitAccount {
+        id: "cn".into(),
+        platform: "qoder_cn".into(),
+        label: "离线 CN".into(),
+        enabled: true,
+    });
+    for a in &config.accounts {
+        center.set_token(&config, &a.id, TOKEN).await.unwrap();
+    }
+    let app = llm_gateway_lib::config::AppConfig {
+        benefits: config,
+        ..Default::default()
+    };
+    let root = std::env::temp_dir().join(format!("llmgw-benefit-test-{}", uuid::Uuid::new_v4()));
+    assert!(
+        llm_gateway_lib::benefit_task::execute_once(&app, &center, &root)
+            .await
+            .is_err()
+    );
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    let summary: Value = serde_json::from_slice(
+        &std::fs::read(root.join("benefits-receipts/last-run.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(summary["claims"][0]["result"]["run"]["verdict"], "error");
+    assert_eq!(summary["claims"][1]["result"]["run"]["verdict"], "granted");
+    assert!(
+        llm_gateway_lib::benefit_task::execute_once(&app, &center, &root)
+            .await
+            .is_err()
+    );
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn beijing(raw: &str) -> DateTime<Local> {
@@ -552,6 +732,62 @@ async fn automatic_claim_respects_switch_local_hour_and_actual_window() {
         .unwrap();
     assert_eq!(result.run.verdict, BenefitVerdict::NoClaimable);
     assert_eq!(mock.posts.load(Ordering::SeqCst), 1, "窗口外不POST");
+}
+
+#[tokio::test]
+async fn automatic_claim_honors_minute_and_explicit_beijing_clock() {
+    let before = beijing("2026-10-10T04:04:59Z");
+    let due = beijing("2026-10-10T04:05:00Z");
+    let (_db, center, mock) = setup(due).await;
+    let mut raw = serde_json::to_value(cfg()).unwrap();
+    raw["auto_claim"] = json!(true);
+    raw["auto_claim_after_hour"] = json!(12);
+    raw["auto_claim_after_minute"] = json!(5);
+    raw["auto_claim_timezone"] = json!("Asia/Shanghai");
+    let config: BenefitsConfig = serde_json::from_value(raw).unwrap();
+    assert!(center
+        .auto_tick(&config, None, before)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        mock.gets.load(Ordering::SeqCst),
+        0,
+        "12:04:59 must not query or claim"
+    );
+    let result = center.auto_tick(&config, None, due).await.unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        serde_json::to_value(&config).unwrap()["auto_claim_after_minute"],
+        5
+    );
+    center.auto_tick(&config, None, due).await.unwrap();
+    assert_eq!(
+        mock.posts.load(Ordering::SeqCst),
+        1,
+        "same settled activity must not be claimed again"
+    );
+}
+
+#[test]
+fn benefit_schedule_defaults_remain_compatible_and_invalid_minutes_are_rejected() {
+    let legacy: BenefitsConfig =
+        serde_json::from_value(json!({"auto_claim_after_hour": 10})).unwrap();
+    let encoded = serde_json::to_value(&legacy).unwrap();
+    assert_eq!(encoded["auto_claim_after_minute"], 0);
+    assert_eq!(encoded["auto_claim_timezone"], "local");
+    for (field, value) in [
+        ("auto_claim_after_minute", json!(60)),
+        ("auto_claim_timezone", json!("arbitrary-zone")),
+    ] {
+        let mut bad = encoded.clone();
+        bad[field] = value;
+        assert!(serde_json::from_value::<BenefitsConfig>(bad)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
 }
 
 #[tokio::test]

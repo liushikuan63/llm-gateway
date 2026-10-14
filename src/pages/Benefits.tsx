@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { api, AppConfig, BenefitAccount, BenefitAccountView, BenefitClaimResult, BenefitOverview, BenefitPlatform, BenefitRunRecord, BenefitsConfig } from "../api";
 
 type Message = { kind: "ok" | "err"; text: string };
-const PLATFORM: Record<BenefitPlatform, string> = { qoder: "Qoder 国际版", qoder_cn: "Qoder 中国版" };
+const PLATFORM: Record<BenefitPlatform, string> = { qoder: "Qoder 国际版", qoder_cn: "Qoder 中国版", trae_cn: "Trae 中国版" };
 const VERDICT = { granted: "实际发放", replayed: "重复领取，未再次发放", no_claimable: "暂无可领活动", skipped: "已跳过", error: "领取失败" };
-const DEFAULTS: BenefitsConfig = { enabled: false, auto_claim: false, auto_claim_after_hour: 10, accounts: [] };
+const DEFAULTS: BenefitsConfig = { enabled: false, auto_claim: false, auto_claim_after_hour: 10, auto_claim_after_minute: 0, auto_claim_timezone: "local", accounts: [] };
 
 function dateText(value: string | number | null) {
   if (value === null) return "未知";
@@ -23,7 +23,8 @@ export default function BenefitsPage() {
   const [loadError, setLoadError] = useState(false);
   const [message, setMessage] = useState<Message | null>(null);
   const [lastClaim, setLastClaim] = useState<BenefitClaimResult | null>(null);
-  const [hour, setHour] = useState("10");
+  const [claimTime, setClaimTime] = useState("10:00");
+  const [claimZone, setClaimZone] = useState<"local" | "Asia/Shanghai">("local");
   const [accountDraft, setAccountDraft] = useState<BenefitAccount | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [tokenAccount, setTokenAccount] = useState<BenefitAccountView | null>(null);
@@ -39,7 +40,8 @@ export default function BenefitsPage() {
     setConfig(nextConfig);
     setOverview(nextOverview);
     setHistory(nextHistory);
-    setHour(String(nextConfig.benefits?.auto_claim_after_hour ?? 10));
+    setClaimTime(`${String(nextConfig.benefits?.auto_claim_after_hour ?? 10).padStart(2,"0")}:${String(nextConfig.benefits?.auto_claim_after_minute ?? 0).padStart(2,"0")}`);
+    setClaimZone(nextConfig.benefits?.auto_claim_timezone ?? "local");
     setLoadError(false);
   };
 
@@ -165,31 +167,36 @@ export default function BenefitsPage() {
     {!config || !overview ? <div className="empty" role="status">{busy === "load" ? "正在读取账号权益…" : "尚无权益结果，请刷新权益。"}</div> : <>
       <div className="card" data-testid="benefits-settings">
         <strong>查询与自动领取</strong>
-        <div className="sub">总开关关闭时不向平台发请求。自动领取默认关闭；开启后会在应用运行期间真实领取活动权益，使用各账号自己的 Token。</div>
+        <div className="sub">总开关关闭时不向平台发请求。自动领取默认关闭；开启后使用各账号独立的加密登录上下文或 Token。</div>
         <div className="row" style={{ flexWrap: "wrap" }}>
           <label className="row"><input type="checkbox" checked={settings.enabled} disabled={busy !== null} onChange={event => { const enabled = event.target.checked; void saveSettings(previous => ({ ...previous, enabled }), enabled ? "账号权益已开启。" : "账号权益已关闭，不再向平台发请求。"); }} />启用账号权益</label>
           <label className="row"><input type="checkbox" checked={settings.auto_claim} disabled={busy !== null || !settings.enabled} onChange={event => { const auto_claim = event.target.checked; void saveSettings(previous => ({ ...previous, auto_claim }), auto_claim ? "每日自动领取已开启。" : "每日自动领取已关闭。"); }} />每日自动领取</label>
         </div>
         <div className="row" style={{ flexWrap: "wrap", marginTop: 12 }}>
-          <label htmlFor="benefit-hour">本地时间不早于</label><input id="benefit-hour" type="number" min={0} max={23} step={1} value={hour} disabled={busy !== null} style={{ width: 80 }} onChange={event => setHour(event.target.value)} /><span>点（0–23）</span>
-          <button disabled={busy !== null || Number(hour) === settings.auto_claim_after_hour} onClick={() => {
-            const value = Number(hour);
-            if (!hour.trim() || !Number.isInteger(value) || value < 0 || value > 23) { setMessage({ kind: "err", text: "领取小时必须是 0 到 23 之间的整数。" }); return; }
-            void saveSettings(previous => ({ ...previous, auto_claim_after_hour: value }), "自动领取时间已保存。");
+          <label htmlFor="benefit-time">每日领取时间</label><input id="benefit-time" type="time" step={60} value={claimTime} disabled={busy !== null} onChange={event => setClaimTime(event.target.value)} />
+          <label htmlFor="benefit-zone">领取时区</label><select id="benefit-zone" value={claimZone} disabled={busy !== null} onChange={event=>setClaimZone(event.target.value as "local" | "Asia/Shanghai")}><option value="local">本机时间</option><option value="Asia/Shanghai">北京时间</option></select>
+          <button disabled={busy !== null || (claimTime === `${String(settings.auto_claim_after_hour).padStart(2,"0")}:${String(settings.auto_claim_after_minute??0).padStart(2,"0")}` && claimZone === (settings.auto_claim_timezone??"local"))} onClick={() => {
+            if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(claimTime)) { setMessage({ kind: "err", text: "请选择有效的每日领取时间。" }); return; }
+            const [hour,minute] = claimTime.split(":").map(Number);
+            void saveSettings(previous => ({ ...previous, auto_claim_after_hour: hour, auto_claim_after_minute: minute, auto_claim_timezone: claimZone }), "每日领取时间已保存。");
           }}>保存领取时间</button>
         </div>
-        <div className="muted" style={{ marginTop: 10 }}>应用关闭时不会自动领取；按平台逐条活动状态判断可领，失败后可重试。</div>
+        <label>执行方式 <select aria-label="领取执行方式" value={settings.scheduler_mode??"app"} disabled={busy!==null} onChange={e=>{const scheduler_mode=e.target.value as "app"|"windows_task";void saveSettings(previous=>({...previous,scheduler_mode}),"领取执行方式已保存。");}}><option value="app">应用运行时领取</option><option value="windows_task">Windows 后台每日领取</option></select></label>
+        <div className="muted" style={{ marginTop: 10 }}>{settings.scheduler_mode==="windows_task"?"Windows 后台任务可在本应用关闭时执行，不打开窗口。需当前 Windows 用户已登录；关机、休眠或退出登录后会延后。每日保留收据，失败不自动重试；登录失效时请重新复用客户端登录。":"应用关闭时不会自动领取。按平台逐条活动状态判断是否可领。"}</div>
       </div>
-      {overview.accounts.length === 0 ? <div className="empty">尚未添加权益账号。添加后自行粘贴对应平台 Token；不会读取 CLI 登录凭据。</div> : overview.accounts.map(account => {
+      {overview.accounts.length === 0 ? <div className="empty">尚未添加权益账号。添加后可复用已登录客户端，或手工设置 Token。</div> : overview.accounts.map(account => {
         const status = account.status;
         const canClaim = account.capabilities.manual_claim && status?.campaigns.some(item => item.claim_status === "CLAIMABLE" && item.action_type === "CLAIM_BENEFIT");
         return <div className="card" key={account.account_id} data-testid={`benefit-account-${account.account_id}`}>
-          <div className="spread" style={{ flexWrap: "wrap" }}><div><strong>{account.label}</strong><div className="muted breakable">{PLATFORM[account.platform] ?? account.platform} · {account.account_id}</div></div><span className={`tag ${account.has_token ? "ok" : "warn"}`}>{account.has_token ? "Token 已保存" : "缺少 Token"}</span></div>
+          <div className="spread" style={{ flexWrap: "wrap" }}><div><strong>{account.label}</strong><div className="muted breakable">{PLATFORM[account.platform] ?? account.platform} · {account.account_id}</div></div><span className={`tag ${account.has_token ? "ok" : "warn"}`}>{account.platform==="trae_cn"?(account.has_token?"登录已保存":"尚未复用登录"):(account.has_token ? "Token 已保存" : "缺少 Token")}</span></div>
           <div className="sub">{account.capabilities.scope} · {account.enabled ? "账号已启用" : "账号已停用"}</div>
+          <div className="row" style={{flexWrap:"wrap",marginBottom:12}}><label htmlFor={`claim-time-${account.account_id}`}>该账号每日领取时间</label><input id={`claim-time-${account.account_id}`} type="time" aria-label={`${account.label}每日领取时间`} disabled={busy!==null} value={settings.account_claim_times?.[account.account_id]??`${String(settings.auto_claim_after_hour).padStart(2,"0")}:${String(settings.auto_claim_after_minute??0).padStart(2,"0")}`} onChange={event=>{const value=event.target.value;if(/^\d{2}:\d{2}$/.test(value))void saveSettings(previous=>({...previous,account_claim_times:{...previous.account_claim_times,[account.account_id]:value}}),"账号每日领取时间已保存。");}}/><span className="muted">{(settings.auto_claim_timezone??"local")==="Asia/Shanghai"?"北京时间":"本机时间"}</span>{settings.account_claim_times?.[account.account_id]&&<button disabled={busy!==null} onClick={()=>void saveSettings(previous=>{const times={...previous.account_claim_times};delete times[account.account_id];return {...previous,account_claim_times:times};},"已恢复默认领取时间。")}>使用默认时间</button>}</div>
           {account.error && <div className="msg err breakable" role="alert">{account.error}</div>}
+          {account.session_error && <div className="msg warn" role="status">{account.session_error}</div>}
+          {account.session_account && <div className="grid2" style={{marginTop:12}}><div><strong>已复用客户端登录</strong><div>{account.session_account.identity.display_name??account.session_account.identity.masked_email??"已验证账号"}</div><div className="sub">{account.session_account.plan_name??"套餐未知"}</div></div><div><strong>套餐用量</strong><div>{account.session_account.quota?.used??"未知"} / {account.session_account.quota?.total??"未知"} {account.session_account.quota?.unit??""}</div><div className="sub">剩余 {account.session_account.quota?.remaining??"未知"}；附加额度 {account.session_account.addon_quota?.remaining??"未知"}</div></div></div>}
           {!settings.enabled && <div className="muted">权益总开关已关闭，未向平台查询。</div>}
           {settings.enabled && !account.enabled && <div className="muted">账号已停用，未向该账号查询。</div>}
-          {settings.enabled && account.enabled && !account.has_token && <div className="muted">请先设置该平台的 Token。</div>}
+          {settings.enabled && account.enabled && !account.has_token && <div className="muted">{account.platform==="trae_cn"?"请点击复用客户端登录，导入已登录的 Trae CN 账号。":"请先设置该平台的 Token。"}</div>}
           {settings.enabled && account.enabled && account.has_token && !status && !account.error && <div className="muted">尚无活动结果，不能据此确认没有可领权益。</div>}
           {status && <div style={{ marginTop: 12 }} data-testid={`benefit-campaigns-${account.account_id}`}>
             {status.warnings.map((warning, index) => <div className="msg warn breakable" key={index} role="status">{warning}</div>)}
@@ -205,10 +212,11 @@ export default function BenefitsPage() {
           {account.last_run && <div className="muted" style={{ marginTop: 12 }}>最近执行：{VERDICT[account.last_run.verdict]} · {dateText(account.last_run.created_at)}</div>}
           <div className="row" style={{ flexWrap: "wrap", marginTop: 16 }}>
             <button className="primary" disabled={busy !== null || !settings.enabled || !account.enabled || !account.has_token || !canClaim} onClick={() => void claim(account)}>手动领取</button>
-            <button disabled={busy !== null} onClick={() => setTokenAccount(account)}>{account.has_token ? "更新 Token" : "设置 Token"}</button>
+            <button disabled={busy!==null||!settings.enabled||!account.enabled} onClick={()=>void run("复用客户端登录",async()=>{await api.importBenefitClientSession(account.account_id);return {kind:"ok",text:"客户端登录已验证并加密保存，可直接查询账号与领取权益。"};})}>复用客户端登录</button>
+            {account.platform!=="trae_cn"&&<button disabled={busy !== null} onClick={() => setTokenAccount(account)}>{account.has_token ? "更新 Token" : "设置 Token"}</button>}
             <button disabled={busy !== null} onClick={() => { const item = settings.accounts.find(value => value.id === account.account_id); if (item) { setEditingId(item.id); setAccountDraft({ ...item }); } }}>编辑账号</button>
             {account.has_token && <button disabled={busy !== null} onClick={() => { if (window.confirm(`清除“${account.label}”的 Token？领取记录会保留。`)) void run("清除 Token", async () => { await api.clearBenefitToken(account.account_id); return { kind: "ok", text: "Token 已清除。" }; }); }}>清除 Token</button>}
-            <button className="danger" disabled={busy !== null} onClick={() => { if (window.confirm(`移除“${account.label}”的权益账号？历史记录会保留。`)) void saveSettings(previous => ({ ...previous, accounts: previous.accounts.filter(item => item.id !== account.account_id) }), "权益账号已移除。"); }}>移除账号</button>
+            <button className="danger" disabled={busy !== null} onClick={() => { if (window.confirm(`移除“${account.label}”的权益账号？历史记录会保留。`)) void saveSettings(previous => {const times={...previous.account_claim_times};delete times[account.account_id];return {...previous,account_claim_times:times,accounts:previous.accounts.filter(item=>item.id!==account.account_id)};}, "权益账号已移除。"); }}>移除账号</button>
           </div>
         </div>;
       })}
@@ -224,7 +232,7 @@ export default function BenefitsPage() {
       </div>
     </>}
     <div className="card" data-testid="benefit-capabilities"><div className="spread" style={{ flexWrap: "wrap" }}><strong>平台能力差异</strong><button onClick={() => void openOfficialHelp()}>Qoder 官方活动说明</button></div><div className="sub">活动权益、账号型上游调用和客户端接管是独立能力，不共用登录或 Token。活动规则可能变化，以平台当前状态为准。</div><div className="grid2">
-      <div><strong>Qoder / Qoder 中国版</strong><div className="muted">已适配活动查询、手动领取与可选自动领取。两个平台须分别设置 Token，CLI 登录态不会自动导入。</div></div>
+      <div><strong>Qoder / Qoder 中国版</strong><div className="muted">活动查询、账号用量、手动和定时领取。分别复用客户端登录后直连平台；导入可能在隔离的后台桌面启动客户端。不会读取客户端凭据文件，已运行但无后台连接的客户端需要先关闭。</div></div>
       <div><strong>Trae / 其他平台</strong><div className="muted">权益接口未适配，自动签到能力未知。本页不提供领取操作，也不读取客户端凭据。</div></div>
     </div></div>
     {(accountDraft || tokenAccount) && <div className="modal-mask" onClick={event => { if (event.target === event.currentTarget) closeDialogs(); }}><div className="modal" role="dialog" aria-modal="true" aria-label={tokenAccount ? "设置权益 Token" : editingId ? "编辑权益账号" : "添加权益账号"}>

@@ -1,0 +1,83 @@
+.workbuddy-login {
+  min-width: 0;
+  padding: 18px;
+  margin-bottom: 18px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-sm);
+}
+.workbuddy-login .workbuddy-login__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.workbuddy-login h3 { margin: 0 0 5px; }
+.workbuddy-login p { margin: 6px 0; line-height: 1.65; }
+.workbuddy-login .workbuddy-login__header p,
+.workbuddy-login .workbuddy-login__account p,
+.workbuddy-login .workbuddy-login__footnote { color: var(--muted); font-size: 12px; }
+.workbuddy-login .workbuddy-login__badge {
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  color: var(--text-soft);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.workbuddy-login .workbuddy-login__badge.is-authenticated { color: var(--ok); background: var(--ok-soft); }
+.workbuddy-login .workbuddy-login__account { max-width: 420px; margin-bottom: 12px; }
+.workbuddy-login .workbuddy-login__account label { display: block; margin-bottom: 5px; color: var(--text-soft); font-size: 12px; font-weight: 600; }
+.workbuddy-login .workbuddy-login__account input { display: block; width: 100%; min-width: 0; }
+.workbuddy-login .workbuddy-login__actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.workbuddy-login button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.workbuddy-login button:focus-visible,
+.workbuddy-login input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.workbuddy-login .workbuddy-login__authorization {
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 7px;
+  background: var(--panel-2);
+  font-size: 13px;
+}
+.workbuddy-login .workbuddy-login__authorization p { color: var(--text-soft); font-size: 12px; }
+.workbuddy-login .workbuddy-login__authorization > button { margin: 5px 0 10px; }
+.workbuddy-login .workbuddy-login__notice {
+  margin-top: 12px;
+  padding: 10px 12px;
+  color: var(--text-soft);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.workbuddy-login .workbuddy-login__notice.is-error { color: var(--err); background: var(--err-soft); border-color: var(--err); }
+.workbuddy-login .workbuddy-login__details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px 20px;
+  margin: 16px 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+.workbuddy-login .workbuddy-login__details > div { min-width: 0; }
+.workbuddy-login dt { color: var(--muted); margin-bottom: 4px; }
+.workbuddy-login dd { margin: 0; color: var(--text); overflow-wrap: anywhere; }
+.workbuddy-login dd span { display: block; margin-top: 3px; color: var(--muted); }
+.workbuddy-login .workbuddy-login__footnote { margin-top: 14px; }
+@media (max-width: 600px) {
+  .workbuddy-login { padding: 14px; }
+  .workbuddy-login .workbuddy-login__header { flex-direction: column; gap: 9px; }
+  .workbuddy-login .workbuddy-login__account { max-width: none; }
+  .workbuddy-login .workbuddy-login__details { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .workbuddy-login .workbuddy-login__actions button { flex: 1 1 auto; }
+}

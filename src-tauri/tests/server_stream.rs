@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 #[derive(Clone, Default)]
 struct MockState {
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    response_delay: Duration,
 }
 
 #[derive(Clone, Default)]
@@ -69,6 +70,9 @@ async fn mock_chat(
     Json(request): Json<serde_json::Value>,
 ) -> Response {
     state.requests.lock().unwrap().push(request.clone());
+    if !state.response_delay.is_zero() {
+        tokio::time::sleep(state.response_delay).await;
+    }
     if request
         .get("stream")
         .and_then(|value| value.as_bool())
@@ -154,6 +158,83 @@ async fn spawn_mock_upstream() -> (String, MockState, JoinHandle<()>) {
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}/v1"), state, task)
+}
+
+#[tokio::test]
+async fn runtime_bound_model_never_uses_placeholder_http_for_streaming() {
+    let (trap_url, trap, trap_task) = spawn_mock_upstream().await;
+    let (backup_url, backup, backup_task) = spawn_mock_upstream().await;
+    let db = db::Db::connect_in_memory().await.unwrap();
+    let mut runtime =
+        llm_gateway_lib::domain::AgentRuntime::new("desktop-account", "fake", "Fixture account");
+    runtime.options =
+        Some(serde_json::json!({"model_aliases":{"integration-model":"account-model"}}));
+    repo::upsert_agent_runtime(db.pool(), &runtime)
+        .await
+        .unwrap();
+    let mut account = mock_provider(trap_url);
+    account.id = "account".into();
+    account.priority = 0;
+    account.runtime_id = Some(runtime.id.clone());
+    account.models[0].alias = "qoder-cli-auto".into();
+    account.models[0].supports_stream = false;
+    let mut http = mock_provider(backup_url);
+    http.id = "http".into();
+    http.priority = 10;
+    repo::upsert_provider(db.pool(), &account).await.unwrap();
+    repo::upsert_provider(db.pool(), &http).await.unwrap();
+    let mut cfg = AppConfig {
+        port: unused_loopback_port().await,
+        ..Default::default()
+    };
+    cfg.smart_routing.enabled = false;
+    let gateway = Arc::new(GatewayState::new(db.clone(), cfg.clone()));
+    gateway.reload_providers().await.unwrap();
+    let task = tokio::spawn(serve(gateway.clone()));
+    let base = format!("http://127.0.0.1:{}", cfg.port);
+    wait_for_gateway(&base).await;
+    let summary = gateway
+        .summarize(
+            vec![llm_gateway_lib::domain::Message::user("summarize test")],
+            "",
+        )
+        .await
+        .unwrap();
+    assert!(
+        summary.contains("account-model"),
+        "internal summarizer uses the bound account adapter"
+    );
+    let request = |model: &str, stream| {
+        reqwest::Client::new().post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(&cfg.unified_key).json(&serde_json::json!({"model":model,"stream":stream,"messages":[{"role":"user","content":"test"}]}))
+    };
+    let normal = request("qoder-cli-auto", false).send().await.unwrap();
+    assert_eq!(normal.status(), StatusCode::OK);
+    assert!(
+        normal.json::<serde_json::Value>().await.unwrap()["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("account-model")
+    );
+    for stream_claim in [false, true] {
+        account.models[0].supports_stream = stream_claim;
+        repo::upsert_provider(db.pool(), &account).await.unwrap();
+        gateway.reload_providers().await.unwrap();
+        let auto = request("auto", true).send().await.unwrap();
+        assert_eq!(auto.status(), StatusCode::OK);
+        assert!(auto.text().await.unwrap().contains("[DONE]"));
+        let explicit = request("qoder-cli-auto", true).send().await.unwrap();
+        assert_eq!(explicit.status(), StatusCode::BAD_REQUEST);
+        explicit.text().await.unwrap();
+    }
+    assert!(
+        trap.requests.lock().unwrap().is_empty(),
+        "bound accounts must never use placeholder HTTP"
+    );
+    assert_eq!(backup.requests.lock().unwrap().len(), 2);
+    task.abort();
+    trap_task.abort();
+    backup_task.abort();
 }
 
 async fn mock_truncated_stream() -> Response {
@@ -841,7 +922,26 @@ async fn anthropic_and_responses_streams_emit_complete_item_lifecycles() {
 /// 「单独删时没有用例会红」—— 这条用例就是来消掉那句话的。
 #[tokio::test]
 async fn 流式完成后健康统计记下吞吐() {
-    let (upstream_url, _mock_state, upstream_task) = spawn_mock_upstream().await;
+    // This sample needs a nonzero measured generation time. An immediate
+    // loopback fixture can finish within the clock's millisecond precision,
+    // which production deliberately excludes from throughput statistics.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = MockState {
+        response_delay: Duration::from_millis(10),
+        ..Default::default()
+    };
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/v1/chat/completions", post(mock_chat))
+                .with_state(state),
+        )
+        .await
+        .unwrap();
+    });
+    let upstream_url = format!("http://{address}/v1");
     let (db, config, gateway_task, base_url, gateway) =
         spawn_gateway_with_state(vec![mock_provider(upstream_url)]).await;
     let client = reqwest::Client::new();
@@ -890,6 +990,10 @@ async fn 流式完成后健康统计记下吞吐() {
         after.avg_tps > 0.0,
         "记了样本就要能算出吞吐，实际 {}",
         after.avg_tps
+    );
+    assert!(
+        after.avg_latency_ms >= 10,
+        "the throughput fixture must exercise a measurable duration"
     );
 
     let _ = db;

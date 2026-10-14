@@ -183,6 +183,19 @@ fn 指定_provider_时只在该家里面挑() {
     let candidates = vec![candidate("thinker", true, 10), candidate("cheap", false, 0)];
     let target = refine::pick_target(&c, &candidates).expect("应当挑得出目标");
     assert_eq!(target.base_url, "http://cheap.local");
+    assert_eq!(target.provider_id, "cheap");
+}
+
+#[test]
+fn shared_endpoint_refine_preserves_selected_account_identity() {
+    let mut first = candidate("account-a", false, 0);
+    let mut second = candidate("account-b", false, 0);
+    first.provider.base_url = "http://127.0.0.1:9999/v1".into();
+    second.provider.base_url = first.provider.base_url.clone();
+    let mut c = cfg();
+    c.provider_id = Some("account-b".into());
+    let target = refine::pick_target(&c, &[first, second]).unwrap();
+    assert_eq!(target.provider_id, "account-b");
 }
 
 #[test]
@@ -262,6 +275,7 @@ enum Upstream {
 
 fn target(base: &str) -> refine::RefineTarget {
     refine::RefineTarget {
+        provider_id: "fixture-provider".into(),
         base_url: base.to_owned(),
         api_key: None,
         model: "tiny".into(),
@@ -310,6 +324,62 @@ async fn 短提示词一次网络往返都不发() {
 }
 
 #[tokio::test]
+async fn response_body_stall_respects_refine_deadline_and_keeps_original() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |Json(_body): Json<serde_json::Value>| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let body = axum::body::Body::from_stream(async_stream::stream! {
+                    // Headers and a JSON prefix arrive promptly, but no complete body follows.
+                    yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{"));
+                    std::future::pending::<()>().await;
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut config = cfg();
+    config.timeout_ms = 200;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        refine::refine(&http(), &target(&base), None, LONG_PROMPT, &config),
+    )
+    .await;
+    server.abort();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "fixture must receive the actual refinement request"
+    );
+    let outcome = result.expect("body reads must finish within the configured refinement deadline");
+    assert!(!outcome.applied);
+    assert_eq!(outcome.prompt, LONG_PROMPT);
+    assert_eq!(outcome.reason.as_deref(), Some("改写超时（200ms）"));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "timeout must not retry or issue another paid request"
+    );
+}
+
+#[tokio::test]
 async fn 端点超时时用原文且不重试() {
     // 监听但永不回应：客户端会等到超时。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -322,11 +392,16 @@ async fn 端点超时时用原文且不重试() {
     });
 
     let mut c = cfg();
-    c.timeout_ms = 400;
+    c.timeout_ms = 50;
     let base = format!("http://{addr}");
     let outcome = refine::refine(&http(), &target(&base), None, LONG_PROMPT, &c).await;
     assert!(!outcome.applied, "超时后不得改写");
     assert_eq!(outcome.prompt, LONG_PROMPT, "超时后必须用原文");
+    assert_eq!(
+        outcome.reason.as_deref(),
+        Some("改写超时（200ms）"),
+        "report the effective clamped deadline, not the requested 50ms"
+    );
     assert!(
         outcome
             .reason
@@ -374,6 +449,7 @@ async fn 改写把提示词清空时判失败() {
 async fn 凭据不会出现在_debug_输出里() {
     // Debug 会被 tracing 带进日志。密钥一旦进去就是明文落盘。
     let target = refine::RefineTarget {
+        provider_id: "fixture-provider".into(),
         base_url: "http://x".into(),
         api_key: Some("sk-secret-value".into()),
         model: "m".into(),
@@ -456,6 +532,7 @@ async fn 带_v1_前缀的真实形状上游能收到改写请求() {
 
     // base_url 带上真实的 `/v1` 形状。
     let target = refine::RefineTarget {
+        provider_id: "fixture-provider".into(),
         base_url: format!("http://{addr}/v1"),
         api_key: None,
         model: "tiny".into(),

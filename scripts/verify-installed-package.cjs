@@ -86,13 +86,30 @@ function verifyPayload({ bundle, directory }) {
     const actual = readRegularFile(path.join(payloadResources, relative), `Payload resource ${relative}`);
     requireCondition(actual.equals(expected), `Payload resource differs from repository: ${relative}`);
   }
+  let integratedFiles = 0;
+  const releaseResources = path.join(repository, "src-tauri", "resources", "release");
+  for (const name of fileList(releaseResources)) {
+    requireCondition(readRegularFile(path.join(releaseResources, name), name).equals(
+      readRegularFile(path.join(directory, "resources", "release", name), name)), `release/${name} resource bytes differ`);
+    integratedFiles++;
+  }
+  for (const runtime of ["node", "xray", "qoder-rewards", "qoder-protocol", "trae-protocol"]) {
+    const expectedRoot = path.join(repository, "src-tauri", "resources", runtime);
+    const actualRoot = path.join(directory, "resources", runtime);
+    const expected = fileList(expectedRoot);
+    requireCondition(JSON.stringify(fileList(actualRoot)) === JSON.stringify(expected), `${runtime} resource list differs`);
+    for (const relative of expected) {
+      requireCondition(readRegularFile(path.join(expectedRoot, relative), relative).equals(readRegularFile(path.join(actualRoot, relative), relative)), `${runtime}/${relative} resource bytes differ`);
+      integratedFiles++;
+    }
+  }
   return {
     verified: true,
     bundle,
     bundle_marker_offset: offset,
     normalized_exe_sha256: createHash("sha256").update(normalized).digest("hex"),
     dll_verified: dllPresent,
-    resource_files_verified: expectedFiles.length,
+    resource_files_verified: expectedFiles.length + integratedFiles,
   };
 }
 

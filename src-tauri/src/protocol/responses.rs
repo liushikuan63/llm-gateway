@@ -25,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use crate::domain::{ChatRequest, ChatResponse, Role};
+use crate::domain::{ChatRequest, ChatResponse, FunctionCall, Role, ToolCall};
 
 /// 取消息的纯文本。`Content::Parts` 里只收文本块 —— 图片/音频在 Responses
 /// 里的表示与 Chat Completions 不同，单独处理会引入转换歧义，这里从简。
@@ -61,14 +61,32 @@ pub fn to_responses_body(req: &ChatRequest, model: &str) -> Value {
                     instructions.push(t);
                 }
             }
-            Role::User | Role::Tool => input.push(json!({
+            Role::User => input.push(json!({
                 "role": "user",
                 "content": [{ "type": "input_text", "text": plain_text(message) }],
             })),
-            Role::Assistant => input.push(json!({
-                "role": "assistant",
-                "content": [{ "type": "output_text", "text": plain_text(message) }],
+            Role::Tool => input.push(json!({
+                "type": "function_call_output",
+                "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
+                "output": plain_text(message),
             })),
+            Role::Assistant => {
+                let text = plain_text(message);
+                if !text.is_empty() || message.tool_calls.as_ref().map_or(true, Vec::is_empty) {
+                    input.push(json!({
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": text }],
+                    }));
+                }
+                for call in message.tool_calls.iter().flatten() {
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": call.id,
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }));
+                }
+            }
         }
     }
 
@@ -96,10 +114,33 @@ pub fn to_responses_body(req: &ChatRequest, model: &str) -> Value {
         }
     }
     if let Some(tools) = &req.tools {
-        body["tools"] = tools.clone();
+        body["tools"] = match tools.as_array() {
+            Some(tools) => Value::Array(
+                tools
+                    .iter()
+                    .map(|tool| {
+                        if tool.get("type").and_then(Value::as_str) == Some("function") {
+                            if let Some(function) = tool.get("function").and_then(Value::as_object)
+                            {
+                                let mut flat = function.clone();
+                                flat.insert("type".into(), json!("function"));
+                                return Value::Object(flat);
+                            }
+                        }
+                        tool.clone()
+                    })
+                    .collect(),
+            ),
+            None => tools.clone(),
+        };
     }
     if let Some(tc) = &req.tool_choice {
-        body["tool_choice"] = tc.clone();
+        body["tool_choice"] = match tc.get("function").and_then(|f| f.get("name")) {
+            Some(name) if tc.get("type").and_then(Value::as_str) == Some("function") => {
+                json!({"type": "function", "name": name})
+            }
+            _ => tc.clone(),
+        };
     }
 
     body
@@ -111,12 +152,72 @@ pub fn to_responses_body(req: &ChatRequest, model: &str) -> Value {
 /// 与 Chat Completions 的 `choices[0].message.content` 完全不同。
 pub fn from_responses_response(v: &Value, model: &str) -> ChatResponse {
     let mut text = String::new();
+    let mut reasoning = None::<String>;
+    let mut refusal = None::<String>;
+    let mut tool_calls = Vec::new();
     if let Some(output) = v.get("output").and_then(Value::as_array) {
         for item in output {
+            if item.get("type").and_then(Value::as_str) == Some("reasoning")
+                && !item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("reasoning_text")
+                        })
+                    })
+            {
+                for summary in item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(t) = summary.get("text").and_then(Value::as_str) {
+                        reasoning.get_or_insert_with(String::new).push_str(t);
+                    }
+                }
+            }
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                if let (Some(id), Some(name)) = (
+                    item.get("call_id").and_then(Value::as_str),
+                    item.get("name").and_then(Value::as_str),
+                ) {
+                    tool_calls.push(ToolCall {
+                        id: id.to_owned(),
+                        kind: "function".into(),
+                        function: FunctionCall {
+                            name: name.to_owned(),
+                            arguments: item
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        },
+                    });
+                }
+            }
             if let Some(content) = item.get("content").and_then(Value::as_array) {
                 for part in content {
-                    if let Some(t) = part.get("text").and_then(Value::as_str) {
-                        text.push_str(t);
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("reasoning_text") => {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                reasoning.get_or_insert_with(String::new).push_str(t);
+                            }
+                        }
+                        Some("refusal") => {
+                            if let Some(t) = part.get("refusal").and_then(Value::as_str) {
+                                refusal.get_or_insert_with(String::new).push_str(t);
+                            }
+                        }
+                        Some("output_text") | None
+                            if item.get("type").and_then(Value::as_str) != Some("reasoning") =>
+                        {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                text.push_str(t);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -139,6 +240,12 @@ pub fn from_responses_response(v: &Value, model: &str) -> ChatResponse {
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32,
         cache_creation_tokens: 0,
+        credit: u.get("credit").and_then(Value::as_f64),
+        reasoning_tokens: u
+            .get("output_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .map(|tokens| tokens as u32),
     });
 
     ChatResponse {
@@ -155,9 +262,17 @@ pub fn from_responses_response(v: &Value, model: &str) -> ChatResponse {
             .unwrap_or(model)
             .to_owned(),
         content: text,
-        tool_calls: None,
-        finish_reason: finish_reason_of(v),
+        finish_reason: if !tool_calls.is_empty()
+            && v.get("status").and_then(Value::as_str) == Some("completed")
+        {
+            Some("tool_calls".into())
+        } else {
+            finish_reason_of(v)
+        },
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
         usage,
+        reasoning_content: reasoning,
+        refusal,
     }
 }
 
@@ -188,6 +303,30 @@ fn finish_reason_of(v: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::domain::{Content, Message, Role};
+
+    #[test]
+    fn reasoning_refusal_and_zero_usage_do_not_enter_answer() {
+        let r = from_responses_response(
+            &json!({"status":"completed", "output":[
+            {"type":"reasoning","content":[{"type":"reasoning_text","text":"provided"}]},
+            {"type":"message","content":[{"type":"output_text","text":"answer"},{"type":"refusal","refusal":"no"}]}
+        ],"usage":{"output_tokens_details":{"reasoning_tokens":0},"credit":0}}),
+            "m",
+        );
+        assert_eq!(r.content, "answer");
+        assert_eq!(r.reasoning_content.as_deref(), Some("provided"));
+        assert_eq!(r.refusal.as_deref(), Some("no"));
+        let u = r.usage.unwrap();
+        assert_eq!(u.reasoning_tokens, Some(0));
+        assert_eq!(u.credit, Some(0.0));
+        let plain = from_responses_response(
+            &json!({"output":[{"type":"message","content":[{"type":"output_text","text":"answer"}]}]}),
+            "m",
+        );
+        assert_eq!(plain.content, "answer");
+        assert_eq!(plain.reasoning_content, None);
+        assert_eq!(plain.refusal, None);
+    }
 
     // Message / ChatRequest 都没实现 Default，所以显式列全字段 ——
     // 用 `..Default::default()` 会编译失败，且将来加字段时也不会提醒。

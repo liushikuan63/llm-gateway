@@ -153,18 +153,12 @@ impl UpstreamClient {
         }
     }
 
-    /// 在协议整流之后应用模型级覆盖：先覆盖采样参数，再合并额外请求体。
+    /// 规范化参数已在 build_body 中按候选应用；这里仅合并方言专属额外字段。
     /// 额外请求体在保存期已校验为对象且不含受保护键，这里的合并是浅合并。
     fn apply_overrides(body: &mut serde_json::Value, overrides: Option<&ModelOverrides>) {
         let Some(overrides) = overrides else {
             return;
         };
-        if let Some(temperature) = overrides.temperature {
-            body["temperature"] = serde_json::json!(temperature);
-        }
-        if let Some(max_tokens) = overrides.max_tokens {
-            body["max_tokens"] = serde_json::json!(max_tokens);
-        }
         if let (Some(serde_json::Value::Object(extra)), Some(target)) =
             (&overrides.extra_body, body.as_object_mut())
         {
@@ -218,6 +212,23 @@ impl UpstreamClient {
         model: &str,
         defaults: &crate::config::OllamaOptionsConfig,
     ) -> serde_json::Value {
+        // Apply canonical overrides before converting: each dialect stores these
+        // fields in a different location. The shared failover request stays intact.
+        let mut effective;
+        let req = if let Some(options) = overrides(model, p)
+            .filter(|options| options.temperature.is_some() || options.max_tokens.is_some())
+        {
+            effective = req.clone();
+            if let Some(temperature) = options.temperature {
+                effective.temperature = Some(temperature);
+            }
+            if let Some(max_tokens) = options.max_tokens {
+                effective.max_tokens = Some(max_tokens);
+            }
+            &effective
+        } else {
+            req
+        };
         match p.dialect {
             Dialect::OpenAI => crate::protocol::openai::to_upstream_body(req, model),
             Dialect::Anthropic => {
@@ -241,7 +252,7 @@ impl UpstreamClient {
         let url = Self::build_url(p, model, false)?;
         let key = decrypt_provider_key(p)?;
         let mut body = Self::build_body(p, req, model, defaults);
-        if body.get("stream").is_none() {
+        if p.dialect != Dialect::Gemini && body.get("stream").is_none() {
             body["stream"] = serde_json::Value::Bool(false);
         }
         // 上游不支持 thinking 时剥掉，否则 DeepSeek/GLM 直接 400
@@ -406,7 +417,9 @@ impl UpstreamClient {
         let url = Self::build_url(p, model, true)?;
         let key = decrypt_provider_key(p)?;
         let mut body = Self::build_body(p, req, model, defaults);
-        body["stream"] = serde_json::Value::Bool(true);
+        if p.dialect != Dialect::Gemini {
+            body["stream"] = serde_json::Value::Bool(true);
+        }
         crate::protocol::convert::strip_thinking(&mut body);
         Self::apply_overrides(&mut body, overrides(model, p).as_ref());
 
@@ -445,7 +458,12 @@ impl UpstreamClient {
                             _ => drain_sse_blocks(dialect, &mut buffer),
                         };
                         for event in events {
+                            let terminal = dialect == Dialect::Responses
+                                && (event.is_err() || matches!(&event, Ok(UpstreamEvent::Done { .. })));
                             yield event;
+                            if terminal {
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
@@ -462,7 +480,12 @@ impl UpstreamClient {
                     _ => parse_sse_block(dialect, &buffer),
                 };
                 for event in events {
+                        let terminal = dialect == Dialect::Responses
+                            && (event.is_err() || matches!(&event, Ok(UpstreamEvent::Done { .. })));
                     yield event;
+                        if terminal {
+                            return;
+                        }
                 }
             }
         };
@@ -477,11 +500,15 @@ impl UpstreamClient {
 pub enum UpstreamEvent {
     /// 一段文本增量
     Delta(String),
+    ReasoningDelta(String),
+    RefusalDelta(String),
     /// 工具调用增量（简化：整体下发，够 Claude Code / Codex 用）
     ToolCalls(serde_json::Value),
     /// 上游宣告生成已完成，但传输流尚未结束。OpenAI 的 usage-only chunk
     /// 正常会出现在该事件之后、`[DONE]` 之前，不能在这里提前关闭下游流。
-    Finish { finish_reason: Option<String> },
+    Finish {
+        finish_reason: Option<String>,
+    },
     /// 独立用量事件。某些上游（特别是 OpenAI `include_usage`）会以
     /// `choices: []` 的最后一个 chunk 单独发送它。
     Usage(Usage),
@@ -579,7 +606,8 @@ fn parse_event_value(
 ) -> Vec<Result<UpstreamEvent>> {
     let mut out = Vec::new();
     match dialect {
-        Dialect::OpenAI | Dialect::Responses => parse_openai_chunk(v, &mut out),
+        Dialect::OpenAI => parse_openai_chunk(v, &mut out),
+        Dialect::Responses => parse_responses_chunk(event_name, v, &mut out),
         Dialect::Anthropic => parse_anthropic_chunk(event_name, v, &mut out),
         Dialect::Gemini => parse_gemini_chunk(v, &mut out),
         Dialect::Ollama => parse_ollama_chunk(v, &mut out),
@@ -621,6 +649,100 @@ fn parse_openai_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
 fn openai_usage(v: &serde_json::Value) -> Option<Usage> {
     let usage = v.get("usage")?;
     Some(Usage::from_openai(usage))
+}
+
+fn parse_responses_chunk(
+    event_name: Option<&str>,
+    v: serde_json::Value,
+    out: &mut Vec<Result<UpstreamEvent>>,
+) {
+    match v
+        .get("type")
+        .and_then(|value| value.as_str())
+        .or(event_name)
+        .unwrap_or("")
+    {
+        "response.output_text.delta" => {
+            if let Some(text) = v
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .filter(|text| !text.is_empty())
+            {
+                out.push(Ok(UpstreamEvent::Delta(text.to_owned())));
+            }
+        }
+        "response.output_item.added" => {
+            if let Some(item) = v.get("item").filter(|item| {
+                item.get("type").and_then(|kind| kind.as_str()) == Some("function_call")
+            }) {
+                out.push(Ok(UpstreamEvent::ToolCalls(serde_json::json!([
+                    openai_tool_call(
+                        v.get("output_index")
+                            .and_then(|index| index.as_u64())
+                            .unwrap_or(0) as usize,
+                        item.get("call_id").and_then(|id| id.as_str()),
+                        item.get("name").and_then(|name| name.as_str()),
+                        item.get("arguments")
+                            .and_then(|args| args.as_str())
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                ]))));
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            if let Some(delta) = v.get("delta").and_then(|value| value.as_str()) {
+                out.push(Ok(UpstreamEvent::ToolCalls(serde_json::json!([
+                    openai_tool_call_arguments(
+                        v.get("output_index")
+                            .and_then(|index| index.as_u64())
+                            .unwrap_or(0) as usize,
+                        delta,
+                    )
+                ]))));
+            }
+        }
+        "response.completed" | "response.incomplete" => {
+            if let Some(response) = v.get("response") {
+                let response = crate::protocol::responses::from_responses_response(response, "");
+                out.push(Ok(UpstreamEvent::Done {
+                    finish_reason: response.finish_reason,
+                    usage: response.usage,
+                }));
+            } else {
+                out.push(Err(GatewayError::Protocol(
+                    "Responses terminal event is missing response".into(),
+                )));
+            }
+        }
+        "response.failed" | "error" => {
+            let error = v
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .or_else(|| v.get("error"))
+                .unwrap_or(&v);
+            out.push(Err(GatewayError::Upstream {
+                provider: "Responses".into(),
+                model: v
+                    .get("response")
+                    .and_then(|response| response.get("model"))
+                    .and_then(|model| model.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                status: 502,
+                body: truncate(
+                    error
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .unwrap_or("Responses stream failed"),
+                    800,
+                ),
+            }));
+        }
+        // Item/argument done events repeat the complete content. Deltas already
+        // carry it, so replaying these snapshots would duplicate text/arguments.
+        _ => {}
+    }
 }
 
 fn parse_anthropic_chunk(

@@ -1,13 +1,35 @@
 # 本机客户端接入 DSH：Qoder CN / WorkBuddy AI / Trae CN
 
-> 建立 2026-10-12 21:05，最后更新 23:45 (Asia/Shanghai)。
+> 建立 2026-10-12 21:05；2026-10-13 复验与修复结果如下 (Asia/Shanghai)。
 > 目标（用户原话）：测试本机的 workbuddy/qoder/trae 接入本项目，提供登录，使其模型在本 DSH 中可调用。
 > 追加要求：**后续支持多账号**（不限于每种一个）。
 > 本文档不记录任何凭据明文，只记录**位置**与**取用方式**。凭据等同于账号登录态。
 
 ---
 
-## 一、结论：三家全部打通
+## 2026-10-13 当前复验与修复
+
+追加的软件内集成：客户端接入页可探测三家，WorkBuddy/Trae 桥接源码已嵌入 Rust 程序并携带 Node 运行环境，可管理应用自己启动的桥接；Qoder 可走现有原生 CLI 适配器或已运行的外部 HTTP 网关。外部 `D:/Software` 部署和 DSH 的原有端口不迁移、不接管。桌面说明见 [快速开始](桌面快速开始.md)，完整内置与离线说明见 [使用手册](使用手册.md)。
+
+本轮开始时三个桥接及 WorkBuddy / Trae 的 CDP 端口全部未监听。经用户明确授权启动客户端、同步 DSH 配置及最小模型调用后，三家均恢复就绪并完成真实请求。历史的“已打通”不能替代当前进程与账号验收。
+
+| 客户端 | 本轮实际证据 | 能力边界 |
+| --- | --- | --- |
+| Qoder CN | HTTP 200 / 652 ms / 回复“收到”；账号池 ready=1，模型目录 14 项 | 请求模型为 `deepseek-v4.1-flash`，响应模型字段为 `auto`；该证据不证明精确的实际模型身份 |
+| WorkBuddy | HTTP 200 / 878 ms / 回复“收到”；实际 preload API 可读，模型目录 11 项 | 通过客户端 `wb.http` 发文本请求；桥接不读取登录工具生成的 `.env` |
+| Trae CN | 首轮 502 / 182010 ms；修复后 HTTP 200 / 13239 ms / 回复“收到” | 只暴露 `trae-desktop`，使用客户端当前选中的模型；没有指定模型切换、工具或多模态支持 |
+
+Trae 首轮已有真实 completed 回复，但客户端 `created_at` 是秒级 epoch，桥接却与毫秒比较；首次调用没有索引基线，导致已有回复仍等满 180 秒。新回归先在旧逻辑失败，再验证秒/毫秒、旧回复和新会话索引重置。已知基线优先按索引判断，新会话/首条消息使用归一化时间。输入框存在草稿时拒绝写入；两个并发 UI 生成请求中第二个返回 409。
+
+此前静态列出的 13 个 Trae 模型没有 `model` 参数消费者，不能视为可选择模型。本轮已备份并将 DSH `trae` provider 的 8 个具名入口改为单一 `trae-desktop`；其它 provider 与配置段保留。官方打包 CLI 的 `--dump-config` exit 0；独立 desktop 实例 18090 的 `session/modelCatalog` 返回 HTTP 200，实际注册 `qoder/workbuddy/trae`，并包含 `trae-desktop`。未重启当前正在使用的 DSH Desktop；其 GUI 是否已热加载本轮配置仍需与独立实例结果区分。
+
+`npm run verify:clients` 是新增的只读就绪检查：不登录、不读 Token、不发提示词；Qoder 必须有 ready 账号，两家桌面桥接必须有真实 API。报告明确保留 `model_call_verified=false`，不能把就绪报告当模型调用通过。回归与源码在 [桥接维护源](../scripts/local-client-bridges/README.md)，部署位置仍为 `D:/Software/workbuddy2api`。Qoder 管理器仍在 `D:/Software/qoder2api-hub`；两套管理器均使用 WMI 启动、停止前核验脚本/端口归属，不再按端口盲杀或只用 detached 声称脱离宿主 Job Object。
+
+登录状态也要分开：Qoder 设备流此前已实测；WorkBuddy 登录工具能取得凭据供直连服务使用，但 CDP 桥接不消费 `.env`；Trae 的独立 PKCE 登录脚本已存在，统一入口改为提示该脚本，ExchangeToken 和凭据消费尚未完成本人授权验收。本文下方保留历史现场记录，不以历史未开始表覆盖现状。
+
+完整门禁、VPN 证据及产物见 [本轮验收记录](2026-10-13-VPN与客户端接管验收.md)。
+
+## 一、2026-10-12 历史验收：三家曾全部打通
 
 | 客户端 | 端口 | 模型数 | 实现方式 | DSH 全链路判据 |
 |---|---|---|---|---|

@@ -94,6 +94,41 @@ fn throttled(provider: &str) -> GatewayError {
     }
 }
 
+#[tokio::test]
+async fn confirmed_refusal_skips_remaining_models_of_the_same_provider() {
+    let mut first = candidate(provider("a", "m", true));
+    let mut second = first.clone();
+    second.model = model("m2");
+    first.model = model("m1");
+    let candidates = vec![first, second, candidate(provider("b", "m", true))];
+    let flag = AtomicFlag::new();
+    let mut records = Vec::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let sink = calls.clone();
+    let result = FailoverChain::new(&candidates, 3, &flag)
+        .with_auth_policy(AuthFailureMode::SkipAndDisable, 1)
+        .run_with_auth_policy(
+            &mut records,
+            move |p, m| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(format!("{}:{m}", p.id));
+                    if p.id == "a" {
+                        Err(refused("a"))
+                    } else {
+                        Ok("fallback".to_string())
+                    }
+                }
+            },
+            |_, _, _| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.provider_id, "b");
+    assert_eq!(*calls.lock().unwrap(), vec!["a:m1", "a:m1", "b:m"]);
+}
+
 /// 每个候选都返回 401，用计数断言「上游到底被打了几次」。
 fn always_401(counter: Arc<AtomicUsize>) -> impl FnMut(Provider, String) -> Boxed {
     move |provider, _model| {
@@ -424,4 +459,69 @@ async fn 首次鉴权拒绝后即使复测变成限流也不能落到免密钥�
     assert_eq!(result.provider_id, "b");
     assert_eq!(counter.load(Ordering::SeqCst), 3);
     assert_eq!(records.len(), 3);
+}
+
+#[tokio::test]
+async fn auth_confirmation_transient_failures_replace_invalid_health() {
+    use llm_gateway_lib::domain::Health;
+    use llm_gateway_lib::proxy::health::HealthRegistry;
+    use llm_gateway_lib::router::ratelimit::RateLimiter;
+    use llm_gateway_lib::router::Router;
+
+    for (status, expected_health) in [(Some(429), Health::RateLimited), (None, Health::Error)] {
+        let health = Arc::new(HealthRegistry::new());
+        let router = Arc::new(Router::new(Arc::new(RateLimiter::new()), health.clone()));
+        let mut p = provider("transient-auth", "m", true);
+        p.rpm_limit = 10;
+        let candidates = [candidate(p)];
+        let flag = AtomicFlag::new();
+        let mut records = Vec::new();
+        let mut sends = 0;
+        let result = FailoverChain::new(&candidates, 4, &flag)
+            .with_admission(router.clone())
+            .with_auth_policy(AuthFailureMode::SkipAndDisable, 1)
+            .run_with_auth_policy(
+                &mut records,
+                |p, _| {
+                    sends += 1;
+                    let first = sends == 1;
+                    async move {
+                        Err::<(), _>(if first {
+                            refused(&p.id)
+                        } else if status == Some(429) {
+                            throttled(&p.id)
+                        } else {
+                            GatewayError::Timeout("confirmation timed out".into())
+                        })
+                    }
+                },
+                |p, model, error| {
+                    if matches!(error, GatewayError::Upstream { status: 429, .. }) {
+                        router.mark_rate_limited(p, &p.models[0]);
+                    }
+                    health.record_failure(&p.id, model, error);
+                },
+                |_, _| panic!("a transient confirmation cannot confirm invalid credentials"),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(sends, 2);
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            health.get("transient-auth", "m").health,
+            expected_health,
+            "the latest observed failure must replace permanent Invalid state"
+        );
+        assert_eq!(
+            health.total_failovers(),
+            2,
+            "both failed sends affect health"
+        );
+        assert_eq!(
+            router.try_reserve(&candidates[0]),
+            status != Some(429),
+            "a confirmation 429 must exhaust RPM; a timeout must not exhaust it"
+        );
+    }
 }

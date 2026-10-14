@@ -40,6 +40,61 @@ fn 日志<'a>(
 }
 
 /// D4 级联的两列：写进去要能读回来。
+#[tokio::test]
+async fn multi_upstream_usage_preserves_currency_and_rolls_back_on_aggregation_failure() {
+    let db = Db::connect_in_memory().await.unwrap();
+    let usage = vec![
+        repo::UsageEntry {
+            provider_id: "cheap".into(),
+            model: "a".into(),
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            cost: Some(0.1),
+            currency: Some("usd".into()),
+            errors: 0,
+        },
+        repo::UsageEntry {
+            provider_id: "strong".into(),
+            model: "b".into(),
+            prompt_tokens: 7,
+            completion_tokens: 4,
+            cost: Some(0.2),
+            currency: Some("cny".into()),
+            errors: 0,
+        },
+    ];
+    repo::log_request_with_usage(db.pool(), 日志("auto", None, Some("b")), &usage)
+        .await
+        .unwrap();
+    let daily: Vec<(String, String, f64)> =
+        sqlx::query_as("SELECT provider_id,currency,cost FROM usage_daily ORDER BY provider_id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        daily,
+        vec![
+            ("cheap".into(), "usd".into(), 0.1),
+            ("strong".into(), "cny".into(), 0.2)
+        ]
+    );
+    sqlx::query("CREATE TRIGGER reject_usage BEFORE INSERT ON usage_daily BEGIN SELECT RAISE(ABORT,'fixture failure'); END").execute(db.pool()).await.unwrap();
+    assert!(
+        repo::log_request_with_usage(db.pool(), 日志("auto", None, Some("b")), &usage)
+            .await
+            .is_err()
+    );
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "failed aggregation cannot leave a partial request audit row"
+    );
+}
+
+/// D4 级联的两列：写进去要能读回来。
 ///
 /// 这条能抓 **bind 顺序错位** —— 30 列对 30 个占位符、一个不多一个不少，
 /// 但值串了位置时，只有「读回来的值对不对」能发现。

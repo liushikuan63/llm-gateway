@@ -60,6 +60,93 @@ fn router() -> (Router, Arc<RateLimiter>, Arc<HealthRegistry>) {
 }
 
 #[test]
+fn desktop_client_models_share_cloud_scoring_and_auto_selection() {
+    use llm_gateway_lib::router::score::RequiredCapabilities;
+    let (router, _, _) = router();
+    let providers: Vec<_> = ["qoder", "workbuddy", "trae", "qoder-cli"]
+        .into_iter()
+        .map(|id| {
+            let mut p = provider(id, 30, 60);
+            p.models = vec![model(&format!("{id}/desktop"), "auto")];
+            p.models[0].supports_tools = false;
+            p
+        })
+        .collect();
+    for strategy in [
+        RoutingStrategy::Priority,
+        RoutingStrategy::Balanced,
+        RoutingStrategy::Smartest,
+        RoutingStrategy::Fastest,
+        RoutingStrategy::Reliable,
+    ] {
+        let cfg = AppConfig {
+            routing_strategy: strategy,
+            ..AppConfig::default()
+        };
+        let explanation = router.explain_candidates(&providers, &cfg, "auto").unwrap();
+        assert_eq!(explanation.len(), 4);
+        assert!(explanation
+            .iter()
+            .all(|e| e.eligible && e.score.is_finite() && e.score > 0.0));
+        let ranked = router.rank(
+            router.resolve("auto", &providers).unwrap(),
+            &cfg,
+            RequiredCapabilities::default(),
+            None,
+        );
+        assert_eq!(ranked.len(), 4);
+        for p in &providers {
+            let selected = router.rank(
+                router.resolve("auto", std::slice::from_ref(p)).unwrap(),
+                &cfg,
+                RequiredCapabilities::default(),
+                None,
+            );
+            assert_eq!(
+                selected[0].provider.id, p.id,
+                "each desktop source can win auto"
+            );
+        }
+        assert!(
+            router
+                .rank(
+                    router.resolve("auto", &providers).unwrap(),
+                    &cfg,
+                    RequiredCapabilities {
+                        tools: true,
+                        ..Default::default()
+                    },
+                    None
+                )
+                .is_empty(),
+            "unknown desktop capabilities must not become tool support"
+        );
+    }
+}
+
+#[test]
+fn disabled_desktop_models_are_absent_from_public_catalog_and_scoring() {
+    let (router, _, _) = router();
+    let mut p = provider("trae", 30, 60);
+    p.models = vec![
+        model("trae/desktop", "trae-desktop"),
+        model("trae/disabled", "disabled"),
+    ];
+    p.models[1].enabled = false;
+    let catalog = Router::public_models(std::slice::from_ref(&p));
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].id, "trae/desktop");
+    let explanations = router
+        .explain_candidates(std::slice::from_ref(&p), &AppConfig::default(), "auto")
+        .unwrap();
+    assert_eq!(explanations.len(), 1);
+    assert_eq!(explanations[0].model, "trae/desktop");
+    p.enabled = false;
+    assert!(Router::public_models(std::slice::from_ref(&p)).is_empty());
+    assert!(router.resolve("auto", &[p]).is_err());
+}
+
+#[test]
 fn colon_model_ids_resolve_exactly_before_provider_qualification() {
     let (router, _, _) = router();
     let mut cloud = provider("openrouter", 10, 50);
@@ -80,6 +167,167 @@ fn colon_model_ids_resolve_exactly_before_provider_qualification() {
     assert!(router
         .resolve("other:vendor/chat:free", &providers)
         .is_err());
+}
+
+#[test]
+fn smart_disabled_has_identical_scores_and_order_to_auto() {
+    use llm_gateway_lib::router::score::RequiredCapabilities;
+    let (router, _, _) = router();
+    let providers = vec![provider("weak", 10, 70), provider("strong", 10, 90)];
+    let mut cfg = AppConfig {
+        routing_strategy: RoutingStrategy::Smart,
+        ..Default::default()
+    };
+    cfg.smart_routing.enabled = false;
+    let order = |name| {
+        router
+            .rank(
+                router
+                    .resolve_typed_with(name, &providers, ModelType::Chat, false)
+                    .unwrap(),
+                &cfg,
+                RequiredCapabilities::default(),
+                None,
+            )
+            .into_iter()
+            .map(|c| c.provider.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order("auto"), vec!["strong", "weak"]);
+    assert_eq!(order("smart"), order("auto"));
+    let auto = router.explain_candidates(&providers, &cfg, "auto").unwrap();
+    let smart = router
+        .explain_candidates(&providers, &cfg, "smart")
+        .unwrap();
+    for (a, s) in auto.iter().zip(&smart) {
+        assert_eq!(a.provider_id, s.provider_id);
+        assert_eq!(a.score, s.score);
+        assert_eq!(s.breakdown.exact_match_bonus, 1.0);
+    }
+}
+
+#[test]
+fn custom_preview_and_execution_agree_on_excluded_providers() {
+    use llm_gateway_lib::router::score::RequiredCapabilities;
+    let (router, _, _) = router();
+    let providers = vec![provider("excluded", 10, 90), provider("allowed", 10, 70)];
+    router.set_custom_rules(vec![RouteRule {
+        prefix: "auto".into(),
+        action: RuleAction::ExcludeProvider {
+            provider_id: "excluded".into(),
+        },
+    }]);
+    let cfg = AppConfig {
+        routing_strategy: RoutingStrategy::Custom,
+        ..Default::default()
+    };
+    let explanations = router.explain_candidates(&providers, &cfg, "auto").unwrap();
+    assert!(
+        !explanations
+            .iter()
+            .find(|e| e.provider_id == "excluded")
+            .unwrap()
+            .eligible
+    );
+    let ranked = router.rank(
+        router.resolve("auto", &providers).unwrap(),
+        &cfg,
+        RequiredCapabilities::default(),
+        None,
+    );
+    assert_eq!(ranked.len(), 1);
+    assert_eq!(ranked[0].provider.id, "allowed");
+}
+
+#[test]
+fn token_settlement_does_not_consume_a_second_rpm_slot() {
+    let limiter = RateLimiter::new();
+    let quota = Quota {
+        rpm: 2,
+        tpm: 10,
+        ..Default::default()
+    };
+    assert!(limiter.try_consume("p", &quota, 0));
+    limiter.record_tokens("p", 4);
+    limiter.record_tokens("p", 4);
+    assert!(
+        limiter.try_consume("p", &quota, 0),
+        "two settlement events still leave one RPM slot"
+    );
+    assert!(!limiter.try_consume("p", &quota, 0));
+    let token_quota = Quota {
+        tpm: 8,
+        ..Default::default()
+    };
+    assert!(!limiter.allows("p", &token_quota));
+}
+
+#[test]
+fn upstream_429_exhausts_large_rpm_and_daily_windows_without_backdating() {
+    let limiter = RateLimiter::new();
+    let rpm = Quota {
+        rpm: 120,
+        ..Default::default()
+    };
+    assert!(limiter.try_consume("rpm", &rpm, 0));
+    limiter.mark_exhausted("rpm", &rpm);
+    assert!(
+        !limiter.allows("rpm", &rpm),
+        "RPM above 60 must still be fully exhausted"
+    );
+    assert_eq!(limiter.headroom("rpm", &rpm), 0.0);
+    let daily = Quota {
+        rpm: 120,
+        rpd: 10000,
+        tpm: 200,
+        tpd: 20000,
+    };
+    limiter.mark_exhausted("daily", &daily);
+    assert!(!limiter.allows("daily", &daily));
+    assert_eq!(limiter.headroom("daily", &daily), 0.0);
+}
+
+#[test]
+fn unavailable_fast_model_cannot_change_eligible_preview_scores() {
+    let (router, _, health) = router();
+    let ps = vec![
+        provider("a", 10, 70),
+        provider("b", 10, 70),
+        provider("invalid", 10, 70),
+    ];
+    for (id, tokens) in [("a", 10), ("b", 20), ("invalid", 2000)] {
+        health.record_success(id, "mock-model", 1000);
+        health.record_tps(id, "mock-model", tokens, 1000);
+    }
+    health.record_failure(
+        "invalid",
+        "mock-model",
+        &GatewayError::Unauthorized("fixture".into()),
+    );
+    let mut cfg = AppConfig {
+        routing_strategy: RoutingStrategy::Balanced,
+        ..Default::default()
+    };
+    cfg.cost_routing.enabled = true;
+    cfg.cost_routing.efficiency_weight = 0.5;
+    cfg.cost_routing.min_efficiency_samples = 1;
+    let all = router.explain_candidates(&ps, &cfg, "auto").unwrap();
+    let eligible = router.explain_candidates(&ps[..2], &cfg, "auto").unwrap();
+    assert!(
+        !all.iter()
+            .find(|e| e.provider_id == "invalid")
+            .unwrap()
+            .eligible
+    );
+    for e in eligible {
+        assert_eq!(
+            e.score,
+            all.iter()
+                .find(|a| a.provider_id == e.provider_id)
+                .unwrap()
+                .score
+        );
+    }
 }
 
 #[test]

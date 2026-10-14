@@ -336,7 +336,7 @@ impl Router {
         let exact_name = providers.iter().filter(|p| p.enabled).any(|p| {
             p.models
                 .iter()
-                .filter(|m| m.model_type == model_type)
+                .filter(|m| m.enabled && m.model_type == model_type)
                 .any(|m| m.alias == requested || m.upstream == requested)
         });
 
@@ -366,7 +366,7 @@ impl Router {
             };
 
             for m in models {
-                if m.model_type != model_type {
+                if !m.enabled || m.model_type != model_type {
                     continue;
                 }
                 let hit = match requested {
@@ -386,7 +386,10 @@ impl Router {
                         provider: p.clone(),
                         model: m.clone(),
                         requested_model: requested.to_owned(),
-                        exact_match: requested != "auto" && virtual_strategy.is_none(),
+                        exact_match: !matches!(
+                            requested,
+                            "auto" | "fastest" | "smartest" | "reliable" | "balanced" | "smart"
+                        ),
                         virtual_strategy,
                     });
                 }
@@ -762,11 +765,22 @@ impl Router {
         cfg: &AppConfig,
         requested: &str,
     ) -> Result<Vec<CandidateExplanation>> {
-        let candidates = self.resolve(requested, providers)?;
+        let candidates = self.resolve_typed_with(
+            requested,
+            providers,
+            ModelType::Chat,
+            cfg.smart_routing.enabled,
+        )?;
+        let participating = self.rank(
+            candidates.clone(),
+            cfg,
+            RequiredCapabilities::default(),
+            None,
+        );
         let (strategy, _) = self.effective_strategy(&candidates, cfg);
         let w = Weights::with_cost_routing(Weights::for_strategy(strategy), &cfg.cost_routing);
         let minute_of_day = crate::proxy::server::utc_minute_of_day();
-        let cost = self.cost_context(&candidates, cfg, None, 0, minute_of_day);
+        let cost = self.cost_context(&participating, cfg, None, 0, minute_of_day);
 
         let mut out: Vec<CandidateExplanation> = candidates
             .iter()
@@ -786,6 +800,11 @@ impl Router {
                     Some("冷却中，尚未到半开探测时机")
                 } else if !allowed {
                     Some("额度已耗尽")
+                } else if !participating
+                    .iter()
+                    .any(|p| p.provider.id == c.provider.id && p.model.alias == c.model.alias)
+                {
+                    Some("被自定义路由规则排除")
                 } else {
                     None
                 };
@@ -815,6 +834,19 @@ impl Router {
         self.limiter.consume(&rate_key(provider, model), tokens);
     }
 
+    pub fn try_reserve(&self, candidate: &Candidate) -> bool {
+        self.limiter.try_consume(
+            &rate_key(&candidate.provider, &candidate.model),
+            &quota_of(&candidate.provider),
+            0,
+        )
+    }
+
+    pub fn record_tokens(&self, provider: &Provider, model: &ModelRef, tokens: u32) {
+        self.limiter
+            .record_tokens(&rate_key(provider, model), tokens);
+    }
+
     pub fn mark_rate_limited(&self, provider: &Provider, model: &ModelRef) {
         let q = quota_of(provider);
         self.limiter.mark_exhausted(&rate_key(provider, model), &q);
@@ -825,7 +857,7 @@ impl Router {
         let mut map: std::collections::BTreeMap<String, PublicModel> =
             std::collections::BTreeMap::new();
         for p in providers.iter().filter(|p| p.enabled) {
-            for m in &p.models {
+            for m in p.models.iter().filter(|m| m.enabled) {
                 let e = map.entry(m.alias.clone()).or_insert_with(|| PublicModel {
                     id: m.alias.clone(),
                     object: "model".into(),

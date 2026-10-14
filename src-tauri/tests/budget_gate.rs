@@ -110,29 +110,108 @@ fn access_key(id: &str, enabled: bool, budget: (i64, &str, Vec<String>)) -> Remo
     }
 }
 
-async fn unused_loopback_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-async fn wait_for_gateway(base_url: &str) {
+async fn wait_for_gateway(gateway: &Arc<GatewayState>, task: &mut JoinHandle<()>) -> String {
     // 必须 no_proxy：默认 client 会走系统代理，连不上时每轮要等到超时，
     // 200 轮下来是 400 秒 —— 实测第一次跑就是 411 秒才发现网关没起来。
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    for _ in 0..200 {
-        if client
-            .get(format!("{base_url}/healthz"))
-            .send()
-            .await
-            .is_ok_and(|r| r.status() == reqwest::StatusCode::OK)
-        {
-            return;
+    let client = client();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if task.is_finished() {
+            panic!(
+                "Own budget gateway exited before readiness: {:?}",
+                (&mut *task).await
+            );
+        }
+        if let Some(listener) = gateway.listener_snapshot() {
+            assert!(listener.bound_addr.ip().is_loopback());
+            let base_url = format!("http://{}", listener.bound_addr);
+            if tokio::time::timeout_at(deadline, client.get(format!("{base_url}/healthz")).send())
+                .await
+                .is_ok_and(|result| result.is_ok_and(|r| r.status() == reqwest::StatusCode::OK))
+            {
+                return base_url;
+            }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("网关没在预期时间内起来");
+}
+
+#[tokio::test]
+async fn budget_fixtures_use_distinct_owned_ports_and_one_shutdown_does_not_stop_the_other() {
+    let (first, second) = tokio::join!(
+        spawn(vec![access_key("rk-main", true, (0, "", vec![]))], |_| {}),
+        spawn(vec![access_key("rk-main", true, (0, "", vec![]))], |_| {})
+    );
+    assert_ne!(first.base_url, second.base_url);
+    assert_eq!(first.gateway.cfg.read().port, 0);
+    assert_eq!(second.gateway.cfg.read().port, 0);
+    assert_eq!(
+        chat_with(&first.base_url, KEY_SECRET, "alpha")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(second.mock_calls.load(Ordering::SeqCst), 0);
+    first._task.abort();
+    assert_eq!(
+        chat_with(&second.base_url, KEY_SECRET, "alpha")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(second.mock_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn budget_readiness_rejects_failed_bind_even_if_another_server_reports_healthy() {
+    use futures_util::FutureExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let foreign = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/healthz", axum::routing::get(|| async { "ok" })),
+        )
+        .await
+        .unwrap();
+    });
+    let db = db::Db::connect_in_memory().await.unwrap();
+    let gateway = Arc::new(GatewayState::new(
+        db,
+        AppConfig {
+            port: addr.port(),
+            unified_key: "fixture-owned-key".into(),
+            ..Default::default()
+        },
+    ));
+    gateway.reload_providers().await.unwrap();
+    let mut task = tokio::spawn({
+        let gateway = gateway.clone();
+        async move {
+            serve(gateway)
+                .await
+                .expect("Occupied fixture must fail its bind");
+        }
+    });
+    let result = std::panic::AssertUnwindSafe(wait_for_gateway(&gateway, &mut task))
+        .catch_unwind()
+        .await;
+    assert!(
+        result.is_err(),
+        "Foreign health must never prove this gateway is ready"
+    );
+    assert!(gateway.listener_snapshot().is_none());
+    assert_eq!(
+        client()
+            .get(format!("http://{addr}/healthz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    foreign.abort();
 }
 
 struct Harness {
@@ -193,7 +272,7 @@ async fn spawn(keys: Vec<RemoteAccessKey>, mutate: impl FnOnce(&mut AppConfig)) 
     }
 
     let mut config = AppConfig {
-        port: unused_loopback_port().await,
+        port: 0,
         unified_key: "lgw-local-unified".into(),
         ..Default::default()
     };
@@ -210,14 +289,15 @@ async fn spawn(keys: Vec<RemoteAccessKey>, mutate: impl FnOnce(&mut AppConfig)) 
 
     let gateway = Arc::new(GatewayState::new(database.clone(), config.clone()));
     gateway.reload_providers().await.unwrap();
-    let task = tokio::spawn({
+    let mut task = tokio::spawn({
         let gateway = gateway.clone();
         async move {
-            let _ = serve(gateway).await;
+            serve(gateway)
+                .await
+                .expect("Own budget fixture must bind and serve successfully");
         }
     });
-    let base_url = format!("http://{}:{}", config.bind, config.port);
-    wait_for_gateway(&base_url).await;
+    let base_url = wait_for_gateway(&gateway, &mut task).await;
 
     Harness {
         db: database,
@@ -229,7 +309,11 @@ async fn spawn(keys: Vec<RemoteAccessKey>, mutate: impl FnOnce(&mut AppConfig)) 
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder().no_proxy().build().unwrap()
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
 }
 
 /// 用远程 Key 发一次请求。`secret` 是明文。
@@ -303,6 +387,37 @@ async fn seed_spend(db: &db::Db, key_id: &str, cost: f64, currency: &str) {
 }
 
 // ---------- 放行路径 ----------
+
+#[tokio::test]
+async fn 预算账本读取失败时拒绝调用且恢复后正常放行() {
+    let h = spawn(
+        vec![access_key(
+            "rk-main",
+            true,
+            (MICROS_PER_UNIT, "USD", vec![]),
+        )],
+        |_| {},
+    )
+    .await;
+    // Simulate an unavailable accounting column while session storage remains usable.
+    // Treating the failed SUM as zero would still permit a charged upstream call.
+    sqlx::query("ALTER TABLE requests RENAME COLUMN cost TO cost_unavailable")
+        .execute(h.db.pool())
+        .await
+        .unwrap();
+    let (status, code, _) = error_code(chat_with(&h.base_url, KEY_SECRET, "alpha").await).await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(code, "budget_unavailable");
+    assert_eq!(h.mock_calls.load(Ordering::SeqCst), 0);
+
+    sqlx::query("ALTER TABLE requests RENAME COLUMN cost_unavailable TO cost")
+        .execute(h.db.pool())
+        .await
+        .unwrap();
+    let response = chat_with(&h.base_url, KEY_SECRET, "alpha").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(h.mock_calls.load(Ordering::SeqCst), 1);
+}
 
 #[tokio::test]
 async fn 未超预算时请求正常放行() {
@@ -694,6 +809,75 @@ fn auxiliary_requests() -> Vec<(&'static str, &'static str, serde_json::Value)> 
             }),
         ),
     ]
+}
+
+async fn auxiliary_cost_case(index: usize, expected: Option<f64>) {
+    let h = spawn(
+        vec![access_key(
+            "rk-main",
+            true,
+            (MICROS_PER_UNIT, "USD", vec![]),
+        )],
+        |_| {},
+    )
+    .await;
+    let mut priced = h.gateway.providers.read()[0].clone();
+    for model in &mut priced.models {
+        model.price = Some(ModelPrice {
+            prompt: 1_000_000.0,
+            completion: 1_000_000.0,
+            cache_read: None,
+            cache_creation: None,
+            currency: Currency::Usd,
+            tiers: vec![],
+            rules: vec![],
+            source: Default::default(),
+        });
+    }
+    repo::upsert_provider(h.db.pool(), &priced).await.unwrap();
+    h.gateway.reload_providers().await.unwrap();
+    let cases = auxiliary_requests();
+    let (path, _, body) = &cases[index];
+    let response = auxiliary_request(&h, path, body).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.bytes().await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let row = sqlx::query_as::<_, (Option<f64>, Option<String>)>("SELECT cost,currency FROM requests WHERE access_key_id='rk-main' ORDER BY id DESC LIMIT 1")
+            .fetch_optional(h.db.pool()).await.unwrap();
+        if let Some((cost, currency)) = row {
+            assert_eq!(
+                cost, expected,
+                "successful auxiliary requests with reported tokens must be priced"
+            );
+            assert_eq!(currency.as_deref(), expected.map(|_| "usd"));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "audit row must actually be written"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    if expected.is_some() {
+        let (status, code, _) = error_code(auxiliary_request(&h, path, body).await).await;
+        assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(code, "budget_exceeded");
+        assert_eq!(h.mock_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn embeddings_reported_tokens_are_charged_and_block_next_request() {
+    auxiliary_cost_case(0, Some(5.0)).await;
+}
+#[tokio::test]
+async fn remote_compaction_reported_tokens_are_charged_and_block_next_request() {
+    auxiliary_cost_case(3, Some(6.0)).await;
+}
+#[tokio::test]
+async fn priced_image_without_token_usage_keeps_cost_unknown() {
+    auxiliary_cost_case(1, None).await;
 }
 
 async fn auxiliary_request(h: &Harness, path: &str, body: &serde_json::Value) -> reqwest::Response {

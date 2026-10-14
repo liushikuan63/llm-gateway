@@ -179,6 +179,10 @@ pub struct ChatResponse {
     pub id: String,
     pub model: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
@@ -206,6 +210,11 @@ pub struct Usage {
     /// 已包含在 `prompt_tokens` 内的缓存创建 token。
     #[serde(default)]
     pub cache_creation_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+    /// Vendor credit units are not a monetary API price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<f64>,
 }
 
 impl Usage {
@@ -246,6 +255,15 @@ impl Usage {
             total_tokens,
             cache_read_tokens,
             cache_creation_tokens,
+            reasoning_tokens: value
+                .get("completion_tokens_details")
+                .and_then(|v| v.get("reasoning_tokens"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+            credit: value
+                .get("credit")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.),
         }
     }
 
@@ -263,6 +281,14 @@ impl Usage {
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
             cache_read_tokens,
             cache_creation_tokens,
+            reasoning_tokens: value
+                .get("reasoning_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+            credit: value
+                .get("credit")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.),
         }
     }
 
@@ -279,6 +305,14 @@ impl Usage {
             total_tokens,
             cache_read_tokens,
             cache_creation_tokens,
+            reasoning_tokens: value
+                .get("thoughtsTokenCount")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+            credit: value
+                .get("credit")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.),
         }
     }
 }

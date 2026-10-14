@@ -85,6 +85,12 @@ pub fn openai_response_to_internal(v: &serde_json::Value) -> crate::domain::Chat
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(parts)) => parts
             .iter()
+            .filter(|part| {
+                matches!(
+                    part.get("type").and_then(serde_json::Value::as_str),
+                    Some("text" | "output_text") | None
+                )
+            })
             .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
             .join(""),
@@ -118,6 +124,15 @@ pub fn openai_response_to_internal(v: &serde_json::Value) -> crate::domain::Chat
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),
         usage,
+        reasoning_content: msg
+            .get("reasoning_content")
+            .or_else(|| msg.get("reasoning"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        refusal: msg
+            .get("refusal")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
     }
 }
 
@@ -268,5 +283,29 @@ pub fn strip_thinking(body: &mut serde_json::Value) {
         o.remove("thinking");
         o.remove("reasoning");
         o.remove("reasoning_effort");
+    }
+}
+
+#[cfg(test)]
+mod auxiliary_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_and_refusal_are_separate_from_content() {
+        let r = openai_response_to_internal(&json!({
+            "choices":[{"message":{"content":"answer","reasoning_content":"provided","refusal":"no"}}],
+            "usage":{"prompt_tokens":1,"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":0},"credit":0}
+        }));
+        assert_eq!(r.content, "answer");
+        assert_eq!(r.reasoning_content.as_deref(), Some("provided"));
+        assert_eq!(r.refusal.as_deref(), Some("no"));
+        let u = r.usage.unwrap();
+        assert_eq!(u.reasoning_tokens, Some(0));
+        assert_eq!(u.credit, Some(0.0));
+        let plain =
+            openai_response_to_internal(&json!({"choices":[{"message":{"content":"answer"}}]}));
+        assert_eq!(plain.content, "answer");
+        assert_eq!(plain.reasoning_content, None);
+        assert_eq!(plain.refusal, None);
     }
 }

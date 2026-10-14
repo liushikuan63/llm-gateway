@@ -1,0 +1,6 @@
+.trae-login .workbuddy-login__account select { width: 100%; min-width: 0; }
+.trae-login .trae-login__consent { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.6; }
+.trae-login .trae-login__consent input { flex: 0 0 auto; width: auto; margin-top: 3px; }
+.trae-login select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.trae-login .workbuddy-login__notice button { display: block; margin-top: 8px; }
+.trae-login .workbuddy-login__actions { margin-top: 12px; }

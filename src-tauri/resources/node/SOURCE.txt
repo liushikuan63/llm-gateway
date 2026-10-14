@@ -1,0 +1,4 @@
+Official upstream: https://nodejs.org/dist/v24.19.0/
+Source code: https://github.com/nodejs/node/tree/v24.19.0
+Bundled without modification; license and third-party notices are in LICENSE.
+OpenJS Foundation Authenticode signature verified Valid on 2026-10-13.

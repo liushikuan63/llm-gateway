@@ -55,6 +55,8 @@ pub struct DiscoveredModel {
     pub supports_audio: Option<bool>,
     pub supports_video: Option<bool>,
     pub supports_stream: Option<bool>,
+    #[serde(default)]
+    pub supports_thinking: Option<bool>,
     /// 模型用途；只有目录明确给出结构或方法时才填写，缺失时由用户在录入界面确认。
     #[serde(default)]
     pub model_type: Option<ModelType>,
@@ -95,6 +97,7 @@ impl DiscoveredModel {
             supports_audio: None,
             supports_video: None,
             supports_stream: None,
+            supports_thinking: None,
             model_type: None,
             is_free: None,
             price: None,
@@ -623,6 +626,11 @@ fn apply_ollama_details(model: &mut DiscoveredModel, response: &Value) {
             capabilities
                 .iter()
                 .any(|capability| capability.eq_ignore_ascii_case("video")),
+        );
+        model.supports_thinking = Some(
+            capabilities
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case("thinking")),
         );
         model.model_type = Some(
             if capabilities
@@ -1183,6 +1191,39 @@ mod catalog_capability_tests {
         .expect("至少 reasoning 是合法的");
         assert_eq!(set.resolve(Dimension::Coding), None, "非法类型不该被当成 0");
         assert_eq!(set.resolve(Dimension::Reasoning).unwrap().value, 0.8);
+    }
+}
+
+#[cfg(test)]
+mod ollama_thinking_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_ollama_thinking_bit_is_imported_without_model_name_guessing() {
+        let mut model = DiscoveredModel::default_for("plain-model".into(), "plain-model".into());
+        apply_ollama_details(
+            &mut model,
+            &serde_json::json!({"capabilities":["completion","THINKING"]}),
+        );
+        assert_eq!(model.supports_thinking, Some(true));
+        apply_ollama_details(
+            &mut model,
+            &serde_json::json!({"capabilities":["completion"]}),
+        );
+        assert_eq!(model.supports_thinking, Some(false));
+    }
+
+    #[test]
+    fn missing_or_invalid_ollama_capabilities_leave_thinking_unknown() {
+        for doc in [
+            serde_json::json!({}),
+            serde_json::json!({"capabilities":"thinking"}),
+        ] {
+            let mut model =
+                DiscoveredModel::default_for("thinking-by-name".into(), "thinking-by-name".into());
+            apply_ollama_details(&mut model, &doc);
+            assert_eq!(model.supports_thinking, None);
+        }
     }
 }
 
