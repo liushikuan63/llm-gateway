@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import { api, QoderJobStatus, QoderLoginStatus, QoderRegion } from "../api";
 import "./workbuddy-login.css";
+import { qoderPollFailure, QoderPollFailureCode } from "./qoder-poll-errors";
 
 type Phase = "idle" | "starting" | "waiting" | "poll_error" | "expired" | "cancelled";
 type Action = "check" | "start" | "cancel" | "refresh" | "prepare" | "refresh_model" | "reissue_model" | "register";
@@ -9,13 +10,14 @@ const MODEL_LABELS: Record<QoderJobStatus["status"], string> = {
   not_logged_in: "请先网页登录", not_prepared: "尚未准备", stale: "登录已变化，请重新准备",
   expired: "模型认证已到期", verification_required: "需要核验账号身份", prepared: "模型认证已准备",
 };
-type Notice = { error: boolean; text: string };
+type Notice = { error: boolean; text: string; code?: QoderPollFailureCode; httpStatus?: number };
 type LoginSession = {
   generation: number;
   accountId: string;
   loginId: string | null;
   deadline: number;
   polling: boolean;
+  pollStopped: boolean;
   pollTimer: ReturnType<typeof setTimeout> | null;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
 };
@@ -183,10 +185,11 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
       }
       setPhase("waiting");
       session.pollTimer = setTimeout(() => void poll(session), 2000);
-    } catch {
+    } catch (error: unknown) {
       if (!sessionIsCurrent(session)) return;
+      session.pollStopped = true;
       setPhase("poll_error");
-      setNotice({ error: true, text: "本次授权检查失败或结果不明，已停止检查。请取消后重新登录，不会自动重放。" });
+      setNotice({ error: true, ...qoderPollFailure(error) });
     } finally {
       session.polling = false;
     }
@@ -203,7 +206,7 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
     setPhase("starting");
     setNotice(null);
     const finish=beginRegionOperation(region);
-    const session: LoginSession = { generation: id, accountId: account, loginId: null, deadline: Date.now() + 300_000, polling: false, pollTimer: null, deadlineTimer: null };
+    const session: LoginSession = { generation: id, accountId: account, loginId: null, deadline: Date.now() + 300_000, polling: false, pollStopped: false, pollTimer: null, deadlineTimer: null };
     active.current = session;
     session.deadlineTimer = setTimeout(() => expireSession(session), 300_000);
     try {
@@ -247,18 +250,18 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
 
   const openAuthorization = async () => {
     const session = active.current;
-    if (!loginView || !session || !sessionIsCurrent(session) || openingGeneration.current === session.generation) return;
+    if (!loginView || !session || session.pollStopped || !sessionIsCurrent(session) || openingGeneration.current === session.generation) return;
     if (Date.now() >= session.deadline) { expireSession(session); return; }
     openingGeneration.current = session.generation;
     setOpening(true);
     try {
       const url = officialAuthorizationUrl(loginView.url, region);
       const { openUrl } = await import("@tauri-apps/plugin-opener");
-      if (!sessionIsCurrent(session)) return;
+      if (!sessionIsCurrent(session) || session.pollStopped) return;
       await openUrl(url);
-      if (sessionIsCurrent(session)) setNotice({ error: false, text: "已请求打开官方授权网页，请在浏览器完成登录。此处会检查结果，失败即停止。" });
+      if (sessionIsCurrent(session) && !session.pollStopped) setNotice({ error: false, text: "已请求打开官方授权网页，请在浏览器完成登录。此处会检查结果，失败即停止。" });
     } catch {
-      if (sessionIsCurrent(session)) setNotice({ error: true, text: "无法打开官方授权网页，请重试打开，或取消后重新登录。" });
+      if (sessionIsCurrent(session) && !session.pollStopped) setNotice({ error: true, text: "无法打开官方授权网页，请重试打开，或取消后重新登录。" });
     } finally {
       if (openingGeneration.current === session.generation) openingGeneration.current = null;
       if (isCurrent(session.generation)) setOpening(false);
@@ -326,7 +329,7 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
   const pending = phase === "starting" || phase === "waiting" || phase === "poll_error";
   const validAccount = ACCOUNT_PATTERN.test(accountId.trim());
   const disabled = !!busy || pending || regionBusy || !!cancelRetry || !validAccount;
-  const label = pending ? (phase === "starting" ? "正在准备网页登录" : "等待网页授权") : phase === "expired" ? "等待已结束" : phase === "cancelled" ? "已取消等待" : status ? STATUS_LABELS[status.status] : "状态待确认";
+  const label = phase === "poll_error" ? "检查已停止" : pending ? (phase === "starting" ? "正在准备网页登录" : "等待网页授权") : phase === "expired" ? "等待已结束" : phase === "cancelled" ? "已取消等待" : status ? STATUS_LABELS[status.status] : "状态待确认";
 
   return <section className="workbuddy-login" aria-labelledby={`${inputId}-heading`} data-testid={`qoder-login-${region}`}>
     <header className="workbuddy-login__header">
@@ -359,15 +362,15 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
       <p>准备认证与读取目录不发送模型请求。目录接入后可在供应商页设置模型；实际生成可能消耗账号额度。目录中的免费标记与积分倍率不等于现金价格。</p>
     </div>}
     {pending && <div className="workbuddy-login__authorization">
-      <strong>{phase === "starting" ? "正在准备官方授权页面" : `请在 ${title} 官方网页完成登录`}</strong>
-      {loginView && <><p>登录等待截止：{displayTime(loginView.deadline)}。{loginView.serverTtl == null ? "官方未提供授权链接的有效时长，本机最多等待 5 分钟。" : "此处会自动检查登录结果。"}</p><button type="button" disabled={opening} aria-busy={opening} onClick={() => void openAuthorization()}>{opening ? "正在打开…" : "打开官方授权网页"}</button></>}
+      <strong>{phase === "poll_error" ? "授权检查已停止，请先取消本次等待" : phase === "starting" ? "正在准备官方授权页面" : `请在 ${title} 官方网页完成登录`}</strong>
+      {loginView && <><p>登录等待截止：{displayTime(loginView.deadline)}。{phase === "poll_error" ? "本次检查已停止，不会继续检查登录结果。" : loginView.serverTtl == null ? "官方未提供授权链接的有效时长，本机最多等待 5 分钟。" : "此处会自动检查登录结果。"}</p><button type="button" disabled={opening || phase === "poll_error"} aria-busy={opening} onClick={() => void openAuthorization()}>{opening ? "正在打开…" : "打开官方授权网页"}</button></>}
       <div className="workbuddy-login__actions">
         <button type="button" disabled={busy === "cancel"} onClick={() => void cancelLogin()}>取消登录</button>
       </div>
     </div>}
     {cancelRetry > 0 && <p role="alert">原登录取消尚未确认；同区新操作保持停用，可明确重试取消。此处不证明供应商凭据已撤销。</p>}
     {cancelRetry > 0 && <button type="button" disabled={!!busy||regionBusy} onClick={() => void cancelLogin()}>重试取消</button>}
-    {notice && <p className={`workbuddy-login__notice ${notice.error ? "is-error" : ""}`} role={notice.error ? "alert" : "status"}>{notice.text}</p>}
+    {notice && <p className={`workbuddy-login__notice ${notice.error ? "is-error" : ""}`} role={notice.error ? "alert" : "status"} data-auth-error-code={notice.code} data-auth-http-status={notice.httpStatus}>{notice.text}</p>}
     {status && !pending && <dl className="workbuddy-login__details">
       <div><dt>登录用户</dt><dd>{status.identity?.display_name || "未提供"}{status.identity?.masked_email && <span>{status.identity.masked_email}</span>}</dd></div>
       <div><dt>资料更新时间</dt><dd>{displayTime(status.identity?.captured_at)}</dd></div>

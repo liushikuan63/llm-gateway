@@ -18,6 +18,7 @@ const BODY_LIMIT: usize = 512 * 1024;
 // Public client metadata from both locally installed product bundles.
 const CLIENT_ID: &str = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa";
 
+mod diagnostics;
 mod job;
 mod protocol;
 pub(crate) use protocol::invoke_trae;
@@ -514,6 +515,8 @@ impl QoderAuth {
         access: Option<&str>,
         body: Option<Value>,
     ) -> Result<(u16, Value), String> {
+        let started = std::time::Instant::now();
+        let operation = diagnostics::Operation::from_path(path);
         let mut url = Url::parse(region.api()).map_err(|_| "Qoder认证域名无效")?;
         url.set_path(path);
         #[cfg(test)]
@@ -537,16 +540,38 @@ impl QoderAuth {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| "Qoder认证请求失败或超时")?;
+        let response = request.send().await.map_err(|error| {
+            diagnostics::record(
+                operation,
+                diagnostics::Stage::Send,
+                diagnostics::Kind::from_reqwest(&error),
+                None,
+                started.elapsed(),
+            );
+            "Qoder认证请求失败或超时"
+        })?;
         let status = response.status().as_u16();
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| "Qoder认证响应读取失败")?;
+            let chunk = chunk.map_err(|error| {
+                diagnostics::record(
+                    operation,
+                    diagnostics::Stage::ResponseRead,
+                    diagnostics::Kind::from_reqwest(&error),
+                    Some(status),
+                    started.elapsed(),
+                );
+                "Qoder认证响应读取失败"
+            })?;
             if bytes.len().saturating_add(chunk.len()) > BODY_LIMIT {
+                diagnostics::record(
+                    operation,
+                    diagnostics::Stage::ResponseRead,
+                    diagnostics::Kind::BodyLimit,
+                    Some(status),
+                    started.elapsed(),
+                );
                 return Err("Qoder认证响应过大".into());
             }
             bytes.extend_from_slice(&chunk);
@@ -555,7 +580,16 @@ impl QoderAuth {
         if status != 200 {
             return Ok((status, Value::Null));
         }
-        let value = serde_json::from_slice(&bytes).map_err(|_| "Qoder认证响应不是有效JSON")?;
+        let value = serde_json::from_slice(&bytes).map_err(|_| {
+            diagnostics::record(
+                operation,
+                diagnostics::Stage::ResponseParse,
+                diagnostics::Kind::InvalidJson,
+                Some(status),
+                started.elapsed(),
+            );
+            "Qoder认证响应不是有效JSON"
+        })?;
         Ok((status, value))
     }
     pub async fn start(&self, region: Region, account: &str) -> Result<LoginStart, String> {
@@ -1568,5 +1602,265 @@ mod tests {
             &format!("{}#fragment", start.authorization_url),
             Region::Cn
         ));
+    }
+
+    #[derive(Clone)]
+    struct SafeDiagnosticWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SafeDiagnosticWriter {
+        fn write(&mut self, value: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(value);
+            Ok(value.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SafeDiagnosticWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    fn diagnostic_capture() -> (tracing::Dispatch, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(SafeDiagnosticWriter(bytes.clone()))
+            .finish();
+        (tracing::Dispatch::new(subscriber), bytes)
+    }
+    fn captured_diagnostic(bytes: &Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+    }
+    fn assert_safe_diagnostic(text: &str, operation: &str, stage: &str, kind: &str) {
+        assert_eq!(
+            text.matches("Qoder authentication request failed").count(),
+            1,
+            "{text}"
+        );
+        for field in [
+            format!("operation=\"{operation}\""),
+            format!("stage=\"{stage}\""),
+            format!("classification=\"{kind}\""),
+            "remote_auth_outcome=\"unknown\"".into(),
+            "request_elapsed_ms=".into(),
+        ] {
+            assert!(text.contains(&field), "missing fixed field {field}: {text}");
+        }
+        for private in [
+            "DO_NOT_LOG",
+            "nonce=",
+            "verifier=",
+            "Bearer",
+            "http://",
+            "https://",
+        ] {
+            assert!(
+                !text.contains(private),
+                "private input leaked into diagnostic"
+            );
+        }
+    }
+    async fn synthetic_response(f: &mut Fixture, response: Vec<u8>) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        f.auth.test_origin =
+            Some(Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = [0; 4096];
+            let _ = stream.read(&mut headers).await.unwrap();
+            // A body-limit test can legitimately close before this completes.
+            let _ = stream.write_all(&response).await;
+        })
+    }
+    #[tokio::test]
+    async fn transport_diagnostic_send_connect_keeps_pending_unknown_and_does_not_retry() {
+        use tracing::instrument::WithSubscriber;
+        let mut f = fixture().await;
+        let start = f.auth.start(Region::Global, "main").await.unwrap();
+        f.server.abort();
+        let _ = (&mut f.server).await;
+        let (dispatch, bytes) = diagnostic_capture();
+        let error = f
+            .auth
+            .poll(Region::Global, &start.login_id)
+            .with_subscriber(dispatch.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Qoder认证请求失败或超时");
+        let again = f
+            .auth
+            .poll(Region::Global, &start.login_id)
+            .with_subscriber(dispatch)
+            .await
+            .unwrap_err();
+        assert!(again.contains("已发起轮询且结果不明"));
+        let text = captured_diagnostic(&bytes);
+        assert_safe_diagnostic(&text, "device_poll", "send", "connect_or_tls");
+        assert!(text.contains("http_status=None"));
+    }
+    #[tokio::test]
+    async fn transport_diagnostic_userinfo_does_not_log_bearer_or_query() {
+        use tracing::instrument::WithSubscriber;
+        let mut f = fixture().await;
+        f.server.abort();
+        let _ = (&mut f.server).await;
+        let (dispatch, bytes) = diagnostic_capture();
+        let error = f
+            .auth
+            .request(
+                Region::Global,
+                Method::GET,
+                "/api/v1/userinfo",
+                &[("nonce", "DO_NOT_LOG_NONCE")],
+                Some("DO_NOT_LOG_ACCESS"),
+                None,
+            )
+            .with_subscriber(dispatch)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Qoder认证请求失败或超时");
+        assert_safe_diagnostic(
+            &captured_diagnostic(&bytes),
+            "userinfo",
+            "send",
+            "connect_or_tls",
+        );
+    }
+    #[tokio::test]
+    async fn transport_diagnostic_timeout_is_not_guessed_as_connect_failure() {
+        use tracing::instrument::WithSubscriber;
+        let mut f = fixture().await;
+        f.auth.client = Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_millis(40))
+            .build()
+            .unwrap();
+        f.mock.hold.store(true, Ordering::SeqCst);
+        let start = f.auth.start(Region::Global, "main").await.unwrap();
+        let (dispatch, bytes) = diagnostic_capture();
+        let error = f
+            .auth
+            .poll(Region::Global, &start.login_id)
+            .with_subscriber(dispatch)
+            .await
+            .unwrap_err();
+        f.mock.release.notify_one();
+        assert_eq!(error, "Qoder认证请求失败或超时");
+        assert_safe_diagnostic(
+            &captured_diagnostic(&bytes),
+            "device_poll",
+            "send",
+            "timeout",
+        );
+        assert_eq!(f.mock.polls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn transport_diagnostic_response_read_retains_known_http_without_body() {
+        use tracing::instrument::WithSubscriber;
+        let mut f = fixture().await;
+        let server = synthetic_response(&mut f, b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\nDO_NOT_LOG_TRUNCATED_BODY".to_vec()).await;
+        let (dispatch, bytes) = diagnostic_capture();
+        let error = f
+            .auth
+            .request(
+                Region::Global,
+                Method::GET,
+                "/api/v1/deviceToken/poll",
+                &[],
+                None,
+                None,
+            )
+            .with_subscriber(dispatch)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error, "Qoder认证响应读取失败");
+        let text = captured_diagnostic(&bytes);
+        assert_safe_diagnostic(&text, "device_poll", "response_read", "other");
+        assert!(text.contains("http_status=Some(200)"));
+    }
+    #[tokio::test]
+    async fn transport_diagnostic_json_failure_drops_raw_body_and_parser_error() {
+        use tracing::instrument::WithSubscriber;
+        let mut f = fixture().await;
+        let body = b"DO_NOT_LOG_INVALID_JSON";
+        let response = [
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes(),
+            body.to_vec(),
+        ]
+        .concat();
+        let server = synthetic_response(&mut f, response).await;
+        let (dispatch, bytes) = diagnostic_capture();
+        let error = f
+            .auth
+            .request(Region::Cn, Method::GET, "/api/v1/userinfo", &[], None, None)
+            .with_subscriber(dispatch)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error, "Qoder认证响应不是有效JSON");
+        assert_safe_diagnostic(
+            &captured_diagnostic(&bytes),
+            "userinfo",
+            "response_parse",
+            "invalid_json",
+        );
+    }
+    #[tokio::test]
+    async fn transport_diagnostic_body_limit_remains_a_failure_with_safe_status() {
+        use tracing::instrument::WithSubscriber;
+        let mut f = fixture().await;
+        let body = vec![b'x'; BODY_LIMIT + 1];
+        let response = [
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes(),
+            body,
+        ]
+        .concat();
+        let server = synthetic_response(&mut f, response).await;
+        let (dispatch, bytes) = diagnostic_capture();
+        let error = f
+            .auth
+            .request(Region::Cn, Method::GET, "/api/v1/userinfo", &[], None, None)
+            .with_subscriber(dispatch)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error, "Qoder认证响应过大");
+        assert_safe_diagnostic(
+            &captured_diagnostic(&bytes),
+            "userinfo",
+            "response_read",
+            "body_limit",
+        );
+    }
+    #[tokio::test]
+    async fn transport_diagnostic_normal_pending_emits_no_failure() {
+        use tracing::instrument::WithSubscriber;
+        let f = fixture().await;
+        f.mock.poll_code.store(202, Ordering::SeqCst);
+        let start = f.auth.start(Region::Cn, "main").await.unwrap();
+        let (dispatch, bytes) = diagnostic_capture();
+        let status = f
+            .auth
+            .poll(Region::Cn, &start.login_id)
+            .with_subscriber(dispatch)
+            .await
+            .unwrap();
+        assert_eq!(status.status, "awaiting_authorization");
+        assert_eq!(f.mock.polls.load(Ordering::SeqCst), 1);
+        assert!(captured_diagnostic(&bytes).is_empty());
     }
 }
