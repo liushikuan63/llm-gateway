@@ -1,0 +1,15 @@
+.catalog-maintenance { margin-top: 20px; padding: 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); }
+.catalog-maintenance header h2 { margin: 0 0 8px; font-size: 18px; }
+.catalog-maintenance p { line-height: 1.6; }
+.catalog-maintenance fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.catalog-providers, .catalog-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 12px 0; }
+.catalog-providers label, .catalog-controls label { display: flex; align-items: center; gap: 7px; }
+.catalog-controls select, .catalog-controls input:not([type="checkbox"]) { background: var(--panel); color: var(--text); min-height: 34px; border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; max-width: 100%; }
+.catalog-status { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.catalog-status dt { color: var(--muted); font-size: 12px; }
+.catalog-status dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.catalog-table { overflow-x: auto; }
+.catalog-table table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.catalog-table th, .catalog-table td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.catalog-table code { overflow-wrap: anywhere; }
+@media (max-width: 600px) { .catalog-maintenance { padding: 12px; } .catalog-controls label { flex-wrap: wrap; } }

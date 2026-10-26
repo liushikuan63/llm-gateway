@@ -1,0 +1,10 @@
+.free-routing-panel { margin-top: 20px; padding: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; }
+.free-routing-panel h2 { font-size: 18px; margin: 0 0 8px; }
+.free-routing-panel p { line-height: 1.6; }
+.free-routing-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.free-routing-controls label { display: flex; gap: 7px; align-items: center; }
+.free-preview-table { overflow-x: auto; }
+.free-preview-table table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.free-preview-table th, .free-preview-table td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.free-preview-table code { overflow-wrap: anywhere; }
+@media (max-width: 600px) { .free-routing-panel { padding: 12px; } }

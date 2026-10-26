@@ -1,40 +1,40 @@
-{
-  "name": "llm-gateway-ui",
-  "private": true,
-  "version": "0.2.1",
-  "type": "module",
-  "scripts": {
-    "release:prepare": "node scripts/prepare-release.mjs",
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "preview": "vite preview",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build --bundles nsis,msi",
-    "verify:release": "node scripts/verify-release.mjs && npm run verify:manual",
-    "verify:ui": "node scripts/ui-smoke.cjs",
-    "docs:manual": "node scripts/generate-manual.mjs",
-    "verify:manual": "node scripts/generate-manual.mjs --check",
-    "verify:plan": "node scripts/check-plan-refs.mjs",
-    "verify:scripts": "node --test scripts/check-script-syntax.test.mjs scripts/verify-client-bridges.test.mjs scripts/local-client-bridges/bridge-contract.test.js scripts/qoder-protocol/cosy.test.cjs scripts/qoder-protocol/inference.test.cjs scripts/qoder-protocol/worker.test.cjs scripts/trae-protocol/crypto.test.cjs scripts/trae-protocol/worker.test.cjs && node scripts/check-script-syntax.mjs && node scripts/check-fixture-redaction.mjs",
-    "verify:clients": "node scripts/verify-client-bridges.mjs",
-    "verify:redaction": "node scripts/check-log-redaction.mjs --self-test && node scripts/check-log-redaction.mjs",
-    "icons": "node scripts/generate-icons.mjs"
-  },
-  "dependencies": {
-    "@tauri-apps/api": "^2.1.1",
-    "@tauri-apps/plugin-dialog": "^2.0.3",
-    "@tauri-apps/plugin-opener": "^2.2.6",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
-  },
-  "devDependencies": {
-    "@tauri-apps/cli": "^2.1.0",
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.4",
-    "playwright": "1.63.0",
-    "typescript": "^5.6.3",
-    "vite": "^5.4.11"
-  }
-}
+{
+  "name": "llm-gateway-ui",
+  "private": true,
+  "version": "0.2.1",
+  "type": "module",
+  "scripts": {
+    "release:prepare": "node scripts/prepare-release.mjs",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build --bundles nsis,msi",
+    "verify:release": "node scripts/verify-release.mjs && npm run verify:manual",
+    "verify:ui": "node scripts/ui-smoke.cjs",
+    "docs:manual": "node scripts/generate-manual.mjs",
+    "verify:manual": "node scripts/generate-manual.mjs --check",
+    "verify:plan": "node scripts/check-plan-refs.mjs",
+    "verify:scripts": "node scripts/chat-stream-contract.cjs && node --test scripts/trae-web-errors.test.cjs scripts/check-script-syntax.test.mjs scripts/verify-client-bridges.test.mjs scripts/client-usage-cost.test.cjs scripts/model-labels.test.cjs scripts/chat-text-copy.test.cjs scripts/chat-text-copy-reader.test.cjs scripts/local-client-bridges/bridge-contract.test.js scripts/qoder-protocol/cosy.test.cjs scripts/qoder-protocol/inference.test.cjs scripts/qoder-protocol/worker.test.cjs scripts/trae-protocol/crypto.test.cjs scripts/trae-protocol/worker.test.cjs && node scripts/check-script-syntax.mjs && node scripts/check-fixture-redaction.mjs",
+    "verify:clients": "node scripts/verify-client-bridges.mjs",
+    "verify:redaction": "node scripts/check-log-redaction.mjs --self-test && node scripts/check-log-redaction.mjs",
+    "icons": "node scripts/generate-icons.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-dialog": "^2.0.3",
+    "@tauri-apps/plugin-opener": "^2.2.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "playwright": "1.63.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

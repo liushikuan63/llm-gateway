@@ -178,7 +178,7 @@ impl CodexAdapter {
         }
     }
 
-    fn program(&self) -> &str {
+    pub(crate) fn program(&self) -> &str {
         self.executable.as_deref().unwrap_or("codex")
     }
 }

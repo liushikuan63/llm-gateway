@@ -1239,3 +1239,502 @@ async fn stream_首字节后的失败不复测不换家() {
     bad_task.abort();
     good_task.abort();
 }
+
+#[tokio::test]
+async fn desktop_stream_observation_is_opt_in_and_comes_before_done() {
+    let (upstream, mock, upstream_task) = spawn_mock_upstream().await;
+    let (_db, cfg, gateway_task, base) = spawn_gateway(upstream).await;
+    for opted_in in [false, true] {
+        let mut request = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(&cfg.unified_key)
+            .json(&openai_stream_body("synthetic streaming evidence"));
+        if opted_in {
+            request = request.header("x-llmgw-desktop-observation", "1");
+        }
+        let response = request.send().await.unwrap();
+        assert!(response.status().is_success());
+        let body = response.text().await.unwrap();
+        assert_eq!(body.contains("event: llmgw_reply_observation"), opted_in);
+        if opted_in {
+            let event = parse_sse_events(&body)
+                .into_iter()
+                .find(|(kind, _)| kind == "llmgw_reply_observation")
+                .unwrap()
+                .1;
+            assert_eq!(event["version"], 1);
+            assert_eq!(event["finish_reason"], "stop");
+            assert_eq!(event["usage_present"], true);
+            assert_eq!(event["usage_evidence"], "unknown");
+            assert!(
+                body.find("event: llmgw_reply_observation").unwrap()
+                    < body.find("data: [DONE]").unwrap()
+            );
+        }
+    }
+    let address = base.trim_start_matches("http://").parse().unwrap();
+    let mut chunks = Vec::new();
+    let result = llm_gateway_lib::desktop_chat::stream::send(
+        &cfg,
+        address,
+        llm_gateway_lib::desktop_chat::ChatInput {
+            personal_test: false,
+            model: "integration-model".into(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            max_tokens: 16,
+            messages: vec![llm_gateway_lib::desktop_chat::ChatMessage {
+                role: "user".into(),
+                content: "synthetic observed usage".into(),
+                reasoning_content: None,
+            }],
+        },
+        uuid::Uuid::new_v4(),
+        |event| {
+            chunks.push(event.text);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(chunks.concat(), "hello");
+    assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(result.usage.as_ref().unwrap()["prompt_tokens"], 3);
+    assert_eq!(result.usage.as_ref().unwrap()["completion_tokens"], 2);
+    assert_eq!(mock.requests.lock().unwrap().len(), 3);
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn desktop_stream_through_production_gateway_preserves_missing_finish_and_usage() {
+    let app=Router::new().route("/v1/chat/completions",post(||async {
+        ([("content-type","text/event-stream")],"data: {\"id\":\"no-usage\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"synthetic answer\"}}]}\n\ndata: [DONE]\n\n")
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (_db, cfg, gateway_task, base) = spawn_gateway(format!("http://{address}/v1")).await;
+    let address = base.trim_start_matches("http://").parse().unwrap();
+    // Public OpenAI compatibility still supplies stop/zero when not opted in.
+    let legacy = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(&cfg.unified_key)
+        .json(&openai_stream_body("legacy synthetic"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!legacy.contains("llmgw_reply_observation"));
+    let terminal = legacy
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find(|value| {
+            value
+                .pointer("/choices/0/finish_reason")
+                .is_some_and(|reason| reason == "stop")
+        })
+        .unwrap();
+    assert!(terminal.get("usage").is_none()); // Preserve the existing ordinary OpenAI wire.
+
+    let mut chunks = Vec::new();
+    let result = llm_gateway_lib::desktop_chat::stream::send(
+        &cfg,
+        address,
+        llm_gateway_lib::desktop_chat::ChatInput {
+            personal_test: false,
+            model: "integration-model".into(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            max_tokens: 16,
+            messages: vec![llm_gateway_lib::desktop_chat::ChatMessage {
+                role: "user".into(),
+                content: "synthetic".into(),
+                reasoning_content: None,
+            }],
+        },
+        uuid::Uuid::new_v4(),
+        |event| {
+            chunks.push(event.text);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(chunks.concat(), "synthetic answer");
+    assert_eq!(result.content, "synthetic answer");
+    assert!(result.finish_reason.is_none());
+    assert!(result.usage.is_none());
+    assert_eq!(
+        serde_json::to_value(result.response_metadata).unwrap()["usage"],
+        "unavailable"
+    );
+    gateway_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn desktop_stream_review_usage_null_zero_partial_production_boundary() {
+    for (raw, expected) in [
+        (serde_json::Value::Null, None),
+        (serde_json::json!(42), None),
+        (
+            serde_json::json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}),
+            Some(serde_json::json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0})),
+        ),
+        (
+            serde_json::json!({"completion_tokens":2}),
+            Some(serde_json::json!({"completion_tokens":2})),
+        ),
+        (
+            serde_json::json!({"completion_tokens":2,"credit":0.5}),
+            Some(serde_json::json!({"completion_tokens":2,"credit":0.5})),
+        ),
+        (
+            serde_json::json!({"prompt_tokens":-1,"completion_tokens":"PRIVATE_SYNTHETIC","debug_authorization":"PRIVATE_SYNTHETIC"}),
+            Some(serde_json::json!({})),
+        ),
+    ] {
+        let wire = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"id":"usage-review","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":raw})
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let wire = wire.clone();
+                async move { ([("content-type", "text/event-stream")], wire) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (_db, cfg, gateway, base) = spawn_gateway(format!("http://{address}/v1")).await;
+        let result = llm_gateway_lib::desktop_chat::stream::send(
+            &cfg,
+            base.trim_start_matches("http://").parse().unwrap(),
+            llm_gateway_lib::desktop_chat::ChatInput {
+                personal_test: false,
+                model: "integration-model".into(),
+                session_id: uuid::Uuid::new_v4().to_string(),
+                max_tokens: 16,
+                messages: vec![llm_gateway_lib::desktop_chat::ChatMessage {
+                    role: "user".into(),
+                    content: "synthetic".into(),
+                    reasoning_content: None,
+                }],
+            },
+            uuid::Uuid::new_v4(),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        gateway.abort();
+        upstream.abort();
+        assert_eq!(
+            result.usage, expected,
+            "raw null/invalid/partial must not become reported zero"
+        );
+    }
+}
+
+#[tokio::test]
+async fn desktop_stream_review_single_attempt_does_not_change_ordinary_failover() {
+    for desktop in [false, true] {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let calls = primary_calls.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error":{"message":"synthetic unavailable"}})),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let primary_task =
+            tokio::spawn(async move { axum::serve(listener, primary).await.unwrap() });
+        let (backup_url, backup_calls, backup_task) = spawn_mock_upstream().await;
+        let mut first = mock_provider(format!("http://{address}/v1"));
+        first.id = "primary-review".into();
+        first.priority = 0;
+        let mut second = mock_provider(backup_url);
+        second.id = "backup-review".into();
+        second.priority = 10;
+        let cfg = AppConfig {
+            port: unused_loopback_port().await,
+            unified_key: "synthetic-key".into(),
+            routing_strategy: llm_gateway_lib::config::RoutingStrategy::Priority,
+            failover_enabled: true,
+            max_fallback_attempts: 3,
+            ..Default::default()
+        };
+        let (_db, cfg, gateway, base) = spawn_gateway_with_config(vec![first, second], cfg).await;
+        if desktop {
+            let result = llm_gateway_lib::desktop_chat::stream::send(
+                &cfg,
+                base.trim_start_matches("http://").parse().unwrap(),
+                llm_gateway_lib::desktop_chat::ChatInput {
+                    personal_test: false,
+                    model: "auto".into(),
+                    session_id: uuid::Uuid::new_v4().to_string(),
+                    max_tokens: 16,
+                    messages: vec![llm_gateway_lib::desktop_chat::ChatMessage {
+                        role: "user".into(),
+                        content: "synthetic".into(),
+                        reasoning_content: None,
+                    }],
+                },
+                uuid::Uuid::new_v4(),
+                |_| Ok(()),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "desktop must not replay generation before first chunk"
+            );
+            assert_eq!(backup_calls.requests.lock().unwrap().len(), 0);
+        } else {
+            let response=reqwest::Client::new().post(format!("{base}/v1/chat/completions")).bearer_auth(&cfg.unified_key)
+                .json(&serde_json::json!({"model":"auto","messages":[{"role":"user","content":"synthetic"}],"stream":true})).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.text().await.unwrap().contains("[DONE]"));
+            assert_eq!(
+                backup_calls.requests.lock().unwrap().len(),
+                1,
+                "ordinary client policy preserved"
+            );
+        }
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        gateway.abort();
+        primary_task.abort();
+        backup_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn desktop_stream_review_new_uuid_keeps_partial_history_out_of_manual_replay() {
+    let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let requests = captured.clone();
+    let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<serde_json::Value>|{let requests=requests.clone();async move {
+        let index={let mut seen=requests.lock().unwrap();let index=seen.len();seen.push(body);index};
+        let text=if index==0 {"known complete"} else if index==1 {"BROKEN_PARTIAL"} else {"manual complete"};
+        let packet=serde_json::json!({"id":format!("history-{index}"),"choices":[{"index":0,"delta":{"content":text},"finish_reason":if index==1 {None} else {Some("stop")}}]});
+        let wire=if index==1 {format!("data: {packet}\n\n")} else {format!("data: {packet}\n\ndata: [DONE]\n\n")};
+        ([("content-type","text/event-stream")],wire)
+    }}));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (db, cfg, gateway, base, state) =
+        spawn_gateway_with_state(vec![mock_provider(format!("http://{addr}/v1"))]).await;
+    let address = base.trim_start_matches("http://").parse().unwrap();
+    let old = uuid::Uuid::new_v4().to_string();
+    let user = llm_gateway_lib::desktop_chat::ChatMessage {
+        role: "user".into(),
+        content: "stable first".into(),
+        reasoning_content: None,
+    };
+    let mut input = llm_gateway_lib::desktop_chat::ChatInput {
+        personal_test: false,
+        model: "integration-model".into(),
+        session_id: old.clone(),
+        max_tokens: 16,
+        messages: vec![user],
+    };
+    let known = llm_gateway_lib::desktop_chat::stream::send(
+        &cfg,
+        address,
+        input.clone(),
+        uuid::Uuid::new_v4(),
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    input
+        .messages
+        .push(llm_gateway_lib::desktop_chat::ChatMessage {
+            role: "assistant".into(),
+            content: known.content,
+            reasoning_content: None,
+        });
+    input
+        .messages
+        .push(llm_gateway_lib::desktop_chat::ChatMessage {
+            role: "user".into(),
+            content: "preserved draft".into(),
+            reasoning_content: None,
+        });
+    assert!(llm_gateway_lib::desktop_chat::stream::send(
+        &cfg,
+        address,
+        input.clone(),
+        uuid::Uuid::new_v4(),
+        |_| Ok(())
+    )
+    .await
+    .is_err());
+    let old_rows = repo::recent_messages(db.pool(), &old, 20).await.unwrap();
+    assert!(
+        old_rows.iter().any(|row| row.content == "BROKEN_PARTIAL"),
+        "retain Gateway's existing incomplete audit/history contract"
+    );
+    let cooling = state.health.get("stream-mock", "integration-model");
+    assert!(matches!(
+        cooling.health,
+        llm_gateway_lib::domain::Health::Error
+    ));
+    assert!(cooling.cooldown_until > chrono::Utc::now().timestamp());
+    assert!(!state
+        .health
+        .allow_half_open("stream-mock", "integration-model"));
+    input.session_id = uuid::Uuid::new_v4().to_string();
+    let blocked = llm_gateway_lib::desktop_chat::stream::send(
+        &cfg,
+        address,
+        input.clone(),
+        uuid::Uuid::new_v4(),
+        |_| Ok(()),
+    )
+    .await
+    .unwrap_err();
+    assert!(blocked.contains("http_503"), "{blocked}");
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        2,
+        "cooldown refusal must not dispatch or retry upstream"
+    );
+    assert_eq!(
+        state
+            .health
+            .get("stream-mock", "integration-model")
+            .cooldown_until,
+        cooling.cooldown_until
+    );
+    let wait_bound = Duration::from_secs(
+        (cooling.cooldown_until - chrono::Utc::now().timestamp()).max(0) as u64 + 7,
+    );
+    tokio::time::timeout(wait_bound, async {
+        let mut clock = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            clock.tick().await;
+            if state
+                .health
+                .allow_half_open("stream-mock", "integration-model")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("observe eligibility return; never bypass or reset health");
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        2,
+        "observing readiness performs no model request"
+    );
+    // The frontend also rotates after a refused stream; the next manual send
+    // replays only known complete local history into another fresh UUID.
+    input.session_id = uuid::Uuid::new_v4().to_string();
+    let new = input.session_id.clone();
+    let result = llm_gateway_lib::desktop_chat::stream::send(
+        &cfg,
+        address,
+        input,
+        uuid::Uuid::new_v4(),
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.content, "manual complete");
+    {
+        let seen = captured.lock().unwrap();
+        let history = seen[2]["messages"].as_array().unwrap();
+        assert!(!history
+            .iter()
+            .any(|message| message["content"] == "BROKEN_PARTIAL"));
+        for content in ["stable first", "known complete", "preserved draft"] {
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|message| message["content"] == content)
+                    .count(),
+                1,
+                "{content}"
+            );
+        }
+        assert_eq!(seen.len(), 3);
+    }
+    let new_rows = repo::recent_messages(db.pool(), &new, 20).await.unwrap();
+    assert!(!new_rows.iter().any(|row| row.content == "BROKEN_PARTIAL"));
+    gateway.abort();
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn desktop_stream_review_auth_confirmation_never_replays_desktop_generation() {
+    use llm_gateway_lib::config::{AuthFailureMode, RoutingStrategy};
+    for desktop in [false, true] {
+        let (bad_url, bad_calls, bad_task) = spawn_auth_stream_upstream(usize::MAX, false).await;
+        let (good_url, good_calls, good_task) = spawn_auth_stream_upstream(0, false).await;
+        let mut cfg = auth_stream_config(AuthFailureMode::SkipAndDisable, 4).await;
+        cfg.routing_strategy = RoutingStrategy::Priority;
+        let (_db, cfg, gateway, base) = spawn_gateway_with_config(
+            vec![
+                auth_stream_provider("review-auth-bad", bad_url, 1, true),
+                auth_stream_provider("review-auth-good", good_url, 2, true),
+            ],
+            cfg,
+        )
+        .await;
+        if desktop {
+            let input = llm_gateway_lib::desktop_chat::ChatInput {
+                personal_test: false,
+                model: "integration-model".into(),
+                session_id: uuid::Uuid::new_v4().to_string(),
+                max_tokens: 16,
+                messages: vec![llm_gateway_lib::desktop_chat::ChatMessage {
+                    role: "user".into(),
+                    content: "synthetic auth".into(),
+                    reasoning_content: None,
+                }],
+            };
+            let error = llm_gateway_lib::desktop_chat::stream::send(
+                &cfg,
+                base.trim_start_matches("http://").parse().unwrap(),
+                input,
+                uuid::Uuid::new_v4(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("http_401"), "{error}");
+            assert_eq!(bad_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(good_calls.load(Ordering::SeqCst), 0);
+        } else {
+            let response = send_auth_stream(&base).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.text().await.unwrap().contains("[DONE]"));
+            assert_eq!(
+                bad_calls.load(Ordering::SeqCst),
+                2,
+                "ordinary confirmation still allowed"
+            );
+            assert_eq!(
+                good_calls.load(Ordering::SeqCst),
+                1,
+                "ordinary fallback policy preserved"
+            );
+        }
+        gateway.abort();
+        bad_task.abort();
+        good_task.abort();
+    }
+}

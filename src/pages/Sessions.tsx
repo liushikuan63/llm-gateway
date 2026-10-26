@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Icon } from "../components/Icons";
 import { api, Session, SessionMessage } from "../api";
 import "./sessions.css";
@@ -49,6 +49,15 @@ export default function SessionsPage() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [messages, setMessages] = useState<SessionMessage[]>([]);
   const [query, setQuery] = useState("");
+  const [selectedSession, setSelectedSession] = useState<Session | null>(null);
+  const [appliedQuery, setAppliedQuery] = useState("");
+  const [pendingQuery, setPendingQuery] = useState<string | null>(null);
+  const [totalCount, setTotalCount] = useState<number | null>(null);
+  const [listCursor, setListCursor] = useState<string | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [listRetry, setListRetry] = useState<{ query: string; cursor: string | null; append: boolean } | null>(null);
+  const appliedQueryRef = useRef("");
+  const listFlight = useRef<{ query: string; cursor: string | null; append: boolean } | null>(null);
   const [listLoading, setListLoading] = useState(false);
   const [messageLoadingId, setMessageLoadingId] = useState<string | null>(null);
   const [nextCursor, setNextCursor] = useState<number | null>(null);
@@ -59,33 +68,43 @@ export default function SessionsPage() {
   const messageLoadRef = useRef(0);
   const currentIdRef = useRef<string | null>(null);
   const pageInFlight = useRef(false);
+  const messageRetryRef = useRef<{ id: string; afterId: number | null } | null>(null);
 
-  const load = async () => {
+  const readList = async (query: string, cursor: string | null, append: boolean) => {
+    const job = { query, cursor, append };
+    if (listFlight.current && JSON.stringify(listFlight.current) === JSON.stringify(job)) return;
     const requestId = ++sessionLoadRef.current;
-    setListLoading(true);
+    const selected = currentIdRef.current;
+    listFlight.current = job;
+    setListLoading(true); setPendingQuery(query);
     try {
-      const next = await api.listSessions();
+      const page = await api.listSessionsPage({ query, cursor, limit: 50, selected_id: selected });
       if (requestId !== sessionLoadRef.current) return;
-      setSessions(next);
-      const selected = currentIdRef.current;
-      if (selected && !next.some((item) => item.id === selected)) {
-        messageLoadRef.current += 1;
-        currentIdRef.current = null;
-        setCurrentId(null);
-        setMessages([]);
-        setMessageLoadingId(null);
-        setNextCursor(null);
-        setMessageError(null);
-        pageInFlight.current = false;
+      if (!Array.isArray(page.rows) || page.query !== query || !Number.isSafeInteger(page.total_count) || page.total_count < 0
+          || typeof page.has_more !== "boolean" || (page.has_more ? typeof page.next_cursor !== "string" || !page.next_cursor : page.next_cursor !== null)
+          || !("selected" in page) || page.selected !== null && (!selected || page.selected.id !== selected)) throw new Error("会话列表返回无法确认");
+      if (append && appliedQueryRef.current !== query) return;
+      setSessions(previous => append ? Array.from(new Map([...previous, ...page.rows].map(item => [item.id, item])).values()) : page.rows);
+      appliedQueryRef.current = query; setAppliedQuery(query); setTotalCount(page.total_count);
+      setListCursor(page.has_more ? page.next_cursor : null); setListError(null); setListRetry(null);
+      // Being outside a filter/page does not prove deletion. Only the independent
+      // selected row from this read snapshot can invalidate the current detail.
+      if (selected && currentIdRef.current === selected) {
+        if (page.selected) setSelectedSession(page.selected);
+        else {
+          messageLoadRef.current++; currentIdRef.current = null; setCurrentId(null); setSelectedSession(null);
+          setMessages([]); setMessageLoadingId(null); setNextCursor(null); setMessageError(null); pageInFlight.current = false;
+        }
       }
     } catch (error) {
       if (requestId === sessionLoadRef.current) {
-        setMsg({ kind: "err", text: `加载会话失败：${errorText(error)}` });
+        setListError(`加载会话失败：${errorText(error)}。保留上次读取结果。`); setListRetry(job);
       }
     } finally {
-      if (requestId === sessionLoadRef.current) setListLoading(false);
+      if (requestId === sessionLoadRef.current) { listFlight.current = null; setListLoading(false); setPendingQuery(null); }
     }
   };
+  const load = () => readList(appliedQueryRef.current, null, false);
 
   useEffect(() => {
     void load();
@@ -97,15 +116,34 @@ export default function SessionsPage() {
     pageInFlight.current = true;
     setMessageLoadingId(id);
     setMessageError(null);
+    messageRetryRef.current = null;
     try {
       const next = await api.getSessionMessagesPage(id, afterId);
       if (requestId !== messageLoadRef.current || currentIdRef.current !== id) return;
+      // Match the existing exclusive-ID/session contract before committing any
+      // rows; malformed pages must not erase history or cross the active scope.
+      if (!next || !Array.isArray(next.rows) || typeof next.has_more !== "boolean") {
+        throw new Error("消息分页返回无法确认");
+      }
+      let previousId = afterId ?? 0;
+      for (const row of next.rows) {
+        if (!row || !Number.isSafeInteger(row.id) || row.id <= previousId || row.session_id !== id) {
+          throw new Error("消息分页返回无法确认");
+        }
+        previousId = row.id;
+      }
+      if (next.has_more ? next.rows.length === 0 || next.next_cursor !== previousId : next.next_cursor !== null) {
+        throw new Error("消息分页返回无法确认");
+      }
       setMessages(previous => afterId === null ? next.rows : [
         ...previous, ...next.rows.filter(row => !previous.some(existing => existing.id === row.id)),
       ]);
       setNextCursor(next.has_more ? next.next_cursor : null);
     } catch (error) {
-      if (requestId !== messageLoadRef.current) return;
+      if (requestId !== messageLoadRef.current || currentIdRef.current !== id) return;
+      // Retained rows do not identify the failed read: a first-page refresh
+      // may fail while an older later-page cursor is still displayed.
+      messageRetryRef.current = { id, afterId };
       setMessageError(`加载消息失败：${errorText(error)}`);
     } finally {
       if (requestId === messageLoadRef.current) {
@@ -118,6 +156,7 @@ export default function SessionsPage() {
   const open = async (id: string) => {
     currentIdRef.current = id;
     setCurrentId(id);
+    setSelectedSession(previous => sessions.find(item => item.id === id) ?? (previous?.id === id ? previous : null));
     setMessages([]);
     setNextCursor(null);
     await readPage(id, null);
@@ -128,14 +167,14 @@ export default function SessionsPage() {
     void readPage(currentId, messages.length ? nextCursor : null);
   };
 
-  const session = sessions.find((item) => item.id === currentId);
-  const visibleSessions = useMemo(() => {
-    const keyword = query.trim().toLocaleLowerCase();
-    if (!keyword) return sessions;
-    return sessions.filter((item) => [item.title, item.id, item.sticky_provider_id, item.sticky_model]
-      .filter((value): value is string => Boolean(value))
-      .some((value) => value.toLocaleLowerCase().includes(keyword)));
-  }, [query, sessions]);
+  const retryMessages = () => {
+    const failed = messageRetryRef.current;
+    if (!failed || failed.id !== currentId || operation || pageInFlight.current) return;
+    void readPage(failed.id, failed.afterId);
+  };
+
+  const session = selectedSession;
+  const visibleSessions = sessions;
   const loadingMessages = currentId !== null && messageLoadingId === currentId;
 
   const compactSession = async () => {
@@ -144,7 +183,11 @@ export default function SessionsPage() {
     setOperation("compact");
     try {
       const result = await api.compactSession(targetId);
-      await Promise.all([load(), open(targetId)]);
+      // Confirmed compaction supersedes older list metadata; refresh this
+      // same message timeline without erasing its last successful snapshot.
+      sessionLoadRef.current += 1;
+      listFlight.current = null;
+      await Promise.all([load(), readPage(targetId, null)]);
       setMsg({ kind: "ok", text: result });
     } catch (error) {
       setMsg({ kind: "err", text: `压缩失败：${errorText(error)}` });
@@ -162,8 +205,17 @@ export default function SessionsPage() {
     messageLoadRef.current += 1;
     try {
       await api.deleteSession(targetId);
+      // A confirmed deletion supersedes every older list snapshot, even when
+      // its refresh fails. Keep other loaded rows, but not stale totals/cursors.
+      sessionLoadRef.current += 1;
+      listFlight.current = null;
+      setSessions(previous => previous.filter(item => item.id !== targetId));
+      setTotalCount(null);
+      setListCursor(null);
+      setListRetry(null);
       currentIdRef.current = null;
       setCurrentId(null);
+      setSelectedSession(null);
       setMessages([]);
       setMessageLoadingId(null);
       setNextCursor(null);
@@ -174,7 +226,7 @@ export default function SessionsPage() {
     } catch (error) {
       setMsg({ kind: "err", text: `删除会话失败：${errorText(error)}` });
       // Deletion invalidates pending reads; on failure issue a fresh read instead of leaving their spinner behind.
-      await open(targetId);
+      await Promise.all([load(), open(targetId)]);
     } finally {
       setOperation(null);
     }
@@ -193,33 +245,30 @@ export default function SessionsPage() {
       </div>
 
       {msg && <div className={`msg ${msg.kind}`} role="status">{msg.text}</div>}
+      {listError && <div className="msg err" role="alert">{listError}<button type="button" disabled={listLoading || operation !== null} onClick={() => listRetry && void readList(listRetry.query, listRetry.cursor, listRetry.append)}>重试读取会话</button></div>}
 
       <div className="sessions-layout">
         <aside className="card session-list-card" aria-label="会话列表">
           <div className="session-list-header">
             <div>
-              <strong>最近会话</strong>
-              <span>最近 {sessions.length} 个会话{sessions.length >= 100 ? "（最多 100 个）" : ""}</span>
+              <strong>持久化会话</strong>
+              <span>本次匹配 {totalCount ?? "—"} 项 · 已读取 {sessions.length} 项</span>
             </div>
             <Icon name="sessions" size={18} />
           </div>
 
-          <label className="session-search">
-            <span className="sr-only">搜索会话</span>
-            <input
-              aria-label="搜索会话"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="按标题、模型或会话 ID 搜索"
-            />
-          </label>
+          <form className="session-search" onSubmit={event => { event.preventDefault(); if (operation === null) void readList(query.trim(), null, false); }}>
+            <label><span className="sr-only">搜索会话</span><input aria-label="搜索会话" value={query} disabled={operation !== null} onChange={event => setQuery(event.target.value)} placeholder="标题、模型、供应商或会话 ID" /></label>
+            <div className="row"><button type="submit" disabled={operation !== null || listLoading && query.trim() === pendingQuery}>搜索会话</button><button type="button" disabled={operation !== null || !query && !appliedQuery} onClick={() => { setQuery(""); void readList("", null, false); }}>清空筛选</button></div>
+            <small role="status" aria-live="polite">显示：{appliedQuery || "全部会话"}。{pendingQuery !== null && `正在读取：${pendingQuery || "全部会话"}。`}{query.trim() !== appliedQuery && "输入尚未应用，请搜索。"}</small>
+          </form>
 
           <div className="session-list" aria-busy={listLoading}>
             {listLoading && sessions.length === 0 ? (
               <div className="empty session-empty">正在读取会话</div>
             ) : visibleSessions.length === 0 ? (
               <div className="empty session-empty">
-                {sessions.length === 0 ? "暂无持久化会话。发送带会话标识的请求后会显示在这里。" : "没有匹配的会话，请调整搜索条件。"}
+                {listError ? "当前读取未成功，无法确认会话是否为空。" : appliedQuery ? "没有匹配的会话，请调整搜索条件。" : "暂无持久化会话。发送带会话标识的请求后会显示在这里。"}
               </div>
             ) : (
               visibleSessions.map((item) => {
@@ -248,6 +297,10 @@ export default function SessionsPage() {
               })
             )}
           </div>
+          <div className="session-list-controls">
+            {listCursor && <button type="button" disabled={listLoading || operation !== null || query.trim() !== appliedQuery || !!listRetry} onClick={() => void readList(appliedQueryRef.current, listCursor, true)}>加载更多会话</button>}
+            <small>每页按读取时结果显示；新增或更新会话请刷新。搜索忽略 ASCII 字母大小写。</small>
+          </div>
         </aside>
 
         <section className="card session-detail-card" aria-live="polite">
@@ -264,6 +317,7 @@ export default function SessionsPage() {
                   <div className="session-detail-overline">持久化上下文</div>
                   <h3>{session?.title || "(无标题会话)"}</h3>
                   <code className="session-id" title={currentId}>{currentId}</code>
+                  {!sessions.some(item => item.id === currentId) && <small className="sub">当前详情不在本次已加载列表中；仍属于此会话。</small>}
                 </div>
                 <div className="row session-actions">
                   <button type="button" disabled={operation !== null || loadingMessages} onClick={() => void compactSession()}>
@@ -299,7 +353,7 @@ export default function SessionsPage() {
                 </section>
               )}
 
-              {messageError && <div className="msg err" role="alert">{messageError}</div>}
+              {messageError && <div className="msg err" role="alert">{messageError}{messages.length > 0 && "。保留上次读取的本会话消息。"}</div>}
               {loadingMessages && messages.length === 0 ? (
                 <div className="empty session-loading">正在加载消息时间线</div>
               ) : messages.length === 0 && !messageError ? (
@@ -345,7 +399,7 @@ export default function SessionsPage() {
               <div className="session-pagination">
                 <span className="muted" role="status">已加载 {messages.length} 条消息</span>
                 {messageError
-                  ? <button type="button" disabled={operation !== null || loadingMessages} onClick={loadMore}>重试读取消息</button>
+                  ? <button type="button" disabled={operation !== null || loadingMessages} onClick={retryMessages}>重试读取消息</button>
                   : nextCursor !== null && <button type="button" disabled={operation !== null || loadingMessages} onClick={loadMore}>{loadingMessages ? "加载中…" : "加载更多消息"}</button>}
               </div>
             </>

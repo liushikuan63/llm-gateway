@@ -11,7 +11,9 @@
 | 想知道什么 | 去哪里 |
 | --- | --- |
 | 硬约束、执行纪律、模式隔离红线 | [`CLAUDE.md`](CLAUDE.md) |
-| 当前批次要做什么 | [`docs/VibeCoding任务卡-后续完善方案.md`](docs/VibeCoding任务卡-后续完善方案.md) |
+| 维护 Wiki：模块设计、请求流程、验证及故障边界 | [`docs/wiki/README.md`](docs/wiki/README.md) |
+| 当前执行目标、并行分工与下一批 | [`docs/持续目标与任务索引.md`](docs/持续目标与任务索引.md) 顶部「2026-10-18 执行调度」 |
+| A–D 原始批次与历史验收判据 | [`docs/VibeCoding任务卡-后续完善方案.md`](docs/VibeCoding任务卡-后续完善方案.md)；当前状态先读持续目标，避免重复实施 |
 | 所有待完成与可优化任务的持续目标 | [`docs/持续目标与任务索引.md`](docs/持续目标与任务索引.md) |
 | 本轮整体检查与顺序补充 | [`docs/VibeCoding任务卡-全项目完善-20261013.md`](docs/VibeCoding任务卡-全项目完善-20261013.md) |
 | 能力维度与使用数据后续补充 | [`docs/VibeCoding任务卡-能力评价与使用数据.md`](docs/VibeCoding任务卡-能力评价与使用数据.md) |

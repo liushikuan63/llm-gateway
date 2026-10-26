@@ -111,6 +111,45 @@ pub struct PreparedContext {
     pub new_messages: Vec<Message>,
 }
 
+pub(crate) struct PreviewContext {
+    pub session: Session,
+    pub prepared: PreparedContext,
+    pub history_messages: usize,
+    pub replay_messages: usize,
+    pub capped: bool,
+}
+
+// One pure reconciliation path for dispatch and readonly preview. Raw history
+// stays inside the backend; preview serializes counts/flags, never this object.
+fn assemble_context(
+    session: &Session,
+    incoming: &[Message],
+    history: &[RehydratedSessionMessage],
+    persisted: &[RehydratedSessionMessage],
+) -> PreparedContext {
+    let history_messages: Vec<Message> =
+        history.iter().map(rehydrated_message_to_message).collect();
+    let persisted_messages: Vec<Message> = persisted
+        .iter()
+        .map(rehydrated_message_to_message)
+        .collect();
+    let new_messages = incoming_delta(&persisted_messages, incoming).to_vec();
+    let mut messages = Vec::with_capacity(history.len() + incoming.len() + 1);
+    if let Some(summary) = &session.summary {
+        if !summary.trim().is_empty() {
+            messages.push(Message::system(format!(
+                "【以下为此前对话的压缩摘要，请据此保持上下文连贯】\n{summary}\n【摘要结束】"
+            )));
+        }
+    }
+    messages.extend(history_messages);
+    messages.extend(new_messages.clone());
+    PreparedContext {
+        messages,
+        new_messages,
+    }
+}
+
 /// 一次已完成交换需要持久化的路由与用量元数据。
 ///
 /// 让生产调用方以一个对象传递这些彼此关联的字段，避免继续扩张上下文写入的
@@ -180,8 +219,6 @@ impl ContextStore {
         let history =
             repo::recent_messages_with_content(self.db.pool(), &session.id, max_messages as i64)
                 .await?;
-        let history_messages: Vec<Message> =
-            history.iter().map(rehydrated_message_to_message).collect();
         // 被压缩的历史不会再发给上游，但客户端可能继续重放它。用完整持久化
         // 尾部识别新增输入，避免压缩后把旧消息重新写入数据库并重复发送。
         let persisted = repo::recent_all_messages_with_content(
@@ -190,32 +227,24 @@ impl ContextStore {
             max_messages as i64,
         )
         .await?;
-        let persisted_messages: Vec<Message> = persisted
-            .iter()
-            .map(rehydrated_message_to_message)
-            .collect();
-        let new_messages = incoming_delta(&persisted_messages, incoming).to_vec();
+        Ok(assemble_context(session, incoming, &history, &persisted))
+    }
 
-        let mut out: Vec<Message> = Vec::with_capacity(history.len() + incoming.len() + 1);
-
-        if let Some(summary) = &session.summary {
-            if !summary.trim().is_empty() {
-                out.push(Message::system(format!(
-                    "【以下为此前对话的压缩摘要，请据此保持上下文连贯】\n{summary}\n【摘要结束】"
-                )));
-            }
-        }
-
-        out.extend(history_messages);
-
-        // 客户端（Claude Code / Continue）常自带完整历史，网关又存了一份，
-        // 直接拼接会导致消息翻倍、token 翻倍、费用翻倍 —— 必须只追加真正新增
-        // 的尾部。不能在这里使用未压缩历史做去重，否则压缩过的重放会被误当新消息。
-        out.extend(new_messages.clone());
-        Ok(PreparedContext {
-            messages: out,
-            new_messages,
-        })
+    pub(crate) async fn preview_context(
+        &self,
+        scoped_id: &str,
+        incoming: &[Message],
+        max_messages: usize,
+    ) -> Result<Option<PreviewContext>> {
+        let snapshot =
+            repo::context_read_snapshot(self.db.pool(), scoped_id, max_messages as i64).await?;
+        Ok(snapshot.map(|s| PreviewContext {
+            prepared: assemble_context(&s.session, incoming, &s.history, &s.persisted),
+            history_messages: s.history.len(),
+            replay_messages: s.persisted.len(),
+            capped: s.capped,
+            session: s.session,
+        }))
     }
 
     /// 落库一轮对话（用户 + 助手）。

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, FixedOffset, Local, Timelike};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::benefits::ClaimPlatform;
 
@@ -30,7 +31,19 @@ pub struct BenefitsConfig {
     pub scheduler_mode: String,
     /// Account ID to HH:MM; omitted accounts inherit the default time and timezone.
     pub account_claim_times: BTreeMap<String, String>,
+    /// Existing files omit this map and keep their global-auto behavior. New
+    /// APP slots are explicitly false; only the narrow policy commit changes it.
+    pub account_auto_claim: BTreeMap<String, bool>,
     pub accounts: Vec<BenefitAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountAutoClaimChange {
+    pub account_id: String,
+    pub platform: String,
+    pub expected_revision: String,
+    pub allowed: bool,
 }
 
 impl Default for BenefitsConfig {
@@ -43,12 +56,71 @@ impl Default for BenefitsConfig {
             auto_claim_timezone: "local".into(),
             scheduler_mode: "app".into(),
             account_claim_times: BTreeMap::new(),
+            account_auto_claim: BTreeMap::new(),
             accounts: Vec::new(),
         }
     }
 }
 
 impl BenefitsConfig {
+    /// Permission only: global enabled/auto, account enabled and due time are
+    /// still mandatory at execution. This is not UID or free-entitlement proof.
+    pub fn account_auto_claim_allowed(&self, account_id: &str) -> bool {
+        self.account_auto_claim
+            .get(account_id)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    pub fn settings_revision(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("serializable benefits policy");
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// Whole-config writes do not own per-slot permission. Preserve the latest
+    /// values for unchanged identities, and force new/retyped slots off.
+    pub fn preserve_account_auto_claim_from(&mut self, previous: &Self) {
+        self.account_auto_claim = self
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                if previous
+                    .accounts
+                    .iter()
+                    .any(|old| old.id == account.id && old.platform == account.platform)
+                {
+                    previous
+                        .account_auto_claim
+                        .get(&account.id)
+                        .map(|allowed| (account.id.clone(), *allowed))
+                } else {
+                    Some((account.id.clone(), false))
+                }
+            })
+            .collect();
+    }
+
+    pub fn apply_account_auto_claim_change(
+        &mut self,
+        change: &AccountAutoClaimChange,
+    ) -> Result<(), String> {
+        self.validate()
+            .map_err(|_| "权益设置无效，未更改自动领取")?;
+        if self.settings_revision() != change.expected_revision {
+            return Err("自动领取设置已变化，请刷新后重试".into());
+        }
+        if !self
+            .accounts
+            .iter()
+            .any(|account| account.id == change.account_id && account.platform == change.platform)
+        {
+            return Err("权益账号不存在或平台已变化，未更改自动领取".into());
+        }
+        self.account_auto_claim
+            .insert(change.account_id.clone(), change.allowed);
+        Ok(())
+    }
+
     pub fn is_due(&self, now: DateTime<Local>) -> bool {
         self.clock_minutes(now) >= self.auto_claim_after_hour * 60 + self.auto_claim_after_minute
     }
@@ -72,11 +144,16 @@ impl BenefitsConfig {
 
     pub fn trigger_minutes(&self) -> Vec<u32> {
         let mut times = vec![self.auto_claim_after_hour * 60 + self.auto_claim_after_minute];
-        times.extend(self.accounts.iter().filter(|a| a.enabled).filter_map(|a| {
-            self.account_claim_times
-                .get(&a.id)
-                .and_then(|s| parse_claim_time(s))
-        }));
+        times.extend(
+            self.accounts
+                .iter()
+                .filter(|a| a.enabled && self.account_auto_claim_allowed(&a.id))
+                .filter_map(|a| {
+                    self.account_claim_times
+                        .get(&a.id)
+                        .and_then(|s| parse_claim_time(s))
+                }),
+        );
         times.sort_unstable();
         times.dedup();
         times
@@ -97,6 +174,13 @@ impl BenefitsConfig {
             issues.push("自动领取时区只能为本机时间或北京时间".into());
         }
         let mut ids = HashSet::new();
+        if self
+            .account_auto_claim
+            .keys()
+            .any(|id| !self.accounts.iter().any(|account| &account.id == id))
+        {
+            issues.push("账号自动领取设置必须对应现有账号".into());
+        }
         for (id, time) in &self.account_claim_times {
             if !self.accounts.iter().any(|a| &a.id == id) || parse_claim_time(time).is_none() {
                 issues.push("账号领取时间必须对应现有账号，格式为 HH:MM".into());
@@ -110,7 +194,7 @@ impl BenefitsConfig {
                 issues.push("权益账号 id 不能重复".into());
             }
             if ClaimPlatform::parse(&account.platform).is_none() {
-                issues.push("权益平台尚未适配；当前支持 qoder、qoder_cn 和 trae_cn".into());
+                issues.push("权益平台尚未适配；当前支持 qoder、qoder_cn、trae_cn、workbuddy 和 workbuddy_cn".into());
             }
             if account.label.trim().is_empty() || account.label.chars().count() > 100 {
                 issues.push("权益账号显示名必须为 1..100 个字符".into());

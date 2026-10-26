@@ -23,7 +23,13 @@ pub(super) async fn post(
     token: &str,
     body: &Value,
 ) -> Result<Value, String> {
-    if ![contract::EXCHANGE, contract::PRINCIPAL].contains(&path) {
+    if ![
+        contract::EXCHANGE,
+        contract::PRINCIPAL,
+        super::web_auth::EXCHANGE_WEB,
+    ]
+    .contains(&path)
+    {
         return Err("Trae认证操作尚未验证".into());
     }
     let url = origin.join(path).map_err(|_| "Trae认证目标无效")?;

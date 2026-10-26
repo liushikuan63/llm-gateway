@@ -9,6 +9,10 @@
 //!
 //! 三种都必须能单测打穿。
 
+pub(crate) mod auxiliary;
+pub(crate) mod native_usage;
+pub mod route_decision;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -267,6 +271,8 @@ pub fn build_where(f: &RequestFilter) -> (String, Vec<Bind>) {
 /// 来验证，而下面的 JSONL / CSV 两条路径都要能对着结构断言。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRow {
+    #[serde(default)]
+    pub route_decision: route_decision::Projection,
     pub id: i64,
     pub ts: i64,
     pub session_id: Option<String>,
@@ -276,8 +282,8 @@ pub struct AuditRow {
     pub routed_model: Option<String>,
     pub status: Option<i64>,
     pub latency_ms: Option<i64>,
-    pub prompt_tokens: i64,
-    pub completion_tokens: i64,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
     pub fallback_attempts: i64,
     pub error: Option<String>,
     pub cost: Option<f64>,
@@ -300,12 +306,15 @@ pub struct AuditRow {
     pub refined_prompt: Option<String>,
     /// B4 贯穿全链路的 traceId。同一请求的所有尝试共享同一个值。
     pub trace_id: Option<String>,
+    /// Safe authoritative projection, absent for legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_usage: Option<Value>,
 }
 
 impl AuditRow {
     /// 转成 JSONL 里的一行。`attempts` 是**数组**。
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "id": self.id,
             "ts": self.ts,
             "session_id": self.session_id,
@@ -325,6 +334,7 @@ impl AuditRow {
             "estimated_prompt_tokens": self.estimated_prompt_tokens,
             // 数组，不是字符串
             "attempts": self.attempts,
+            "route_decision": self.route_decision,
             "route_intent": self.route_intent,
             "route_classifier": self.route_classifier,
             "route_search": self.route_search,
@@ -334,7 +344,11 @@ impl AuditRow {
             "access_key_id": self.access_key_id,
             "refined_prompt": self.refined_prompt,
             "trace_id": self.trace_id,
-        })
+        });
+        if let Some(usage) = &self.native_usage {
+            value["native_usage"] = usage.clone();
+        }
+        value
     }
 }
 
@@ -360,6 +374,8 @@ pub const ATTEMPT_FIELDS: &[&str] = &[
     "latency_ms",
     "error",
     "error_kind",
+    "timing",
+    "wire_modes",
 ];
 
 /// 基础列（不含 attempts 展开列）。
@@ -389,6 +405,7 @@ pub const BASE_COLUMNS: &[&str] = &[
     "route_refine_note",
     "access_key_id",
     "refined_prompt",
+    "native_usage",
 ];
 
 /// 整份 CSV 的表头：基础列 + 按**最大尝试次数**展开的列。
@@ -431,8 +448,10 @@ pub fn csv_cells(row: &AuditRow, max_attempts: usize) -> Vec<String> {
         opt_str(&row.routed_model),
         row.status.map(|v| v.to_string()).unwrap_or_default(),
         row.latency_ms.map(|v| v.to_string()).unwrap_or_default(),
-        row.prompt_tokens.to_string(),
-        row.completion_tokens.to_string(),
+        row.prompt_tokens.map(|v| v.to_string()).unwrap_or_default(),
+        row.completion_tokens
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         row.fallback_attempts.to_string(),
         opt_str(&row.error),
         row.cost.map(|v| v.to_string()).unwrap_or_default(),
@@ -453,10 +472,33 @@ pub fn csv_cells(row: &AuditRow, max_attempts: usize) -> Vec<String> {
         // refined_prompt 在 CSV 里也要出现（列固定），空就是空。
         // 换行会被 csv_escape 引起来，不会破坏行结构。
         opt_str(&row.refined_prompt),
+        row.native_usage
+            .as_ref()
+            .map(Value::to_string)
+            .unwrap_or_default(),
     ];
     for i in 0..max_attempts {
         let attempt = row.attempts.get(i);
         for field in ATTEMPT_FIELDS {
+            if *field == "timing" || *field == "wire_modes" {
+                cells.push(
+                    attempt
+                        .and_then(|a| a.get(*field))
+                        // Validate every field, preserving the stored version
+                        // so historical CSV v1 remains compatible.
+                        .filter(|timing| {
+                            if *field == "timing" {
+                                crate::proxy::timing::TimingSnapshot::project(timing).is_some()
+                            } else {
+                                crate::proxy::control_modes::WireModeSnapshot::project(timing)
+                                    .is_some()
+                            }
+                        })
+                        .map(Value::to_string)
+                        .unwrap_or_default(),
+                );
+                continue;
+            }
             let v = attempt
                 .and_then(|a| a.get(*field))
                 .map(|v| match v {
@@ -548,11 +590,11 @@ pub const BASE_COLUMN_DOCS: &[(&str, &str)] = &[
     ("routed_model", "实际命中的上游模型名"),
     ("status", "HTTP 状态码。NULL 表示请求没走到上游"),
     ("latency_ms", "端到端耗时（毫秒）"),
-    ("prompt_tokens", "上游返回的输入 token"),
-    ("completion_tokens", "上游返回的输出 token"),
+    ("prompt_tokens", "上游返回的输入 token；原生未知为空，已知零为 0"),
+    ("completion_tokens", "上游返回的输出 token；原生未知为空，已知零为 0"),
     ("fallback_attempts", "降级次数。> 0 表示换过上游"),
     ("error", "错误原文。NULL 表示成功"),
-    ("cost", "估算花费。NULL 表示该模型没配价格"),
+    ("cost", "旧路径本地估算花费；原生请求为空，API 参考费用见 native_usage"),
     ("currency", "花费币种。不同币种不能相加"),
     ("rate_label", "生效的计价档位（时段价 / 输入长度分档）"),
     (
@@ -579,6 +621,10 @@ pub const BASE_COLUMN_DOCS: &[(&str, &str)] = &[
         "refined_prompt",
         "改写后的最终提示词。仅在开启审计存储时有值，且已脱敏",
     ),
+    (
+        "native_usage",
+        "原生实际用量的安全 JSON；未知计数为 null，API 参考费保留币种与 min/max 区间，不代表平台账单；旧记录为空",
+    ),
 ];
 
 /// 逐跳列的中文说明。
@@ -589,6 +635,8 @@ pub const ATTEMPT_FIELD_DOCS: &[(&str, &str)] = &[
     ("latency_ms", "这一跳的耗时"),
     ("error", "这一跳的错误原文。空表示这一跳成功"),
     ("error_kind", "错误归类，用于统计同一类失败"),
+    ("timing", "版本化逐跳观测 JSON：相对发送的毫秒时间点，未知为 null；旧记录、未覆盖或无效观测为空，不代表供应商内部处理或排队耗时"),
+    ("wire_modes", "独立版本化固定控制标签 JSON：原始入口、归一后、编码前与最终待发送 body；缺失或无效为空，不证明供应商收到或执行"),
 ];
 
 /// 脱敏：把用户内容里不该落盘的东西抹掉。
@@ -735,6 +783,8 @@ mod tests {
 
     fn row(id: i64, attempts: Vec<Value>) -> AuditRow {
         AuditRow {
+            route_decision: route_decision::Projection::Unobserved,
+            native_usage: None,
             id,
             ts: 1_791_286_496,
             session_id: Some("s1".into()),
@@ -744,8 +794,8 @@ mod tests {
             routed_model: Some("alpha".into()),
             status: Some(200),
             latency_ms: Some(120),
-            prompt_tokens: 10,
-            completion_tokens: 5,
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
             fallback_attempts: attempts.len() as i64,
             error: None,
             cost: Some(0.5),
@@ -1119,5 +1169,112 @@ mod tests {
         assert!(got.contains("[已脱敏:密钥]"));
         // 没东西可存时也不该造出一个空串
         assert_eq!(refined_prompt_to_store(&cfg, None), None);
+    }
+    #[test]
+    fn s2_csv_timing_keeps_known_zero_and_jsonl_but_unknown_legacy_is_empty() {
+        let observed = serde_json::json!({"schema_version":1,"mode":"streaming","terminal":"completed","response_headers_ms":0,"first_text_ms":0,"first_reasoning_ms":null,"first_refusal_ms":null,"first_tool_ms":null,"finished_ms":3});
+        let r = row(
+            7,
+            vec![
+                serde_json::json!({"provider":"owned","timing":observed}),
+                serde_json::json!({"provider":"legacy"}),
+            ],
+        );
+        let header = csv_header(2);
+        let cells = csv_cells(&r, 2);
+        let first = header
+            .iter()
+            .position(|c| c == "attempt_1_timing")
+            .expect("CSV must export per-attempt timing contract");
+        let second = header.iter().position(|c| c == "attempt_2_timing").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&cells[first]).unwrap(),
+            observed
+        );
+        assert_eq!(cells[second], "");
+        assert_eq!(r.to_json()["attempts"][0]["timing"], observed);
+        let unknown = row(
+            8,
+            vec![
+                serde_json::json!({"timing":{"schema_version":99,"mode":"streaming","first_text_ms":0,"sensitive":"not-a-numeric-observation"}}),
+            ],
+        );
+        assert_eq!(csv_cells(&unknown, 2)[first], "");
+        assert!(ATTEMPT_FIELD_DOCS.iter().any(|(key, _)| *key == "timing"));
+    }
+    #[test]
+    fn first_byte_csv_preserves_v1_v2_and_rejects_extra_fields() {
+        let old = serde_json::json!({"schema_version":1,"mode":"streaming","terminal":"completed","response_headers_ms":0,"first_text_ms":0,"first_reasoning_ms":null,"first_refusal_ms":null,"first_tool_ms":null,"finished_ms":3});
+        let mut modern = old.clone();
+        modern["schema_version"] = serde_json::json!(2);
+        modern["first_byte_ms"] = serde_json::json!(0);
+        let mut bad = modern.clone();
+        bad["private_body"] = serde_json::json!("must-not-export");
+        let row = row(
+            9,
+            vec![
+                serde_json::json!({"timing":old}),
+                serde_json::json!({"timing":modern}),
+                serde_json::json!({"timing":bad}),
+            ],
+        );
+        let header = csv_header(3);
+        let cells = csv_cells(&row, 3);
+        for (index, expected) in [(1, Some(old)), (2, Some(modern)), (3, None)] {
+            let cell = &cells[header
+                .iter()
+                .position(|s| s == &format!("attempt_{index}_timing"))
+                .unwrap()];
+            match expected {
+                Some(v) => assert_eq!(serde_json::from_str::<Value>(cell).unwrap(), v),
+                None => assert!(cell.is_empty()),
+            }
+        }
+    }
+    #[test]
+    fn controls_csv_exports_only_strict_versioned_tags_and_preserves_jsonl() {
+        let modes =
+            serde_json::json!({"reasoning":"enabled","tools":"configured","tool_choice":"auto"});
+        let good = serde_json::json!({"schema_version":1,"dialect":"openai","declared_thinking":true,"caller":{"dialect":"responses","modes":modes},"normalized_ingress":modes,"effective_request":modes,"wire":modes});
+        let mut bad = good.clone();
+        bad["private_body"] = serde_json::json!("PRIVATE-CONTROL-CONTENT");
+        let mut future = good.clone();
+        future["schema_version"] = serde_json::json!(99);
+        let record = row(
+            7,
+            vec![
+                serde_json::json!({"wire_modes":good}),
+                serde_json::json!({"wire_modes":bad}),
+                serde_json::json!({"wire_modes":future}),
+                serde_json::json!({"provider":"legacy"}),
+            ],
+        );
+        let header = csv_header(4);
+        let cells = csv_cells(&record, 4);
+        let position = header
+            .iter()
+            .position(|key| key == "attempt_1_wire_modes")
+            .expect("CSV must expose the independently versioned mode projection");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&cells[position]).unwrap(),
+            good
+        );
+        for index in 2..=4 {
+            let position = header
+                .iter()
+                .position(|key| key == &format!("attempt_{index}_wire_modes"))
+                .unwrap();
+            assert_eq!(cells[position], "");
+        }
+        assert_eq!(record.to_json()["attempts"][0]["wire_modes"], good);
+        assert_eq!(
+            record.to_json()["attempts"][1]["wire_modes"],
+            bad,
+            "JSONL preserves original history contract"
+        );
+        assert!(!to_csv(&[record]).contains("PRIVATE-CONTROL-CONTENT"));
+        assert!(ATTEMPT_FIELD_DOCS
+            .iter()
+            .any(|(key, _)| *key == "wire_modes"));
     }
 }

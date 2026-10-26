@@ -106,3 +106,9 @@ button.session-item:disabled { opacity: 0.62; }
   .session-message { padding: 12px; }
   .tool-call-body > div { grid-template-columns: 1fr; gap: 2px; }
 }
+
+.session-search .row { gap: 6px; margin-top: 6px; }
+.session-search small, .session-list-controls small { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.session-list-controls { padding: 8px 3px 0; flex: 0 0 auto; }
+.session-list { flex: 1 1 auto; }
+@media (max-width: 1100px) { .session-list-card { max-height: min(420px, 60vh); } }

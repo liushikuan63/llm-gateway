@@ -24,6 +24,9 @@ use tokio::task::JoinHandle;
 
 const KEY_SECRET: &str = "rk-budget-test-secret";
 
+#[path = "support/budget_holds.rs"]
+mod budget_holds;
+
 #[derive(Clone, Default)]
 struct Mock {
     calls: Arc<AtomicUsize>,
@@ -43,7 +46,18 @@ fn model(alias: &str) -> ModelRef {
         supports_stream: true,
         model_type: llm_gateway_lib::domain::ModelType::Chat,
         upstream_path: None,
-        price: None,
+        // Explicit low synthetic reference price; budget-limited positive cases
+        // now require a price and a bounded final body. No real pricing claim.
+        price: Some(ModelPrice {
+            prompt: 1.0,
+            completion: 1.0,
+            cache_read: None,
+            cache_creation: None,
+            currency: Currency::Usd,
+            tiers: vec![],
+            rules: vec![],
+            source: Default::default(),
+        }),
         overrides: None,
         local: None,
         capabilities: None,
@@ -224,12 +238,22 @@ struct Harness {
 
 /// 起一套「mock 上游 + 真网关（远程模式）」。`keys` 是要建的远程 Key。
 async fn spawn(keys: Vec<RemoteAccessKey>, mutate: impl FnOnce(&mut AppConfig)) -> Harness {
+    spawn_held(keys, mutate, None).await
+}
+
+async fn spawn_held(
+    keys: Vec<RemoteAccessKey>,
+    mutate: impl FnOnce(&mut AppConfig),
+    release: Option<Arc<tokio::sync::Semaphore>>,
+) -> Harness {
     let mock = Mock::default();
     let calls = mock.calls.clone();
     let app = Router::new().fallback(post(move |uri: axum::extract::OriginalUri, Json(_b): Json<serde_json::Value>| {
         let calls = calls.clone();
+        let release = release.clone();
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(release) = release { release.acquire().await.unwrap().forget(); }
             if uri.path().ends_with("/audio/speech") {
                 return ([("content-type", "audio/mpeg")], b"mock-audio".to_vec()).into_response();
             }
@@ -308,6 +332,64 @@ async fn spawn(keys: Vec<RemoteAccessKey>, mutate: impl FnOnce(&mut AppConfig)) 
     }
 }
 
+#[tokio::test]
+async fn n3_concurrent_reference_reservation_prevents_second_post() {
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let h = spawn_held(
+        vec![access_key("rk-main", true, (1, "USD", vec![]))],
+        |_| {},
+        Some(release.clone()),
+    )
+    .await;
+    let mut p = h.gateway.providers.read()[0].clone();
+    p.models[0].price = Some(ModelPrice {
+        prompt: 0.0,
+        completion: 1.0,
+        cache_read: None,
+        cache_creation: None,
+        currency: Currency::Usd,
+        tiers: vec![],
+        rules: vec![],
+        source: Default::default(),
+    });
+    repo::upsert_provider(h.db.pool(), &p).await.unwrap();
+    h.gateway.reload_providers().await.unwrap();
+    let send = |base: String| {
+        tokio::spawn(async move {
+            client().post(format!("{base}/v1/chat/completions"))
+            .header("x-forwarded-for", "198.51.100.7").header("x-forwarded-proto", "https").bearer_auth(KEY_SECRET)
+            .json(&serde_json::json!({"model":"alpha","messages":[{"role":"user","content":"owned N3"}],"max_tokens":1})).send().await.unwrap().status()
+        })
+    };
+    let a = send(h.base_url.clone());
+    let b = send(h.base_url.clone());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while h.mock_calls.load(Ordering::SeqCst) < 2 && !a.is_finished() && !b.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    release.add_permits(2);
+    let results = [a.await.unwrap(), b.await.unwrap()];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|s| **s == reqwest::StatusCode::OK)
+            .count(),
+        1,
+        "one configured-reference micro admits one held POST, never two: {results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|s| **s == reqwest::StatusCode::TOO_MANY_REQUESTS)
+            .count(),
+        1
+    );
+    assert_eq!(h.mock_calls.load(Ordering::SeqCst), 1);
+}
+
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
@@ -330,7 +412,8 @@ async fn chat_with(base_url: &str, secret: &str, model: &str) -> reqwest::Respon
         .bearer_auth(secret)
         .json(&serde_json::json!({
             "model": model,
-            "messages": [{"role": "user", "content": "你好"}]
+            "messages": [{"role": "user", "content": "你好"}],
+            "max_tokens": 1
         }))
         .send()
         .await
@@ -511,7 +594,8 @@ async fn 累计超过预算后返回_429_且_不写_requests_行() {
     );
     // 报具体的已用与上限，用户才知道该充值还是该换 Key
     assert_eq!(body["error"]["limit"], MICROS_PER_UNIT);
-    assert_eq!(body["error"]["used"], 2 * MICROS_PER_UNIT);
+    // Explicit priced positive control reported 5 input + 1 output tokens.
+    assert_eq!(body["error"]["used"], 2 * MICROS_PER_UNIT + 6);
     assert_eq!(body["error"]["currency"], "USD");
 
     // 关键：被拒的请求不该打上游，也不该进 requests 表
@@ -813,11 +897,7 @@ fn auxiliary_requests() -> Vec<(&'static str, &'static str, serde_json::Value)> 
 
 async fn auxiliary_cost_case(index: usize, expected: Option<f64>) {
     let h = spawn(
-        vec![access_key(
-            "rk-main",
-            true,
-            (MICROS_PER_UNIT, "USD", vec![]),
-        )],
+        vec![access_key("rk-main", true, (0, "USD", vec![]))],
         |_| {},
     )
     .await;
@@ -860,6 +940,21 @@ async fn auxiliary_cost_case(index: usize, expected: Option<f64>) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     if expected.is_some() {
+        // Compatibility control: original unlimited auxiliary pricing remains.
+        // Enabling a limit after that known spend must reject at auth; new
+        // limited typed calls without a reference-bound contract reject before POST.
+        sqlx::query("UPDATE remote_access_keys SET monthly_budget_micros=? WHERE id='rk-main'")
+            .bind(MICROS_PER_UNIT)
+            .execute(h.db.pool())
+            .await
+            .unwrap();
+        h.gateway
+            .remote_access_keys
+            .write()
+            .iter_mut()
+            .find(|k| k.id == "rk-main")
+            .unwrap()
+            .monthly_budget_micros = MICROS_PER_UNIT;
         let (status, code, _) = error_code(auxiliary_request(&h, path, body).await).await;
         assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(code, "budget_exceeded");
@@ -983,7 +1078,7 @@ async fn 真实小写计费币种计入大写预算并阻止下一请求() {
     .await;
     let mut priced = h.gateway.providers.read()[0].clone();
     priced.models[0].price = Some(ModelPrice {
-        prompt: 1_000_000.0,
+        prompt: 0.0,
         completion: 1_000_000.0,
         cache_read: None,
         cache_creation: None,
@@ -1010,7 +1105,7 @@ async fn 真实小写计费币种计入大写预算并阻止下一请求() {
             .unwrap();
         if rows
             .iter()
-            .any(|(currency, cost)| currency == "usd" && *cost > 1.0)
+            .any(|(currency, cost)| currency == "usd" && *cost >= 1.0)
         {
             recorded = true;
             break;
@@ -1027,4 +1122,39 @@ async fn 真实小写计费币种计入大写预算并阻止下一请求() {
         1,
         "超预算后不能再调用上游"
     );
+}
+
+/// Actual authenticated Gateway path must honor the existing non-chat bound guard.
+#[tokio::test]
+async fn typed_limited_key_actual_gateway_rejects_before_post_without_reference_contract() {
+    for (path, _model, body) in auxiliary_requests().into_iter().take(3) {
+        let h = spawn(
+            vec![access_key(
+                "rk-main",
+                true,
+                (MICROS_PER_UNIT, "USD", vec![]),
+            )],
+            |_| {},
+        )
+        .await;
+        let response = auxiliary_request(&h, path, &body).await;
+        let status = response.status();
+        let value: serde_json::Value = response.json().await.unwrap();
+        eprintln!(
+            "owned limited typed path={path} status={} POST={}",
+            status.as_u16(),
+            h.mock_calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(status,reqwest::StatusCode::CONFLICT,"typed HTTP producer must honor the same existing budget-bound refusal as the public upstream API");
+        assert_eq!(value["error"]["code"], "budget_contract_unavailable");
+        assert_eq!(
+            value["error"]["reason"],
+            "passthrough_reference_bound_unverified"
+        );
+        assert_eq!(
+            h.mock_calls.load(Ordering::SeqCst),
+            0,
+            "unknown typed units cannot dispatch without a bound"
+        );
+    }
 }

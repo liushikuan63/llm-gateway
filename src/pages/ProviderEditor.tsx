@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, clockToMinutes, Currency, DIALECT_LABEL, DiscoveredModel, formatPricePerMillion, HeaderPair, minutesToClock, ModelOverrides, ModelRef, ModelType, PriceRule, PriceSource, ProviderInput } from "../api";
+import { AgentRuntime, api, clockToMinutes, Currency, DIALECT_LABEL, DiscoveredModel, formatPricePerMillion, HeaderPair, minutesToClock, ModelOverrides, ModelRef, ModelType, PriceRule, PriceSource, ProviderInput } from "../api";
 import { DEFAULT_CONTEXT_WINDOW, emptyModel, errorText, formatContext, PRESETS, ProviderForm } from "./providerPresets";
+
+import { DECLARATION_FIELDS, declarationFlags, DeclarationDraft, ModelDeclarationFields } from "./ModelDeclarationFields";
+import type { ModelDeclarationField, ModelDeclarationPatch, ModelDeclarationState, ModelDeclarationView } from "../api";
 
 type Source = "provider" | "default" | "manual" | "saved";
 type DraftModel = ModelRef & { rowId: number; source: Source; originalModel?: ModelRef };
@@ -49,14 +52,29 @@ const draftFromOverrides = (overrides: ModelRef["overrides"]): OverridesDraft =>
   headers: (overrides.extra_headers ?? []).map(header => ({ ...header })),
 } : emptyOverridesDraft();
 
-export default function ProviderEditor({ initial, onClose, onSaved }: {
-  initial: ProviderForm; onClose: () => void; onSaved: () => Promise<void>;
+export type ProviderEditorRuntime = { runtime: AgentRuntime } | { unavailable: true };
+
+export default function ProviderEditor({ initial, runtimeContext, declarationViews, accountBound, onClose, onSaved }: {
+  initial: ProviderForm; runtimeContext?: ProviderEditorRuntime; declarationViews?: Record<string, ModelDeclarationView>; accountBound?: boolean; onClose: () => void; onSaved: () => Promise<void>;
 }) {
+  const nativeRuntime = runtimeContext && "runtime" in runtimeContext && runtimeContext.runtime.kind === "trae-model" ? runtimeContext.runtime : null;
+  const native = !!nativeRuntime;
+  const unavailable = !!runtimeContext && "unavailable" in runtimeContext;
+  const fixed = native || unavailable;
+  const selection = (alias: string): Record<string, unknown> => {
+    const rows = nativeRuntime?.options?.model_selections;
+    const value = rows && typeof rows === "object" && !Array.isArray(rows) ? (rows as Record<string, unknown>)[alias] : null;
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  };
+  const declared = (value: unknown) => value === true ? "目录声明支持 · 未实测" : value === false ? "目录声明不支持 · 未实测" : "未知 · 未实测";
   const nextRow = useRef(0);
   const [form, setForm] = useState(initial);
   const [models, setModels] = useState<DraftModel[]>(() => initial.models.map(m => ({ ...m, originalModel: m, rowId: nextRow.current++, source: "saved" })));
   const [priceDrafts, setPriceDrafts] = useState<Record<number, PriceDraft>>(() => Object.fromEntries(models.map(m => [m.rowId, draftFromPrice(m.price)])));
   const [overrideDrafts, setOverrideDrafts] = useState<Record<number, OverridesDraft>>(() => Object.fromEntries(models.map(m => [m.rowId, draftFromOverrides(m.overrides)])));
+  // Capture the read token once. Background refresh must not bless an old draft.
+  const [declarationSnapshot] = useState(() => declarationViews);
+  const [declarationDrafts, setDeclarationDrafts] = useState<Record<number, DeclarationDraft>>({});
   const [preset, setPreset] = useState("");
   const [defaultContext, setDefaultContext] = useState(DEFAULT_CONTEXT_WINDOW);
   const [catalog, setCatalog] = useState<DiscoveredModel[] | null>(null);
@@ -71,26 +89,48 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
   const requestVersion = useRef(0);
   const modal = useRef<HTMLDivElement>(null);
   const busy = discovering || saving;
+  const editingDisabled = busy || unavailable;
   const dirty = useRef(false);
   const dismiss = () => { if (!busy && (!dirty.current || window.confirm("有尚未保存的配置，确定放弃这些修改吗？"))) onClose(); };
   const dismissRef = useRef(dismiss);
   dismissRef.current = dismiss;
 
+  const focusable = () => Array.from(modal.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, [tabindex="0"]') ?? []).filter(el => el.getClientRects().length > 0);
+
   useEffect(() => {
     const before = document.activeElement as HTMLElement | null;
-    modal.current?.querySelector<HTMLElement>("input, button, select")?.focus();
+    (focusable()[0] ?? modal.current)?.focus();
+    const contain = (event: FocusEvent) => {
+      if (event.target instanceof Node && !modal.current?.contains(event.target)) (focusable()[0] ?? modal.current)?.focus();
+    };
     const keydown = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); dismissRef.current(); }
       if (event.key === "Tab") {
-        const items = Array.from(modal.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, [tabindex="0"]') ?? []).filter(el => el.getClientRects().length > 0);
+        const items = focusable();
         const first = items[0], last = items[items.length - 1];
-        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
-        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+        const active = document.activeElement;
+        if (!first || !modal.current?.contains(active) || active === modal.current || active?.matches(":disabled")
+          || event.shiftKey && active === first || !event.shiftKey && active === last) {
+          event.preventDefault(); (event.shiftKey ? last ?? modal.current : first ?? modal.current)?.focus();
+        }
       }
     };
     document.addEventListener("keydown", keydown);
-    return () => { requestVersion.current++; document.removeEventListener("keydown", keydown); before?.focus(); };
+    document.addEventListener("focusin", contain);
+    return () => {
+      requestVersion.current++;
+      document.removeEventListener("keydown", keydown); document.removeEventListener("focusin", contain);
+      if (before?.isConnected) before.focus();
+    };
   }, []);
+
+
+  useEffect(() => {
+    const active = document.activeElement;
+    if (!modal.current?.contains(active) || active?.matches(":disabled")) {
+      (focusable()[0] ?? modal.current)?.focus();
+    }
+  }, [busy, unavailable]);
 
   const patchForm = (patch: Partial<ProviderForm>, invalidate = false) => {
     dirty.current = true;
@@ -161,6 +201,7 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
     setMessage({ kind: "ok", text: "已添加预设名称；它们尚未经过当前账户验证，请确认上下文长度和能力。" });
   };
   const discover = async () => {
+    if (fixed) return;
     if (!form.base_url.trim()) { setMessage({ kind: "err", text: "请先填写 API 地址。" }); return; }
     const version = ++requestVersion.current;
     setDiscovering(true); setMessage(null);
@@ -185,6 +226,25 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
       // 版本号只该用来丢弃**过期结果**，不该用来决定状态复位。
       setDiscovering(false);
     }
+  };
+  const s6Applicable = (m: DraftModel) => !fixed && !accountBound && m.model_type === "chat" && (declarationSnapshot !== undefined || !initial.id);
+  const declarationInfo = (m: DraftModel) => {
+    const previous = initial.models.find(old => old.alias === m.alias.trim());
+    const view = declarationSnapshot?.[m.alias.trim()];
+    const changed = !!initial.id && (form.dialect !== initial.dialect || form.base_url.trim() !== initial.base_url.trim()
+      || !!previous && (m.upstream.trim() !== previous.upstream || m.model_type !== previous.model_type || m.upstream_path !== previous.upstream_path));
+    return { view, blocked: changed ? "模型目标已修改，请先保存目标并重新打开，再设置声明。" : previous && !view ? "声明未完整读取，请重新打开配置。" : "" };
+  };
+  const recordDeclaration = (m: DraftModel, field: ModelDeclarationField, state: ModelDeclarationState) => {
+    if (editingDisabled || !s6Applicable(m) || declarationInfo(m).blocked || declarationInfo(m).view?.read_only) return;
+    const property = DECLARATION_FIELDS.find(item => item[0] === field)![1];
+    setDeclarationDrafts(previous => ({ ...previous, [m.rowId]: { originalFlags: previous[m.rowId]?.originalFlags ?? declarationFlags(m), fields: { ...previous[m.rowId]?.fields, [field]: state } } }));
+    patchModel(m.rowId, { [property]: state === "supported" });
+  };
+  const undoDeclaration = (m: DraftModel) => {
+    const draft = declarationDrafts[m.rowId]; if (!draft) return;
+    patchModel(m.rowId, draft.originalFlags);
+    setDeclarationDrafts(previous => { const next = { ...previous }; delete next[m.rowId]; return next; });
   };
   const configured = useMemo(() => new Set(models.map(m => m.upstream.trim())), [models]);
   const visible = useMemo(() => (catalog ?? []).filter(m => `${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase()) && (filter === "all" || filter === "free" && m.is_free === true || filter === "tools" && m.supports_tools === true || filter === "vision" && m.supports_vision === true || filter === "audio" && m.supports_audio === true || filter === "video" && m.supports_video === true || filter === "chat" && (m.model_type ?? "chat") === "chat" || filter === "embedding" && m.model_type === "embedding" || filter === "image" && m.model_type === "image" || filter === "speech" && m.model_type === "speech")), [catalog, query, filter]);
@@ -214,6 +274,22 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
       source: m.context_source, rowId: nextRow.current++,
     }));
     setModels(previous => [...previous, ...added]);
+    // Selecting a catalog row explicitly adopts only known boolean declarations.
+    // A missing value keeps the original legacy default, never a known negative.
+    setDeclarationDrafts(previous => {
+      const next = { ...previous };
+      added.forEach((m, index) => {
+        if (!s6Applicable(m)) return;
+        const remote = incoming[index];
+        const fields: Partial<Record<ModelDeclarationField, ModelDeclarationState>> = {};
+        for (const [field, property] of DECLARATION_FIELDS) {
+          const value = remote[property];
+          if (typeof value === "boolean") fields[field] = value ? "supported" : "unsupported";
+        }
+        if (Object.keys(fields).length) next[m.rowId] = { originalFlags: declarationFlags(m), fields };
+      });
+      return next;
+    });
     setPriceDrafts(previous => ({
       ...previous,
       ...Object.fromEntries(added.map(m => [m.rowId, draftFromPrice(m.price)])),
@@ -343,6 +419,7 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
     return { temperature: temperatureValue, max_tokens: maxTokensValue, extra_body: extraBodyValue, extra_headers: headers.length ? headers : null };
   };
   const save = async () => {
+    if (unavailable) { setMessage({ kind: "err", text: "运行时绑定不可用，请前往客户端接入检查。" }); return; }
     if (!form.name.trim() || !form.base_url.trim()) { setMessage({ kind: "err", text: "请填写供应商名称和 API 地址。" }); return; }
     if (!models.length || models.some(m => !m.alias.trim() || !m.upstream.trim())) { setMessage({ kind: "err", text: "请至少添加一个模型，并填写每个模型的名称与别名。" }); return; }
     if (new Set(models.map(m => m.alias.trim())).size !== models.length) { setMessage({ kind: "err", text: "模型对外别名不能重复。" }); return; }
@@ -359,70 +436,89 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
         || placeholders.some(placeholder => placeholder !== "{model}");
     });
     if (invalidPath) { setMessage({ kind: "err", text: `模型 ${invalidPath.alias || invalidPath.upstream} 的上游请求路径无效。路径必须以 / 开头，只支持 {model} 占位符。` }); return; }
-    if (models.some(m => !Number.isInteger(m.context_window) || m.context_window < 1 || m.context_window > 2147483647)) { setMessage({ kind: "err", text: "上下文长度必须为 1 到 2,147,483,647 之间的整数。" }); return; }
+    if (models.some(m => !Number.isInteger(m.context_window) || m.context_window < (native ? 0 : 1) || m.context_window > 2147483647)) { setMessage({ kind: "err", text: "上下文长度必须为 1 到 2,147,483,647 之间的整数。" }); return; }
     if (![form.priority, form.rpm_limit, form.intelligence].every(Number.isInteger) || form.rpm_limit < 0 || form.intelligence < 0 || form.intelligence > 100) { setMessage({ kind: "err", text: "请检查优先级、RPM（非负整数）和能力分（0–100）。" }); return; }
     const resolved: ModelRef[] = [];
     for (const m of models) {
       const price = resolvePrice(m);
       if (price && "error" in price) { setMessage({ kind: "err", text: price.error }); return; }
-      const overrides = resolveOverrides(m);
+      const maxTokens = overrideDrafts[m.rowId]?.max_tokens.trim() ?? "";
+      if (native && maxTokens && (!Number.isInteger(Number(maxTokens)) || Number(maxTokens) < 1 || Number(maxTokens) > 4294967295)) { setMessage({ kind: "err", text: "max_tokens 覆盖必须是 1 到 4,294,967,295 之间的整数。" }); return; }
+      const maxChanged = maxTokens !== String(m.originalModel?.overrides?.max_tokens ?? "");
+      const overrides = native ? maxChanged ? { ...(m.originalModel?.overrides ?? { temperature: null, extra_body: null, extra_headers: null }), max_tokens: maxTokens ? Number(maxTokens) : null } : m.originalModel?.overrides ?? null : resolveOverrides(m);
       if (overrides && "error" in overrides) { setMessage({ kind: "err", text: overrides.error }); return; }
       const { rowId: _rowId, source: _source, originalModel: _originalModel, ...rest } = m;
-      resolved.push({ ...rest, alias: m.alias.trim(), upstream: m.upstream.trim(), price, overrides });
+      resolved.push(native ? { ...m.originalModel!, enabled: m.enabled, price, overrides } : { ...rest, alias: m.alias.trim(), upstream: m.upstream.trim(), price, overrides });
     }
+    const declarations: Record<string, ModelDeclarationPatch> = {};
+    for (const m of models) {
+      const draft = declarationDrafts[m.rowId]; if (!draft || !Object.keys(draft.fields).length) continue;
+      const info = declarationInfo(m);
+      if (!s6Applicable(m) || info.blocked || info.view?.read_only) { setMessage({ kind: "err", text: info.blocked || "声明目标已变化，请撤销该行声明改动后再保存。" }); return; }
+      const alias = m.alias.trim();
+      if (declarations[alias]) { setMessage({ kind: "err", text: "能力声明不能绑定重复别名。" }); return; }
+      declarations[alias] = { binding: info.view?.binding ?? "new", revision: info.view?.revision ?? "new", fields: draft.fields };
+    }
+    // A completed write may outlive this editor. Its UI callbacks must not
+    // refresh or close an editor opened after this instance was removed.
+    const version = ++requestVersion.current;
     setSaving(true); setMessage(null);
     try {
-      const input: ProviderInput = { ...form, name: form.name.trim(), base_url: form.base_url.trim(), api_key: form.api_key.trim(), note: form.note.trim() || null,
+      const { capability_declarations: _oldPatch, ...configuration } = form;
+      const input: ProviderInput = { ...configuration, name: form.name.trim(), base_url: form.base_url.trim(), api_key: form.api_key.trim(), note: form.note.trim() || null,
         models: resolved,
+        ...(Object.keys(declarations).length ? { capability_declarations: declarations } : {}),
       };
       await api.upsertProvider(input);
+      if (version !== requestVersion.current) return;
       dirty.current = false;
       await onSaved();
-      onClose();
-    } catch (error) { setMessage({ kind: "err", text: `保存失败：${errorText(error)}` }); }
-    finally { setSaving(false); }
+      if (version === requestVersion.current) onClose();
+    } catch (error) { if (version === requestVersion.current) setMessage({ kind: "err", text: `保存失败：${errorText(error)}` }); }
+    finally { if (version === requestVersion.current) setSaving(false); }
   };
 
   return <div className="modal-mask provider-editor-mask" onMouseDown={event => { if (event.target === event.currentTarget) dismiss(); }}>
-    <div className="provider-editor" role="dialog" aria-modal="true" aria-labelledby="provider-editor-title" ref={modal}>
+    <div className="provider-editor" role="dialog" aria-modal="true" aria-labelledby="provider-editor-title" ref={modal} tabIndex={-1}>
       <header className="editor-heading">
-        <div><span className="eyebrow">供应商配置</span><h2 id="provider-editor-title">{form.id ? `编辑 ${initial.name}` : "连接你的模型服务"}</h2><p>填写连接信息，获取模型，再按需加入网关。</p></div>
+        <div><span className="eyebrow">供应商配置</span><h2 id="provider-editor-title">{form.id ? `编辑 ${initial.name}` : "连接你的模型服务"}</h2><p>{fixed ? "账号与模型绑定由客户端接入管理，可在此调整启停、定价及请求上限。" : "填写连接信息，获取模型，再按需加入网关。"}</p></div>
         <button className="icon-button ghost" onClick={dismiss} disabled={busy} aria-label="关闭供应商配置">×</button>
       </header>
       <div className="editor-scroll">
         {message && <div role={message.kind === "err" ? "alert" : "status"} className={`msg ${message.kind}`}>{message.text}</div>}
+        {fixed && <p role={unavailable ? "alert" : "status"}>{unavailable ? "运行时绑定不可用，配置已锁定。" : "Trae CN · 独立登录 · 无需 API Key · 账号模型能力未实测。"} 如需调整账号或模型，请前往「客户端接入 → 独立模型」。</p>}
         <div className="editor-columns">
           <section className="connection-pane" aria-labelledby="connection-title">
             <div className="section-caption"><span>01</span><h3 id="connection-title">连接信息</h3></div>
-            {!form.id && <div className="field"><label htmlFor="provider-preset">从服务预设开始</label><select id="provider-preset" value={preset} disabled={busy} onChange={e => usePreset(e.target.value)}><option value="">选择服务或自定义 API</option>{PRESETS.map(p => <option key={p.name}>{p.name}</option>)}</select></div>}
-            <div className="field"><label htmlFor="provider-name">供应商名称</label><input id="provider-name" autoComplete="off" value={form.name} disabled={busy} onChange={e => patchForm({ name: e.target.value })} placeholder="例如：我的 OpenRouter" /></div>
-            <div className="field"><label htmlFor="provider-dialect">接口协议</label><select id="provider-dialect" disabled={busy} value={form.dialect} onChange={e => patchForm({ dialect: e.target.value as ProviderForm["dialect"] }, true)}>{Object.entries(DIALECT_LABEL).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></div>
-            <div className="field"><label htmlFor="provider-url">API 地址</label><input id="provider-url" type="url" autoComplete="off" spellCheck={false} disabled={busy} value={form.base_url} onChange={e => patchForm({ base_url: e.target.value }, true)} placeholder="https://api.example.com/v1" /><small>可粘贴基础地址或完整聊天接口地址。</small></div>
-            <div className="field"><label htmlFor="provider-key">API Key {form.id && <span className="muted">· 留空保留原密钥</span>}</label><div className="key-input"><input id="provider-key" type={showKey ? "text" : "password"} autoComplete="new-password" spellCheck={false} disabled={busy} value={form.api_key} onChange={e => patchForm({ api_key: e.target.value }, true)} placeholder={form.id ? "使用已保存的密钥" : "填写 API Key；本地服务可留空"} /><button type="button" className="ghost" onClick={() => setShowKey(v => !v)} aria-label={showKey ? "隐藏密钥" : "显示密钥"}>{showKey ? "隐藏" : "显示"}</button></div><small>只用于当前服务，保存时加密存储。</small></div>
-            <button className="primary fetch-models-button" disabled={busy || !form.base_url.trim()} onClick={() => void discover()}>{discovering ? "正在获取模型…" : catalog ? "重新获取模型" : "获取支持模型"}</button>
-            <div className="default-context-box"><label htmlFor="default-context">未识别时的默认上下文</label><div className="row"><input id="default-context" type="number" min={1} max={2147483647} step={1024} disabled={busy} value={defaultContext} onChange={e => setDefaultContext(Number(e.target.value))} /><span className="muted">tokens</span></div><small>默认 32,768 tokens，仅用于新添加且未提供长度的模型。请按服务限制调整。</small></div>
-            <details className="provider-advanced"><summary>路由与其他设置</summary><div className="field"><label htmlFor="provider-priority">优先级（越小越优先）</label><input id="provider-priority" type="number" disabled={busy} value={form.priority} onChange={e => patchForm({ priority: Number(e.target.value) })} /></div><div className="field"><label htmlFor="provider-rpm">每分钟请求上限（0 为不限）</label><input id="provider-rpm" type="number" min={0} disabled={busy} value={form.rpm_limit} onChange={e => patchForm({ rpm_limit: Number(e.target.value) })} /></div><div className="field"><label htmlFor="provider-intelligence">能力分（0–100）</label><input id="provider-intelligence" type="number" min={0} max={100} disabled={busy} value={form.intelligence} onChange={e => patchForm({ intelligence: Number(e.target.value) })} /></div><div className="field"><label htmlFor="provider-note">备注</label><textarea id="provider-note" rows={2} disabled={busy} value={form.note} onChange={e => patchForm({ note: e.target.value })} /></div></details>
+            {!form.id && <div className="field"><label htmlFor="provider-preset">从服务预设开始</label><select id="provider-preset" value={preset} disabled={editingDisabled} onChange={e => usePreset(e.target.value)}><option value="">选择服务或自定义 API</option>{PRESETS.map(p => <option key={p.name}>{p.name}</option>)}</select></div>}
+            <div className="field"><label htmlFor="provider-name">供应商名称</label><input id="provider-name" autoComplete="off" value={form.name} disabled={editingDisabled} onChange={e => patchForm({ name: e.target.value })} placeholder="例如：我的 OpenRouter" /></div>
+            <div className="field"><label htmlFor="provider-dialect">接口协议</label><select id="provider-dialect" disabled={editingDisabled || fixed} value={form.dialect} onChange={e => patchForm({ dialect: e.target.value as ProviderForm["dialect"] }, true)}>{Object.entries(DIALECT_LABEL).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></div>
+            <div className="field"><label htmlFor="provider-url">API 地址</label><input id="provider-url" type="url" autoComplete="off" spellCheck={false} disabled={editingDisabled || fixed} value={form.base_url} onChange={e => patchForm({ base_url: e.target.value }, true)} placeholder="https://api.example.com/v1" /><small>可粘贴基础地址或完整聊天接口地址。</small></div>
+            {!fixed && <><div className="field"><label htmlFor="provider-key">API Key {form.id && <span className="muted">· 留空保留原密钥</span>}</label><div className="key-input"><input id="provider-key" type={showKey ? "text" : "password"} autoComplete="new-password" spellCheck={false} disabled={editingDisabled} value={form.api_key} onChange={e => patchForm({ api_key: e.target.value }, true)} placeholder={form.id ? "使用已保存的密钥" : "填写 API Key；本地服务可留空"} /><button type="button" className="ghost" onClick={() => setShowKey(v => !v)} aria-label={showKey ? "隐藏密钥" : "显示密钥"}>{showKey ? "隐藏" : "显示"}</button></div><small>只用于当前服务，保存时加密存储。</small></div>
+            <button className="primary fetch-models-button" disabled={editingDisabled || !form.base_url.trim()} onClick={() => void discover()}>{discovering ? "正在获取模型…" : catalog ? "重新获取模型" : "获取支持模型"}</button>
+            <div className="default-context-box"><label htmlFor="default-context">未识别时的默认上下文</label><div className="row"><input id="default-context" type="number" min={1} max={2147483647} step={1024} disabled={editingDisabled} value={defaultContext} onChange={e => setDefaultContext(Number(e.target.value))} /><span className="muted">tokens</span></div><small>默认 32,768 tokens，仅用于新添加且未提供长度的模型。请按服务限制调整。</small></div></>}
+            <details className="provider-advanced"><summary>路由与其他设置</summary><div className="field"><label htmlFor="provider-priority">优先级（越小越优先）</label><input id="provider-priority" type="number" disabled={editingDisabled} value={form.priority} onChange={e => patchForm({ priority: Number(e.target.value) })} /></div><div className="field"><label htmlFor="provider-rpm">每分钟请求上限（0 为不限）</label><input id="provider-rpm" type="number" min={0} disabled={editingDisabled} value={form.rpm_limit} onChange={e => patchForm({ rpm_limit: Number(e.target.value) })} /></div><div className="field"><label htmlFor="provider-intelligence">能力分（0–100）</label><input id="provider-intelligence" type="number" min={0} max={100} disabled={editingDisabled} value={form.intelligence} onChange={e => patchForm({ intelligence: Number(e.target.value) })} /></div><div className="field"><label htmlFor="provider-note">备注</label><textarea id="provider-note" rows={2} disabled={editingDisabled} value={form.note} onChange={e => patchForm({ note: e.target.value })} /></div></details>
           </section>
           <section className="model-pane" aria-labelledby="model-selection-title">
             <div className="section-caption"><span>02</span><h3 id="model-selection-title">选择与配置模型</h3></div>
-            {catalog === null ? <div className="catalog-placeholder"><div className="catalog-symbol" aria-hidden="true">≋</div><strong>{discovering ? "正在读取服务的模型目录" : "让服务告诉你支持哪些模型"}</strong><p>获取后可搜索、多选，并自动填入上游提供的上下文长度。</p><span>接口不提供目录时，也可以手动添加。</span></div> : <div className="model-catalog">
+            {!fixed && (catalog === null ? <div className="catalog-placeholder"><div className="catalog-symbol" aria-hidden="true">≋</div><strong>{discovering ? "正在读取服务的模型目录" : "让服务告诉你支持哪些模型"}</strong><p>获取后可搜索、多选，并自动填入上游提供的上下文长度。</p><span>接口不提供目录时，也可以手动添加。</span></div> : <div className="model-catalog">
               <div className="catalog-toolbar"><input aria-label="搜索可用模型" placeholder="搜索模型名称或 ID…" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="筛选模型能力和类型" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部模型</option><option value="chat">聊天模型</option><option value="embedding">Embedding</option><option value="image">文生图</option><option value="speech">语音合成</option><option value="free">免费模型</option><option value="tools">支持工具</option><option value="vision">支持图像</option><option value="audio">支持音频</option><option value="video">支持视频</option></select></div>
               <div className="catalog-meta"><span>显示 {visible.length} / {catalog.length} 个</span><button className="ghost" disabled={!selectable.length || busy} onClick={() => setSelected(previous => { const next = new Set(previous); const all = selectable.every(m => next.has(m.id)); selectable.forEach(m => all ? next.delete(m.id) : next.add(m.id)); return next; })}>{selectable.length > 0 && selectable.every(m => selected.has(m.id)) ? "取消当前筛选" : "选择当前筛选"}</button></div>
-              <div className="catalog-list" aria-label="可用模型目录">{visible.length === 0 ? <p className="empty">没有匹配的模型，试试其他关键词或筛选条件。</p> : visible.map(m => <label className={`catalog-item ${configured.has(m.id) ? "configured" : ""}`} key={m.id}><input type="checkbox" disabled={busy || configured.has(m.id)} checked={configured.has(m.id) || selected.has(m.id)} onChange={e => setSelected(previous => { const next = new Set(previous); e.target.checked ? next.add(m.id) : next.delete(m.id); return next; })} /><span className="catalog-item-content"><strong>{m.name || m.id}</strong><span className="mono breakable">{m.id}</span><span className="model-tags"><span>{formatContext(m.context_source === "provider" ? m.context_window : defaultContext)} tokens · {m.context_source === "provider" ? "上游提供" : "默认待确认"}</span><span className="tag">{MODEL_TYPE_LABEL[m.model_type ?? "chat"]}</span>{m.is_free === true && <span className="tag ok">免费</span>}{m.price && <span className="tag">{formatPricePerMillion(m.price)}</span>}{m.supports_tools === true && <span className="tag">工具</span>}{m.supports_vision === true && <span className="tag">图像</span>}{m.supports_audio === true && <span className="tag">音频</span>}{m.supports_video === true && <span className="tag">视频</span>}{configured.has(m.id) && <span className="tag">已添加</span>}</span></span></label>)}</div>
+              <div className="catalog-list" aria-label="可用模型目录">{visible.length === 0 ? <p className="empty">没有匹配的模型，试试其他关键词或筛选条件。</p> : visible.map(m => <label className={`catalog-item ${configured.has(m.id) ? "configured" : ""}`} key={m.id}><input type="checkbox" disabled={editingDisabled || configured.has(m.id)} checked={configured.has(m.id) || selected.has(m.id)} onChange={e => setSelected(previous => { const next = new Set(previous); e.target.checked ? next.add(m.id) : next.delete(m.id); return next; })} /><span className="catalog-item-content"><strong>{m.name || m.id}</strong><span className="mono breakable">{m.id}</span><span className="model-tags"><span>{formatContext(m.context_source === "provider" ? m.context_window : defaultContext)} tokens · {m.context_source === "provider" ? "上游提供" : "默认待确认"}</span><span className="tag">{MODEL_TYPE_LABEL[m.model_type ?? "chat"]}</span>{m.is_free === true && <span className="tag ok">免费</span>}{m.price && <span className="tag">{formatPricePerMillion(m.price)}</span>}{m.supports_tools === true && <span className="tag">工具</span>}{m.supports_vision === true && <span className="tag">图像</span>}{m.supports_audio === true && <span className="tag">音频</span>}{m.supports_video === true && <span className="tag">视频</span>}{configured.has(m.id) && <span className="tag">已添加</span>}</span></span></label>)}</div>
               <div className="catalog-footer"><span>已勾选 {selected.size} 个</span><button className="primary" disabled={!selected.size || busy} onClick={addSelected}>添加所选模型</button></div>
-            </div>}
+            </div>)}
             {catalogWarnings.map((warning, i) => <p className="catalog-warning" key={i}>{warning}</p>)}
-            <div className="selected-heading"><h3>已配置 <span className="count-badge">{models.length}</span></h3><button className="ghost" disabled={busy} onClick={addManual}>＋ 手动添加</button></div>
-            {!models.length && <div className="selected-empty">还未添加模型。{PRESETS.find(p => p.name === preset)?.models.length ? <button className="ghost" disabled={busy} onClick={addPresetModels}>使用预设名称</button> : null}</div>}
+            <div className="selected-heading"><h3>已配置 <span className="count-badge">{models.length}</span></h3>{!fixed && <button className="ghost" disabled={editingDisabled} onClick={addManual}>＋ 手动添加</button>}</div>
+            {!models.length && <div className="selected-empty">还未添加模型。{PRESETS.find(p => p.name === preset)?.models.length ? <button className="ghost" disabled={editingDisabled} onClick={addPresetModels}>使用预设名称</button> : null}</div>}
             <div className="configured-models">{models.map((m, index) => <article className="configured-model" key={m.rowId}>
               <div className="configured-model-title"><strong className="breakable">{m.upstream || `新模型 ${index + 1}`}</strong><span className={`enable-toggle ${m.enabled === false ? "off" : ""}`}>
-                <input type="checkbox" disabled={busy} checked={m.enabled !== false} aria-label={`${m.enabled === false ? "启用" : "停用"}模型 ${m.upstream || index + 1}`} onChange={e => patchModel(m.rowId, { enabled: e.target.checked })} />
+                <input type="checkbox" disabled={editingDisabled} checked={m.enabled !== false} aria-label={`${m.enabled === false ? "启用" : "停用"}模型 ${m.upstream || index + 1}`} onChange={e => patchModel(m.rowId, { enabled: e.target.checked })} />
                 <span>{m.enabled === false ? "已停用" : "参与路由"}</span>
-              </span><button className="icon-button ghost danger" disabled={busy} aria-label={`移除模型 ${m.upstream || index + 1}`} onClick={() => removeModel(m.rowId)}>×</button></div>
-              <div className="grid2"><div className="field"><label htmlFor={`upstream-${m.rowId}`}>上游模型 ID</label><input id={`upstream-${m.rowId}`} disabled={busy} value={m.upstream} placeholder="例如 deepseek-chat" onChange={e => patchModel(m.rowId, { upstream: e.target.value, source: "manual" })} /></div><div className="field"><label htmlFor={`model-type-${m.rowId}`}>模型类型</label><select id={`model-type-${m.rowId}`} disabled={busy} value={m.model_type} onChange={e => patchModel(m.rowId, { model_type: e.target.value as ModelType })}><option value="chat">聊天 / Responses</option><option value="embedding">Embedding</option><option value="image">文生图</option><option value="speech">语音合成 TTS</option></select></div><div className="field"><label htmlFor={`alias-${m.rowId}`}>对外别名</label><input id={`alias-${m.rowId}`} disabled={busy} value={m.alias} placeholder="客户端使用的模型名" onChange={e => patchModel(m.rowId, { alias: e.target.value })} /></div></div>
-              <div className="field"><label htmlFor={`upstream-path-${m.rowId}`}>上游请求路径 <span className="muted">· 可选</span></label><input id={`upstream-path-${m.rowId}`} disabled={busy} spellCheck={false} value={m.upstream_path ?? ""} placeholder={m.model_type === "embedding" ? "/v1/embeddings" : m.model_type === "image" ? "/v1/images/generations" : m.model_type === "speech" ? "/v1/audio/speech" : "/v1/chat/completions"} onChange={e => patchModel(m.rowId, { upstream_path: e.target.value.trim() ? e.target.value : null })} /><small>从域名根开始填写；留空使用协议默认路径。支持 <code>{"{model}"}</code> 占位符。</small></div>
-              <div className="context-line"><div className="field"><label htmlFor={`context-${m.rowId}`}>上下文长度（tokens）</label><input id={`context-${m.rowId}`} type="number" min={1} max={2147483647} disabled={busy} value={m.context_window} onChange={e => patchModel(m.rowId, { context_window: Number(e.target.value), source: "manual" })} /></div><span className={`context-source ${m.source === "default" ? "unverified" : ""}`}>{SOURCE_LABEL[m.source]}</span>{catalog?.find(item => item.id === m.upstream)?.context_source === "provider" && <button className="ghost" disabled={busy} onClick={() => { const remote = catalog.find(item => item.id === m.upstream)!; patchModel(m.rowId, { context_window: remote.context_window, source: "provider" }); }}>采用上游长度</button>}</div>
-              <div className="model-capabilities">{([['supports_tools', '工具调用'], ['supports_thinking', '思考 / 推理'], ['supports_vision', '图像输入'], ['supports_audio', '音频输入'], ['supports_video', '视频输入'], ['supports_stream', '流式响应']] as const).map(([key, label]) => <label key={key}><input type="checkbox" checked={m[key]} disabled={busy} onChange={e => patchModel(m.rowId, { [key]: e.target.checked })} />{label}</label>)}</div>
+              </span><button className="icon-button ghost danger" disabled={editingDisabled || fixed} aria-label={`移除模型 ${m.upstream || index + 1}`} onClick={() => removeModel(m.rowId)}>×</button></div>
+              <div className="grid2"><div className="field"><label htmlFor={`upstream-${m.rowId}`}>上游模型 ID</label><input id={`upstream-${m.rowId}`} disabled={editingDisabled || fixed} value={m.upstream} placeholder="例如 deepseek-chat" onChange={e => patchModel(m.rowId, { upstream: e.target.value, source: "manual" })} /></div><div className="field"><label htmlFor={`model-type-${m.rowId}`}>模型类型</label><select id={`model-type-${m.rowId}`} disabled={editingDisabled || fixed} value={m.model_type} onChange={e => patchModel(m.rowId, { model_type: e.target.value as ModelType })}><option value="chat">聊天 / Responses</option><option value="embedding">Embedding</option><option value="image">文生图</option><option value="speech">语音合成 TTS</option></select></div><div className="field"><label htmlFor={`alias-${m.rowId}`}>对外别名</label><input id={`alias-${m.rowId}`} disabled={editingDisabled || fixed} value={m.alias} placeholder="客户端使用的模型名" onChange={e => patchModel(m.rowId, { alias: e.target.value })} /></div></div>
+              <div className="field"><label htmlFor={`upstream-path-${m.rowId}`}>上游请求路径 <span className="muted">· 可选</span></label><input id={`upstream-path-${m.rowId}`} disabled={editingDisabled || fixed} spellCheck={false} value={m.upstream_path ?? ""} placeholder={m.model_type === "embedding" ? "/v1/embeddings" : m.model_type === "image" ? "/v1/images/generations" : m.model_type === "speech" ? "/v1/audio/speech" : "/v1/chat/completions"} onChange={e => patchModel(m.rowId, { upstream_path: e.target.value.trim() ? e.target.value : null })} /><small>从域名根开始填写；留空使用协议默认路径。支持 <code>{"{model}"}</code> 占位符。</small></div>
+              <div className="context-line"><div className="field"><label htmlFor={`context-${m.rowId}`}>上下文长度（tokens）</label><input id={`context-${m.rowId}`} type="number" min={1} max={2147483647} disabled={editingDisabled || fixed} value={native && m.context_window === 0 ? "" : m.context_window} placeholder={native ? "未知" : undefined} onChange={e => patchModel(m.rowId, { context_window: Number(e.target.value), source: "manual" })} /></div><span className={`context-source ${m.source === "default" ? "unverified" : ""}`}>{native ? (m.context_window > 0 ? "目录快照 · 未实测" : "上下文未知 · 未实测") : SOURCE_LABEL[m.source]}</span>{catalog?.find(item => item.id === m.upstream)?.context_source === "provider" && <button className="ghost" disabled={editingDisabled} onClick={() => { const remote = catalog.find(item => item.id === m.upstream)!; patchModel(m.rowId, { context_window: remote.context_window, source: "provider" }); }}>采用上游长度</button>}</div>
+              {native ? <div className="model-capabilities">{([["declared_tools", "工具调用"], ["declared_thinking", "思考 / 推理"], ["declared_vision", "图像输入"]] as const).map(([key, label]) => <span key={key}>{label}：{declared(selection(m.alias)[key])}</span>)}<span>流式响应、音频与视频：账号能力未实测</span>{selection(m.alias).allow_undeclared_images === true && <span>已允许未实测图片请求 · 本地候选设置</span>}</div> : s6Applicable(m) ? <ModelDeclarationFields model={m} view={declarationInfo(m).view} draft={declarationDrafts[m.rowId]} disabled={editingDisabled} blockedReason={declarationInfo(m).blocked} onRecord={(field, state) => recordDeclaration(m, field, state)} onUndo={() => undoDeclaration(m)} /> : <div className="model-capabilities">{([['supports_tools', '工具调用'], ['supports_thinking', '思考 / 推理'], ['supports_vision', '图像输入'], ['supports_audio', '音频输入'], ['supports_video', '视频输入'], ['supports_stream', '流式响应']] as const).map(([key, label]) => <label key={key}><input type="checkbox" checked={m[key]} disabled={editingDisabled} onChange={e => patchModel(m.rowId, { [key]: e.target.checked })} />{label}</label>)}</div>}
               {(() => {
                 const draft = priceDrafts[m.rowId] ?? draftFromPrice(m.price);
                 const filled = draft.prompt.trim() !== "" || draft.completion.trim() !== "";
@@ -430,11 +526,11 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
                 const tiers = m.price?.tiers ?? [];
                 return <div className="price-block">
                   <div className="price-line">
-                    <div className="field"><label htmlFor={`price-prompt-${m.rowId}`}>输入价格</label><input id={`price-prompt-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={busy} value={draft.prompt} placeholder="每 100 万 token" onChange={e => patchPrice(m.rowId, { prompt: e.target.value })} /></div>
-                    <div className="field"><label htmlFor={`price-completion-${m.rowId}`}>输出价格</label><input id={`price-completion-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={busy} value={draft.completion} placeholder="每 100 万 token" onChange={e => patchPrice(m.rowId, { completion: e.target.value })} /></div>
-                    <div className="field"><label htmlFor={`price-cache-read-${m.rowId}`}>缓存命中价</label><input id={`price-cache-read-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={busy} value={draft.cacheRead} placeholder="留空 = 输入价" onChange={e => patchPrice(m.rowId, { cacheRead: e.target.value })} /></div>
-                    <div className="field"><label htmlFor={`price-cache-creation-${m.rowId}`}>缓存创建价</label><input id={`price-cache-creation-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={busy} value={draft.cacheCreation} placeholder="留空 = 输入价" onChange={e => patchPrice(m.rowId, { cacheCreation: e.target.value })} /></div>
-                    <div className="field"><label htmlFor={`price-currency-${m.rowId}`}>币种</label><select id={`price-currency-${m.rowId}`} disabled={busy || !filled} value={draft.currency} onChange={e => patchPrice(m.rowId, { currency: e.target.value as Currency })}><option value="usd">美元 USD</option><option value="cny">人民币 CNY</option></select></div>
+                    <div className="field"><label htmlFor={`price-prompt-${m.rowId}`}>输入价格</label><input id={`price-prompt-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={editingDisabled} value={draft.prompt} placeholder="每 100 万 token" onChange={e => patchPrice(m.rowId, { prompt: e.target.value })} /></div>
+                    <div className="field"><label htmlFor={`price-completion-${m.rowId}`}>输出价格</label><input id={`price-completion-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={editingDisabled} value={draft.completion} placeholder="每 100 万 token" onChange={e => patchPrice(m.rowId, { completion: e.target.value })} /></div>
+                    <div className="field"><label htmlFor={`price-cache-read-${m.rowId}`}>缓存命中价</label><input id={`price-cache-read-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={editingDisabled} value={draft.cacheRead} placeholder="留空 = 输入价" onChange={e => patchPrice(m.rowId, { cacheRead: e.target.value })} /></div>
+                    <div className="field"><label htmlFor={`price-cache-creation-${m.rowId}`}>缓存创建价</label><input id={`price-cache-creation-${m.rowId}`} type="number" min={0} step="any" inputMode="decimal" disabled={editingDisabled} value={draft.cacheCreation} placeholder="留空 = 输入价" onChange={e => patchPrice(m.rowId, { cacheCreation: e.target.value })} /></div>
+                    <div className="field"><label htmlFor={`price-currency-${m.rowId}`}>币种</label><select id={`price-currency-${m.rowId}`} disabled={editingDisabled || !filled} value={draft.currency} onChange={e => patchPrice(m.rowId, { currency: e.target.value as Currency })}><option value="usd">美元 USD</option><option value="cny">人民币 CNY</option></select></div>
                     <span className={`price-state ${filled ? "" : "unverified"}`}>{filled ? (m.price?.source === "catalog" ? "目录定价 · 可自动更新" : "手工定价 · 刷新时不覆盖") : "未配置价格 · 不计花费"}</span>
                   </div>
                   {tiers.length > 0 && <p className="price-tiers muted">目录提供的输入长度分档：{tiers.map(tier => {
@@ -448,15 +544,15 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
                     <summary>峰谷价 / 忙闲价 {draft.rules.length > 0 && <span className="tag">已配置 {draft.rules.length} 条</span>}</summary>
                     <p className="overrides-help">按 UTC 时间对基础价打折：倍率填百分比（50 = 五折）。起点晚于终点表示跨午夜，例如 16:30 → 00:30。同一时刻命中多条时以第一条为准。</p>
                     {draft.rules.map((rule, ruleIndex) => <div className="price-rule-row" key={ruleIndex}>
-                      <input aria-label={`时段名称 ${ruleIndex + 1}`} placeholder="谷时" disabled={busy} value={rule.label} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, label: e.target.value } : item))} />
-                      <input aria-label={`时段开始 ${ruleIndex + 1}`} placeholder="16:30" disabled={busy} value={rule.start} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, start: e.target.value } : item))} />
-                      <input aria-label={`时段结束 ${ruleIndex + 1}`} placeholder="00:30" disabled={busy} value={rule.end} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, end: e.target.value } : item))} />
-                      <input aria-label={`输入折扣 ${ruleIndex + 1}`} type="number" min={0} max={1000} step={1} placeholder="输入 %" disabled={busy} value={rule.promptPercent} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, promptPercent: e.target.value } : item))} />
-                      <input aria-label={`输出折扣 ${ruleIndex + 1}`} type="number" min={0} max={1000} step={1} placeholder="输出 %" disabled={busy} value={rule.completionPercent} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, completionPercent: e.target.value } : item))} />
-                      <button className="icon-button ghost danger" aria-label={`移除时段 ${ruleIndex + 1}`} disabled={busy} onClick={() => setRules(draft.rules.filter((_, i) => i !== ruleIndex))}>×</button>
+                      <input aria-label={`时段名称 ${ruleIndex + 1}`} placeholder="谷时" disabled={editingDisabled} value={rule.label} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, label: e.target.value } : item))} />
+                      <input aria-label={`时段开始 ${ruleIndex + 1}`} placeholder="16:30" disabled={editingDisabled} value={rule.start} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, start: e.target.value } : item))} />
+                      <input aria-label={`时段结束 ${ruleIndex + 1}`} placeholder="00:30" disabled={editingDisabled} value={rule.end} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, end: e.target.value } : item))} />
+                      <input aria-label={`输入折扣 ${ruleIndex + 1}`} type="number" min={0} max={1000} step={1} placeholder="输入 %" disabled={editingDisabled} value={rule.promptPercent} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, promptPercent: e.target.value } : item))} />
+                      <input aria-label={`输出折扣 ${ruleIndex + 1}`} type="number" min={0} max={1000} step={1} placeholder="输出 %" disabled={editingDisabled} value={rule.completionPercent} onChange={e => setRules(draft.rules.map((item, i) => i === ruleIndex ? { ...item, completionPercent: e.target.value } : item))} />
+                      <button className="icon-button ghost danger" aria-label={`移除时段 ${ruleIndex + 1}`} disabled={editingDisabled} onClick={() => setRules(draft.rules.filter((_, i) => i !== ruleIndex))}>×</button>
                     </div>)}
-                    <div className="row"><button className="ghost" disabled={busy} onClick={() => setRules([...draft.rules, { label: "", start: "", end: "", promptPercent: "", completionPercent: "" }])}>＋ 添加时段</button>
-                      {draft.rules.length > 0 && <button className="ghost" disabled={busy} onClick={() => setRules(priceRulesDraft(m.price?.rules ?? []))}>还原</button>}
+                    <div className="row"><button className="ghost" disabled={editingDisabled} onClick={() => setRules([...draft.rules, { label: "", start: "", end: "", promptPercent: "", completionPercent: "" }])}>＋ 添加时段</button>
+                      {draft.rules.length > 0 && <button className="ghost" disabled={editingDisabled} onClick={() => setRules(priceRulesDraft(m.price?.rules ?? []))}>还原</button>}
                     </div>
                   </details>
                 </div>;
@@ -469,26 +565,26 @@ export default function ProviderEditor({ initial, onClose, onSaved }: {
                   <summary>参数覆盖 {active && <span className="tag">已配置</span>}</summary>
                   <p className="overrides-help">这些配置只作用于该模型的上游请求；留空表示不覆盖。受保护字段（model / messages / stream 等）与鉴权头不允许改写。</p>
                   <div className="price-line">
-                    <div className="field"><label htmlFor={`override-temperature-${m.rowId}`}>温度覆盖</label><input id={`override-temperature-${m.rowId}`} type="number" min={0} max={2} step="0.05" inputMode="decimal" disabled={busy} value={draft.temperature} placeholder="留空不覆盖" onChange={e => patchOverrides(m.rowId, { temperature: e.target.value })} /></div>
-                    <div className="field"><label htmlFor={`override-max-tokens-${m.rowId}`}>max_tokens 覆盖</label><input id={`override-max-tokens-${m.rowId}`} type="number" min={1} step={1} disabled={busy} value={draft.max_tokens} placeholder="留空不覆盖" onChange={e => patchOverrides(m.rowId, { max_tokens: e.target.value })} /></div>
+                    <div className="field"><label htmlFor={`override-temperature-${m.rowId}`}>温度覆盖</label><input id={`override-temperature-${m.rowId}`} type="number" min={0} max={2} step="0.05" inputMode="decimal" disabled={editingDisabled || fixed} value={draft.temperature} placeholder="留空不覆盖" onChange={e => patchOverrides(m.rowId, { temperature: e.target.value })} /></div>
+                    <div className="field"><label htmlFor={`override-max-tokens-${m.rowId}`}>max_tokens 覆盖</label><input id={`override-max-tokens-${m.rowId}`} type="number" min={1} step={1} disabled={editingDisabled} value={draft.max_tokens} placeholder="留空不覆盖" onChange={e => patchOverrides(m.rowId, { max_tokens: e.target.value })} /></div>
                   </div>
-                  <div className="field"><label htmlFor={`override-body-${m.rowId}`}>额外请求体（JSON 对象）</label><textarea id={`override-body-${m.rowId}`} rows={3} spellCheck={false} disabled={busy} value={draft.extraBody} placeholder={'例如 {"top_k": 12}'} onChange={e => patchOverrides(m.rowId, { extraBody: e.target.value })} /></div>
+                  <div className="field"><label htmlFor={`override-body-${m.rowId}`}>额外请求体（JSON 对象）</label><textarea id={`override-body-${m.rowId}`} rows={3} spellCheck={false} disabled={editingDisabled || fixed} value={draft.extraBody} placeholder={'例如 {"top_k": 12}'} onChange={e => patchOverrides(m.rowId, { extraBody: e.target.value })} /></div>
                   <div className="override-headers">
-                    <div className="spread"><span className="muted">额外请求头</span><button className="ghost" disabled={busy} onClick={() => setHeaders([...draft.headers, { name: "", value: "" }])}>＋ 添加请求头</button></div>
+                    <div className="spread"><span className="muted">额外请求头</span><button className="ghost" disabled={editingDisabled || fixed} onClick={() => setHeaders([...draft.headers, { name: "", value: "" }])}>＋ 添加请求头</button></div>
                     {draft.headers.map((header, headerIndex) => <div className="override-header-row" key={headerIndex}>
-                      <input aria-label={`请求头名称 ${headerIndex + 1}`} placeholder="X-Custom-Header" disabled={busy} value={header.name} onChange={e => setHeaders(draft.headers.map((item, i) => i === headerIndex ? { ...item, name: e.target.value } : item))} />
-                      <input aria-label={`请求头值 ${headerIndex + 1}`} placeholder="值" disabled={busy} value={header.value} onChange={e => setHeaders(draft.headers.map((item, i) => i === headerIndex ? { ...item, value: e.target.value } : item))} />
-                      <button className="icon-button ghost danger" aria-label={`移除请求头 ${headerIndex + 1}`} disabled={busy} onClick={() => setHeaders(draft.headers.filter((_, i) => i !== headerIndex))}>×</button>
+                      <input aria-label={`请求头名称 ${headerIndex + 1}`} placeholder="X-Custom-Header" disabled={editingDisabled || fixed} value={header.name} onChange={e => setHeaders(draft.headers.map((item, i) => i === headerIndex ? { ...item, name: e.target.value } : item))} />
+                      <input aria-label={`请求头值 ${headerIndex + 1}`} placeholder="值" disabled={editingDisabled || fixed} value={header.value} onChange={e => setHeaders(draft.headers.map((item, i) => i === headerIndex ? { ...item, value: e.target.value } : item))} />
+                      <button className="icon-button ghost danger" aria-label={`移除请求头 ${headerIndex + 1}`} disabled={editingDisabled || fixed} onClick={() => setHeaders(draft.headers.filter((_, i) => i !== headerIndex))}>×</button>
                     </div>)}
                   </div>
                 </details>;
               })()}
             </article>)}</div>
-            <p className="model-help">目录可见不代表当前账户一定有调用额度。未识别的能力请手动确认；保存后可进行连接测试。价格用于本地花费估算，未配置的模型在用量页只统计 token 而不折算金额。</p>
+            <p className="model-help">{native ? "目录快照不代表账号实测能力。价格仅用于本地参考估算，max_tokens 仅为本地请求上限，不代表服务容量。" : <>目录可见不代表当前账户一定有调用额度。未识别的能力请手动确认；保存后可进行连接测试。价格用于本地花费估算，未配置的模型在用量页只统计 token 而不折算金额。</>}</p>
           </section>
         </div>
       </div>
-      <footer className="editor-footer"><label><input type="checkbox" checked={form.enabled} disabled={busy} onChange={e => patchForm({ enabled: e.target.checked })} />保存后参与路由</label><div className="row"><span className="muted">{models.length} 个模型</span><button disabled={busy} onClick={dismiss}>取消</button><button className="primary" disabled={busy || !models.length} onClick={() => void save()}>{saving ? "保存中…" : "保存供应商"}</button></div></footer>
+      <footer className="editor-footer"><label><input type="checkbox" checked={form.enabled} disabled={editingDisabled} onChange={e => patchForm({ enabled: e.target.checked })} />保存后参与路由</label><div className="row"><span className="muted">{models.length} 个模型</span><button disabled={busy} onClick={dismiss}>取消</button><button className="primary" disabled={editingDisabled || !models.length} onClick={() => void save()}>{saving ? "保存中…" : "保存供应商"}</button></div></footer>
     </div>
   </div>;
 }

@@ -1,15 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { api, AgentRuntime, AppConfig, CascadePolicy, DIALECT_LABEL, HEALTH_LABEL, PricingRefreshOutcome, PricingStatus, ProviderInput, ProviderView, StaleScanResult } from "../api";
-import ProviderEditor from "./ProviderEditor";
+import ProviderEditor, { ProviderEditorRuntime } from "./ProviderEditor";
 import ProviderQuota from "./ProviderQuota";
+import CatalogMaintenance from "./CatalogMaintenance";
+import FreeRouting from "./FreeRouting";
 import { blankForm, errorText, formatContext, ProviderForm } from "./providerPresets";
 import "./providers.css";
+import { modelDisplayLabel } from "./model-labels";
 
 function providerInput(p: ProviderView, overrides: Partial<ProviderInput> = {}): ProviderInput {
   return { id: p.id, name: p.name, dialect: p.dialect, base_url: p.base_url, api_key: "", enabled: p.enabled,
     priority: p.priority, models: p.models, rpm_limit: p.rpm_limit, intelligence: p.intelligence, note: p.note, ...overrides };
 }
 const STRATEGIES = { priority: "手工优先级", balanced: "综合均衡", smartest: "能力优先", fastest: "速度优先", reliable: "稳定优先", custom: "自定义规则", smart: "智能模式（先分类再选模）", cascade: "级联（先便宜，不够自信再升级）" };
+const ACCOUNT_RUNTIME_KINDS = ["trae-model", "workbuddy-model", "qoder-model"];
 
 /**
  * 任务卡二 A5：账号型上游运行时的清单与管理。
@@ -22,31 +26,73 @@ const STRATEGIES = { priority: "手工优先级", balanced: "综合均衡", smar
  * 这里如实显示，不做级联删除：用户点的是「删运行时」，
  * 不是「删那几个供应商」，多删的东西不会自己回来。
  */
-function ProviderRuntimeBinding({ provider, runtimes, onClose, onSaved }: {
-  provider: ProviderView; runtimes: AgentRuntime[]; onClose: () => void; onSaved: () => Promise<unknown>;
+function ProviderRuntimeBinding({ provider, runtimes, locked, onClose, onSaved }: {
+  provider: ProviderView; runtimes: AgentRuntime[]; locked: boolean; onClose: () => void; onSaved: () => Promise<unknown>;
 }) {
   const [runtimeId, setRuntimeId] = useState(provider.runtime_id ?? "");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const focusable = () => Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), select:not([disabled]), input:not([disabled]), [tabindex="0"]',
+  ) ?? []).filter(node => node.offsetParent !== null);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  // aria-modal alone does not isolate keyboard focus. Keep it inside this
+  // request-owned dialog, including the period when saving disables all controls.
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape" && !working) onClose(); };
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frame = window.requestAnimationFrame(() => (focusable()[0] ?? dialogRef.current)?.focus());
+    const contain = (event: FocusEvent) => {
+      if (event.target instanceof Node && !dialogRef.current?.contains(event.target)) {
+        (focusable()[0] ?? dialogRef.current)?.focus();
+      }
+    };
+    document.addEventListener("focusin", contain);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("focusin", contain);
+      if (previous?.isConnected) previous.focus();
+    };
+  }, []);
+  useEffect(() => {
+    const active = document.activeElement;
+    if (!dialogRef.current?.contains(active) || active?.matches(":disabled")) {
+      (focusable()[0] ?? dialogRef.current)?.focus();
+    }
+  }, [working, locked]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault(); event.stopPropagation();
+        if (!working) onClose();
+      } else if (event.key === "Tab") {
+        const nodes = focusable(), first = nodes[0], last = nodes[nodes.length - 1];
+        const active = document.activeElement;
+        if (!first || !dialogRef.current?.contains(active) || active === dialogRef.current
+          || event.shiftKey && active === first || !event.shiftKey && active === last) {
+          event.preventDefault();
+          (event.shiftKey ? last ?? dialogRef.current : first ?? dialogRef.current)?.focus();
+        }
+      }
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [working, onClose]);
   const selected = runtimes.find(runtime => runtime.id === runtimeId);
-  return <div className="modal-mask" onClick={event => { if (event.target === event.currentTarget && !working) onClose(); }}><div className="modal" role="dialog" aria-modal="true" aria-label="选择供应商上游">
+  return <div className="modal-mask" onClick={event => { if (event.target === event.currentTarget && !working) onClose(); }}><div ref={dialogRef} tabIndex={-1} className="modal" role="dialog" aria-modal="true" aria-label="选择供应商上游">
     <h3>{provider.name} · 选择上游</h3>
     <div className="sub">HTTP 直连使用供应商地址和 Key；账号上游使用绑定的独立登录或本机 CLI。修改绑定保留原地址、Key、模型和定价。</div>
     {error && <div className="msg err" role="alert">{error}</div>}
-    <div className="field"><label htmlFor="provider-runtime-binding">上游来源</label><select id="provider-runtime-binding" value={runtimeId} disabled={working} onChange={event => setRuntimeId(event.target.value)}>
+    <div className="field"><label htmlFor="provider-runtime-binding">上游来源</label><select id="provider-runtime-binding" value={runtimeId} disabled={working || locked} onChange={event => setRuntimeId(event.target.value)}>
       <option value="">HTTP 直连（解除账号型绑定）</option>
       {runtimeId && !selected && <option value={runtimeId} disabled>{runtimeId}（运行时不存在）</option>}
-      {runtimes.map(runtime => <option key={runtime.id} value={runtime.id} disabled={!runtime.enabled}>{runtime.label} · {runtime.kind}{runtime.enabled ? "" : "（已停用）"}</option>)}
+      {runtimes.filter(runtime => runtime.kind !== "trae-model").map(runtime => <option key={runtime.id} value={runtime.id} disabled={!runtime.enabled}>{runtime.label} · {runtime.kind}{runtime.enabled ? "" : "（已停用）"}</option>)}
     </select></div>
+    {locked && <p role="alert">上游绑定已锁定或不可用，请前往「客户端接入 → 独立模型」重新接入。</p>}
     <div className="muted">WorkBuddy 国际版可在「客户端接入」网页登录并接入模型；CLI 运行时在本页底部管理。活动领取 Token 不用于模型调用。</div>
-    <div className="row" style={{ justifyContent: "flex-end", marginTop: 16 }}><button disabled={working} onClick={onClose}>取消</button><button className="primary" disabled={working || runtimeId === (provider.runtime_id ?? "") || !!runtimeId && !selected?.enabled} onClick={() => void (async () => {
+    <div className="row" style={{ justifyContent: "flex-end", marginTop: 16 }}><button disabled={working} onClick={onClose}>取消</button><button className="primary" disabled={working || locked || runtimeId === (provider.runtime_id ?? "") || !!runtimeId && !selected?.enabled} onClick={() => void (async () => {
+      if (locked || selected?.kind === "trae-model") return;
       setWorking(true); setError(null);
       try { await api.setProviderRuntime(provider.id, runtimeId || null); if (!mounted.current) return; await onSaved(); if (mounted.current) onClose(); }
       catch (cause) { if (mounted.current) setError(`保存上游绑定失败：${errorText(cause)}`); }
@@ -68,23 +114,43 @@ function AgentRuntimes({ runtimes, adapters, onChanged, onError }: {
   const [editing, setEditing] = useState<AgentRuntime | null>(null);
   const [executable, setExecutable] = useState("");
   const [aliases, setAliases] = useState("");
+  const [aliasesChanged, setAliasesChanged] = useState(false);
+  const [enabled, setEnabled] = useState(true);
+  const native = editing?.kind === "trae-model";
+  const accountRuntime = !!editing && ACCOUNT_RUNTIME_KINDS.includes(editing.kind);
+  const defaultKind = adapters.find(([value]) => !ACCOUNT_RUNTIME_KINDS.includes(value))?.[0] ?? "";
   const supportsPath = ["codex", "qoder", "qoder-cn", "claude-code", "opencode"].includes(kind);
+  const region = editing?.options?.region;
+  const legacyGlobal = editing?.kind === "workbuddy-model" && region === undefined;
+  const regionLabel = region === "cn" ? "中国区 CN" : region === "global" ? "国际区 Global" : legacyGlobal ? "国际区 Global（旧配置默认）" : "区域未明确";
+  const regionError = accountRuntime && !native && region !== "cn" && region !== "global" && !legacyGlobal
+    ? "账号运行时区域缺失或无效，请前往「客户端接入」重新接入以修复区域绑定。" : null;
 
   // 适配器表到了就默认选第一个：留空会让用户以为配不出 kind。
-  useEffect(() => { if (!kind && adapters.length) setKind(adapters[0][0]); }, [adapters, kind]);
+  useEffect(() => { if (!kind && defaultKind) setKind(defaultKind); }, [defaultKind, kind]);
 
   const create = async () => {
     const trimmed = id.trim();
     if (!trimmed) { onError("运行时 id 不能为空（供应商引用的是它）"); return; }
+    if (!accountRuntime && ACCOUNT_RUNTIME_KINDS.includes(kind)) { onError("独立模型请前往客户端接入中添加，不能转换本机 CLI 运行时"); return; }
+    if (regionError) { onError(regionError); return; }
     if (!kind) { onError("请选择已注册的运行时类型"); return; }
     if (!editing && runtimes.some(runtime => runtime.id === trimmed)) { onError("运行时 id 已存在，请使用编辑操作或另一个 id"); return; }
     let modelAliases: Record<string, string> | null = null;
-    if (aliases.trim()) {
+    if (!native && (!accountRuntime || aliasesChanged) && aliases.trim()) {
       try {
         const value: unknown = JSON.parse(aliases);
         if (!value || typeof value !== "object" || Array.isArray(value) || Object.entries(value).some(([name, target]) => !name.trim() || typeof target !== "string" || !target.trim())) throw new Error("invalid");
         modelAliases = value as Record<string, string>;
-      } catch { onError("模型别名须为 JSON 对象，键和目标 CLI 模型名均为非空字符串"); return; }
+      } catch { onError("模型别名须为 JSON 对象，键和目标模型名均为非空字符串"); return; }
+    }
+    // 通用编辑只更新明确改过的别名；账号、区域和模型身份等字段保持原结构。
+    let options: AgentRuntime["options"] = editing && accountRuntime ? editing.options
+      : executable.trim() && supportsPath || modelAliases ? { ...(executable.trim() && supportsPath ? { executable: executable.trim() } : {}), ...(modelAliases ? { model_aliases: modelAliases } : {}) } : null;
+    if (editing && accountRuntime && !native && aliasesChanged) {
+      options = { ...editing.options };
+      if (modelAliases) options.model_aliases = modelAliases;
+      else delete options.model_aliases;
     }
     setWorking(true);
     try {
@@ -92,14 +158,11 @@ function AgentRuntimes({ runtimes, adapters, onChanged, onError }: {
       // 空串会在 IPC 反序列化阶段就失败（报错离操作很远）。
       const now = new Date().toISOString();
       await api.saveAgentRuntime({
-        id: trimmed, kind, label: label.trim() || trimmed,
-        options: (kind === "workbuddy-model" ? {
-          account_id: editing?.options?.account_id,
-          ...(modelAliases ? { model_aliases: modelAliases } : {}),
-        } : executable.trim() && supportsPath || modelAliases ? { ...(executable.trim() && supportsPath ? { executable: executable.trim() } : {}), ...(modelAliases ? { model_aliases: modelAliases } : {}) } : null),
-        enabled: editing?.enabled ?? true, created_at: editing?.created_at ?? now, updated_at: now,
+        id: trimmed, kind: editing && accountRuntime ? editing.kind : kind, label: label.trim() || trimmed,
+        options, enabled: accountRuntime ? enabled : editing?.enabled ?? true,
+        created_at: editing?.created_at ?? now, updated_at: now,
       });
-      setId(""); setLabel(""); setExecutable(""); setAliases(""); setEditing(null);
+      setId(""); setLabel(""); setExecutable(""); setAliases(""); setAliasesChanged(false); setEditing(null); if (accountRuntime) setKind(defaultKind);
       await onChanged();
     } catch (cause) { onError(errorText(cause)); } finally { setWorking(false); }
   };
@@ -124,22 +187,28 @@ function AgentRuntimes({ runtimes, adapters, onChanged, onError }: {
           <span className="breakable" style={{ maxWidth: "100%", flexShrink: 0 }}>{r.label}</span>
           <span className="tag">{r.kind}</span>
           {!r.enabled && <span className="muted">已停用</span>}
-          <span className="row" style={{ flexShrink: 0, gap: 6 }}><button disabled={working} onClick={() => { setEditing(r); setId(r.id); setKind(r.kind); setLabel(r.label); setExecutable(typeof (r.options?.executable ?? r.options?.exe) === "string" ? String(r.options?.executable ?? r.options?.exe) : ""); setAliases(r.options?.model_aliases ? JSON.stringify(r.options.model_aliases, null, 2) : ""); }}>编辑</button>
+          <span className="row" style={{ flexShrink: 0, gap: 6 }}><button disabled={working} onClick={() => { setEditing(r); setId(r.id); setKind(r.kind); setLabel(r.label); setEnabled(r.enabled); setExecutable(typeof (r.options?.executable ?? r.options?.exe) === "string" ? String(r.options?.executable ?? r.options?.exe) : ""); setAliases(r.options?.model_aliases ? JSON.stringify(r.options.model_aliases, null, 2) : ""); setAliasesChanged(false); }}>编辑</button>
           <button className="danger" disabled={working} onClick={() => void remove(r)}>删除</button></span>
         </li>)}</ul>
       : <p className="muted">还没有运行时。建一个之后，就能把某个供应商指到它上面去。</p>}
     <div className="row agent-runtime-new">
       <input aria-label="运行时 id" placeholder="id（供应商引用它，唯一）" value={id} disabled={working || !!editing} onChange={(e) => setId(e.target.value)} />
       <input aria-label="运行时显示名" placeholder="显示名" value={label} disabled={working} onChange={(e) => setLabel(e.target.value)} />
-      <select aria-label="运行时类型" value={kind} disabled={working} onChange={(e) => setKind(e.target.value)}>
+      <select aria-label="运行时类型" value={kind} disabled={working || accountRuntime} onChange={(e) => { if (!accountRuntime) setKind(e.target.value); }}>
+        {native && <option value="trae-model">Trae CN 独立模型</option>}
         {editing?.kind === "workbuddy-model" && <option value="workbuddy-model">WorkBuddy 独立登录直连</option>}
-        {adapters.map(([value, text]) => <option value={value} key={value}>{text}（{value}）</option>)}
+        {editing?.kind === "qoder-model" && <option value="qoder-model">Qoder 独立登录直连</option>}
+        {adapters.filter(([value]) => !ACCOUNT_RUNTIME_KINDS.includes(value)).map(([value, text]) => <option value={value} key={value}>{text}（{value}）</option>)}
       </select>
-      <button className="primary" disabled={working} onClick={() => void create()}>{editing ? "保存运行时" : "新建运行时"}</button>
-      {editing && <button disabled={working} onClick={() => { setEditing(null); setId(""); setLabel(""); setExecutable(""); setAliases(""); }}>取消编辑</button>}
+      <button className="primary" disabled={working || !!regionError} onClick={() => void create()}>{editing ? "保存运行时" : "新建运行时"}</button>
+      {editing && <button disabled={working} onClick={() => { setEditing(null); setId(""); setLabel(""); setExecutable(""); setAliases(""); setAliasesChanged(false); if (accountRuntime) setKind(defaultKind); }}>取消编辑</button>}
     </div>
-    {supportsPath && <div className="field" style={{ marginTop: 12 }}><label>CLI 可执行文件路径（可选）</label><input aria-label="运行时可执行文件" value={executable} disabled={working} onChange={event => setExecutable(event.target.value)} placeholder="留空使用该 CLI 的默认命令；可填写已安装文件的路径" /></div>}
-    <div className="field" style={{ marginTop: 12 }}><label>模型别名映射（可选 JSON）</label><textarea aria-label="运行时模型别名" value={aliases} disabled={working} rows={3} onChange={event => setAliases(event.target.value)} placeholder={'{"网关模型名":"上游模型名"}'} /><div className="muted">WorkBuddy 直连保留账号绑定，支持目录明确声明的工具和图片能力；CLI 能力取决于各自适配器。模型别名不会改变登录账号。</div></div>
+    {native && <p>Trae CN · 独立登录 · 无需 API Key。账号、模型及图片候选设置由「客户端接入 → 独立模型」管理。</p>}
+    {accountRuntime && !native && <p>{editing?.kind === "workbuddy-model" ? "WorkBuddy" : "Qoder"} · {regionLabel} · 独立登录 · 无需 API Key。账号：<span className="mono breakable">{typeof editing?.options?.account_id === "string" ? editing.options.account_id : "未绑定"}</span>。账号和区域由「客户端接入」管理。</p>}
+    {regionError && <p role="alert">{regionError}</p>}
+    {accountRuntime && <label><input type="checkbox" aria-label="运行时已启用" checked={enabled} disabled={working} onChange={event => setEnabled(event.target.checked)} />运行时已启用</label>}
+    {supportsPath && !accountRuntime && <div className="field" style={{ marginTop: 12 }}><label>CLI 可执行文件路径（可选）</label><input aria-label="运行时可执行文件" value={executable} disabled={working} onChange={event => setExecutable(event.target.value)} placeholder="留空使用该 CLI 的默认命令；可填写已安装文件的路径" /></div>}
+    {!native && <div className="field" style={{ marginTop: 12 }}><label>模型别名映射（可选 JSON）</label><textarea aria-label="运行时模型别名" value={aliases} disabled={working} rows={3} onChange={event => { setAliases(event.target.value); setAliasesChanged(true); }} placeholder={'{"网关模型名":"上游模型名"}'} /><div className="muted">账号直连保留账号和区域绑定，模型别名不会改变登录账号；留空可清除别名。CLI 能力取决于各自适配器。</div></div>}
   </details>;
 }
 
@@ -232,6 +301,9 @@ export default function ProvidersPage() {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [loading, setLoading] = useState(true);
+  // An empty list is authoritative only after all snapshot reads succeeded.
+  const [hasSnapshot, setHasSnapshot] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [testResult, setTestResult] = useState<{ id: string; latency: number } | null>(null);
@@ -253,10 +325,11 @@ export default function ProvidersPage() {
     try {
       const [providers, config, pricingStatus, agentRuntimes, agentAdapters] = await Promise.all([api.listProviders(), api.getConfig(), api.pricingStatus(), api.listAgentRuntimes(), api.listAgentAdapters()]);
       if (version !== loadVersion.current) return false;
-      setList(providers); setCfg(config); setPricing(pricingStatus); setRuntimes(agentRuntimes); setAdapters(agentAdapters); return true;
+      setList(providers); setCfg(config); setPricing(pricingStatus); setRuntimes(agentRuntimes); setAdapters(agentAdapters);
+      setHasSnapshot(true); setLoadError(null); return true;
     } catch (error) {
       if (version !== loadVersion.current) return false;
-      setMessage({ kind: "err", text: `加载失败：${errorText(error)}` });
+      setLoadError(`加载失败：${errorText(error)}`);
       if (propagateError) throw new Error(`操作已完成，但列表刷新失败：${errorText(error)}`);
       return false;
     } finally { if (version === loadVersion.current) setLoading(false); }
@@ -298,7 +371,20 @@ export default function ProvidersPage() {
     // 用 `·` 而不是再套一对括号：`Codex（工作）（codex）` 两个括号连着读不断句。
     return hit ? `${hit.label} · ${hit.kind}` : `${id}（找不到这个运行时）`;
   };
-  const runtimeDescription = (id: string) => runtimes.find(r => r.id === id)?.kind === "workbuddy-model"
+  const editorRuntime = (id?: string | null): ProviderEditorRuntime | undefined => {
+    if (!id) return undefined;
+    const runtime = runtimes.find(item => item.id === id);
+    if (runtime) return { runtime };
+    return adapters.some(([kind]) => kind === id) ? undefined : { unavailable: true };
+  };
+  const bindingLocked = (id?: string | null) => {
+    const context = editorRuntime(id);
+    return !!context && ("unavailable" in context || context.runtime.kind === "trae-model");
+  };
+  const runtimeDescription = (id: string) => runtimes.find(r => r.id === id)?.kind === "trae-model"
+    ? "CN · 独立登录 · 无需 API Key · 账号模型能力未实测"
+    : !runtimes.some(r => r.id === id) && !adapters.some(([kind]) => kind === id) ? "运行时绑定不可用，请检查客户端接入"
+    : runtimes.find(r => r.id === id)?.kind === "workbuddy-model"
     ? "使用独立登录账号直连官方模型接口" : "请求经本机 CLI 发出，不走上面的地址";
   const run = async (id: string, operation: () => Promise<unknown>, text: string) => {
     setBusy(id); setMessage(null);
@@ -381,13 +467,19 @@ export default function ProvidersPage() {
       }, `已复制为「${p.name} 副本」。请点它的「配置」补上 API Key 后再启用。`);
     };
 
-      const test = (p: ProviderView) => run(p.id, async () => {
+      const test = (p: ProviderView) => {
+    const context = editorRuntime(p.runtime_id);
+    if (context && ("unavailable" in context || context.runtime.kind === "trae-model")) return;
+    return run(p.id, async () => {
+    // A new explicit test supersedes only this provider's last displayed measurement.
+    setTestResult(previous => previous?.id === p.id ? null : previous);
     const result = await api.testProvider(p.id);
     if (!result.ok) throw new Error(`连接失败：${result.error ?? "上游未返回详情"}`);
     setTestResult({ id: p.id, latency: result.latency_ms });
   }, `${p.name} 连接正常`);
+  };
   const ordered = list.slice().sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name));
-  const filtered = ordered.filter(p => `${p.name} ${p.base_url} ${p.models.map(m => `${m.alias} ${m.upstream}`).join(" ")}`.toLowerCase().includes(query.toLowerCase()) && (filter === "all" || filter === "enabled" && p.enabled || filter === "disabled" && !p.enabled))
+  const filtered = ordered.filter(p => `${p.name} ${p.base_url} ${p.models.map(m => `${m.alias} ${m.upstream} ${modelDisplayLabel(p, m)}`).join(" ")}`.toLowerCase().includes(query.toLowerCase()) && (filter === "all" || filter === "enabled" && p.enabled || filter === "disabled" && !p.enabled))
     .sort((a, b) => Number(b.is_active) - Number(a.is_active) || Number(b.enabled) - Number(a.enabled));
   const active = list.find(p => p.is_active);
   const move = (p: ProviderView, direction: -1 | 1) => {
@@ -410,12 +502,13 @@ export default function ProvidersPage() {
   };
   return <div className="providers-page">
     <section className="provider-overview" aria-label="供应商概况">
-      <div><span className="overview-label">已连接供应商</span><strong>{list.length}<small>个配置</small></strong></div>
-      <div><span className="overview-label">参与路由</span><strong>{list.filter(p => p.enabled).length}<small>已启用</small></strong></div>
-      <div><span className="overview-label">模型映射</span><strong>{list.reduce((n, p) => n + p.models.length, 0)}<small>个模型</small></strong></div>
-      <div className="overview-current"><span className="overview-label">当前主用</span><strong title={active?.name}>{active?.name ?? "自动选择"}</strong><small>{cfg ? STRATEGIES[cfg.routing_strategy as keyof typeof STRATEGIES] ?? cfg.routing_strategy : "读取配置中"}</small></div>
+      <div><span className="overview-label">已连接供应商</span><strong>{hasSnapshot ? list.length : "—"}<small>个配置</small></strong></div>
+      <div><span className="overview-label">参与路由</span><strong>{hasSnapshot ? list.filter(p => p.enabled).length : "—"}<small>已启用</small></strong></div>
+      <div><span className="overview-label">模型映射</span><strong>{hasSnapshot ? list.reduce((n, p) => n + p.models.length, 0) : "—"}<small>个模型</small></strong></div>
+      <div className="overview-current"><span className="overview-label">当前主用</span><strong title={active?.name}>{hasSnapshot ? active?.name ?? "自动选择" : "未读取"}</strong><small>{cfg ? STRATEGIES[cfg.routing_strategy as keyof typeof STRATEGIES] ?? cfg.routing_strategy : loading ? "读取配置中" : "配置未读取"}</small></div>
     </section>
-    <div className="providers-toolbar"><div><h2>模型供应商 <span className="count-badge">{list.length}</span></h2><p>统一管理服务与模型，让每一次请求都有合适的去处。{pricing && <span className="muted"> 定价上次刷新：{new Date(pricing.at).toLocaleString()}（更新 {pricing.updated} 个，跳过手工价 {pricing.skipped_manual} 个）</span>}</p></div><div className="row"><button disabled={loading || busy !== null} onClick={() => void load()}>{loading ? "加载中…" : "刷新列表"}</button><button disabled={loading || busy !== null || !list.length} onClick={() => void refreshPrices()} title="从公开定价源获取最新单价；手工填写的价格不会被覆盖">{busy === "pricing" ? "刷新定价中…" : "刷新定价"}</button><button className="ghost" disabled={loading || busy !== null} onClick={() => void scanStale()} title="对照上游目录找出已下架的模型；只读，不改任何数据">{scanning ? "扫描中…" : "扫描失效模型"}</button><button className="primary" onClick={() => setEditor(blankForm())}>＋ 添加供应商</button></div></div>
+    <div className="providers-toolbar"><div><h2>模型供应商 <span className="count-badge">{hasSnapshot ? list.length : "—"}</span></h2><p>统一管理服务与模型，让每一次请求都有合适的去处。{pricing && <span className="muted"> 定价上次刷新：{new Date(pricing.at).toLocaleString()}（更新 {pricing.updated} 个，跳过手工价 {pricing.skipped_manual} 个）</span>}</p></div><div className="row"><button disabled={loading || busy !== null} onClick={() => void load()}>{loading ? "加载中…" : "刷新列表"}</button><button disabled={loading || busy !== null || !list.length} onClick={() => void refreshPrices()} title="从公开定价源获取最新单价；手工填写的价格不会被覆盖">{busy === "pricing" ? "刷新定价中…" : "刷新定价"}</button><button className="ghost" disabled={loading || busy !== null} onClick={() => void scanStale()} title="对照上游目录找出已下架的模型；只读，不改任何数据">{scanning ? "扫描中…" : "扫描失效模型"}</button><button className="primary" onClick={() => setEditor(blankForm())}>＋ 添加供应商</button></div></div>
+    {loadError && <div className="msg err" role="alert">{loadError}。{hasSnapshot ? "当前保留上次完整读取的结果，可能已过期。" : "尚未取得完整配置，无法确认供应商或运行时是否为空。"}<button className="ghost" disabled={loading || busy !== null} onClick={() => void load()}>重试读取</button></div>}
     {message && <div className={`msg ${message.kind}`} role={message.kind === "err" ? "alert" : "status"}>{message.text}<button className="ghost icon-button" aria-label="关闭提示" onClick={() => setMessage(null)}>×</button></div>}
 {stale && <section className="stale-panel" aria-label="失效模型扫描结果">
       <header>
@@ -449,25 +542,28 @@ export default function ProvidersPage() {
       {stale.entries.length === 0 && <p className="muted">没有可扫描的模型。</p>}
     </section>}
     {list.length > 0 && <div className="provider-search-row"><input aria-label="搜索供应商" placeholder="搜索名称、地址或模型…" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="供应商状态筛选" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><span className="muted">{filtered.length} 个结果</span></div>}
-    {loading && !list.length ? <div className="provider-empty" role="status"><strong>正在加载供应商…</strong></div> : !list.length ? <section className="provider-empty">
+    {loading && !list.length ? <div className="provider-empty" role="status"><strong>正在加载供应商…</strong></div> : !hasSnapshot ? <section className="provider-empty" role="status"><h3>供应商信息暂不可用</h3><p>请重试读取；这不表示尚未配置供应商。</p></section> : !list.length ? <section className="provider-empty">
       <svg width="100" height="68" viewBox="0 0 100 68" fill="none" aria-hidden="true"><path d="M25 19L50 34L75 19M25 49L50 34L75 49" stroke="currentColor" strokeWidth="2"/><rect x="36" y="20" width="28" height="28" rx="9" fill="currentColor" opacity=".14"/><rect x="5" y="5" width="30" height="22" rx="6" stroke="currentColor"/><rect x="65" y="5" width="30" height="22" rx="6" stroke="currentColor"/><rect x="5" y="41" width="30" height="22" rx="6" stroke="currentColor"/><rect x="65" y="41" width="30" height="22" rx="6" stroke="currentColor"/><circle cx="50" cy="34" r="4" fill="currentColor"/></svg>
       <h3>从连接第一个模型服务开始</h3><p>填写 API 地址和 Key，自动获取可选模型。<br />云端服务和本地 Ollama 都可以加入同一个网关。</p><button className="primary" onClick={() => setEditor(blankForm())}>添加第一个供应商</button><small>密钥仅在本机加密保存</small>
     </section> : !filtered.length ? <div className="provider-empty"><h3>没有匹配的供应商</h3><button className="ghost" onClick={() => { setQuery(""); setFilter("all"); }}>清除筛选</button></div> : <div className="provider-grid">
       {filtered.map(p => {
         const index = ordered.findIndex(item => item.id === p.id), health = p.health?.health;
-        const stateClass = !p.enabled ? "" : health === "healthy" ? "ok" : health === "invalid" || health === "error" ? "err" : health ? "warn" : "";
-        const stateText = !p.enabled ? "已停用" : health ? HEALTH_LABEL[health] ?? health : "待测试";
+        const context = editorRuntime(p.runtime_id);
+        const native = !!context && "runtime" in context && context.runtime.kind === "trae-model";
+        const locked = native || !!context && "unavailable" in context;
+        const stateClass = locked ? "" : !p.enabled ? "" : health === "healthy" ? "ok" : health === "invalid" || health === "error" ? "err" : health ? "warn" : "";
+        const stateText = !p.enabled ? "已停用" : native ? "CN · 未实测" : locked ? "绑定不可用" : health ? HEALTH_LABEL[health] ?? health : "待测试";
         return <article className={`provider-card ${p.is_active ? "active" : ""}`} key={p.id}>
           <header><div className={`provider-avatar dialect-${p.dialect}`} aria-hidden="true">{p.name.slice(0, 2)}</div><div className="provider-card-name"><h3>{p.name}</h3><span>{DIALECT_LABEL[p.dialect]}</span></div>{p.is_active && <span className="tag primary-tag">主用</span>}<span className={`tag ${stateClass}`}>{stateText}</span></header>
-          <div className="provider-address mono" title={p.base_url}>{p.base_url}</div>{p.runtime_id ? <div className="provider-runtime"><span className="tag runtime-tag">账号型上游</span><span className="mono">{runtimeLabel(p.runtime_id)}</span><span className="muted">{runtimeDescription(p.runtime_id)}</span></div> : null}<div className="provider-secret"><span>API Key</span><span className="mono">{p.api_key_masked || "未设置"}</span></div>
-          <div className="provider-model-preview"><div><span>可用映射</span><strong>{p.models.length}</strong></div><div className="provider-model-tags">{p.models.slice(0, 4).map(m => <span className="tag" key={m.alias} title={`${m.upstream} · ${formatContext(m.context_window)} tokens`}>{m.alias}</span>)}{p.models.length > 4 && <span className="tag">+{p.models.length - 4}</span>}{!p.models.length && <span className="muted">未配置模型映射</span>}</div></div>
+          <div className="provider-address mono" title={p.base_url}>{p.base_url}</div>{p.runtime_id ? <div className="provider-runtime"><span className="tag runtime-tag">账号型上游</span><span className="mono">{runtimeLabel(p.runtime_id)}</span><span className="muted">{runtimeDescription(p.runtime_id)}</span></div> : null}<div className="provider-secret"><span>{native ? "独立登录" : locked ? "认证状态" : "API Key"}</span><span className="mono">{native ? "无需 API Key" : locked ? "绑定不可用" : p.api_key_masked || "未设置"}</span></div>
+          <div className="provider-model-preview"><div><span>可用映射</span><strong>{p.models.length}</strong></div><div className="provider-model-tags">{p.models.slice(0, 4).map(m => <span className="tag" key={m.alias} title={native ? `${m.upstream} · 上下文${m.context_window > 0 ? "目录快照 " + formatContext(m.context_window) + " tokens" : "未知"} · 未实测` : `${m.upstream} · ${formatContext(m.context_window)} tokens`}>{modelDisplayLabel(p, m)}</span>)}{p.models.length > 4 && <span className="tag">+{p.models.length - 4}</span>}{!p.models.length && <span className="muted">未配置模型映射</span>}</div></div>
           <div className="provider-meta"><span>{p.rpm_limit ? `${p.rpm_limit} RPM` : "RPM 不限"}</span><span>优先级 {p.priority}</span>{testResult?.id === p.id && <span className="test-latency">实测 {testResult.latency} ms</span>}</div>
-          <footer><div className="row"><button className="ghost" disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), note: p.note ?? "" })}>配置</button><button className="ghost" disabled={busy !== null} onClick={() => void test(p)}>{busy === p.id ? "处理中…" : "测试连接"}</button><button className="ghost" disabled={busy !== null || !p.enabled || p.is_active} onClick={() => void run(p.id, () => api.setActive(p.id), `${p.name} 已设为主用`)}>{p.is_active ? "已主用" : "设为主用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void toggleEnabled(p)}>{p.enabled ? "停用" : "启用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void duplicate(p)} title="复制配置并落库，API Key 留空需自行填写">复制</button></div>
+          <footer><div className="row"><button className="ghost" disabled={busy !== null} onClick={() => setEditor({ ...providerInput(p), note: p.note ?? "" })}>配置</button>{!locked && <button className="ghost" disabled={busy !== null} onClick={() => void test(p)}>{busy === p.id ? "处理中…" : "测试连接"}</button>}<button className="ghost" disabled={busy !== null || !p.enabled || p.is_active} onClick={() => void run(p.id, () => api.setActive(p.id), `${p.name} 已设为主用`)}>{p.is_active ? "已主用" : "设为主用"}</button><button className="ghost" disabled={busy !== null} onClick={() => void toggleEnabled(p)}>{p.enabled ? "停用" : "启用"}</button><button className="ghost" disabled={busy !== null || locked} onClick={() => void duplicate(p)} title="复制配置并落库，API Key 留空需自行填写">复制</button></div>
           <details className="provider-more" open={openMenu === p.id}><summary aria-label={`${p.name} 更多操作`} onClick={event => { event.preventDefault(); event.stopPropagation(); setOpenMenu(current => current === p.id ? null : p.id); }}>•••</summary><div className="provider-more-menu">
-            <button disabled={busy !== null} onClick={() => { setOpenMenu(null); setRuntimeProvider(p); }}>选择 HTTP / 账号型上游</button>
-            <button disabled={busy !== null} onClick={() => { setOpenMenu(null); setQuotaProvider(p); }}>查询额度 / 有效期</button>
+            <button disabled={busy !== null || locked} onClick={() => { setOpenMenu(null); setRuntimeProvider(p); }}>选择 HTTP / 账号型上游</button>
+            <button disabled={busy !== null || locked} onClick={() => { if (locked) return; setOpenMenu(null); setQuotaProvider(p); }}>查询额度 / 有效期</button>
             <button disabled={busy !== null} onClick={() => { setOpenMenu(null); void run(p.id, () => api.upsertProvider(providerInput(p, { enabled: !p.enabled })), p.enabled ? `已停用 ${p.name}` : `已启用 ${p.name}`); }}>{p.enabled ? "停用供应商" : "启用供应商"}</button>
-            <button disabled={busy !== null} onClick={() => { setOpenMenu(null); void duplicate(p); }}>复制配置并新建</button>
+            <button disabled={busy !== null || locked} onClick={() => { setOpenMenu(null); void duplicate(p); }}>复制配置并新建</button>
             <button disabled={busy !== null || index === 0} onClick={() => { setOpenMenu(null); moveTo(p, "top"); }}>置顶</button><button disabled={busy !== null || index === ordered.length - 1} onClick={() => { setOpenMenu(null); moveTo(p, "bottom"); }}>置底</button>
             <button disabled={busy !== null || index === 0} onClick={() => { setOpenMenu(null); move(p, -1); }}>上移优先级</button><button disabled={busy !== null || index === ordered.length - 1} onClick={() => { setOpenMenu(null); move(p, 1); }}>下移优先级</button>
             <button className="danger" disabled={busy !== null} onClick={() => { setOpenMenu(null); if (window.confirm(`确定删除供应商“${p.name}”及其模型映射吗？`)) void run(p.id, () => api.deleteProvider(p.id), `已删除 ${p.name}`); }}>删除供应商</button>
@@ -477,9 +573,11 @@ export default function ProvidersPage() {
     </div>}
     {cfg && <section className="route-strip"><div><strong>自动路由策略</strong><p>主用供应商优先；其余候选按策略与可用性排序。</p></div><select aria-label="路由策略" disabled={busy !== null} value={cfg.routing_strategy} onChange={e => { const strategy = e.target.value; void run("strategy", async () => { const result = await api.updateConfig({ ...cfg, routing_strategy: strategy }); setCfg(result.config); window.dispatchEvent(new CustomEvent("llm-gateway-config-changed", { detail: result.config })); }, "路由策略已更新，后续请求立即生效"); }}>{Object.entries(STRATEGIES).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></section>}
     {cfg && cfg.routing_strategy === "cascade" && <CascadeStrip cfg={cfg} onSaved={setCfg} />}
-    <section className="agent-runtimes-strip"><AgentRuntimes runtimes={runtimes} adapters={adapters} onChanged={load} onError={(text) => setMessage({ kind: "err", text })} /></section>
-    {editor && <ProviderEditor initial={editor} onClose={() => setEditor(null)} onSaved={async () => { if (await load()) setMessage({ kind: "ok", text: "供应商配置已保存；已启用的供应商将参与后续路由。" }); }} />}
+    {hasSnapshot && <CatalogMaintenance providers={list} locked={busy !== null} onChanged={load} />}
+    {cfg && <FreeRouting enabled={cfg.free_routing?.enabled ?? false} locked={busy !== null} onSaved={load} />}
+    {hasSnapshot && <section className="agent-runtimes-strip"><AgentRuntimes runtimes={runtimes} adapters={adapters} onChanged={load} onError={(text) => setMessage({ kind: "err", text })} /></section>}
+    {editor && <ProviderEditor initial={editor} declarationViews={list.find(item => item.id === editor.id)?.capability_declarations} accountBound={!!list.find(item => item.id === editor.id)?.runtime_id} runtimeContext={editorRuntime(list.find(item => item.id === editor.id)?.runtime_id)} onClose={() => setEditor(null)} onSaved={async () => { if (await load()) setMessage({ kind: "ok", text: "供应商配置已保存；已启用的供应商将参与后续路由。" }); }} />}
     {quotaProvider && <ProviderQuota provider={quotaProvider} onClose={() => setQuotaProvider(null)} />}
-    {runtimeProvider && <ProviderRuntimeBinding provider={runtimeProvider} runtimes={runtimes} onClose={() => setRuntimeProvider(null)} onSaved={async () => { await load(true); setMessage({ kind: "ok", text: "供应商上游绑定已保存，后续请求立即生效。" }); }} />}
+    {runtimeProvider && <ProviderRuntimeBinding provider={runtimeProvider} runtimes={runtimes} locked={bindingLocked(runtimeProvider.runtime_id)} onClose={() => setRuntimeProvider(null)} onSaved={async () => { await load(true); setMessage({ kind: "ok", text: "供应商上游绑定已保存，后续请求立即生效。" }); }} />}
   </div>;
 }

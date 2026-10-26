@@ -12,3 +12,18 @@
 .chat-compose textarea { width: 100%; resize: vertical; box-sizing: border-box; margin: 8px 0; padding: 12px; background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; font: inherit; }
 .chat-compose .row { justify-content: space-between; flex-wrap: wrap; }
 @media (max-width: 640px) { .chat-controls { grid-template-columns: minmax(0, 1fr); } .chat-score-list > div { flex-direction: column; gap: 2px; } }
+
+.chat-model-filter-row { display: flex; gap: 8px; min-width: 0; margin: 5px 0 10px; }
+.chat-model-filter-row input { flex: 1; min-width: 0; width: 100%; }
+.chat-model-filter-row button { flex-shrink: 0; }
+.chat-model-filter-summary { grid-column: 1 / -1; margin: 0; overflow-wrap: anywhere; }
+.chat-model-reference { grid-column: 1 / -1; min-width: 0; border-top: 1px solid var(--border); padding-top: 10px; overflow-wrap: anywhere; }
+.chat-model-reference h3 { font-size: 1rem; margin: 0 0 6px; }
+.chat-model-reference p { margin: 5px 0; }
+.chat-model-reference small { display: block; margin: 4px 0; }
+.chat-favorites { grid-column: 1 / -1; min-width: 0; overflow-wrap: anywhere; }
+.chat-favorites > button { margin: 3px 6px 3px 0; }
+.chat-favorites summary { cursor: pointer; }
+.chat-favorites ul { max-height: 220px; overflow: auto; padding-left: 22px; }
+.chat-favorites li { display: flex; gap: 8px; justify-content: space-between; align-items: baseline; margin: 5px 0; }
+.chat-favorites li button { flex-shrink: 0; }

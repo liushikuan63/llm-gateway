@@ -37,6 +37,7 @@ fn cfg() -> BenefitsConfig {
         auto_claim_timezone: "local".into(),
         scheduler_mode: "app".into(),
         account_claim_times: Default::default(),
+        account_auto_claim: Default::default(),
         accounts: vec![BenefitAccount {
             id: "intl".into(),
             platform: "qoder".into(),
@@ -857,4 +858,906 @@ async fn settled_ledger_survives_closing_and_reopening_the_sqlite_file() {
     assert_eq!(center.runs(Some("intl"), 200).await.unwrap().len(), 2);
     drop(center);
     reopened.pool().close().await;
+}
+
+// Pause only the first POST. A second center can finish while that POST is
+// outstanding, so the persisted success shortcut cannot conceal the race.
+struct CrossInstanceTransport {
+    gets: AtomicUsize,
+    posts: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    now: DateTime<Local>,
+}
+
+#[async_trait]
+impl BenefitTransport for CrossInstanceTransport {
+    async fn request(
+        &self,
+        platform: ClaimPlatform,
+        token: &str,
+        proxy: Option<&str>,
+        campaign_id: Option<&str>,
+    ) -> Result<Value, String> {
+        assert_eq!(platform, ClaimPlatform::Qoder);
+        assert_eq!(auth_value(token), format!("Bearer {TOKEN}"));
+        assert!(proxy.is_none());
+        if let Some(id) = campaign_id {
+            assert_eq!(id, "daily-1");
+            if self.posts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                tokio::time::timeout(std::time::Duration::from_secs(15), self.release.notified())
+                    .await
+                    .map_err(|_| "offline first POST was not released".to_string())?;
+            }
+            Ok(outcome("daily-1", "today", false))
+        } else {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            Ok(status(
+                "daily-1",
+                "today",
+                "CLAIMABLE",
+                self.now.timestamp() - 3600,
+                self.now.timestamp() + 3600,
+            ))
+        }
+    }
+}
+
+async fn cross_instance_call(
+    headless: bool,
+    center: &BenefitsCenter,
+    app: &llm_gateway_lib::config::AppConfig,
+    root: &std::path::Path,
+    now: DateTime<Local>,
+) -> Result<Value, String> {
+    if headless {
+        llm_gateway_lib::benefit_task::execute_once(app, center, root).await
+    } else {
+        center
+            .claim_at(&app.benefits, None, "intl", true, now)
+            .await
+            .map(|result| serde_json::to_value(result).unwrap())
+    }
+}
+
+async fn assert_cross_instance_single_post(first_headless: bool, second_headless: bool) {
+    init_crypto();
+    let root = std::env::temp_dir().join(format!(
+        "llmgw-benefit-cross-instance-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("gateway.db");
+    // Separate pools/connections to the same owned SQLite file, not pool clones.
+    let first_db = Db::connect_path(&path).await.unwrap();
+    let second_db = Db::connect_path(&path).await.unwrap();
+    let now = Local::now();
+    let transport = Arc::new(CrossInstanceTransport {
+        gets: AtomicUsize::new(0),
+        posts: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        now,
+    });
+    let first = BenefitsCenter::with_transport(first_db.pool().clone(), transport.clone());
+    let second = BenefitsCenter::with_transport(second_db.pool().clone(), transport.clone());
+    let mut settings = cfg();
+    settings.auto_claim = true;
+    settings.auto_claim_after_hour = 0;
+    settings.scheduler_mode = "windows_task".into();
+    let app = llm_gateway_lib::config::AppConfig {
+        benefits: settings,
+        ..Default::default()
+    };
+    first.set_token(&app.benefits, "intl", TOKEN).await.unwrap();
+    let first_call = cross_instance_call(first_headless, &first, &app, &root, now);
+    let second_call = async {
+        let entered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            transport.entered.notified(),
+        )
+        .await;
+        let result = if entered.is_ok() {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                cross_instance_call(second_headless, &second, &app, &root, now),
+            )
+            .await
+            .map_err(|_| "second call did not finish while first POST was outstanding".to_string())
+            .and_then(|result| result)
+        } else {
+            Err("first call did not reach POST".into())
+        };
+        // Release even on fixture timeout; no task is left waiting on this gate.
+        transport.release.notify_one();
+        result
+    };
+    let (one, two) = tokio::join!(first_call, second_call);
+    let runs = first.runs(Some("intl"), 200).await.unwrap();
+    drop(first);
+    drop(second);
+    close_workers(first_db.pool()).await;
+    close_workers(second_db.pool()).await;
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(one.is_ok(), "first flow failed: {one:?}");
+    if first_headless {
+        assert!(
+            two.is_err(),
+            "pending daily receipt must deny the concurrent manual call"
+        );
+        assert_eq!(runs.len(), 1);
+    } else {
+        assert!(two.is_ok(), "second flow failed: {two:?}");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].window_key, runs[1].window_key);
+        assert_eq!(runs[1].verdict, BenefitVerdict::Skipped);
+    }
+    assert_eq!(transport.gets.load(Ordering::SeqCst), 2);
+    eprintln!(
+        "cross-instance evidence: first_headless={first_headless} second_headless={second_headless} gets={} posts={} runs={} verdicts={:?}",
+        transport.gets.load(Ordering::SeqCst),
+        transport.posts.load(Ordering::SeqCst),
+        runs.len(),
+        runs.iter().map(|run| &run.verdict).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "same account/window must share a durable reservation across independent centers"
+    );
+}
+
+#[tokio::test]
+async fn cross_instance_two_centers_share_one_post() {
+    assert_cross_instance_single_post(false, false).await;
+}
+
+#[tokio::test]
+async fn cross_instance_gui_then_headless_share_one_post() {
+    assert_cross_instance_single_post(false, true).await;
+}
+
+#[tokio::test]
+async fn cross_instance_headless_then_gui_share_one_post() {
+    assert_cross_instance_single_post(true, false).await;
+}
+
+#[tokio::test]
+async fn cross_instance_uncertain_automatic_attempt_is_not_reposted_by_new_center() {
+    let now = Local::now();
+    let (db, center, mock) = setup(now).await;
+    let mut config = cfg();
+    config.auto_claim = true;
+    config.auto_claim_after_hour = 0;
+    *mock.reply.lock() = Err("offline response lost after POST".into());
+    let first = center
+        .claim_at(&config, None, "intl", false, now)
+        .await
+        .unwrap();
+    assert_eq!(first.run.verdict, BenefitVerdict::Error);
+    assert!(!first.run.manual);
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(center.runs(Some("intl"), 200).await.unwrap().len(), 1);
+    let fresh = BenefitsCenter::with_transport(db.pool().clone(), mock.clone());
+    let second = fresh
+        .claim_at(&config, None, "intl", false, now)
+        .await
+        .unwrap();
+    assert!(!second.run.manual);
+    assert_eq!(first.run.window_key, second.run.window_key);
+    eprintln!(
+        "automatic unknown-result evidence: gets={} posts={} first={:?} second={:?}",
+        mock.gets.load(Ordering::SeqCst),
+        mock.posts.load(Ordering::SeqCst),
+        first.run.verdict,
+        second.run.verdict
+    );
+    assert_eq!(
+        mock.posts.load(Ordering::SeqCst),
+        1,
+        "an automatic request must not repost a window with an uncertain prior attempt"
+    );
+}
+
+// Explicit connection close awaits each SQLite worker's shutdown; pool close alone
+// may return while its dropped workers still hold Windows file handles.
+async fn close_workers(pool: &sqlx::SqlitePool) {
+    use sqlx::Connection;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while pool.size() > 0 {
+            pool.acquire()
+                .await
+                .unwrap()
+                .detach()
+                .close()
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+    })
+    .await
+    .expect("all owned SQLite workers shut down");
+}
+
+struct FileFixture {
+    root: std::path::PathBuf,
+    db: Db,
+    center: BenefitsCenter,
+    mock: Arc<Mock>,
+    now: DateTime<Local>,
+}
+
+impl FileFixture {
+    async fn new() -> Self {
+        init_crypto();
+        let root = std::env::temp_dir().join(format!(
+            "llmgw-benefit-reservation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let db = Db::connect_path(root.join("gateway.db")).await.unwrap();
+        let now = Local::now();
+        let mock = Mock::new(now);
+        let center = BenefitsCenter::with_transport(db.pool().clone(), mock.clone());
+        center.set_token(&cfg(), "intl", TOKEN).await.unwrap();
+        Self {
+            root,
+            db,
+            center,
+            mock,
+            now,
+        }
+    }
+
+    fn receipt(&self, bytes: &[u8]) -> std::path::PathBuf {
+        let directory = self.root.join("benefits-receipts");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{}-intl.json", self.now.format("%Y-%m-%d")));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    async fn close(self) {
+        drop(self.center);
+        close_workers(self.db.pool()).await;
+        std::fs::remove_dir_all(self.root).unwrap();
+    }
+}
+
+fn automatic() -> BenefitsConfig {
+    let mut config = cfg();
+    config.auto_claim = true;
+    config.auto_claim_after_hour = 0;
+    config
+}
+
+#[tokio::test]
+async fn file_receipt_unknown_blocks_auto_and_manual_but_claimed_get_reconciles() {
+    for bytes in [
+        b"".as_slice(),
+        b"broken",
+        b"{\"status\":\"reserved_no_automatic_retry\"}",
+        b"{\"result\":{\"run\":{\"verdict\":\"error\"}}}",
+    ] {
+        let f = FileFixture::new().await;
+        let path = f.receipt(bytes);
+        let auto = f
+            .center
+            .claim_at(&automatic(), None, "intl", false, f.now)
+            .await;
+        assert!(auto.is_err() || auto.unwrap().run.verdict == BenefitVerdict::Skipped);
+        assert!(f
+            .center
+            .claim_at(&cfg(), None, "intl", true, f.now)
+            .await
+            .is_err());
+        assert_eq!(f.mock.posts.load(Ordering::SeqCst), 0);
+        *f.mock.state.lock() = status(
+            "daily-1",
+            "today",
+            "CLAIMED",
+            f.now.timestamp() - 3600,
+            f.now.timestamp() + 3600,
+        );
+        let reconciled = f
+            .center
+            .claim_at(&cfg(), None, "intl", true, f.now)
+            .await
+            .unwrap();
+        assert_eq!(reconciled.run.verdict, BenefitVerdict::Replayed);
+        assert_eq!(f.mock.posts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            bytes,
+            "legacy receipt immutable"
+        );
+        f.close().await;
+    }
+}
+
+#[tokio::test]
+async fn file_completed_error_receipt_requires_exact_audit_and_allows_later_manual() {
+    let f = FileFixture::new().await;
+    *f.mock.reply.lock() = Err("offline lost response".into());
+    let failed = f
+        .center
+        .claim_at(&automatic(), None, "intl", false, f.now)
+        .await
+        .unwrap();
+    let bytes = serde_json::to_vec(&json!({"account_id":"intl","result":failed})).unwrap();
+    let path = f.receipt(&bytes);
+    let restarted = Db::connect_path(f.root.join("gateway.db")).await.unwrap();
+    let center = BenefitsCenter::with_transport(restarted.pool().clone(), f.mock.clone());
+    assert_eq!(
+        center
+            .claim_at(&automatic(), None, "intl", false, f.now)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Skipped
+    );
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 1);
+    let mut forged: Value = serde_json::from_slice(&bytes).unwrap();
+    forged["result"]["run"]["message"] = json!("changed");
+    std::fs::write(&path, serde_json::to_vec(&forged).unwrap()).unwrap();
+    assert!(center
+        .claim_at(&cfg(), None, "intl", true, f.now)
+        .await
+        .is_err());
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 1);
+    std::fs::write(&path, &bytes).unwrap();
+    *f.mock.reply.lock() = Ok(outcome("daily-1", "today", false));
+    assert_eq!(
+        center
+            .claim_at(&cfg(), None, "intl", true, f.now)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Granted
+    );
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    drop(center);
+    close_workers(restarted.pool()).await;
+    f.close().await;
+}
+
+#[tokio::test]
+async fn headless_origin_must_match_actual_file_database_parent() {
+    let f = FileFixture::new().await;
+    let wrong = f.root.join("unrelated-owned-directory");
+    std::fs::create_dir(&wrong).unwrap();
+    let mut settings = automatic();
+    settings.scheduler_mode = "windows_task".into();
+    let app = llm_gateway_lib::config::AppConfig {
+        benefits: settings,
+        ..Default::default()
+    };
+    assert!(
+        llm_gateway_lib::benefit_task::execute_once(&app, &f.center, &wrong)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 0);
+    // The correctly attributed first owner remains usable; it still acquires the DB reservation.
+    llm_gateway_lib::benefit_task::execute_once(&app, &f.center, &f.root)
+        .await
+        .unwrap();
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 1);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn legacy_error_audit_blocks_auto_but_unresolved_errors_do_not() {
+    let now = Local::now();
+    let (db, center, mock) = setup(now).await;
+    let window = format!(
+        "qoder:daily-1:{}:{}",
+        now.timestamp() - 3600,
+        now.timestamp() + 3600
+    );
+    let insert = |window: String| llm_gateway_lib::benefits::BenefitRunRecord {
+        id: 0,
+        account_id: "intl".into(),
+        platform: "qoder".into(),
+        window_key: window,
+        campaign_key: None,
+        verdict: BenefitVerdict::Error,
+        amount: None,
+        message: "legacy error".into(),
+        manual: false,
+        created_at: now.to_rfc3339(),
+    };
+    repo::insert_benefit_run(db.pool(), &insert(window))
+        .await
+        .unwrap();
+    assert_eq!(
+        center
+            .claim_at(&automatic(), None, "intl", false, now)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Skipped
+    );
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        center
+            .claim_at(&cfg(), None, "intl", true, now)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Granted
+    );
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    let (db, center, mock) = setup(now).await;
+    repo::insert_benefit_run(db.pool(), &insert("qoder:unresolved".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        center
+            .claim_at(&automatic(), None, "intl", false, now)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Granted
+    );
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+}
+
+struct SlowGetTransport {
+    mock: Arc<Mock>,
+    first_post: tokio::sync::Notify,
+    release_post: tokio::sync::Notify,
+    second_get: tokio::sync::Notify,
+    release_get: tokio::sync::Notify,
+}
+
+async fn notified(signal: &tokio::sync::Notify) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), signal.notified())
+        .await
+        .expect("fixture signal");
+}
+
+#[async_trait]
+impl BenefitTransport for SlowGetTransport {
+    async fn request(
+        &self,
+        _: ClaimPlatform,
+        _: &str,
+        _: Option<&str>,
+        campaign: Option<&str>,
+    ) -> Result<Value, String> {
+        if campaign.is_some() {
+            if self.mock.posts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_post.notify_one();
+                notified(&self.release_post).await;
+                return Err("offline first attempt uncertain".into());
+            }
+            Ok(outcome("daily-1", "today", false))
+        } else {
+            if self.mock.gets.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.second_get.notify_one();
+                notified(&self.release_get).await;
+            }
+            Ok(self.mock.state.lock().clone())
+        }
+    }
+}
+
+#[tokio::test]
+async fn delayed_manual_get_cannot_turn_concurrent_intent_into_retry() {
+    let f = FileFixture::new().await;
+    let other = Db::connect_path(f.root.join("gateway.db")).await.unwrap();
+    let transport = Arc::new(SlowGetTransport {
+        mock: f.mock.clone(),
+        first_post: Default::default(),
+        release_post: Default::default(),
+        second_get: Default::default(),
+        release_get: Default::default(),
+    });
+    let first = Arc::new(BenefitsCenter::with_transport(
+        f.db.pool().clone(),
+        transport.clone(),
+    ));
+    let second = Arc::new(BenefitsCenter::with_transport(
+        other.pool().clone(),
+        transport.clone(),
+    ));
+    let now = f.now;
+    let a = first.clone();
+    let one = tokio::spawn(async move { a.claim_at(&cfg(), None, "intl", true, now).await });
+    notified(&transport.first_post).await;
+    let b = second.clone();
+    let two = tokio::spawn(async move { b.claim_at(&cfg(), None, "intl", true, now).await });
+    notified(&transport.second_get).await;
+    transport.release_post.notify_one();
+    assert_eq!(
+        one.await.unwrap().unwrap().run.verdict,
+        BenefitVerdict::Error
+    );
+    transport.release_get.notify_one();
+    assert_eq!(
+        two.await.unwrap().unwrap().run.verdict,
+        BenefitVerdict::Skipped
+    );
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        second
+            .claim_at(&cfg(), None, "intl", true, now)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Granted
+    );
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 2);
+    assert_eq!(f.mock.gets.load(Ordering::SeqCst), 3);
+    drop(first);
+    drop(second);
+    close_workers(other.pool()).await;
+    f.close().await;
+}
+
+#[tokio::test]
+async fn actual_post_then_audit_failure_stays_unknown_and_claimed_get_reconciles() {
+    let f = FileFixture::new().await;
+    sqlx::query("CREATE TRIGGER offline_audit_failure BEFORE INSERT ON benefit_runs BEGIN SELECT RAISE(ABORT,'offline'); END")
+        .execute(f.db.pool()).await.unwrap();
+    assert!(f
+        .center
+        .claim_at(&cfg(), None, "intl", true, f.now)
+        .await
+        .is_err());
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 1);
+    assert!(f.center.runs(None, 20).await.unwrap().is_empty());
+    let raw: String = sqlx::query_scalar(
+        "SELECT value_enc FROM app_secrets WHERE name LIKE 'benefit:reservation:%'",
+    )
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert!(crypto::decrypt(&raw)
+        .unwrap()
+        .contains("dispatch_started_outcome_unknown"));
+    sqlx::query("DROP TRIGGER offline_audit_failure")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let reopened = Db::connect_path(f.root.join("gateway.db")).await.unwrap();
+    let center = BenefitsCenter::with_transport(reopened.pool().clone(), f.mock.clone());
+    for manual in [false, true] {
+        assert_eq!(
+            center
+                .claim_at(&automatic(), None, "intl", manual, f.now)
+                .await
+                .unwrap()
+                .run
+                .verdict,
+            BenefitVerdict::Skipped
+        );
+    }
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 1);
+    *f.mock.state.lock() = status(
+        "daily-1",
+        "today",
+        "CLAIMED",
+        f.now.timestamp() - 3600,
+        f.now.timestamp() + 3600,
+    );
+    assert_eq!(
+        center
+            .claim_at(&cfg(), None, "intl", true, f.now)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Replayed
+    );
+    let after: String = sqlx::query_scalar(
+        "SELECT value_enc FROM app_secrets WHERE name LIKE 'benefit:reservation:%'",
+    )
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        after, raw,
+        "GET reconciliation must not steal an unfinished owner's control row"
+    );
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 1);
+    drop(center);
+    close_workers(reopened.pool()).await;
+    f.close().await;
+}
+
+#[tokio::test]
+async fn caller_disconnect_does_not_cancel_owner_or_release_unknown_reservation() {
+    let f = FileFixture::new().await;
+    let transport = Arc::new(CrossInstanceTransport {
+        gets: AtomicUsize::new(0),
+        posts: AtomicUsize::new(0),
+        entered: Default::default(),
+        release: Default::default(),
+        now: f.now,
+    });
+    let owner = Arc::new(BenefitsCenter::with_transport(
+        f.db.pool().clone(),
+        transport.clone(),
+    ));
+    let other_db = Db::connect_path(f.root.join("gateway.db")).await.unwrap();
+    let other = BenefitsCenter::with_transport(other_db.pool().clone(), transport.clone());
+    let a = owner.clone();
+    let now = f.now;
+    let caller = tokio::spawn(async move { a.claim_at(&cfg(), None, "intl", true, now).await });
+    notified(&transport.entered).await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        other
+            .claim_at(&cfg(), None, "intl", true, now)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Skipped
+    );
+    transport.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let runs = other.runs(None, 20).await.unwrap();
+            if runs.iter().any(|r| r.verdict == BenefitVerdict::Granted) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached owner commits");
+    let runs = other.runs(None, 20).await.unwrap();
+    assert_eq!(
+        runs.iter()
+            .filter(|r| r.verdict == BenefitVerdict::Granted)
+            .count(),
+        1
+    );
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    drop(owner);
+    drop(other);
+    close_workers(other_db.pool()).await;
+    f.close().await;
+}
+
+#[tokio::test]
+async fn unverified_alias_cannot_bypass_unknown_but_another_platform_finishes_while_post_is_paused()
+{
+    let f = FileFixture::new().await;
+    let slow = Arc::new(CrossInstanceTransport {
+        gets: AtomicUsize::new(0),
+        posts: AtomicUsize::new(0),
+        entered: Default::default(),
+        release: Default::default(),
+        now: f.now,
+    });
+    let owner = Arc::new(BenefitsCenter::with_transport(
+        f.db.pool().clone(),
+        slow.clone(),
+    ));
+    let other_db = Db::connect_path(f.root.join("gateway.db")).await.unwrap();
+    let other = BenefitsCenter::with_transport(other_db.pool().clone(), f.mock.clone());
+    let a = owner.clone();
+    let now = f.now;
+    let pending = tokio::spawn(async move { a.claim_at(&cfg(), None, "intl", true, now).await });
+    notified(&slow.entered).await;
+    for (id, platform) in [("other", "qoder"), ("intl", "qoder_cn")] {
+        let mut config = cfg();
+        config.accounts[0].id = id.into();
+        config.accounts[0].platform = platform.into();
+        other.set_token(&config, id, TOKEN).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            other.claim_at(&config, None, id, true, now),
+        )
+        .await
+        .unwrap();
+        if platform == "qoder" {
+            assert_eq!(
+                result.unwrap_err(),
+                "旧领取预约没有可信主体归属，本窗口未发送领取请求",
+                "different slot with the same raw token is not a verified independent UID"
+            );
+        } else {
+            assert_eq!(result.unwrap().run.verdict, BenefitVerdict::Granted);
+        }
+    }
+    assert_eq!(f.mock.posts.load(Ordering::SeqCst), 1);
+    slow.release.notify_one();
+    assert_eq!(
+        pending.await.unwrap().unwrap().run.verdict,
+        BenefitVerdict::Granted
+    );
+    assert_eq!(slow.posts.load(Ordering::SeqCst), 1);
+    drop(owner);
+    drop(other);
+    close_workers(other_db.pool()).await;
+    f.close().await;
+}
+
+#[tokio::test]
+async fn completed_no_post_receipt_allows_a_new_window_but_yesterday_unknown_is_not_scanned() {
+    for verdict in [BenefitVerdict::NoClaimable, BenefitVerdict::Skipped] {
+        let f = FileFixture::new().await;
+        let mut run = llm_gateway_lib::benefits::BenefitRunRecord {
+            id: 0,
+            account_id: "intl".into(),
+            platform: "qoder".into(),
+            window_key: "qoder:unresolved".into(),
+            campaign_key: None,
+            verdict,
+            amount: None,
+            message: "offline no POST".into(),
+            manual: false,
+            created_at: f.now.to_rfc3339(),
+        };
+        run.id = repo::insert_benefit_run(f.db.pool(), &run).await.unwrap();
+        let bytes =
+            serde_json::to_vec(&json!({"account_id":"intl","result":{"run":run,"outcome":null}}))
+                .unwrap();
+        let path = f.receipt(&bytes);
+        assert_eq!(
+            f.center
+                .claim_at(&automatic(), None, "intl", false, f.now)
+                .await
+                .unwrap()
+                .run
+                .verdict,
+            BenefitVerdict::Skipped
+        );
+        assert_eq!(f.mock.posts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.center
+                .claim_at(&cfg(), None, "intl", true, f.now)
+                .await
+                .unwrap()
+                .run
+                .verdict,
+            BenefitVerdict::Granted
+        );
+        assert_eq!(f.mock.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        f.close().await;
+    }
+    let f = FileFixture::new().await;
+    let tomorrow = f.now + chrono::Duration::days(1);
+    let path = f.receipt(b"historical unknown");
+    *f.mock.state.lock() = status(
+        "daily-2",
+        "tomorrow",
+        "CLAIMABLE",
+        tomorrow.timestamp() - 60,
+        tomorrow.timestamp() + 3600,
+    );
+    *f.mock.reply.lock() = Ok(outcome("daily-2", "tomorrow", false));
+    assert_eq!(
+        f.center
+            .claim_at(&automatic(), None, "intl", false, tomorrow)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Granted
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"historical unknown");
+    f.close().await;
+}
+
+#[tokio::test]
+async fn automatic_failure_remains_blocked_across_midnight_but_a_new_window_is_independent() {
+    let now = Local::now();
+    let (db, center, mock) = setup(now).await;
+    *mock.state.lock() = status(
+        "multi-day",
+        "long",
+        "CLAIMABLE",
+        now.timestamp() - 3600,
+        now.timestamp() + 3 * 86400,
+    );
+    *mock.reply.lock() = Err("offline lost response".into());
+    assert_eq!(
+        center
+            .claim_at(&automatic(), None, "intl", false, now)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Error
+    );
+    let tomorrow = now + chrono::Duration::days(1);
+    let fresh = BenefitsCenter::with_transport(db.pool().clone(), mock.clone());
+    assert_eq!(
+        fresh
+            .claim_at(&automatic(), None, "intl", false, tomorrow)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Skipped
+    );
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    *mock.state.lock() = status(
+        "new-window",
+        "new",
+        "CLAIMABLE",
+        tomorrow.timestamp() - 60,
+        tomorrow.timestamp() + 3600,
+    );
+    *mock.reply.lock() = Ok(outcome("new-window", "new", false));
+    assert_eq!(
+        fresh
+            .claim_at(&automatic(), None, "intl", false, tomorrow)
+            .await
+            .unwrap()
+            .run
+            .verdict,
+        BenefitVerdict::Granted
+    );
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn reservation_corruption_and_insert_failure_deny_before_transport_post() {
+    use sha2::{Digest, Sha256};
+    for corrupt in [false, true] {
+        let now = Local::now();
+        let (db, center, mock) = setup(now).await;
+        let window = format!(
+            "qoder:daily-1:{}:{}",
+            now.timestamp() - 3600,
+            now.timestamp() + 3600
+        );
+        let key = format!(
+            "benefit:reservation:v1:{:x}",
+            Sha256::digest(serde_json::to_vec(&("qoder", "intl", &window)).unwrap())
+        );
+        if corrupt {
+            repo::set_secret(db.pool(), &key, "broken-ciphertext")
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("CREATE TRIGGER offline_insert_failure BEFORE INSERT ON app_secrets WHEN NEW.name LIKE 'benefit:reservation:%' BEGIN SELECT RAISE(ABORT,'offline'); END")
+                .execute(db.pool()).await.unwrap();
+        }
+        assert!(center
+            .claim_at(&cfg(), None, "intl", true, now)
+            .await
+            .is_err());
+        assert_eq!(mock.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+        assert!(center.runs(None, 20).await.unwrap().is_empty());
+        if corrupt {
+            assert_eq!(
+                repo::get_secret(db.pool(), &key).await.unwrap().as_deref(),
+                Some("broken-ciphertext")
+            );
+        } else {
+            sqlx::query("DROP TRIGGER offline_insert_failure")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                center
+                    .claim_at(&cfg(), None, "intl", true, now)
+                    .await
+                    .unwrap()
+                    .run
+                    .verdict,
+                BenefitVerdict::Granted
+            );
+            assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+        }
+    }
 }

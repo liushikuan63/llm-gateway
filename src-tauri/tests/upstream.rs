@@ -155,7 +155,7 @@ async fn openai_sse_reassembles_an_event_split_across_tcp_writes() {
     );
     server.await.unwrap();
 
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
     match &events[0] {
         UpstreamEvent::Delta(content) => assert_eq!(content, "hello"),
         event => panic!("expected a reassembled text delta, got {event:?}"),
@@ -175,11 +175,20 @@ async fn openai_sse_reassembles_an_event_split_across_tcp_writes() {
         event => panic!("expected an OpenAI usage-only event, got {event:?}"),
     }
     match &events[3] {
+        UpstreamEvent::UsageObservation(value) => assert_eq!(
+            value,
+            &json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5})
+        ),
+        event => panic!("expected private reported counter observation, got {event:?}"),
+    }
+    match &events[4] {
         UpstreamEvent::Done {
             finish_reason,
             usage,
         } => {
-            assert_eq!(finish_reason.as_deref(), Some("stop"));
+            // The explicit stop remains asserted on events[1] above.
+            // [DONE] is transport completion and carries no new reason.
+            assert!(finish_reason.is_none());
             assert!(usage.is_none());
         }
         event => panic!("expected OpenAI [DONE] completion, got {event:?}"),
@@ -332,12 +341,27 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
         br#"event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}"#,
     );
-    match terminal.into_iter().next().unwrap().unwrap() {
-        UpstreamEvent::Done { finish_reason, .. } => {
+    assert_eq!(terminal.len(), 2);
+    assert!(!terminal
+        .iter()
+        .any(|e| matches!(e, Ok(UpstreamEvent::Done { .. }))));
+    let mut terminal = terminal.into_iter();
+    match terminal.next().unwrap().unwrap() {
+        UpstreamEvent::Finish { finish_reason } => {
             assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
         }
-        event => panic!("expected Anthropic tool-call completion, got {event:?}"),
+        event => panic!("expected nonterminal Anthropic tool-call finish reason, got {event:?}"),
     }
+    match terminal.next().unwrap().unwrap() {
+        UpstreamEvent::Usage(v) => assert_eq!(v.completion_tokens, 3),
+        event => panic!("expected retained usage, got {event:?}"),
+    }
+    let stop = parse_sse_block(
+        Dialect::Anthropic,
+        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    assert_eq!(stop.len(), 1);
+    assert!(matches!(stop[0], Ok(UpstreamEvent::Done { .. })));
 }
 
 #[test]
@@ -936,4 +960,43 @@ fn model_override_validation_rejects_protected_and_malformed_values() {
             "拒绝原因应包含 {expected}，实际为 {error}"
         );
     }
+}
+
+#[test]
+fn transport_terminal_does_not_fabricate_a_reported_finish_reason() {
+    for (dialect, wire) in [
+        (Dialect::OpenAI, "data: [DONE]\n\n"),
+        (
+            Dialect::Anthropic,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+        (Dialect::Ollama, "data: {\"done\":true}\n\n"),
+    ] {
+        let events = parse_sse_block(dialect, wire.as_bytes());
+        assert!(
+            matches!(
+                &events[0],
+                Ok(UpstreamEvent::Done {
+                    finish_reason: None,
+                    usage: None
+                })
+            ),
+            "{events:?}"
+        );
+    }
+    let explicit = parse_sse_block(
+        Dialect::OpenAI,
+        br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+    );
+    assert!(
+        matches!(&explicit[0],Ok(UpstreamEvent::Finish{finish_reason:Some(reason)}) if reason=="stop")
+    );
+    let anthropic = parse_sse_block(
+        Dialect::Anthropic,
+        br#"event: message_delta
+data: {"delta":{"stop_reason":"end_turn"}}"#,
+    );
+    assert!(
+        matches!(&anthropic[0],Ok(UpstreamEvent::Finish{finish_reason:Some(reason)}) if reason=="stop")
+    );
 }

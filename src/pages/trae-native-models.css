@@ -1,0 +1,19 @@
+.trae-native-models { min-width: 0; max-width: 100%; padding-top: 16px; border-top: 1px solid var(--border); }
+.trae-native-models h4 { margin: 0 0 8px; }
+.trae-native-models p, .trae-native-models small { font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.trae-native-models fieldset { min-width: 0; max-width: 100%; border: 0; margin: 0; padding: 0; }
+.trae-native-models__legend { font-size: 12px; margin: 8px 0; }
+.trae-native-models__scroll { max-width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
+.trae-native-models table { width: 100%; min-width: 820px; border-collapse: collapse; font-size: 12px; }
+.trae-native-models th, .trae-native-models td { padding: 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); max-width: 260px; overflow-wrap: anywhere; }
+.trae-native-models th { font-weight: 500; }
+.trae-native-models td > span, .trae-native-models td > small, .trae-native-models code { display: block; margin-bottom: 4px; }
+.trae-native-models label { display: flex; align-items: start; gap: 6px; margin-bottom: 6px; }
+.trae-native-models input[type="text"] { box-sizing: border-box; width: 100%; min-width: 150px; margin-bottom: 10px; color: var(--text); background: var(--bg); border: 1px solid var(--border); padding: 6px; border-radius: 4px; }
+.trae-native-models input[aria-invalid="true"] { border-color: var(--danger, #b42318); }
+.trae-native-models [role="alert"] { color: var(--danger, #b42318); }
+.trae-native-models__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px; font-size: 12px; }
+.trae-native-models :focus-visible { outline: 2px solid var(--accent, #2563eb); outline-offset: 2px; }
+.trae-native-models__diagnostic { max-width: 100%; min-width: 0; font-size: 12px; margin: 8px 0; }
+.trae-native-models__diagnostic summary { cursor: pointer; }
+.trae-native-models__diagnostic code { white-space: normal; overflow-wrap: anywhere; word-break: break-word; margin-top: 6px; }

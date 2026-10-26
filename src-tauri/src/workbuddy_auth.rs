@@ -10,10 +10,95 @@ use sqlx::SqlitePool;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
+mod benefits;
+pub use benefits::WorkBuddyCheckinStatus;
+mod daily_claim;
+pub use daily_claim::{WorkBuddyDailyClaim, WorkBuddyDailyVerdict};
+mod quota;
+pub use quota::{WorkBuddyQuota, WorkBuddyQuotaResource};
+pub mod browser_login;
+pub mod personal_billing;
+pub mod personal_usage;
+
 const ISSUER: &str = "https://www.workbuddy.ai";
 const PREFIX: &str = "account-login:workbuddy:global:";
 const LOGIN_LIMIT_MS: i64 = 300_000;
 const BODY_LIMIT: usize = 512 * 1024;
+
+/// Fixed protocol regions. An explicitly unknown region is never treated as Global or CN.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkBuddyRegion {
+    #[default]
+    Global,
+    Cn,
+}
+
+pub(crate) struct WorkBuddyProfile {
+    pub(crate) issuer: &'static str,
+    pub(crate) origin: &'static str,
+    platform: &'static str,
+    domain: &'static str,
+    pub(crate) user_agent: &'static str,
+    client_id: Option<&'static str>,
+    client_version: Option<&'static str>,
+}
+
+impl WorkBuddyRegion {
+    pub(crate) fn profile(self) -> WorkBuddyProfile {
+        match self {
+            Self::Global => WorkBuddyProfile {
+                issuer: ISSUER,
+                origin: ISSUER,
+                platform: "workbuddy-ai",
+                domain: "www.workbuddy.ai",
+                user_agent: "WorkBuddy/5.7.6",
+                client_id: None,
+                client_version: None,
+            },
+            Self::Cn => WorkBuddyProfile {
+                issuer: "https://copilot.tencent.com",
+                origin: "https://www.codebuddy.cn",
+                platform: "VSCode",
+                domain: "copilot.tencent.com",
+                user_agent: "CLI/2.143.1 CodeBuddy/2.143.1",
+                client_id: Some("codebuddy-cli"),
+                client_version: Some("2.143.1"),
+            },
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Global => PREFIX,
+            Self::Cn => "account-login:workbuddy:cn:",
+        }
+    }
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Cn => "cn",
+        }
+    }
+
+    fn from_issuer(issuer: &str) -> Result<Self, String> {
+        match issuer {
+            ISSUER => Ok(Self::Global),
+            "https://copilot.tencent.com" => Ok(Self::Cn),
+            _ => Err("登录凭据无效或区域不一致".into()),
+        }
+    }
+
+    fn identity_hash(self, uid: &str) -> String {
+        // Keep all previously stored Global identity hashes valid.
+        let principal = match self {
+            Self::Global => format!("workbuddy:{uid}"),
+            Self::Cn => format!("workbuddy:cn\0{uid}"),
+        };
+        format!("{:x}", Sha256::digest(principal.as_bytes()))
+    }
+}
 
 // These types deliberately have no Debug and are never returned through IPC or stdout.
 #[derive(Clone, Serialize, Deserialize)]
@@ -36,6 +121,8 @@ struct Credential {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingLogin {
+    #[serde(default)]
+    region: WorkBuddyRegion,
     account_id: String,
     state: String,
     deadline_ms: i64,
@@ -66,11 +153,21 @@ pub struct LoginStatus {
 }
 
 pub fn valid_authorization_url(raw: &str) -> bool {
+    valid_authorization_url_for_region(raw, WorkBuddyRegion::Global)
+}
+
+pub fn valid_authorization_url_for_region(raw: &str, region: WorkBuddyRegion) -> bool {
     raw.len() <= 8192
         && !raw.chars().any(char::is_control)
         && Url::parse(raw).is_ok_and(|url| {
             url.scheme() == "https"
-                && url.host_str() == Some("www.workbuddy.ai")
+                && url.host_str().is_some_and(|host| match region {
+                    WorkBuddyRegion::Global => host == "www.workbuddy.ai",
+                    WorkBuddyRegion::Cn => matches!(
+                        host,
+                        "copilot.tencent.com" | "www.codebuddy.cn" | "www.workbuddy.cn"
+                    ),
+                })
                 && url.port_or_known_default() == Some(443)
                 && url.username().is_empty()
                 && url.password().is_none()
@@ -95,16 +192,32 @@ fn valid_token(token: &str) -> bool {
         && HeaderValue::from_str(token).is_ok()
 }
 
-fn domain_ok(domain: &str) -> bool {
-    matches!(
-        domain,
-        "www.workbuddy.ai" | "workbuddy.ai" | "https://www.workbuddy.ai" | "https://workbuddy.ai"
-    )
+fn domain_ok(domain: &str, region: WorkBuddyRegion) -> bool {
+    match region {
+        WorkBuddyRegion::Global => matches!(
+            domain,
+            "www.workbuddy.ai"
+                | "workbuddy.ai"
+                | "https://www.workbuddy.ai"
+                | "https://workbuddy.ai"
+        ),
+        WorkBuddyRegion::Cn => matches!(
+            domain,
+            "copilot.tencent.com"
+                | "https://copilot.tencent.com"
+                | "www.codebuddy.cn"
+                | "https://www.codebuddy.cn"
+                | "www.workbuddy.cn"
+                | "https://www.workbuddy.cn"
+        ),
+    }
 }
 
+#[cfg(test)]
 fn session_key(account: &str) -> String {
     format!("{PREFIX}session:{account}")
 }
+#[cfg(test)]
 fn pending_key(id: &str) -> String {
     format!("{PREFIX}pending:{id}")
 }
@@ -151,11 +264,24 @@ fn expiry(data: &Value, absolute: &str, relative: &str, at: i64) -> Result<Optio
     Ok(None)
 }
 
+#[cfg(test)]
 fn parse_token(
     value: &Value,
     previous: Option<&Credential>,
     at: i64,
 ) -> Result<Credential, String> {
+    parse_token_for_region(value, previous, at, WorkBuddyRegion::Global)
+}
+
+fn parse_token_for_region(
+    value: &Value,
+    previous: Option<&Credential>,
+    at: i64,
+    region: WorkBuddyRegion,
+) -> Result<Credential, String> {
+    if let Some(previous) = previous {
+        validate_credential(previous, region)?;
+    }
     if value["code"].as_i64() != Some(0) {
         return Err("授权服务拒绝令牌请求".into());
     }
@@ -167,8 +293,8 @@ fn parse_token(
     let domain = data["domain"]
         .as_str()
         .or_else(|| previous.map(|c| c.domain.as_str()))
-        .filter(|v| domain_ok(v))
-        .ok_or("授权区域与 WorkBuddy 国际版不一致")?;
+        .filter(|v| domain_ok(v, region))
+        .ok_or("授权区域与所选 WorkBuddy 区域不一致")?;
     let refresh = match data.get("refreshToken").filter(|v| !v.is_null()) {
         Some(v) => Some(
             v.as_str()
@@ -183,7 +309,7 @@ fn parse_token(
         refresh_expiry = previous.and_then(|p| p.refresh_expires_at_ms);
     }
     Ok(Credential {
-        issuer: ISSUER.into(),
+        issuer: region.profile().issuer.into(),
         access_token: access.into(),
         refresh_token: refresh,
         domain: domain.into(),
@@ -196,9 +322,9 @@ fn parse_token(
     })
 }
 
-fn validate_credential(value: &Credential) -> Result<(), String> {
-    if value.issuer != ISSUER
-        || !domain_ok(&value.domain)
+fn validate_credential(value: &Credential, region: WorkBuddyRegion) -> Result<(), String> {
+    if value.issuer != region.profile().issuer
+        || !domain_ok(&value.domain, region)
         || !valid_token(&value.access_token)
         || value
             .refresh_token
@@ -241,6 +367,8 @@ fn snapshot(
     credential: &Credential,
     state: Option<&str>,
 ) -> Result<AccountSnapshot, String> {
+    let region = WorkBuddyRegion::from_issuer(&credential.issuer)?;
+    validate_credential(credential, region)?;
     let mut secrets = vec![credential.access_token.as_str()];
     secrets.extend(credential.refresh_token.as_deref());
     secrets.extend(state);
@@ -252,7 +380,10 @@ fn snapshot(
     }
     let data = &value["data"];
     let uid = account_uid(data)?;
-    if data["domain"].as_str().is_some_and(|v| !domain_ok(v)) {
+    if data["domain"]
+        .as_str()
+        .is_some_and(|v| !domain_ok(v, region))
+    {
         return Err("账号区域与授权区域不一致".into());
     }
     let display_name = data["displayName"]
@@ -263,10 +394,7 @@ fn snapshot(
     Ok(AccountSnapshot {
         display_name,
         masked_email: None,
-        identity_hash: Some(format!(
-            "{:x}",
-            Sha256::digest(format!("workbuddy:{uid}").as_bytes())
-        )),
+        identity_hash: Some(region.identity_hash(&uid)),
         captured_at: Some(chrono::Utc::now().to_rfc3339()),
     })
 }
@@ -301,6 +429,9 @@ fn bound_account<'a>(
     next: &Credential,
     previous: &Credential,
 ) -> Result<(&'a Value, AccountSnapshot), String> {
+    let region = WorkBuddyRegion::from_issuer(&previous.issuer)?;
+    validate_credential(previous, region)?;
+    validate_credential(next, region)?;
     let mut secrets = vec![next.access_token.as_str(), previous.access_token.as_str()];
     secrets.extend(next.refresh_token.as_deref());
     secrets.extend(previous.refresh_token.as_deref());
@@ -331,11 +462,41 @@ fn bound_account<'a>(
 
 /// Memory-only authorization for the fixed model issuer. Never serialize or Debug this value.
 pub(crate) struct ModelAuthorization {
+    pub(crate) region: WorkBuddyRegion,
     pub(crate) headers: reqwest::header::HeaderMap,
     pub(crate) identity_hash: String,
     pub(crate) credential_fingerprint: String,
+    pub(crate) source: Option<ModelAuthorizationSource>,
+}
+// Opaque captured source; never decoded, refreshed, serialized or logged by a fence.
+pub(crate) struct ModelAuthorizationSource {
+    key: String,
+    cipher: String,
+    fingerprint: String,
+    expires_at_ms: Option<i64>,
 }
 impl ModelAuthorization {
+    pub(crate) fn source_fingerprint(&self) -> &str {
+        self.source
+            .as_ref()
+            .map_or(self.credential_fingerprint.as_str(), |source| {
+                source.fingerprint.as_str()
+            })
+    }
+    pub(crate) fn matches_region(&self, region: WorkBuddyRegion) -> bool {
+        self.region == region
+            && self
+                .headers
+                .get("x-domain")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|domain| domain_ok(domain, region))
+            && self
+                .headers
+                .get("origin")
+                .and_then(|value| value.to_str().ok())
+                == Some(region.profile().origin)
+    }
+
     pub(crate) fn contains_credential(&self, body: &[u8]) -> bool {
         let Some(token) = self
             .headers
@@ -413,8 +574,38 @@ mod tests {
         });
     }
 
+    #[test]
+    fn cn_region_accepts_its_official_authorization_url() {
+        assert!(valid_authorization_url_for_region(
+            "https://www.codebuddy.cn/plugin/login?state=fixture",
+            WorkBuddyRegion::Cn
+        ));
+    }
+
+    #[test]
+    fn cn_region_accepts_its_official_token_domain() {
+        let mut value = token(ACCESS, REFRESH);
+        value["data"]["domain"] = json!("copilot.tencent.com");
+        assert!(parse_token_for_region(&value, None, now_ms(), WorkBuddyRegion::Cn).is_ok());
+    }
+
+    #[test]
+    fn cn_and_global_principals_with_same_uid_must_not_collide() {
+        let global = credential(42);
+        let mut cn = global.clone();
+        cn.issuer = "https://copilot.tencent.com".into();
+        cn.domain = "copilot.tencent.com".into();
+        let cn_snapshot = snapshot(&json!({"code":0,"data":{"uid":42}}), &cn, None).unwrap();
+        assert_ne!(cn_snapshot.identity_hash, global.snapshot.identity_hash);
+        let prefixed_global =
+            snapshot(&json!({"code":0,"data":{"uid":"cn:42"}}), &global, None).unwrap();
+        assert_ne!(cn_snapshot.identity_hash, prefixed_global.identity_hash);
+    }
+
     #[derive(Clone)]
     struct Fixture {
+        region: WorkBuddyRegion,
+        captured: Arc<parking_lot::Mutex<Vec<HeaderMap>>>,
         state_response: Arc<parking_lot::Mutex<Value>>,
         tokens: Arc<parking_lot::Mutex<VecDeque<Value>>>,
         accounts: Arc<parking_lot::Mutex<VecDeque<Value>>>,
@@ -429,6 +620,8 @@ mod tests {
     impl Default for Fixture {
         fn default() -> Self {
             Self {
+                region: WorkBuddyRegion::Global,
+                captured: Arc::new(parking_lot::Mutex::new(Vec::new())),
                 state_response: Arc::new(parking_lot::Mutex::new(
                     json!({"code":0,"data":{"state":STATE,"authUrl":format!("{ISSUER}/plugin/login?state={STATE}")}}),
                 )),
@@ -449,6 +642,20 @@ mod tests {
             }
         }
     }
+
+    fn cn_fixture() -> Fixture {
+        let fixture = Fixture {
+            region: WorkBuddyRegion::Cn,
+            ..Default::default()
+        };
+        *fixture.state_response.lock() = json!({"code":0,"data":{"state":STATE,"authUrl":format!("https://www.codebuddy.cn/plugin/login?state={STATE}")}});
+        for values in [&fixture.tokens, &fixture.accounts, &fixture.refreshes] {
+            for value in values.lock().iter_mut() {
+                value["data"]["domain"] = json!("https://copilot.tencent.com");
+            }
+        }
+        fixture
+    }
     async fn state_handler(
         State(f): State<Fixture>,
         Query(query): Query<HashMap<String, String>>,
@@ -457,13 +664,23 @@ mod tests {
     ) -> Json<Value> {
         assert_eq!(
             query.get("platform").map(String::as_str),
-            Some("workbuddy-ai")
+            Some(match f.region {
+                WorkBuddyRegion::Global => "workbuddy-ai",
+                WorkBuddyRegion::Cn => "VSCode",
+            })
         );
-        assert_eq!(headers["x-domain"], "www.workbuddy.ai");
+        assert_eq!(
+            headers["x-domain"],
+            match f.region {
+                WorkBuddyRegion::Global => "www.workbuddy.ai",
+                WorkBuddyRegion::Cn => "copilot.tencent.com",
+            }
+        );
         assert_eq!(headers["x-no-authorization"], "true");
         assert!(!headers.contains_key("authorization"));
         assert!(!headers.contains_key("x-refresh-token"));
         assert_eq!(body, json!({}));
+        f.captured.lock().push(headers);
         Json(f.state_response.lock().clone())
     }
     async fn token_handler(
@@ -473,6 +690,7 @@ mod tests {
     ) -> Json<Value> {
         assert_eq!(query.get("state").map(String::as_str), Some(STATE));
         assert!(!headers.contains_key("authorization"));
+        f.captured.lock().push(headers);
         f.token_calls.fetch_add(1, Ordering::SeqCst);
         Json(
             f.tokens
@@ -490,12 +708,16 @@ mod tests {
             .to_str()
             .unwrap()
             .starts_with("Bearer fixture-workbuddy-"));
-        assert_eq!(headers["x-domain"], "https://www.workbuddy.ai");
+        assert_eq!(
+            headers["x-domain"],
+            WorkBuddyAuth::issuer_for_region(f.region)
+        );
         assert!(!headers.contains_key("x-refresh-token"));
         if query.get("state").map(String::as_str) != Some(STATE) {
             return Json(json!({"code":400,"msg":"state required for initial account"}));
         }
         f.account_calls.fetch_add(1, Ordering::SeqCst);
+        f.captured.lock().push(headers);
         if f.block_account {
             f.entered.notify_one();
             f.release.notified().await;
@@ -514,6 +736,7 @@ mod tests {
             .starts_with("Bearer fixture-workbuddy-"));
         assert!(!headers.contains_key("x-refresh-token"));
         f.account_calls.fetch_add(1, Ordering::SeqCst);
+        f.captured.lock().push(headers);
         let value = f
             .accounts
             .lock()
@@ -529,9 +752,13 @@ mod tests {
         f.refresh_calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(headers["x-refresh-token"], REFRESH);
         assert_eq!(headers["x-auth-refresh-source"], "plugin");
-        assert_eq!(headers["x-domain"], "https://www.workbuddy.ai");
+        assert_eq!(
+            headers["x-domain"],
+            WorkBuddyAuth::issuer_for_region(f.region)
+        );
         assert!(!headers.contains_key("authorization"));
         assert_eq!(body, json!({}));
+        f.captured.lock().push(headers);
         // Let a simultaneous caller observe the same pre-refresh generation.
         tokio::time::sleep(Duration::from_millis(10)).await;
         Json(
@@ -567,6 +794,7 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         let auth = WorkBuddyAuth {
+            region: fixture.region,
             pool: db.pool().clone(),
             client: Client::builder()
                 .no_proxy()
@@ -585,12 +813,253 @@ mod tests {
         }
     }
     async fn save(auth: &WorkBuddyAuth, account: &str, value: &Credential) {
-        repo::set_secret(&auth.pool, &session_key(account), &encode(value).unwrap())
-            .await
-            .unwrap();
+        repo::set_secret(
+            &auth.pool,
+            &auth.session_key(account),
+            &encode(value).unwrap(),
+        )
+        .await
+        .unwrap();
     }
     async fn saved(auth: &WorkBuddyAuth, account: &str) -> Credential {
-        decode(&auth.read(&session_key(account)).await.unwrap().unwrap()).unwrap()
+        decode(
+            &auth
+                .read(&auth.session_key(account))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn regional_authorization_urls_and_token_domains_fail_closed() {
+        assert_eq!(
+            serde_json::from_value::<WorkBuddyRegion>(json!("cn")).unwrap(),
+            WorkBuddyRegion::Cn
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkBuddyRegion>(json!("global")).unwrap(),
+            WorkBuddyRegion::Global
+        );
+        for unknown in [json!("intl"), json!("CN"), json!(""), json!(null), json!(3)] {
+            assert!(serde_json::from_value::<WorkBuddyRegion>(unknown).is_err());
+        }
+        for host in [
+            "copilot.tencent.com",
+            "www.codebuddy.cn",
+            "www.workbuddy.cn",
+        ] {
+            let url = format!("https://{host}/plugin/login?state=fixture");
+            assert!(valid_authorization_url_for_region(
+                &url,
+                WorkBuddyRegion::Cn
+            ));
+            assert!(!valid_authorization_url(&url));
+        }
+        for url in [
+            "https://www.workbuddy.ai/plugin/login?state=fixture",
+            "https://evil.www.codebuddy.cn/login",
+            "https://www.codebuddy.cn.evil.test/login",
+            "http://www.codebuddy.cn/login",
+            "https://www.codebuddy.cn:444/login",
+            "https://user@www.codebuddy.cn/login",
+            "https://www.codebuddy.cn/login#fragment",
+            "https://evil.test/login",
+            "https://copilot.tencent.com@evil.test/login",
+        ] {
+            assert!(
+                !valid_authorization_url_for_region(url, WorkBuddyRegion::Cn),
+                "{url}"
+            );
+        }
+        let mut cn_token = token(ACCESS, REFRESH);
+        cn_token["data"]["domain"] = json!("copilot.tencent.com");
+        let cn = parse_token_for_region(&cn_token, None, now_ms(), WorkBuddyRegion::Cn).unwrap();
+        assert!(parse_token(&cn_token, None, now_ms()).is_err());
+        assert!(parse_token_for_region(
+            &token(ACCESS, REFRESH),
+            None,
+            now_ms(),
+            WorkBuddyRegion::Cn
+        )
+        .is_err());
+        assert!(parse_token_for_region(
+            &cn_token,
+            Some(&credential(42)),
+            now_ms(),
+            WorkBuddyRegion::Cn
+        )
+        .is_err());
+        assert!(parse_token_for_region(
+            &token(ACCESS, REFRESH),
+            Some(&cn),
+            now_ms(),
+            WorkBuddyRegion::Global
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn cn_login_refresh_and_model_authorization_preserve_global_same_account() {
+        let fixture = cn_fixture();
+        let mut second_account = account(42);
+        second_account["data"]["domain"] = json!("https://copilot.tencent.com");
+        fixture.accounts.lock().push_back(second_account);
+        let s = server(fixture).await;
+        let mut global = s.auth.clone();
+        global.region = WorkBuddyRegion::Global;
+        global
+            .test_seed_account(
+                "same-account",
+                "42",
+                "fixture-global-access",
+                "fixture-global-refresh",
+            )
+            .await;
+        let global_cipher = global
+            .read(&session_key("same-account"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.auth.session_status("same-account").await.unwrap().status,
+            "not_logged_in"
+        );
+        let begin = s.auth.start("same-account").await.unwrap();
+        assert!(begin
+            .authorization_url
+            .starts_with("https://www.codebuddy.cn/"));
+        assert!(global.poll(&begin.login_id).await.is_err());
+        assert!(global.cancel(&begin.login_id).await.is_err());
+        let status = s.auth.poll(&begin.login_id).await.unwrap();
+        assert_eq!(status.status, "authenticated");
+        let global_status = global.session_status("same-account").await.unwrap();
+        assert_ne!(
+            status.identity.unwrap().identity_hash,
+            global_status.identity.unwrap().identity_hash
+        );
+        let authorization = s
+            .auth
+            .prepare_model_authorization("same-account")
+            .await
+            .unwrap();
+        assert_eq!(authorization.region, WorkBuddyRegion::Cn);
+        assert_eq!(authorization.headers["x-user-id"], "42");
+        assert_eq!(
+            authorization.headers["authorization"],
+            format!("Bearer {ACCESS}")
+        );
+        assert_eq!(authorization.headers["origin"], "https://www.codebuddy.cn");
+        assert_eq!(authorization.headers["x-client-id"], "codebuddy-cli");
+        assert_eq!(authorization.headers["x-client-version"], "2.143.1");
+        assert!(!authorization.headers.contains_key("x-refresh-token"));
+        assert!(s.auth.refresh("same-account").await.unwrap().can_refresh);
+        assert_eq!(s.fixture.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            saved(&s.auth, "same-account").await.access_token,
+            "fixture-workbuddy-new-access"
+        );
+        assert_eq!(
+            global.read(&session_key("same-account")).await.unwrap(),
+            Some(global_cipher)
+        );
+        assert!(s
+            .auth
+            .read(&s.auth.pending_key(&begin.login_id))
+            .await
+            .unwrap()
+            .is_none());
+        let captured = s.fixture.captured.lock();
+        assert_eq!(captured.len(), 5);
+        for headers in captured.iter() {
+            assert_eq!(headers["origin"], "https://www.codebuddy.cn");
+            assert_eq!(headers["referer"], "https://www.codebuddy.cn/");
+            assert_eq!(headers["user-agent"], "CLI/2.143.1 CodeBuddy/2.143.1");
+            assert_eq!(headers["x-client-id"], "codebuddy-cli");
+            assert_eq!(headers["x-client-version"], "2.143.1");
+            assert_eq!(headers["x-product"], "SaaS");
+        }
+    }
+
+    #[tokio::test]
+    async fn regional_issuer_domain_and_pending_mismatch_send_no_http_and_preserve_ciphertext() {
+        let s = server(Fixture::default()).await;
+        let mut cn = s.auth.clone();
+        cn.region = WorkBuddyRegion::Cn;
+        for (index, mut invalid) in [credential(42), credential(42)].into_iter().enumerate() {
+            // Independently reject a wrong issuer and a mixed issuer/domain pair.
+            if index == 1 {
+                invalid.issuer = "https://copilot.tencent.com".into();
+            }
+            save(&cn, "fixture", &invalid).await;
+            let before = cn.read(&cn.session_key("fixture")).await.unwrap();
+            assert!(cn.session_status("fixture").await.is_err());
+            assert!(cn.prepare_model_authorization("fixture").await.is_err());
+            assert!(cn.refresh("fixture").await.is_err());
+            assert!(cn.start("fixture").await.is_err());
+            assert_eq!(cn.read(&cn.session_key("fixture")).await.unwrap(), before);
+        }
+        assert!(s.fixture.captured.lock().is_empty());
+        let begin = s.auth.start("global-account").await.unwrap();
+        let cipher = s
+            .auth
+            .read(&pending_key(&begin.login_id))
+            .await
+            .unwrap()
+            .unwrap();
+        repo::set_secret(&cn.pool, &cn.pending_key(&begin.login_id), &cipher)
+            .await
+            .unwrap();
+        assert!(cn.poll(&begin.login_id).await.is_err());
+        assert!(cn.cancel(&begin.login_id).await.is_err());
+        assert_eq!(
+            s.auth.read(&pending_key(&begin.login_id)).await.unwrap(),
+            Some(cipher)
+        );
+        assert_eq!(s.fixture.captured.lock().len(), 1);
+        assert_eq!(s.fixture.token_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.account_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_global_pending_without_region_and_saved_credential_remain_usable() {
+        let s = server(Fixture::default()).await;
+        let begin = s.auth.start("legacy-global").await.unwrap();
+        let key = pending_key(&begin.login_id);
+        let old = s.auth.read(&key).await.unwrap().unwrap();
+        let mut pending: Value = decode(&old).unwrap();
+        pending.as_object_mut().unwrap().remove("region");
+        s.auth
+            .replace(&key, &old, &encode(&pending).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.auth.poll(&begin.login_id).await.unwrap().status,
+            "authenticated"
+        );
+        assert_eq!(
+            s.auth.session_key("legacy-global"),
+            "account-login:workbuddy:global:session:legacy-global"
+        );
+        let cipher = s
+            .auth
+            .read(&session_key("legacy-global"))
+            .await
+            .unwrap()
+            .unwrap();
+        let credential: Value = decode(&cipher).unwrap();
+        assert!(credential.get("region").is_none());
+        assert_eq!(credential["issuer"], "https://www.workbuddy.ai");
+        assert_eq!(
+            s.auth
+                .prepare_model_authorization("legacy-global")
+                .await
+                .unwrap()
+                .region,
+            WorkBuddyRegion::Global
+        );
     }
 
     #[test]
@@ -998,6 +1467,7 @@ mod tests {
         let s = server(Fixture::default()).await;
         for _ in 0..31 {
             let pending = PendingLogin {
+                region: WorkBuddyRegion::Global,
                 account_id: "fixture".into(),
                 state: STATE.into(),
                 deadline_ms: now_ms() + LOGIN_LIMIT_MS,
@@ -1119,10 +1589,117 @@ mod tests {
         );
         task.abort();
     }
+    #[tokio::test]
+    async fn workbuddy_snapshot_local_fence_has_no_identity_refresh_or_write_side_effects() {
+        for mutation in 0..3 {
+            let s = server(Fixture::default()).await;
+            let mut value = credential(42);
+            value.uid = Some("42".into());
+            value.access_expires_at_ms = Some(now_ms() + 120_000);
+            save(&s.auth, "fixture", &value).await;
+            let captured = s.auth.prepare_model_authorization("fixture").await.unwrap();
+            let key = s.auth.session_key("fixture");
+            let original = s.auth.read(&key).await.unwrap();
+            for _ in 0..3 {
+                s.auth
+                    .model_authorization_current("fixture", &captured)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                s.auth.read(&key).await.unwrap(),
+                original,
+                "read-only fence cannot rewrite capture"
+            );
+            assert!(s
+                .auth
+                .model_authorization_current("other-slot", &captured)
+                .await
+                .is_err());
+            match mutation {
+                0 => {
+                    value.access_expires_at_ms = Some(now_ms() - 1);
+                    save(&s.auth, "fixture", &value).await;
+                }
+                1 => {
+                    value.uid = None;
+                    save(&s.auth, "fixture", &value).await;
+                }
+                _ => {
+                    sqlx::query("DELETE FROM app_secrets WHERE name=?")
+                        .bind(&key)
+                        .execute(&s.auth.pool)
+                        .await
+                        .unwrap();
+                }
+            }
+            assert!(s
+                .auth
+                .model_authorization_current("fixture", &captured)
+                .await
+                .is_err());
+            assert_eq!(s.fixture.token_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                s.fixture.account_calls.load(Ordering::SeqCst),
+                0,
+                "do not prepare again to recover missing UID"
+            );
+            assert_eq!(
+                s.fixture.refresh_calls.load(Ordering::SeqCst),
+                0,
+                "do not refresh expired replacement"
+            );
+            assert!(s.fixture.captured.lock().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn workbuddy_snapshot_expiry_is_rechecked_after_owned_database_wait() {
+        use std::sync::atomic::AtomicI64;
+        let s = server(Fixture::default()).await;
+        let at = now_ms();
+        let expires = at + 120_000;
+        let mut value = credential(42);
+        value.uid = Some("42".into());
+        value.access_expires_at_ms = Some(expires);
+        save(&s.auth, "fixture", &value).await;
+        let captured = s.auth.prepare_model_authorization("fixture").await.unwrap();
+        let clock = Arc::new(AtomicI64::new(at));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let connection = s.auth.pool.acquire().await.unwrap();
+        let auth = s.auth.clone();
+        let check_clock = clock.clone();
+        let check_reads = reads.clone();
+        let pending = tokio::spawn(async move {
+            auth.model_authorization_current_with_clock("fixture", &captured, move || {
+                check_reads.fetch_add(1, Ordering::SeqCst);
+                check_clock.load(Ordering::SeqCst)
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while reads.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !pending.is_finished(),
+            "the captured fence is actually waiting on the owned DB"
+        );
+        clock.store(expires, Ordering::SeqCst);
+        drop(connection);
+        assert!(pending.await.unwrap().unwrap_err().contains("到期"));
+        assert!(reads.load(Ordering::SeqCst) >= 2);
+        assert!(s.fixture.captured.lock().is_empty());
+        assert_eq!(s.fixture.account_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.refresh_calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[derive(Clone)]
 pub struct WorkBuddyAuth {
+    region: WorkBuddyRegion,
     pool: SqlitePool,
     client: Client,
     base: String,
@@ -1134,7 +1711,16 @@ pub struct WorkBuddyAuth {
 impl WorkBuddyAuth {
     #[cfg(test)]
     pub(crate) fn with_test_origin(pool: SqlitePool, origin: String) -> Self {
-        let mut auth = Self::new(pool, None).expect("test HTTP client");
+        Self::with_test_origin_for_region(pool, origin, WorkBuddyRegion::Global)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_origin_for_region(
+        pool: SqlitePool,
+        origin: String,
+        region: WorkBuddyRegion,
+    ) -> Self {
+        let mut auth = Self::new_for_region(pool, None, region).expect("test HTTP client");
         auth.base = origin;
         auth
     }
@@ -1148,11 +1734,12 @@ impl WorkBuddyAuth {
         refresh: &str,
     ) {
         assert!(valid_id(account_id));
+        let issuer = Self::issuer_for_region(self.region);
         let mut credential = Credential {
-            issuer: ISSUER.into(),
+            issuer: issuer.into(),
             access_token: access.into(),
             refresh_token: Some(refresh.into()),
-            domain: ISSUER.into(),
+            domain: issuer.into(),
             access_expires_at_ms: None,
             refresh_expires_at_ms: None,
             enterprise_id: None,
@@ -1161,14 +1748,14 @@ impl WorkBuddyAuth {
             refresh_attempted: false,
         };
         credential.snapshot = snapshot(
-            &json!({"code":0,"data":{"uid":uid,"domain":ISSUER}}),
+            &json!({"code":0,"data":{"uid":uid,"domain":issuer}}),
             &credential,
             None,
         )
         .unwrap();
         repo::set_secret(
             &self.pool,
-            &session_key(account_id),
+            &self.session_key(account_id),
             &encode(&credential).unwrap(),
         )
         .await
@@ -1178,7 +1765,20 @@ impl WorkBuddyAuth {
     pub fn issuer() -> &'static str {
         ISSUER
     }
+    pub fn issuer_for_region(region: WorkBuddyRegion) -> &'static str {
+        region.profile().issuer
+    }
+    pub fn region(&self) -> WorkBuddyRegion {
+        self.region
+    }
     pub fn new(pool: SqlitePool, proxy: Option<&str>) -> Result<Self, String> {
+        Self::new_for_region(pool, proxy, WorkBuddyRegion::Global)
+    }
+    pub fn new_for_region(
+        pool: SqlitePool,
+        proxy: Option<&str>,
+        region: WorkBuddyRegion,
+    ) -> Result<Self, String> {
         let client = crate::outbound::apply_proxy(
             Client::builder()
                 .retry(reqwest::retry::never())
@@ -1191,9 +1791,10 @@ impl WorkBuddyAuth {
         .build()
         .map_err(|_| "无法初始化登录服务")?;
         Ok(Self {
+            region,
             pool,
             client,
-            base: ISSUER.into(),
+            base: Self::issuer_for_region(region).into(),
             gate: Arc::new(Mutex::new(())),
             #[cfg(test)]
             before_commit: None,
@@ -1201,24 +1802,81 @@ impl WorkBuddyAuth {
     }
 
     pub(crate) fn with_proxy(&self, proxy: Option<&str>) -> Result<Self, String> {
-        let mut next = Self::new(self.pool.clone(), proxy)?;
+        let mut next = Self::new_for_region(self.pool.clone(), proxy, self.region)?;
         next.gate = self.gate.clone();
         next.base = self.base.clone();
         Ok(next)
+    }
+
+    fn session_key(&self, account: &str) -> String {
+        format!("{}session:{account}", self.region.prefix())
+    }
+
+    pub(crate) fn benefit_session_key(
+        region: WorkBuddyRegion,
+        account: &str,
+    ) -> Result<String, String> {
+        if !valid_id(account) {
+            return Err("账号 ID 无效".into());
+        }
+        Ok(format!("{}session:{account}", region.prefix()))
+    }
+
+    pub(crate) fn benefit_identity(
+        cipher: &str,
+        region: WorkBuddyRegion,
+    ) -> Result<(AccountSnapshot, String, Option<i64>), String> {
+        let credential: Credential = decode(cipher)?;
+        let principal = daily_claim::principal(&credential, region)?;
+        Ok((
+            credential.snapshot,
+            principal,
+            credential.access_expires_at_ms,
+        ))
+    }
+
+    fn pending_key(&self, id: &str) -> String {
+        format!("{}pending:{id}", self.region.prefix())
+    }
+
+    fn validate_pending(&self, pending: &PendingLogin) -> Result<(), String> {
+        if pending.region != self.region {
+            return Err("授权会话与所选 WorkBuddy 区域不一致".into());
+        }
+        if let Some(credential) = &pending.credential {
+            validate_credential(credential, self.region)?;
+        }
+        if let Some(baseline) = &pending.baseline_cipher {
+            validate_credential(&decode::<Credential>(baseline)?, self.region)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn prepare_model_authorization(
         &self,
         account: &str,
     ) -> Result<ModelAuthorization, String> {
+        self.prepare_model_authorization_bound(account, None).await
+    }
+
+    pub(crate) async fn prepare_model_authorization_bound(
+        &self,
+        account: &str,
+        expected_principal: Option<&str>,
+    ) -> Result<ModelAuthorization, String> {
         if !valid_id(account) {
             return Err("账号 ID 无效".into());
         }
         let _guard = self.gate.lock().await;
-        let key = session_key(account);
+        let key = self.session_key(account);
         let mut cipher = self.read(&key).await?.ok_or("请先登录 WorkBuddy")?;
         let mut credential: Credential = decode(&cipher)?;
-        validate_credential(&credential)?;
+        validate_credential(&credential, self.region)?;
+        if let Some(expected) = expected_principal {
+            if daily_claim::principal(&credential, self.region)? != expected {
+                return Err("WorkBuddy 登录主体与权益关联不一致；未发送请求".into());
+            }
+        }
         if credential
             .access_expires_at_ms
             .is_some_and(|at| at <= now_ms() + 60_000)
@@ -1226,6 +1884,7 @@ impl WorkBuddyAuth {
             self.refresh_locked(account, &cipher).await?;
             cipher = self.read(&key).await?.ok_or("账号登录已移除")?;
             credential = decode(&cipher)?;
+            validate_credential(&credential, self.region)?;
             if credential
                 .access_expires_at_ms
                 .is_some_and(|at| at <= now_ms())
@@ -1254,16 +1913,13 @@ impl WorkBuddyAuth {
             credential.snapshot = snapshot;
             let next = encode(&credential)?;
             self.replace(&key, &cipher, &next).await?;
+            cipher = next;
         }
         let uid = credential
             .uid
             .as_deref()
             .ok_or("账号标识缺失，请重新登录")?;
-        if format!(
-            "{:x}",
-            Sha256::digest(format!("workbuddy:{uid}").as_bytes())
-        ) != identity
-        {
+        if self.region.identity_hash(uid) != identity {
             return Err("账号标识与登录身份不一致，请重新登录".into());
         }
         let mut values = vec![
@@ -1285,7 +1941,31 @@ impl WorkBuddyAuth {
             value.set_sensitive(true);
             headers.insert(name, value);
         }
+        let profile = self.region.profile();
+        headers.insert("origin", HeaderValue::from_static(profile.origin));
+        headers.insert(
+            "referer",
+            HeaderValue::from_str(&format!("{}/", profile.origin))
+                .map_err(|_| "账号模型来源头无效")?,
+        );
+        if let Some(id) = profile.client_id {
+            headers.insert("x-client-id", HeaderValue::from_static(id));
+        }
+        if let Some(version) = profile.client_version {
+            headers.insert("x-client-version", HeaderValue::from_static(version));
+        }
+        for value in headers.values_mut() {
+            value.set_sensitive(true);
+        }
+        let source_fingerprint = format!("{:x}", Sha256::digest(cipher.as_bytes()));
         Ok(ModelAuthorization {
+            source: Some(ModelAuthorizationSource {
+                key,
+                cipher,
+                fingerprint: source_fingerprint,
+                expires_at_ms: credential.access_expires_at_ms,
+            }),
+            region: self.region,
             headers,
             identity_hash: identity,
             credential_fingerprint: format!(
@@ -1293,6 +1973,44 @@ impl WorkBuddyAuth {
                 Sha256::digest(credential.access_token.as_bytes())
             ),
         })
+    }
+
+    /// Pure-local currentness check. It must not call prepare, refresh, identity
+    /// lookup or replace: another generation is a rejection, not a new capture.
+    pub(crate) async fn model_authorization_current(
+        &self,
+        account: &str,
+        captured: &ModelAuthorization,
+    ) -> Result<(), String> {
+        self.model_authorization_current_with_clock(account, captured, now_ms)
+            .await
+    }
+    async fn model_authorization_current_with_clock(
+        &self,
+        account: &str,
+        captured: &ModelAuthorization,
+        clock: impl Fn() -> i64 + Send + Sync,
+    ) -> Result<(), String> {
+        let source = captured
+            .source
+            .as_ref()
+            .ok_or("WorkBuddy捕获认证来源缺失")?;
+        if !valid_id(account)
+            || !captured.matches_region(self.region)
+            || source.key != self.session_key(account)
+        {
+            return Err("WorkBuddy捕获认证区域或账号不一致".into());
+        }
+        let expired = |now| source.expires_at_ms.is_some_and(|at| at <= now);
+        if expired(clock()) {
+            return Err("WorkBuddy捕获认证已到期，未刷新".into());
+        }
+        let current = self.read(&source.key).await?;
+        // A SELECT may wait for the sole connection. Recheck time after that wait.
+        if expired(clock()) || current.as_deref() != Some(source.cipher.as_str()) {
+            return Err("WorkBuddy捕获认证已移除、改变或到期，未刷新或重取身份".into());
+        }
+        Ok(())
     }
 
     async fn request(
@@ -1303,17 +2021,33 @@ impl WorkBuddyAuth {
         auth: Option<&Credential>,
         refresh: bool,
     ) -> Result<Value, String> {
+        if let Some(auth) = auth {
+            validate_credential(auth, self.region)?;
+        }
+        let profile = self.region.profile();
         let mut request = self
             .client
             .request(method.clone(), format!("{}{}", self.base, route))
             .query(query)
             .header("Accept", "application/json")
-            .header("X-Domain", auth.map_or("www.workbuddy.ai", |c| &c.domain));
+            .header("X-Domain", auth.map_or(profile.domain, |c| &c.domain));
+        if self.region == WorkBuddyRegion::Cn {
+            request = request
+                .header("Origin", profile.origin)
+                .header("Referer", format!("{}/", profile.origin))
+                .header("User-Agent", profile.user_agent)
+                .header("X-Product", "SaaS");
+            if let Some(id) = profile.client_id {
+                request = request.header("X-Client-ID", id);
+            }
+            if let Some(version) = profile.client_version {
+                request = request.header("X-Client-Version", version);
+            }
+        }
         if method == Method::POST {
             request = request.json(&json!({}));
         }
         if let Some(auth) = auth {
-            validate_credential(auth)?;
             if refresh {
                 let mut value = HeaderValue::from_str(
                     auth.refresh_token
@@ -1378,14 +2112,14 @@ impl WorkBuddyAuth {
             return Err("账号 ID 无效".into());
         }
         let _guard = self.gate.lock().await;
-        let baseline = self.read(&session_key(account_id)).await?;
+        let baseline = self.read(&self.session_key(account_id)).await?;
         if let Some(cipher) = &baseline {
-            validate_credential(&decode::<Credential>(cipher)?)?;
+            validate_credential(&decode::<Credential>(cipher)?, self.region)?;
         }
         // Only our encrypted pending namespace is inspected, bounded to 33 rows.
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT name, value_enc FROM app_secrets WHERE name LIKE ? LIMIT 33")
-                .bind(format!("{PREFIX}pending:%"))
+                .bind(format!("{}pending:%", self.region.prefix()))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|_| "无法读取授权会话")?;
@@ -1410,7 +2144,7 @@ impl WorkBuddyAuth {
             .request(
                 Method::POST,
                 "/v2/plugin/auth/state",
-                &[("platform", "workbuddy-ai")],
+                &[("platform", self.region.profile().platform)],
                 None,
                 false,
             )
@@ -1425,7 +2159,7 @@ impl WorkBuddyAuth {
             .ok_or("授权服务未返回有效 state")?;
         let url = data["authUrl"]
             .as_str()
-            .filter(|v| valid_authorization_url(v))
+            .filter(|v| valid_authorization_url_for_region(v, self.region))
             .ok_or("授权网址不是已验证的官方域名")?;
         if Url::parse(url)
             .map_err(|_| "授权网址无效")?
@@ -1446,6 +2180,7 @@ impl WorkBuddyAuth {
         let deadline = now_ms().checked_add(wait_ms).ok_or("授权会话时间无效")?;
         let login_id = uuid::Uuid::new_v4().to_string();
         let pending = PendingLogin {
+            region: self.region,
             account_id: account_id.into(),
             state: state.into(),
             deadline_ms: deadline,
@@ -1455,8 +2190,8 @@ impl WorkBuddyAuth {
             credential: None,
         };
         let inserted = sqlx::query("INSERT INTO app_secrets (name,value_enc,created_at,updated_at) SELECT ?,?,?,? WHERE (SELECT COUNT(*) FROM app_secrets WHERE name LIKE ?) < 32")
-            .bind(pending_key(&login_id)).bind(encode(&pending)?).bind(chrono::Utc::now()).bind(chrono::Utc::now())
-            .bind(format!("{PREFIX}pending:%")).execute(&self.pool).await.map_err(|_| "无法保存加密授权会话")?;
+            .bind(self.pending_key(&login_id)).bind(encode(&pending)?).bind(chrono::Utc::now()).bind(chrono::Utc::now())
+            .bind(format!("{}pending:%", self.region.prefix())).execute(&self.pool).await.map_err(|_| "无法保存加密授权会话")?;
         if inserted.rows_affected() != 1 {
             return Err("未完成授权过多，请取消或等待过期".into());
         }
@@ -1472,7 +2207,24 @@ impl WorkBuddyAuth {
         if uuid::Uuid::parse_str(login_id).is_err() {
             return Err("登录会话 ID 无效".into());
         }
-        repo::delete_secret(&self.pool, &pending_key(login_id))
+        let key = self.pending_key(login_id);
+        if let Some(cipher) = self.read(&key).await? {
+            self.validate_pending(&decode::<PendingLogin>(&cipher)?)?;
+        } else {
+            let other = match self.region {
+                WorkBuddyRegion::Global => WorkBuddyRegion::Cn,
+                WorkBuddyRegion::Cn => WorkBuddyRegion::Global,
+            };
+            if self
+                .read(&format!("{}pending:{login_id}", other.prefix()))
+                .await?
+                .is_some()
+            {
+                return Err("授权会话与所选 WorkBuddy 区域不一致".into());
+            }
+            return Ok(());
+        }
+        repo::delete_secret(&self.pool, &key)
             .await
             .map_err(|_| "无法取消授权会话")?;
         Ok(())
@@ -1483,12 +2235,12 @@ impl WorkBuddyAuth {
             return Err("账号 ID 无效".into());
         }
         let credential = self
-            .read(&session_key(account))
+            .read(&self.session_key(account))
             .await?
             .map(|c| decode::<Credential>(&c))
             .transpose()?;
         if let Some(c) = &credential {
-            validate_credential(c)?;
+            validate_credential(c, self.region)?;
         }
         Ok(status(account, credential.as_ref()))
     }
@@ -1498,9 +2250,10 @@ impl WorkBuddyAuth {
             return Err("登录会话 ID 无效".into());
         }
         let _guard = self.gate.lock().await;
-        let key = pending_key(login_id);
+        let key = self.pending_key(login_id);
         let old = self.read(&key).await?.ok_or("授权会话不存在或已结束")?;
         let mut pending: PendingLogin = decode(&old)?;
+        self.validate_pending(&pending)?;
         if pending.deadline_ms <= now_ms() {
             self.cancel(login_id).await?;
             return Err("授权会话已过期，请重新登录".into());
@@ -1542,7 +2295,7 @@ impl WorkBuddyAuth {
             if value["code"].as_i64() == Some(11217) {
                 return self.waiting(key, reserved, pending).await;
             }
-            pending.credential = Some(parse_token(&value, None, now_ms())?);
+            pending.credential = Some(parse_token_for_region(&value, None, now_ms(), self.region)?);
         }
         let credential = pending.credential.as_mut().ok_or("授权未返回令牌")?;
         let value = self
@@ -1563,6 +2316,7 @@ impl WorkBuddyAuth {
             .map(decode::<Credential>)
             .transpose()?;
         if let Some(previous) = &previous {
+            validate_credential(previous, self.region)?;
             let mut old_secrets = vec![previous.access_token.as_str()];
             old_secrets.extend(previous.refresh_token.as_deref());
             if reflects(&value, &old_secrets) {
@@ -1602,7 +2356,7 @@ impl WorkBuddyAuth {
         if pending.deadline_ms <= now_ms() {
             return Err("授权会话已过期，未保存令牌".into());
         }
-        let session = session_key(&pending.account_id);
+        let session = self.session_key(&pending.account_id);
         let saved = if let Some(baseline) = &pending.baseline_cipher {
             sqlx::query("UPDATE app_secrets SET value_enc = ?, updated_at = ? WHERE name = ? AND value_enc = ?")
                 .bind(&encrypted).bind(chrono::Utc::now()).bind(&session).bind(baseline).execute(&mut *tx).await
@@ -1638,13 +2392,13 @@ impl WorkBuddyAuth {
         if !valid_id(account) {
             return Err("账号 ID 无效".into());
         }
-        let key = session_key(account);
+        let key = self.session_key(account);
         let old = self.read(&key).await?.ok_or("尚未登录 WorkBuddy")?;
         let _guard = self.gate.lock().await;
         let current = self.read(&key).await?.ok_or("账号登录已移除")?;
         if current != old {
             let current: Credential = decode(&current)?;
-            validate_credential(&current)?;
+            validate_credential(&current, self.region)?;
             if !current.refresh_attempted {
                 return Ok(status(account, Some(&current)));
             }
@@ -1654,9 +2408,9 @@ impl WorkBuddyAuth {
     }
 
     async fn refresh_locked(&self, account: &str, old: &str) -> Result<LoginStatus, String> {
-        let key = session_key(account);
+        let key = self.session_key(account);
         let mut credential: Credential = decode(old)?;
-        validate_credential(&credential)?;
+        validate_credential(&credential, self.region)?;
         if credential.refresh_attempted {
             return Err("该认证的刷新已尝试或中断，请重新登录；不会自动重试".into());
         }
@@ -1681,7 +2435,8 @@ impl WorkBuddyAuth {
                 true,
             )
             .await?;
-        let mut refreshed = parse_token(&value, Some(&credential), now_ms())?;
+        let mut refreshed =
+            parse_token_for_region(&value, Some(&credential), now_ms(), self.region)?;
         if refreshed.access_token == credential.access_token {
             return Err("刷新未返回新的访问认证；不会重复本次刷新，请重新登录".into());
         }

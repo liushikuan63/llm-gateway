@@ -1,7 +1,8 @@
 import { useEffect, useId, useRef, useState } from "react";
 import "./onboarding.css";
+import OnboardingCheck from "./OnboardingCheck";
 
-export type OnboardingTarget = "providers" | "sessions" | "stats" | "settings";
+export type OnboardingTarget = "providers" | "sessions" | "stats" | "settings" | "chat";
 
 export type OnboardingProps = {
   open: boolean;
@@ -24,11 +25,9 @@ const STEPS: OnboardingStep[] = [
   {
     id: "provider",
     eyebrow: "第一步：建立上游连接",
-    title: "添加一个供应商",
-    description: "从供应商页新建兼容协议、服务地址和 API Key，先让网关知道请求可以交给谁。",
-    detail: "此引导不会保存供应商、填写凭据或发起网络请求。密钥仅在你主动保存后由桌面应用处理。",
-    target: "providers",
-    actionLabel: "前往供应商页面",
+    title: "检查当前配置",
+    description: "先核对本机已保存的供应商、聊天映射和网关监听，再选择下一步。",
+    detail: "检查不会保存配置、查询账号或发起模型请求。后续验证、配置和启动操作由你明确发起。",
   },
   {
     id: "models",
@@ -211,6 +210,7 @@ export default function Onboarding({ open, onSkip, onComplete, onNavigate }: Onb
           <h3>{currentStep.title}</h3>
           <p id={descriptionId} className="onboarding-description">{currentStep.description}</p>
           <p className="onboarding-detail">{currentStep.detail}</p>
+          {currentStep.id === "provider" && <OnboardingCheck onNavigate={navigate} />}
 
           {currentStep.target && currentStep.actionLabel && (
             <button

@@ -1,0 +1,27 @@
+.native-usage { margin-bottom: 14px; min-width: 0; overflow-wrap: anywhere; }
+.native-usage h3 { margin: 0 0 10px; font-size: 16px; }
+.native-usage h4 { margin: 16px 0 8px; font-size: 14px; }
+.native-states { margin: 8px 0; line-height: 1.7; }
+.native-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 16px; margin: 12px 0; }
+.native-metrics dt { color: var(--muted); font-size: 12px; }
+.native-metrics dd { margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.native-metrics small, .native-model-name { display: block; margin-top: 4px; line-height: 1.6; }
+.native-fees ul { list-style: none; margin: 0; padding: 0; }
+.native-fees li { margin-bottom: 6px; }
+.native-table-scroll { overflow-x: auto; max-width: 100%; }
+.native-table-scroll:focus-visible, .native-request summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.native-model-table { min-width: 760px; }
+.native-model-table th { text-align: left; font-weight: 500; }
+.native-model-table .native-metrics { grid-template-columns: repeat(2, minmax(100px, 1fr)); font-size: 12px; }
+.native-model-table .native-states { max-width: 170px; font-size: 12px; }
+.native-model-table .native-fees { min-width: 160px; }
+.native-request { margin-top: 8px; min-width: 240px; max-width: 520px; white-space: normal; overflow-wrap: anywhere; }
+.native-request summary { cursor: pointer; color: var(--accent); font-size: 12px; line-height: 1.7; }
+.native-request[open] { padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+.native-request p { font-size: 12px; line-height: 1.7; }
+.native-coverage { display: block; color: var(--muted); font-size: 12px; font-weight: normal; }
+@media (max-width: 600px) {
+  .native-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .native-usage { padding: 12px; }
+  .native-request { min-width: 210px; max-width: 280px; }
+}

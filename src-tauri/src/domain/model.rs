@@ -174,8 +174,22 @@ pub struct ChatRequest {
 }
 
 /// 一次上游响应的内部统一表示
+#[derive(Debug, Clone, Default)]
+pub enum ReportedUsageEvidence {
+    /// Existing non-standard adapters retain their existing accounting contract.
+    #[default]
+    Unobserved,
+    Unknown,
+    /// Syntactically complete reported counts, not a supplier settlement receipt.
+    Complete(Usage),
+}
+
+/// 一次上游响应的内部统一表示
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatResponse {
+    /// Private transport evidence; never changes public wire or persisted cache JSON.
+    #[serde(skip)]
+    pub reported_usage_evidence: ReportedUsageEvidence,
     pub id: String,
     pub model: String,
     pub content: String,
@@ -197,6 +211,16 @@ pub struct ChatResponse {
     /// 而上游改协议、exec-server 起不来这类问题，恰恰只在后者里看得见。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
+}
+
+impl ChatResponse {
+    pub(crate) fn reference_cost_usage(&self) -> Option<&Usage> {
+        match &self.reported_usage_evidence {
+            ReportedUsageEvidence::Unobserved => self.usage.as_ref(),
+            ReportedUsageEvidence::Unknown => None,
+            ReportedUsageEvidence::Complete(usage) => Some(usage),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

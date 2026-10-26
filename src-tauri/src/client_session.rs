@@ -42,6 +42,12 @@ impl SessionCredential {
         Ok(value)
     }
     pub fn validate(&self, platform: ClaimPlatform) -> Result<(), String> {
+        if matches!(
+            platform,
+            ClaimPlatform::Workbuddy | ClaimPlatform::WorkbuddyCn
+        ) {
+            return Err("WorkBuddy 不接受导入客户端会话，请关联本网关独立登录".into());
+        }
         if self.schema_version != 1 || self.platform != platform {
             return Err("登录上下文与所选平台不一致".into());
         }
@@ -121,6 +127,12 @@ pub fn request_headers(
     raw: &str,
     platform: ClaimPlatform,
 ) -> Result<reqwest::header::HeaderMap, String> {
+    if matches!(
+        platform,
+        ClaimPlatform::Workbuddy | ClaimPlatform::WorkbuddyCn
+    ) {
+        return Err("WorkBuddy 权益仅支持关联本网关的独立登录".into());
+    }
     let values = if raw.trim_start().starts_with('{') {
         SessionCredential::parse(raw, platform)?.headers
     } else {

@@ -1,0 +1,11 @@
+.client-usage-panel { min-width: 0; }
+.client-usage-controls label { display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
+.client-usage-controls input { max-width: 100%; min-width: 0; box-sizing: border-box; }
+.client-usage-job { margin-top: 12px; overflow-wrap: anywhere; }
+.client-usage-job progress { width: min(100%, 360px); accent-color: var(--accent); }
+.client-usage-panel button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 460px) {
+  .client-usage-controls > label { width: 100%; }
+  .client-usage-controls > button { flex: 1 1 120px; }
+  .client-usage-job progress { width: 100%; }
+}

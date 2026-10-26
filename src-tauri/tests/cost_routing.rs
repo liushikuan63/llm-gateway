@@ -4,7 +4,7 @@
 //! （`requests.cost`、峰谷价、EWMA 校准），**却完全没参与选模型**。
 //!
 //! 本文件测的是**纯打分函数与权重默认值**。
-//! 调用侧（配置项、候选集区间计算）尚未接 —— 见文末说明。
+//! 调用侧已接配置与候选区间；实际排序合同另见 tests/router.rs。
 
 use llm_gateway_lib::config::RoutingStrategy;
 use llm_gateway_lib::router::score::{cost_bias_applies, cost_score, efficiency_score, Weights};
@@ -464,7 +464,7 @@ fn 简单任务一律计入成本() {
 #[test]
 fn 推理类任务只在长_prompt_时才计入成本() {
     use llm_gateway_lib::intellect::TaskClass;
-    // 关键判据：**不对 reasoning 计代价**。
+    // 短提示推理不偏置；达到长提示阈值时沿既有策略偏置，用户已确认保留。
     // 那会把「用强模型做难题」变成需要解释的例外，
     // 正是 CLAUDE.md 警告的「用贵的模型做简单活」的镜像错误。
     assert!(

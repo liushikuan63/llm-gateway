@@ -4,7 +4,7 @@ use super::upstream::UpstreamEvent;
 use crate::domain::{ChatRequest, ChatResponse, FunctionCall, ToolCall, Usage};
 use crate::error::{GatewayError, Result};
 use crate::model_catalog::{ContextSource, DiscoveredModel, DiscoveryResponse};
-use crate::workbuddy_auth::{ModelAuthorization, WorkBuddyAuth};
+use crate::workbuddy_auth::{ModelAuthorization, WorkBuddyAuth, WorkBuddyRegion};
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
 use serde_json::{json, Value};
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-const ORIGIN: &str = "https://www.workbuddy.ai";
+#[cfg(test)]
 const DESKTOP_UA: &str = "WorkBuddy/5.7.6";
 const JSON_LIMIT: usize = 512 * 1024;
 const FRAME_LIMIT: usize = 1024 * 1024;
@@ -31,6 +31,7 @@ type EventStream = Pin<Box<dyn Stream<Item = Result<UpstreamEvent>> + Send>>;
 type CatalogSlot = Arc<Mutex<Option<CachedCatalog>>>;
 
 pub(crate) struct WorkBuddyModelClient {
+    region: WorkBuddyRegion,
     auth: parking_lot::RwLock<WorkBuddyAuth>,
     http: parking_lot::RwLock<std::result::Result<reqwest::Client, String>>,
     catalogs: parking_lot::Mutex<BTreeMap<String, CatalogSlot>>,
@@ -53,6 +54,7 @@ struct CachedCatalog {
 impl WorkBuddyModelClient {
     pub(crate) fn new(auth: WorkBuddyAuth) -> Self {
         Self {
+            region: auth.region(),
             auth: parking_lot::RwLock::new(auth),
             http: parking_lot::RwLock::new(Self::build_http(None)),
             catalogs: parking_lot::Mutex::new(BTreeMap::new()),
@@ -97,7 +99,7 @@ impl WorkBuddyModelClient {
         if let Some(origin) = &self.test_origin {
             return origin;
         }
-        ORIGIN
+        WorkBuddyAuth::issuer_for_region(self.region)
     }
 
     /// Only crate-internal tests may replace the fixed production origin.
@@ -110,22 +112,50 @@ impl WorkBuddyModelClient {
 
     async fn authorize(&self, account_id: &str) -> Result<ModelAuthorization> {
         let auth = self.auth.read().clone();
-        auth.prepare_model_authorization(account_id)
+        if auth.region() != self.region {
+            return Err(GatewayError::Unauthorized(
+                "WorkBuddy 认证区域与模型区域不一致".into(),
+            ));
+        }
+        let authorization = auth
+            .prepare_model_authorization(account_id)
+            .await
+            .map_err(GatewayError::Unauthorized)?;
+        self.validate_authorization(&authorization)?;
+        Ok(authorization)
+    }
+
+    async fn current(&self, account: &str, captured: &ModelAuthorization) -> Result<()> {
+        let service = self.auth.read().clone();
+        service
+            .model_authorization_current(account, captured)
             .await
             .map_err(GatewayError::Unauthorized)
     }
 
+    fn validate_authorization(&self, auth: &ModelAuthorization) -> Result<()> {
+        if !auth.matches_region(self.region) {
+            return Err(GatewayError::Unauthorized(
+                "WorkBuddy 认证区域与模型区域不一致".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn catalog(&self, account_id: &str, auth: &ModelAuthorization) -> Result<Catalog> {
+        self.validate_authorization(auth)?;
         let key = format!(
-            "{account_id}\0{}\0{}",
-            auth.identity_hash, auth.credential_fingerprint
+            "{}\0{account_id}\0{}\0{}",
+            self.region.key(),
+            auth.identity_hash,
+            auth.source_fingerprint()
         );
         let slot = {
             let mut slots = self.catalogs.lock();
             if !slots.contains_key(&key) {
                 // Keep generations separate; obsolete credential generations never
                 // authorize a request with a new credential. Bound retained accounts.
-                let prefix = format!("{account_id}\0");
+                let prefix = format!("{}\0{account_id}\0", self.region.key());
                 slots.retain(|candidate, _| !candidate.starts_with(&prefix));
                 if slots.len() >= 64 {
                     if let Some(oldest_key) = slots.keys().next().cloned() {
@@ -141,6 +171,7 @@ impl WorkBuddyModelClient {
         // Per account/generation single-flight. Cancellation drops the guard and
         // leaves no poisoned cached result, so the next caller can discover again.
         let mut cached = slot.lock().await;
+        self.current(account_id, auth).await?;
         if let Some(value) = cached.as_ref().filter(|value| {
             value.loaded.elapsed()
                 < if value.catalog.is_some() {
@@ -157,6 +188,7 @@ impl WorkBuddyModelClient {
             });
         }
         let result = self.load_catalog(auth).await;
+        self.current(account_id, auth).await?;
         *cached = Some(CachedCatalog {
             loaded: Instant::now(),
             catalog: result.as_ref().ok().cloned(),
@@ -169,12 +201,13 @@ impl WorkBuddyModelClient {
     }
 
     async fn load_catalog(&self, auth: &ModelAuthorization) -> Result<Catalog> {
+        self.validate_authorization(auth)?;
         let response = self
             .client()?
             .get(format!("{}/v3/config", self.origin()))
             .headers(auth.headers.clone())
             .header(ACCEPT, "application/json")
-            .header(USER_AGENT, DESKTOP_UA)
+            .header(USER_AGENT, self.region.profile().user_agent)
             .timeout(CATALOG_TIMEOUT)
             .send()
             .await
@@ -189,7 +222,7 @@ impl WorkBuddyModelClient {
         }
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| protocol("目录不是有效 JSON"))?;
-        let catalog = parse_catalog(&value)?;
+        let catalog = parse_catalog_for_region(&value, self.region)?;
         Ok(catalog)
     }
 
@@ -214,6 +247,21 @@ impl WorkBuddyModelClient {
         upstream_model: &str,
         timeout: Duration,
     ) -> Result<EventStream> {
+        self.call_stream_with_entitlement(account_id, req, upstream_model, timeout, None)
+            .await
+    }
+
+    pub(crate) async fn call_stream_with_entitlement(
+        &self,
+        account_id: &str,
+        req: &ChatRequest,
+        upstream_model: &str,
+        timeout: Duration,
+        permit: Option<Arc<crate::entitlement::dispatch::Permit>>,
+    ) -> Result<EventStream> {
+        // Reject non-representable Responses fields before authorization or a
+        // catalog request. This transport has the Chat Completions effort field.
+        validate_request_controls(req)?;
         let started = tokio::time::Instant::now();
         let preparation = async {
             let auth = self.authorize(account_id).await?;
@@ -222,18 +270,62 @@ impl WorkBuddyModelClient {
                 GatewayError::ModelNotFound("WorkBuddy 账号目录中没有请求的模型".into())
             })?;
             let body = request_body(req, upstream_model, metadata)?;
-            let response = self
+            self.current(account_id, &auth).await?;
+            if let Some(permit) = &permit {
+                permit
+                    .before_send(
+                        auth.source_fingerprint(),
+                        &auth.identity_hash,
+                        upstream_model,
+                    )
+                    .await?;
+                // The dispatch commit can wait for SQLite. The same captured
+                // source, not a second preparation/refresh, must still be current.
+                self.current(account_id, &auth).await?;
+            }
+            let request = self
                 .client()?
                 .post(format!("{}/v2/chat/completions", self.origin()))
                 .headers(auth.headers.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .header(ACCEPT, "text/event-stream")
-                .header(USER_AGENT, DESKTOP_UA)
+                .header(USER_AGENT, self.region.profile().user_agent)
                 .timeout(timeout)
-                .json(&body)
+                .json(&body);
+            // Global's model protocol carries three conversation IDs. They are
+            // fresh gateway-owned correlation UUIDs, never borrowed client state,
+            // account/credential identifiers or entitlement evidence. Full message
+            // history remains in the body; CN's existing wire is unchanged.
+            let request = if self.region == WorkBuddyRegion::Global {
+                request
+                    .header("x-conversation-id", uuid::Uuid::new_v4().to_string())
+                    .header(
+                        "x-conversation-request-id",
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                    .header(
+                        "x-conversation-message-id",
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+            } else {
+                request
+            };
+            // Capture only existing non-secret identity facts after the final
+            // currentness fence; never copy the authorization object or headers.
+            super::subject_receipt::capture(
+                if self.region == WorkBuddyRegion::Cn {
+                    super::subject_receipt::Profile::WorkBuddyCn
+                } else {
+                    super::subject_receipt::Profile::WorkBuddyGlobal
+                },
+                account_id,
+                &auth.identity_hash,
+            );
+            let response = request
                 .send()
                 .await
                 .map_err(|error| network_error(error, "model"))?;
+            self.current(account_id, &auth).await?;
             let status = response.status().as_u16();
             let is_sse = response
                 .headers()
@@ -270,17 +362,47 @@ impl WorkBuddyModelClient {
             .map(|tokens| (tokens as usize).saturating_mul(128))
             .unwrap_or(OUTPUT_LIMIT)
             .clamp(FRAME_LIMIT, OUTPUT_LIMIT);
-        Ok(Box::pin(async_stream::try_stream! {
+        let service = self.auth.read().clone();
+        let account = account_id.to_owned();
+        let protected = permit.is_some();
+        let events = async_stream::try_stream! {
             let mut bytes = response.bytes_stream();
             let mut parser = SseParser::new(output_limit);
-            while let Some(chunk) = tokio::time::timeout_at(deadline, bytes.next()).await
-                .map_err(|_| GatewayError::Timeout("WorkBuddy 响应超时".into()))? {
-                let chunk = chunk.map_err(|error| network_error(error, &model))?;
-                for event in parser.feed(&chunk, false, &auth)? { yield event; }
-                if parser.done { return; }
+            loop {
+                let chunk = tokio::time::timeout_at(deadline, async {
+                    service.model_authorization_current(&account, &auth).await.map_err(GatewayError::Unauthorized)?;
+                    let next = bytes.next().await.transpose().map_err(|error| network_error(error, &model))?;
+                    service.model_authorization_current(&account, &auth).await.map_err(GatewayError::Unauthorized)?;
+                    Ok::<_,GatewayError>(next)
+                }).await.map_err(|_| GatewayError::Timeout("WorkBuddy 响应超时".into()))??;
+                let eof = chunk.is_none();
+                let decoded = match chunk {
+                    Some(chunk) => parser.feed(&chunk, false, &auth)?,
+                    None => parser.feed(&[], true, &auth)?,
+                };
+                for event in decoded {
+                    // One frame/chunk may contain several events separated by yields.
+                    tokio::time::timeout_at(deadline, service.model_authorization_current(&account, &auth))
+                        .await.map_err(|_| GatewayError::Timeout("WorkBuddy 响应超时".into()))?
+                        .map_err(GatewayError::Unauthorized)?;
+                    if let (Some(permit), UpstreamEvent::Done { usage, .. }) = (&permit, &event) {
+                        tokio::time::timeout_at(deadline, async {
+                            permit.settle_usage(usage.as_ref()).await?;
+                            service.model_authorization_current(&account, &auth).await.map_err(GatewayError::Unauthorized)
+                        }).await.map_err(|_| GatewayError::Timeout("WorkBuddy 结算等待超时".into()))??;
+                    }
+                    yield event;
+                }
+                if eof || parser.done { return; }
             }
-            for event in parser.feed(&[], true, &auth)? { yield event; }
-        }))
+        };
+        // A returned stream has already dispatched. Unknown errors/cancellation
+        // retain the reservation; ordinary non-entitlement policy is unchanged.
+        Ok(Box::pin(events.map(
+            move |result: Result<UpstreamEvent>| {
+                result.map_err(|error| if protected { error.no_replay() } else { error })
+            },
+        )))
     }
 
     pub(crate) async fn call(
@@ -290,8 +412,20 @@ impl WorkBuddyModelClient {
         upstream_model: &str,
         timeout: Duration,
     ) -> Result<ChatResponse> {
+        self.call_with_entitlement(account_id, req, upstream_model, timeout, None)
+            .await
+    }
+
+    pub(crate) async fn call_with_entitlement(
+        &self,
+        account_id: &str,
+        req: &ChatRequest,
+        upstream_model: &str,
+        timeout: Duration,
+        permit: Option<Arc<crate::entitlement::dispatch::Permit>>,
+    ) -> Result<ChatResponse> {
         collect(
-            self.call_stream(account_id, req, upstream_model, timeout)
+            self.call_stream_with_entitlement(account_id, req, upstream_model, timeout, permit)
                 .await?,
             upstream_model,
         )
@@ -425,6 +559,29 @@ fn validate_target_request(
 
 // Only bounded code and request-id metadata are retained. Messages/body are
 // deliberately not reflected, including when a service echoes a credential.
+// Keep a fixed diagnostic branch only when the same authoritative envelope
+// explicitly correlates the known policy code and message. Never infer a
+// specific cause from 11128 alone or retain arbitrary upstream message text.
+fn explicit_policy_rejection(value: &Value) -> bool {
+    let error = value.get("error").unwrap_or(value);
+    [
+        Some(error),
+        error.get("data"),
+        Some(value),
+        value.get("data"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|entry| entry.get("code").map(|code| (entry, code)))
+    .is_some_and(|(entry, code)| {
+        (code.as_i64() == Some(11128) || code.as_str() == Some("11128"))
+            && entry
+                .get("msg")
+                .and_then(Value::as_str)
+                .is_some_and(|msg| msg.trim().eq_ignore_ascii_case("request illegal"))
+    })
+}
+
 fn response_error(
     status: u16,
     model: &str,
@@ -461,6 +618,9 @@ fn response_error(
                     }
                 }
             }
+            if status == 400 && explicit_policy_rejection(&value) {
+                body.push_str("; rejection=policy_denied");
+            }
         }
     }
     GatewayError::Upstream {
@@ -483,7 +643,12 @@ fn business_error(value: &Value) -> bool {
             })
 }
 
+#[cfg(test)]
 fn parse_catalog(value: &Value) -> Result<Catalog> {
+    parse_catalog_for_region(value, WorkBuddyRegion::Global)
+}
+
+fn parse_catalog_for_region(value: &Value, region: WorkBuddyRegion) -> Result<Catalog> {
     if value.get("code").and_then(Value::as_i64) != Some(0) || business_error(value) {
         return Err(protocol("目录业务响应失败"));
     }
@@ -605,7 +770,7 @@ fn parse_catalog(value: &Value) -> Result<Catalog> {
     }
     Ok(Catalog {
         response: DiscoveryResponse {
-            base_url: ORIGIN.into(),
+            base_url: WorkBuddyAuth::issuer_for_region(region).into(),
             models: models.into_values().collect(),
             warnings: vec![
                 "WorkBuddy credit 为积分单位，目录倍率不代表货币价格或免费承诺。".into(),
@@ -615,7 +780,59 @@ fn parse_catalog(value: &Value) -> Result<Catalog> {
     })
 }
 
+fn effort_string(value: &Value) -> Result<&str> {
+    value
+        .as_str()
+        .filter(|effort| !effort.is_empty())
+        .ok_or_else(|| protocol("reasoning effort 必须是非空字符串"))
+}
+
+fn requested_effort(req: &ChatRequest) -> Result<Option<&str>> {
+    let thinking = req.thinking.as_ref();
+    let mut resolved = None;
+    for value in [
+        thinking.and_then(|thinking| thinking.get("effort")),
+        thinking.and_then(|thinking| thinking.get("reasoning_effort")),
+        req.extra
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort")),
+        req.extra.get("reasoning_effort"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let effort = effort_string(value)?;
+        if resolved.is_some_and(|previous| previous != effort) {
+            return Err(protocol("请求包含冲突的 reasoning effort"));
+        }
+        resolved = Some(effort);
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn validate_request_controls(req: &ChatRequest) -> Result<()> {
+    crate::protocol::reasoning::validate(req, crate::domain::Dialect::OpenAI, true)?;
+    if req.extra.contains_key("reasoning") {
+        let reject = || GatewayError::RequestControlUnavailable {
+            reason: "WorkBuddy reasoning effort 载体无效或相互冲突",
+        };
+        let effort = requested_effort(req).map_err(|_| reject())?;
+        let kind = req
+            .thinking
+            .as_ref()
+            .and_then(|v| v.get("type"))
+            .and_then(Value::as_str);
+        if kind == Some("disabled") && effort.is_some_and(|v| v != "none")
+            || kind == Some("enabled") && effort == Some("none")
+        {
+            return Err(reject());
+        }
+    }
+    Ok(())
+}
+
 fn request_body(req: &ChatRequest, model: &str, metadata: &Value) -> Result<Value> {
+    validate_request_controls(req)?;
     if req.max_tokens.is_some_and(|requested| {
         metadata
             .get("maxOutputTokens")
@@ -689,32 +906,35 @@ fn request_body(req: &ChatRequest, model: &str, metadata: &Value) -> Result<Valu
         }
         body["tool_choice"] = normalized;
     }
-    if let Some(thinking) = &req.thinking {
-        if let Some(effort) = thinking
-            .get("effort")
-            .or_else(|| thinking.get("reasoning_effort"))
-            .and_then(Value::as_str)
-        {
-            let reasoning = metadata.get("reasoning");
-            let supported = reasoning
-                .and_then(|reasoning| reasoning.get("supportedEfforts"))
-                .and_then(Value::as_array)
-                .is_some_and(|efforts| {
-                    efforts
-                        .iter()
-                        .any(|candidate| candidate.as_str() == Some(effort))
-                })
-                || reasoning
-                    .and_then(|reasoning| reasoning.get("effort"))
-                    .and_then(Value::as_str)
-                    == Some(effort);
-            if !supported {
-                return Err(protocol("目录没有声明请求的 reasoning effort"));
-            }
-            body["reasoning_effort"] = json!(effort);
+    if let Some(effort) = requested_effort(req)? {
+        body["reasoning_effort"] = json!(effort);
+        if req.thinking.as_ref().is_some_and(|thinking| {
+            thinking.get("effort").is_some() || thinking.get("reasoning_effort").is_some()
+        }) {
+            // Preserve the established typed mapping, including removal of its opaque fields.
             body.as_object_mut()
                 .ok_or_else(|| protocol("请求体无效"))?
                 .remove("thinking");
+        }
+    }
+    // Validate the final wire field with the same catalog rule for every carrier.
+    if let Some(value) = body.get("reasoning_effort") {
+        let effort = effort_string(value)?;
+        let reasoning = metadata.get("reasoning");
+        let supported = reasoning
+            .and_then(|reasoning| reasoning.get("supportedEfforts"))
+            .and_then(Value::as_array)
+            .is_some_and(|efforts| {
+                efforts
+                    .iter()
+                    .any(|candidate| candidate.as_str() == Some(effort))
+            })
+            || reasoning
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str)
+                == Some(effort);
+        if !supported {
+            return Err(protocol("目录没有声明请求的 reasoning effort"));
         }
     }
     validate_target_request(req, &body, metadata, added_system)?;
@@ -1142,6 +1362,7 @@ impl SseParser {
 
 async fn collect(mut stream: EventStream, model: &str) -> Result<ChatResponse> {
     let mut response = ChatResponse {
+        reported_usage_evidence: Default::default(),
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         model: model.into(),
         transport: Some("workbuddy-http".into()),
@@ -1175,6 +1396,8 @@ async fn collect(mut stream: EventStream, model: &str) -> Result<ChatResponse> {
                 }
                 done = true;
             }
+            // Display-only evidence never changes this legacy collector/accounting.
+            UpstreamEvent::UsageObservation(_) => {}
             UpstreamEvent::Ping => {}
         }
     }
@@ -1201,9 +1424,11 @@ mod tests {
         bearer.set_sensitive(true);
         headers.insert(reqwest::header::AUTHORIZATION, bearer);
         ModelAuthorization {
+            region: WorkBuddyRegion::Global,
             headers,
             identity_hash: "fixture-identity-sha256".into(),
             credential_fingerprint: "fixture-generation-sha256".into(),
+            source: None,
         }
     }
 
@@ -1257,6 +1482,350 @@ mod tests {
             "reasoning":{"supportedEfforts":["low","high"]}})
     }
 
+    #[test]
+    fn effort_extra_undeclared_is_rejected_before_model_post() {
+        let mut req = request();
+        req.extra.insert(
+            "reasoning_effort".into(),
+            json!("fixture-undeclared-secret"),
+        );
+        assert!(
+            request_body(&req, "m", &model("m")).is_err(),
+            "undeclared extra effort must be rejected before the model POST"
+        );
+    }
+
+    #[test]
+    fn workbuddy_responses_reasoning_detects_cross_carrier_conflicts() {
+        let mut req = request();
+        req.extra
+            .insert("reasoning".into(), json!({"effort":"high"}));
+        assert_eq!(
+            request_body(&req, "m", &model("m")).unwrap()["reasoning_effort"],
+            "high"
+        );
+        req.thinking = Some(json!({"effort":"low"}));
+        let error = request_body(&req, "m", &model("m")).unwrap_err();
+        assert!(matches!(
+            error,
+            GatewayError::RequestControlUnavailable { .. }
+        ));
+        assert_eq!(error.http_status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(!error.retryable());
+    }
+
+    #[tokio::test]
+    async fn workbuddy_responses_reasoning_summary_rejected_before_authorization() {
+        let server = http_server().await;
+        for stream in [false, true] {
+            let mut req = request();
+            req.extra.insert(
+                "reasoning".into(),
+                json!({"effort":"high","summary":"auto"}),
+            );
+            let error = if stream {
+                server
+                    .client
+                    .call_stream(
+                        "fixture-account-a",
+                        &req,
+                        "fixture-good",
+                        Duration::from_secs(3),
+                    )
+                    .await
+                    .map(|_| ())
+                    .expect_err("local summary rejection")
+            } else {
+                server
+                    .client
+                    .call(
+                        "fixture-account-a",
+                        &req,
+                        "fixture-good",
+                        Duration::from_secs(3),
+                    )
+                    .await
+                    .map(|_| ())
+                    .expect_err("local summary rejection")
+            };
+            assert!(matches!(
+                error,
+                GatewayError::RequestControlUnavailable { .. }
+            ));
+            assert_eq!(error.http_status(), reqwest::StatusCode::BAD_REQUEST);
+            assert!(!error.retryable());
+            assert!(
+                server.fixture.captured.lock().is_empty(),
+                "no authorization/catalog/model HTTP for an unrepresentable control"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_account_review_workbuddy_conflict_zero_authorization_http() {
+        let server = http_server().await;
+        for stream in [false, true] {
+            let mut req = request();
+            req.extra
+                .insert("reasoning".into(), json!({"effort":"high"}));
+            req.thinking = Some(json!({"effort":"low"}));
+            let error = if stream {
+                server
+                    .client
+                    .call_stream(
+                        "fixture-account-a",
+                        &req,
+                        "fixture-good",
+                        Duration::from_secs(3),
+                    )
+                    .await
+                    .map(|_| ())
+                    .expect_err("local conflict")
+            } else {
+                server
+                    .client
+                    .call(
+                        "fixture-account-a",
+                        &req,
+                        "fixture-good",
+                        Duration::from_secs(3),
+                    )
+                    .await
+                    .map(|_| ())
+                    .expect_err("local conflict")
+            };
+            assert!(matches!(
+                error,
+                GatewayError::RequestControlUnavailable { .. }
+            ));
+            assert_eq!(error.http_status(), reqwest::StatusCode::BAD_REQUEST);
+            assert!(!error.retryable());
+            assert!(server.fixture.captured.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_workbuddy_effort_reaches_actual_catalog_validated_http() {
+        use futures_util::StreamExt;
+        let server = http_server().await;
+        for stream in [false, true] {
+            let mut req = request();
+            req.messages = vec![crate::domain::Message::user("owned reasoning input")];
+            req.tools = None;
+            req.tool_choice = None;
+            req.thinking = None;
+            req.extra.clear();
+            req.extra
+                .insert("reasoning".into(), json!({"effort":"high"}));
+            if stream {
+                let mut events = server
+                    .client
+                    .call_stream(
+                        "fixture-account-a",
+                        &req,
+                        "fixture-good",
+                        Duration::from_secs(3),
+                    )
+                    .await
+                    .unwrap();
+                while let Some(event) = events.next().await {
+                    event.unwrap();
+                }
+            } else {
+                server
+                    .client
+                    .call(
+                        "fixture-account-a",
+                        &req,
+                        "fixture-good",
+                        Duration::from_secs(3),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let captured = server.fixture.captured.lock();
+        let posts: Vec<_> = captured
+            .iter()
+            .filter(|capture| capture.method == "POST")
+            .collect();
+        assert_eq!(posts.len(), 2);
+        for post in posts {
+            let body = post.body.as_ref().unwrap();
+            assert_eq!(body["reasoning_effort"], "high");
+            assert!(body.get("reasoning").is_none());
+            assert!(body.get("thinking").is_none());
+        }
+    }
+
+    fn effort_request(carrier: usize, value: Value) -> ChatRequest {
+        let mut req = request();
+        match carrier {
+            0 => req.thinking = Some(json!({"effort":value})),
+            1 => req.thinking = Some(json!({"reasoning_effort":value})),
+            2 => {
+                req.extra.insert("reasoning_effort".into(), value);
+            }
+            _ => unreachable!(),
+        }
+        req
+    }
+
+    fn assert_effort_error(req: &ChatRequest, metadata: &Value, message: &str) {
+        match request_body(req, "fixture-private-model", metadata).unwrap_err() {
+            GatewayError::Upstream {
+                provider,
+                model,
+                status,
+                body,
+            } => {
+                assert_eq!(provider, "WorkBuddy");
+                assert_eq!(model, "model");
+                assert_eq!(status, 502);
+                assert_eq!(body, format!("WorkBuddy 协议错误：{message}"));
+            }
+            error => panic!("unexpected error category: {error}"),
+        }
+    }
+
+    #[test]
+    fn effort_all_three_carriers_use_exact_catalog_and_nonempty_strings() {
+        for carrier in 0..3 {
+            for value in [json!("low"), json!("high")] {
+                let req = effort_request(carrier, value.clone());
+                let body = request_body(&req, "m", &model("m")).unwrap();
+                assert_eq!(body["reasoning_effort"], value);
+                assert!(body.get("thinking").is_none());
+            }
+            for value in [
+                json!(""),
+                Value::Null,
+                json!(false),
+                json!(7),
+                json!([]),
+                json!({}),
+            ] {
+                assert_effort_error(
+                    &effort_request(carrier, value),
+                    &model("m"),
+                    "reasoning effort 必须是非空字符串",
+                );
+            }
+            for value in ["fixture-private-effort", "HIGH", " high", "high ", " "] {
+                let req = effort_request(carrier, json!(value));
+                assert_effort_error(&req, &model("m"), "目录没有声明请求的 reasoning effort");
+                let mut exact = model("m");
+                exact["reasoning"] = json!({"supportedEfforts":[value]});
+                assert_eq!(
+                    request_body(&req, "m", &exact).unwrap()["reasoning_effort"],
+                    value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effort_same_values_deduplicate_and_every_conflicting_alias_is_rejected() {
+        for first in ["low", "high"] {
+            let other = if first == "low" { "high" } else { "low" };
+            for thinking in [
+                json!({"effort":first,"reasoning_effort":first,"budget_tokens":4321}),
+                json!({"reasoning_effort":first,"effort":first,"opaque":true}),
+            ] {
+                let mut req = request();
+                req.thinking = Some(thinking);
+                req.extra.insert("reasoning_effort".into(), json!(first));
+                let body = request_body(&req, "m", &model("m")).unwrap();
+                assert_eq!(body["reasoning_effort"], first);
+                assert!(body.get("thinking").is_none());
+            }
+            for thinking in [
+                json!({"effort":first,"reasoning_effort":other}),
+                json!({"reasoning_effort":other,"effort":first}),
+            ] {
+                let mut req = request();
+                req.thinking = Some(thinking);
+                assert_effort_error(&req, &model("m"), "请求包含冲突的 reasoning effort");
+            }
+            for carrier in 0..2 {
+                let mut req = effort_request(carrier, json!(first));
+                req.extra.insert("reasoning_effort".into(), json!(other));
+                assert_effort_error(&req, &model("m"), "请求包含冲突的 reasoning effort");
+            }
+        }
+        for thinking in [
+            json!({"effort":null,"reasoning_effort":"high"}),
+            json!({"effort":"high","reasoning_effort":null}),
+        ] {
+            let mut req = request();
+            req.thinking = Some(thinking);
+            assert_effort_error(&req, &model("m"), "reasoning effort 必须是非空字符串");
+        }
+    }
+
+    #[test]
+    fn effort_catalog_malformed_entries_keep_exact_or_singleton_fallback() {
+        for carrier in 0..3 {
+            let req = effort_request(carrier, json!("high"));
+            for reasoning in [
+                Value::Null,
+                json!({}),
+                json!(true),
+                json!({"supportedEfforts":"high"}),
+                json!({"supportedEfforts":[null,7,{},"low"]}),
+                json!({"effort":7}),
+            ] {
+                let mut metadata = model("m");
+                metadata["reasoning"] = reasoning;
+                metadata["supports_thinking"] = json!(true);
+                assert_effort_error(&req, &metadata, "目录没有声明请求的 reasoning effort");
+            }
+            for reasoning in [
+                json!({"effort":"high"}),
+                json!({"supportedEfforts":"malformed","effort":"high"}),
+                json!({"supportedEfforts":["low"],"effort":"high"}),
+                json!({"supportedEfforts":[null,7,{},"high"],"effort":null}),
+            ] {
+                let mut metadata = model("m");
+                metadata["reasoning"] = reasoning;
+                assert_eq!(
+                    request_body(&req, "m", &metadata).unwrap()["reasoning_effort"],
+                    "high"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effort_legacy_serialized_bodies_and_opaque_thinking_are_preserved() {
+        let mut req = request();
+        assert_eq!(serde_json::to_vec(&request_body(&req,"m",&model("m")).unwrap()).unwrap(),
+            br#"{"messages":[{"content":"fixture system","role":"system"},{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"{}","name":"past"},"id":"old-tool","type":"function"}]},{"content":"past result","role":"tool","tool_call_id":"old-tool"},{"content":[{"text":"fixture question","type":"text"},{"image_url":{"detail":"low","url":"data:image/png;base64,fixture-image"},"type":"image_url"},{"input_audio":{"data":"fixture-audio","format":"wav"},"type":"input_audio"},{"type":"video_url","video_url":{"url":"https://example.invalid/fixture-video"}}],"role":"user"}],"model":"m","response_format":{"type":"json_object"},"stream":true,"stream_options":{"fixture_option":true,"include_usage":true},"tool_choice":"lookup","tools":[{"function":{"name":"lookup","parameters":{"properties":{},"type":"object"}},"type":"function"}]}"#);
+        req.thinking = Some(json!({"effort":"high","opaque_budget":4321}));
+        assert_eq!(serde_json::to_vec(&request_body(&req,"m",&model("m")).unwrap()).unwrap(),
+            br#"{"messages":[{"content":"fixture system","role":"system"},{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"{}","name":"past"},"id":"old-tool","type":"function"}]},{"content":"past result","role":"tool","tool_call_id":"old-tool"},{"content":[{"text":"fixture question","type":"text"},{"image_url":{"detail":"low","url":"data:image/png;base64,fixture-image"},"type":"image_url"},{"input_audio":{"data":"fixture-audio","format":"wav"},"type":"input_audio"},{"type":"video_url","video_url":{"url":"https://example.invalid/fixture-video"}}],"role":"user"}],"model":"m","reasoning_effort":"high","response_format":{"type":"json_object"},"stream":true,"stream_options":{"fixture_option":true,"include_usage":true},"tool_choice":"lookup","tools":[{"function":{"name":"lookup","parameters":{"properties":{},"type":"object"}},"type":"function"}]}"#);
+        req.thinking = None;
+        let original = request_body(&req, "m", &model("m")).unwrap();
+        for opaque in [
+            json!({"type":"enabled","budget_tokens":4321}),
+            json!({"opaque":"fixture"}),
+            json!(true),
+            json!(["high"]),
+            Value::Null,
+        ] {
+            req.thinking = Some(opaque.clone());
+            let mut expected = original.clone();
+            expected["thinking"] = opaque;
+            let mut metadata = model("m");
+            metadata.as_object_mut().unwrap().remove("reasoning");
+            assert_eq!(request_body(&req, "m", &metadata).unwrap(), expected);
+            req.extra.insert("reasoning_effort".into(), json!("high"));
+            expected["reasoning_effort"] = json!("high");
+            assert_eq!(request_body(&req, "m", &model("m")).unwrap(), expected);
+            req.extra.remove("reasoning_effort");
+        }
+    }
+
     fn request() -> ChatRequest {
         serde_json::from_value(json!({"model":"alias", "stream":false,
             "messages":[{"role":"system","content":"fixture system"},
@@ -1288,7 +1857,7 @@ mod tests {
         assert_eq!(body["stream_options"]["fixture_option"], true);
         assert!(body.get("headers").is_none());
         assert!(body.get("base_url").is_none());
-        assert_eq!(ORIGIN, "https://www.workbuddy.ai");
+        assert_eq!(WorkBuddyAuth::issuer(), "https://www.workbuddy.ai");
         assert_eq!(DESKTOP_UA, "WorkBuddy/5.7.6");
     }
 
@@ -1611,6 +2180,66 @@ mod tests {
     }
 
     #[test]
+    fn workbuddy_policy_reason_requires_correlated_exact_code_and_message_without_reflection() {
+        let auth = authorization();
+        for value in [
+            json!({"code":11128,"msg":"request illegal","request_id":"fixture-private-id"}),
+            json!({"error":{"code":"11128","msg":" request illegal "}}),
+            json!({"data":{"code":11128,"msg":"request illegal"}}),
+            json!({"error":{"data":{"code":11128,"msg":"request illegal"}}}),
+        ] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let error = response_error(400, "fixture-model", &bytes, &auth).no_replay();
+            let public = error.to_openai_error();
+            assert_eq!(public["error"]["code"], "workbuddy_11128");
+            assert_eq!(public["error"]["diagnostic"], "policy_denied");
+            assert!(public["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("策略"));
+            assert!(!public.to_string().contains("fixture-private-id"));
+            assert!(!error.retryable());
+        }
+        for (status, value) in [
+            (
+                400,
+                json!({"code":11128,"msg":"first message role must be system"}),
+            ),
+            (400, json!({"code":11133,"msg":"request illegal"})),
+            (400, json!({"code":"11128suffix","msg":"request illegal"})),
+            (
+                400,
+                json!({"code":11128,"msg":format!("request illegal {FIXTURE_TOKEN}")}),
+            ),
+            (
+                400,
+                json!({"code":11128,"msg":"request illegal","debug":FIXTURE_TOKEN}),
+            ),
+            (
+                400,
+                json!({"code":11128,"msg":"request illegal","error":{"code":11133,"msg":"request illegal"}}),
+            ),
+            (
+                400,
+                json!({"code":11128,"msg":"request illegal","error":{"code":11128,"msg":"other rejection"}}),
+            ),
+            (401, json!({"code":11128,"msg":"request illegal"})),
+            (502, json!({"code":11128,"msg":"request illegal"})),
+        ] {
+            let public = response_error(
+                status,
+                "fixture-model",
+                &serde_json::to_vec(&value).unwrap(),
+                &auth,
+            )
+            .no_replay()
+            .to_openai_error();
+            assert!(public["error"]["diagnostic"].is_null());
+            assert!(!public.to_string().contains(FIXTURE_TOKEN));
+        }
+    }
+
+    #[test]
     fn workbuddy_error_metadata_does_not_reflect_plain_or_escaped_credential() {
         let auth = authorization();
         let bytes=serde_json::to_vec(&json!({"error":{"message":FIXTURE_TOKEN,"code":FIXTURE_TOKEN,"request_id":FIXTURE_TOKEN}})).unwrap();
@@ -1636,6 +2265,9 @@ mod tests {
     struct HttpFixture {
         captured: Arc<parking_lot::Mutex<Vec<CapturedRequest>>>,
         catalog_models: Arc<parking_lot::Mutex<Vec<Value>>>,
+        hold_catalog: Arc<std::sync::atomic::AtomicBool>,
+        catalog_entered: Arc<tokio::sync::Notify>,
+        catalog_release: Arc<tokio::sync::Notify>,
     }
 
     // Deliberately no Debug: captured headers and bodies remain in fixture memory.
@@ -1667,9 +2299,28 @@ mod tests {
             headers,
             body: None,
         });
+        if fixture
+            .hold_catalog
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            fixture.catalog_entered.notify_one();
+            fixture.catalog_release.notified().await;
+        }
         // Give concurrent callers a deterministic opportunity to reach single-flight.
         tokio::time::sleep(Duration::from_millis(10)).await;
         axum::Json(json!({"code":0,"data":{"models":fixture.catalog_models.lock().clone()}}))
+    }
+
+    async fn http_unexpected(
+        axum::extract::State(fixture): axum::extract::State<HttpFixture>,
+        request: axum::extract::Request,
+    ) -> axum::http::StatusCode {
+        fixture.captured.lock().push(CapturedRequest {
+            method: "UNEXPECTED",
+            headers: request.headers().clone(),
+            body: Some(json!({"path": request.uri().path()})),
+        });
+        axum::http::StatusCode::NOT_FOUND
     }
 
     async fn http_model(
@@ -1749,6 +2400,10 @@ mod tests {
     }
 
     async fn http_server() -> HttpServer {
+        http_server_for_region(WorkBuddyRegion::Global).await
+    }
+
+    async fn http_server_for_region(region: WorkBuddyRegion) -> HttpServer {
         use base64::Engine;
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
@@ -1760,6 +2415,9 @@ mod tests {
             }
         });
         let fixture = HttpFixture {
+            hold_catalog: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalog_entered: Arc::new(tokio::sync::Notify::new()),
+            catalog_release: Arc::new(tokio::sync::Notify::new()),
             captured: Arc::new(parking_lot::Mutex::new(Vec::new())),
             catalog_models: Arc::new(parking_lot::Mutex::new(
                 [
@@ -1780,12 +2438,14 @@ mod tests {
         let router = axum::Router::new()
             .route("/v3/config", axum::routing::get(http_catalog))
             .route("/v2/chat/completions", axum::routing::post(http_model))
+            .fallback(http_unexpected)
             .with_state(fixture.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
         let db = crate::db::Db::connect_in_memory().await.unwrap();
-        let auth = WorkBuddyAuth::with_test_origin(db.pool().clone(), origin.clone());
+        let auth =
+            WorkBuddyAuth::with_test_origin_for_region(db.pool().clone(), origin.clone(), region);
         auth.test_seed_account(
             "fixture-account-a",
             "1001",
@@ -1813,6 +2473,122 @@ mod tests {
             client,
             task,
         }
+    }
+
+    #[tokio::test]
+    async fn cn_model_and_catalog_use_fixed_profile_and_retain_region_after_proxy_change() {
+        let server = http_server_for_region(WorkBuddyRegion::Cn).await;
+        let discovery = server
+            .client
+            .discover_models("fixture-account-a")
+            .await
+            .unwrap();
+        assert_eq!(discovery.base_url, "https://copilot.tencent.com");
+        for _ in 0..2 {
+            let response = server
+                .client
+                .call(
+                    "fixture-account-a",
+                    &request(),
+                    "fixture-good",
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.content, "中文回答");
+        }
+        server.client.set_proxy(None);
+        let response = server
+            .client
+            .call(
+                "fixture-account-a",
+                &request(),
+                "fixture-good",
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content, "中文回答");
+        let captured = server.fixture.captured.lock();
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|entry| entry.method == "GET")
+                .count(),
+            1
+        );
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|entry| entry.method == "POST")
+                .count(),
+            3
+        );
+        for entry in captured.iter() {
+            assert_eq!(entry.headers["authorization"], "Bearer fixture-a-access");
+            assert_eq!(entry.headers["x-user-id"], "1001");
+            assert_eq!(entry.headers["x-domain"], "https://copilot.tencent.com");
+            assert_eq!(entry.headers["origin"], "https://www.codebuddy.cn");
+            assert_eq!(entry.headers["referer"], "https://www.codebuddy.cn/");
+            assert_eq!(entry.headers["user-agent"], "CLI/2.143.1 CodeBuddy/2.143.1");
+            assert_eq!(entry.headers["x-client-id"], "codebuddy-cli");
+            assert_eq!(entry.headers["x-client-version"], "2.143.1");
+            assert_eq!(entry.headers["x-product"], "SaaS");
+            assert!(!entry.headers.contains_key("x-refresh-token"));
+            if let Some(body) = &entry.body {
+                assert_eq!(body["model"], "fixture-good");
+                assert_eq!(body["stream"], true);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cn_transport_rejects_global_authorization_and_auth_instance_before_http() {
+        let cn = http_server_for_region(WorkBuddyRegion::Cn).await;
+        let global = http_server().await;
+        let global_authorization = authorization();
+        assert!(cn.client.load_catalog(&global_authorization).await.is_err());
+        assert!(cn
+            .client
+            .catalog("fixture-account-a", &global_authorization)
+            .await
+            .is_err());
+        assert!(cn.client.catalogs.lock().is_empty());
+        let mut mixed_domain = cn.client.authorize("fixture-account-a").await.unwrap();
+        mixed_domain.headers.insert(
+            "x-domain",
+            reqwest::header::HeaderValue::from_static("https://www.workbuddy.ai"),
+        );
+        assert!(cn.client.load_catalog(&mixed_domain).await.is_err());
+        let mut mixed_origin = cn.client.authorize("fixture-account-a").await.unwrap();
+        mixed_origin.headers.insert(
+            "origin",
+            reqwest::header::HeaderValue::from_static("https://www.workbuddy.ai"),
+        );
+        assert!(cn
+            .client
+            .catalog("fixture-account-a", &mixed_origin)
+            .await
+            .is_err());
+        assert!(cn.client.catalogs.lock().is_empty());
+        *cn.client.auth.write() = global.client.auth.read().clone();
+        assert!(cn
+            .client
+            .discover_models("fixture-account-a")
+            .await
+            .is_err());
+        assert!(cn
+            .client
+            .call(
+                "fixture-account-a",
+                &request(),
+                "fixture-good",
+                Duration::from_secs(5)
+            )
+            .await
+            .is_err());
+        assert!(cn.fixture.captured.lock().is_empty());
+        assert!(global.fixture.captured.lock().is_empty());
     }
 
     #[tokio::test]
@@ -1958,6 +2734,69 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn workbuddy_global_dispatch_has_owned_conversation_ids_without_changing_cn() {
+        for region in [WorkBuddyRegion::Global, WorkBuddyRegion::Cn] {
+            let server = http_server_for_region(region).await;
+            let req = request();
+            for _ in 0..2 {
+                let response = server
+                    .client
+                    .call(
+                        "fixture-account-a",
+                        &req,
+                        "fixture-good",
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.content, "中文回答");
+                assert_eq!(response.usage.unwrap().total_tokens, 30);
+            }
+            let capture = server.fixture.captured.lock();
+            assert_eq!(capture.iter().filter(|r| r.method == "GET").count(), 1);
+            let posts: Vec<_> = capture.iter().filter(|r| r.method == "POST").collect();
+            assert_eq!(posts.len(), 2, "no retry or extra dispatch");
+            let mut ids = HashSet::new();
+            for post in posts {
+                for key in [
+                    "x-conversation-id",
+                    "x-conversation-request-id",
+                    "x-conversation-message-id",
+                ] {
+                    if region == WorkBuddyRegion::Global {
+                        let id = post
+                            .headers
+                            .get(key)
+                            .expect("Global model POST needs owned conversation IDs")
+                            .to_str()
+                            .unwrap();
+                        assert_eq!(uuid::Uuid::parse_str(id).unwrap().get_version_num(), 4);
+                        assert!(
+                            ids.insert(id.to_owned()),
+                            "IDs must be fresh, not credentials or another dispatch's identity"
+                        );
+                    } else {
+                        assert!(!post.headers.contains_key(key), "CN wire remains unchanged");
+                    }
+                }
+                assert_eq!(post.headers["authorization"], "Bearer fixture-a-access");
+                assert_eq!(post.headers["x-user-id"], "1001");
+                assert_eq!(
+                    post.headers["user-agent"],
+                    match region {
+                        WorkBuddyRegion::Global => DESKTOP_UA,
+                        WorkBuddyRegion::Cn => "CLI/2.143.1 CodeBuddy/2.143.1",
+                    }
+                );
+                let body = post.body.as_ref().unwrap();
+                assert_eq!(body["model"], "fixture-good");
+                assert_eq!(body["stream_options"]["include_usage"], true);
+                assert!(body.get("headers").is_none());
+            }
+        }
     }
 
     #[tokio::test]
@@ -2350,5 +3189,121 @@ mod tests {
                 .count(),
             0
         );
+    }
+    fn assert_snapshot_requests(fixture: &HttpFixture, gets: usize, posts: usize) {
+        let calls = fixture.captured.lock();
+        assert_eq!(calls.iter().filter(|r| r.method == "GET").count(), gets);
+        assert_eq!(calls.iter().filter(|r| r.method == "POST").count(), posts);
+        assert_eq!(
+            calls.iter().filter(|r| r.method == "UNEXPECTED").count(),
+            0,
+            "snapshot fences cannot add identity/refresh/other HTTP"
+        );
+    }
+    #[tokio::test]
+    async fn workbuddy_snapshot_healthy_stream_preserves_terminal_without_extra_requests() {
+        for region in [WorkBuddyRegion::Global, WorkBuddyRegion::Cn] {
+            let server = http_server_for_region(region).await;
+            let mut events = server
+                .client
+                .call_stream(
+                    "fixture-account-a",
+                    &request(),
+                    "fixture-good",
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            let mut content = String::new();
+            let mut done = 0;
+            while let Some(event) = events.next().await {
+                match event.unwrap() {
+                    UpstreamEvent::Delta(text) => content.push_str(&text),
+                    UpstreamEvent::Done { .. } => done += 1,
+                    _ => (),
+                }
+            }
+            assert_eq!(content, "中文回答");
+            assert_eq!(done, 1);
+            assert_snapshot_requests(&server.fixture, 1, 1);
+        }
+    }
+    #[tokio::test]
+    async fn workbuddy_snapshot_catalog_wait_rotation_rejects_before_model_post() {
+        for region in [WorkBuddyRegion::Global, WorkBuddyRegion::Cn] {
+            let server = Arc::new(http_server_for_region(region).await);
+            server
+                .fixture
+                .hold_catalog
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let running = server.clone();
+            let result = tokio::spawn(async move {
+                running
+                    .client
+                    .call(
+                        "fixture-account-a",
+                        &request(),
+                        "fixture-good",
+                        Duration::from_secs(5),
+                    )
+                    .await
+            });
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                server.fixture.catalog_entered.notified(),
+            )
+            .await
+            .unwrap();
+            let auth = server.client.auth.read().clone();
+            auth.test_seed_account(
+                "fixture-account-a",
+                "1001",
+                "fixture-rotated-access",
+                "fixture-rotated-refresh",
+            )
+            .await;
+            server.fixture.catalog_release.notify_one();
+            let error = result
+                .await
+                .unwrap()
+                .map(|_| ())
+                .expect_err("saved source changed during catalog await; model POST forbidden");
+            assert_eq!(error.http_status(), axum::http::StatusCode::UNAUTHORIZED);
+            assert!(!error.retryable());
+            assert_snapshot_requests(&server.fixture, 1, 0);
+        }
+    }
+    #[tokio::test]
+    async fn workbuddy_snapshot_rotation_between_decoded_events_blocks_next_publication() {
+        for region in [WorkBuddyRegion::Global, WorkBuddyRegion::Cn] {
+            let server = http_server_for_region(region).await;
+            let mut events = server
+                .client
+                .call_stream(
+                    "fixture-account-a",
+                    &request(),
+                    "fixture-good",
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            let first = events.next().await.unwrap().unwrap();
+            assert!(matches!(first,UpstreamEvent::ReasoningDelta(ref text) if text=="思考中文"));
+            let auth = server.client.auth.read().clone();
+            auth.test_seed_account(
+                "fixture-account-a",
+                "1001",
+                "fixture-rotated-access",
+                "fixture-rotated-refresh",
+            )
+            .await;
+            let error = events.next().await.unwrap().expect_err(
+                "buffered decoded events cannot outlive captured credential generation",
+            );
+            assert_eq!(error.http_status(), axum::http::StatusCode::UNAUTHORIZED);
+            assert!(!error.retryable());
+            assert!(events.next().await.is_none());
+            assert_snapshot_requests(&server.fixture, 1, 1);
+        }
     }
 }

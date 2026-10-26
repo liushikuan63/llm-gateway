@@ -586,3 +586,175 @@ async fn live_sensenova_catalog_is_read_only() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn catalog_price_tiers_cannot_hide_paid_or_unknown_billing_behind_zero_base_prices() {
+    let app = Router::new().route(
+        "/v1/models",
+        get(|| async {
+            Json(json!({"data": [
+                {"id": "fully-free", "pricing": {"prompt": "0", "completion": "0", "overrides": [
+                    {"min_prompt_tokens": 4096, "prompt": "0", "completion": "0"}
+                ]}},
+                {"id": "paid-tier", "pricing": {"prompt": "0", "completion": "0", "overrides": [
+                    {"min_prompt_tokens": 4096, "prompt": "0", "completion": "0.0005"}
+                ]}},
+                {"id": "unknown-tier", "pricing": {"prompt": "0", "completion": "0", "overrides": [
+                    {"min_prompt_tokens": 4096, "prompt": "0"}
+                ]}}
+            ]}))
+        }),
+    );
+    let (base, task) = spawn(app).await;
+    let response = discover(
+        &input(Dialect::OpenAI, format!("{base}/v1"), ""),
+        None,
+        None,
+    )
+    .await;
+    task.abort();
+    let response = response.unwrap();
+    let model = |id: &str| response.models.iter().find(|model| model.id == id).unwrap();
+    assert_eq!(
+        model("fully-free").is_free,
+        Some(true),
+        "explicitly zero tiers remain a positive control"
+    );
+    assert_eq!(model("paid-tier").price.as_ref().unwrap().tiers.len(), 1);
+    assert_eq!(
+        model("paid-tier").is_free,
+        Some(false),
+        "a nonzero tier is a real charge even when base prices are zero"
+    );
+    assert_eq!(
+        model("unknown-tier").is_free,
+        None,
+        "discarded or incomplete tiers cannot prove free"
+    );
+}
+
+#[tokio::test]
+async fn catalog_discarded_rows_are_visible_and_clean_observations_remain_warning_free() {
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data": [{"id": "kept"}, {"name": "missing-id"}, null]})) }),
+        )
+        .route(
+            "/clean/v1/models",
+            get(|| async { Json(json!({"data": [{"id": "kept"}]})) }),
+        );
+    let (base, task) = spawn(app).await;
+    let partial = discover(
+        &input(Dialect::OpenAI, format!("{base}/v1"), ""),
+        None,
+        None,
+    )
+    .await;
+    let complete = discover(
+        &input(Dialect::OpenAI, format!("{base}/clean/v1"), ""),
+        None,
+        None,
+    )
+    .await;
+    task.abort();
+    let partial = partial.unwrap();
+    let complete = complete.unwrap();
+    assert_eq!(partial.models.len(), 1);
+    assert_eq!(complete.models.len(), 1);
+    assert!(
+        complete.warnings.is_empty(),
+        "clean input is the no-warning control"
+    );
+    assert!(!partial.warnings.is_empty(), "parse losses must prevent an automatic scanner from treating a partial catalog as complete");
+}
+
+#[tokio::test]
+async fn catalog_free_requires_known_billing_dimensions_and_exact_decimal_zero() {
+    let app = Router::new().route("/v1/models", get(|| async {
+        Json(json!({"data": [
+            {"id": "explicit-zero", "pricing": {"prompt": "0.000000", "completion": "0"}},
+            {"id": "underflow-charge", "pricing": {"prompt": "1e-999", "completion": "0"}},
+            {"id": "underflow-tier-charge", "pricing": {"prompt": "0", "completion": "0", "overrides": [
+                {"min_prompt_tokens": 4096, "prompt": "0", "completion": "1e-999"}
+            ]}},
+            {"id": "unknown-positive", "pricing": {"prompt": "0", "completion": "0", "future_billing_dimension": "1"}},
+            {"id": "unknown-malformed", "pricing": {"prompt": "0", "completion": "0", "future_billing_dimension": "invalid"}},
+            {"id": "unknown-zero", "pricing": {"prompt": "0", "completion": "0", "future_billing_dimension": "0"}}
+        ]}))
+    }));
+    let (base, task) = spawn(app).await;
+    let response = discover(
+        &input(Dialect::OpenAI, format!("{base}/v1"), ""),
+        None,
+        None,
+    )
+    .await;
+    task.abort();
+    let response = response.unwrap();
+    let free = |id: &str| {
+        response
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap()
+            .is_free
+    };
+    assert_eq!(free("explicit-zero"), Some(true));
+    assert_eq!(
+        free("underflow-charge"),
+        Some(false),
+        "positive decimal billing cannot become free through f64 underflow"
+    );
+    assert_eq!(free("underflow-tier-charge"), Some(false));
+    for id in ["unknown-positive", "unknown-malformed", "unknown-zero"] {
+        assert_eq!(
+            free(id),
+            None,
+            "an adapter must understand every billing dimension before confirming free: {id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_http_numeric_underflow_never_proves_free_and_decimal_strings_are_the_contract() {
+    // Preserve the actual JSON number tokens until the production HTTP decoder.
+    // json! or an intermediate f64 would erase this regression before the call.
+    const RAW: &str = r#"{"data":[
+        {"id":"numeric-underflow","pricing":{"prompt":1e-999,"completion":"0"}},
+        {"id":"negative-numeric-underflow","pricing":{"prompt":-1e-999,"completion":"0"}},
+        {"id":"numeric-zero","pricing":{"prompt":0,"completion":"0"}},
+        {"id":"numeric-float-zero","pricing":{"prompt":0.0,"completion":"0"}},
+        {"id":"explicit-string-zero","pricing":{"prompt":"0","completion":"0"}}
+    ]}"#;
+    let app = Router::new().route(
+        "/v1/models",
+        get(|| async { ([("content-type", "application/json")], RAW) }),
+    );
+    let (base, task) = spawn(app).await;
+    let response = discover(
+        &input(Dialect::OpenAI, format!("{base}/v1"), ""),
+        None,
+        None,
+    )
+    .await;
+    task.abort();
+    let response = response.unwrap();
+    let free = |id: &str| {
+        response
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap()
+            .is_free
+    };
+    assert_eq!(free("explicit-string-zero"), Some(true));
+    for id in [
+        "numeric-underflow",
+        "negative-numeric-underflow",
+        "numeric-zero",
+        "numeric-float-zero",
+    ] {
+        assert_eq!(free(id), None, "the catalog free-proof contract accepts decimal strings; decoded numeric zero lacks original-token proof: {id}");
+    }
+}

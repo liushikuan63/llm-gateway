@@ -60,7 +60,8 @@
   padding: 7px 10px;
   border-radius: 8px;
   border: 1px solid var(--line, #2a2f3a);
-  background: var(--input, #0f131a);
+  /* Match inherited theme text instead of falling back to a fixed dark surface. */
+  background: var(--panel);
   color: inherit;
   font: inherit;
 }

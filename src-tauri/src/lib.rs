@@ -12,6 +12,7 @@ pub mod budget;
 pub mod bundle;
 pub mod cache;
 pub mod capability;
+pub mod capability_declarations;
 #[cfg(windows)]
 mod cli_job;
 pub mod cli_tools;
@@ -21,11 +22,13 @@ pub mod client_usage;
 mod commands;
 pub mod config;
 pub mod context;
+pub mod cost_policy;
 pub mod crypto;
 pub mod db;
 pub mod desktop_chat;
 pub mod diagnostics;
 pub mod domain;
+pub mod entitlement;
 pub mod error;
 pub mod intellect;
 pub mod local_models;
@@ -35,6 +38,7 @@ pub mod mcp;
 pub mod media;
 pub mod model_catalog;
 pub mod outbound;
+pub mod personal_test;
 pub mod pet_window;
 pub mod petdex;
 pub mod pricing;
@@ -43,6 +47,7 @@ pub mod proc_util;
 pub mod protocol;
 pub mod provider_quota;
 pub mod proxy;
+pub mod proxy_control;
 pub mod qoder_auth;
 pub mod router;
 pub mod search;
@@ -61,13 +66,19 @@ use crate::config::AppConfig;
 use crate::proxy::server::GatewayState;
 use std::sync::Arc;
 use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder},
+    menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
 
 /// 全局共享状态：SQLite 池 + 运行时配置 + 网关状态（路由表 / 健康表 / 限流计数器）
 pub struct AppState {
+    pub desktop_chat_controls: Arc<crate::desktop_chat::RequestControls>,
+    pub manual_search_controls: Arc<crate::desktop_chat::RequestControls>,
+    pub client_usage_jobs: Result<Arc<crate::client_usage::jobs::UsageJobs>, String>,
+    pub gateway_service: Arc<proxy_control::gateway::GatewayService>,
+    pub system_proxy: proxy_control::system::SystemProxyManager,
+    pub proxy_commands: tokio::sync::Mutex<()>,
     pub db: db::Db,
     pub config: Arc<parking_lot::RwLock<AppConfig>>,
     pub gateway: Arc<GatewayState>,
@@ -81,6 +92,13 @@ pub struct AppState {
     pub xray: Arc<crate::vpn_xray::XrayManager>,
     pub vpn_commands: tokio::sync::Mutex<()>,
     pub client_commands: tokio::sync::Mutex<()>,
+    /// Serializes preference/task-plan updates, never reward HTTP or source gates.
+    pub benefit_settings_commands: tokio::sync::Mutex<()>,
+}
+
+pub struct ProxyTray {
+    pub gateway: CheckMenuItem<tauri::Wry>,
+    pub system: CheckMenuItem<tauri::Wry>,
 }
 
 /// 在事件循环启动后异步完成后端初始化，避免阻塞首帧渲染。
@@ -179,7 +197,34 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
     );
     let xray =
         crate::vpn_xray::XrayManager::new(config::app_data_dir().join("vpn-xray"), resources);
+    let gateway_service = Arc::new(proxy_control::gateway::GatewayService::new(gateway.clone()));
+    let system_proxy = proxy_control::system::SystemProxyManager::default();
+    match crate::db::repo::get_secret(db.pool(), proxy_control::SYSTEM_RESTORE_SECRET).await {
+        Ok(Some(value)) => {
+            let restored = crypto::decrypt(&value)
+                .ok()
+                .and_then(|raw| proxy_control::load_recovery(&system_proxy, &raw).ok());
+            if restored.is_none() {
+                boot.mark_warning("系统代理恢复信息无法读取；当前系统设置未更改".to_owned());
+            }
+        }
+        Err(_) => boot.mark_warning("系统代理恢复信息读取失败；当前系统设置未更改".to_owned()),
+        Ok(None) => {}
+    }
+    let startup = cfg.proxy_control.clone();
+    let client_usage_jobs =
+        crate::client_usage::jobs::UsageJobs::new(config::app_data_dir().join("usage-jobs"))
+            .map(Arc::new);
+    if client_usage_jobs.is_err() {
+        boot.mark_warning("完整历史任务存储不可用；快速读取仍可使用".to_owned());
+    }
     app.manage(AppState {
+        desktop_chat_controls: Arc::new(crate::desktop_chat::RequestControls::default()),
+        manual_search_controls: Arc::new(crate::desktop_chat::RequestControls::default()),
+        client_usage_jobs,
+        gateway_service: gateway_service.clone(),
+        system_proxy,
+        proxy_commands: tokio::sync::Mutex::new(()),
         db,
         config: Arc::new(parking_lot::RwLock::new(cfg)),
         gateway: gateway.clone(),
@@ -190,14 +235,22 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
         xray: Arc::new(xray),
         vpn_commands: tokio::sync::Mutex::new(()),
         client_commands: tokio::sync::Mutex::new(()),
+        benefit_settings_commands: tokio::sync::Mutex::new(()),
     });
 
-    let gw = gateway.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = proxy::server::serve(gw).await {
-            tracing::error!("gateway server exited: {error}");
+    if startup.start_gateway_on_launch {
+        if let Err(error) = gateway_service.set_enabled(true).await {
+            boot.mark_warning(format!("网关启动失败：{error}"));
         }
-    });
+    }
+    if startup.start_system_proxy_on_launch {
+        if let Err(error) = proxy_control::set_system(&app, true).await {
+            boot.mark_warning(format!("系统网络代理启动失败：{error}"));
+        }
+    }
+    proxy_control::publish(&app, &proxy_control::status(&app.state::<AppState>()).await);
+    tauri::async_runtime::spawn(proxy_control::monitor(app.clone()));
+    crate::model_catalog::maintenance::Manager::spawn_background(Arc::downgrade(&gateway));
     let gw2 = gateway.clone();
     tauri::async_runtime::spawn(async move { gw2.background_loop().await });
 
@@ -342,12 +395,27 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_proxy_control_status,
+            commands::set_gateway_proxy_enabled,
+            commands::set_system_proxy_enabled,
+            commands::save_proxy_startup_options,
+            commands::trae_model_catalog,
+            commands::trae_native_model_catalog,
+            commands::trae_web_model_catalog,
+            commands::register_trae_provider,
             commands::trae_login_start,
+            commands::trae_web_login_start,
+            commands::trae_web_login_status,
+            commands::trae_web_login_poll,
+            commands::trae_web_login_cancel,
+            commands::trae_web_login_refresh,
             commands::trae_login_status,
             commands::trae_login_poll,
             commands::trae_login_cancel,
             commands::trae_login_refresh,
             commands::trae_login_cancel_refresh,
+            commands::trae_login_recovery,
+            commands::trae_login_cancel_recovery,
             commands::workbuddy_login_start,
             commands::qoder_login_start,
             commands::qoder_login_poll,
@@ -358,11 +426,14 @@ pub fn run() {
             commands::qoder_model_catalog,
             commands::qoder_job_prepare,
             commands::qoder_job_refresh,
+            commands::qoder_job_reissue,
             commands::qoder_job_cancel,
             commands::workbuddy_login_poll,
             commands::workbuddy_login_cancel,
             commands::workbuddy_login_status,
             commands::workbuddy_login_refresh,
+            commands::workbuddy_checkin_status,
+            commands::workbuddy_account_quota,
             commands::register_workbuddy_provider,
             commands::register_qoder_provider,
             commands::client_bridges_status,
@@ -378,6 +449,11 @@ pub fn run() {
             commands::stop_xray,
             commands::use_xray_for_gateway,
             commands::benefits_overview,
+            commands::benefit_auto_claim::save_benefit_account_auto_claim,
+            commands::benefit_auth_source,
+            commands::bind_trae_benefit_auth,
+            commands::bind_workbuddy_benefit_auth,
+            commands::restore_benefit_auth,
             commands::import_benefit_client_session,
             commands::claim_benefit_now,
             commands::set_benefit_token,
@@ -402,6 +478,12 @@ pub fn run() {
             commands::list_providers,
             provider_quota::get_provider_quota,
             commands::discover_provider_models,
+            commands::catalog_maintenance::catalog_maintenance_status,
+            commands::catalog_maintenance::save_catalog_maintenance,
+            commands::catalog_maintenance::scan_catalog_maintenance,
+            commands::catalog_maintenance::cancel_catalog_maintenance,
+            commands::catalog_maintenance::catalog_inventory,
+            commands::free_routing::save_free_routing,
             commands::upsert_provider,
             commands::set_provider_runtime,
             commands::delete_provider,
@@ -412,15 +494,25 @@ pub fn run() {
             commands::list_models,
             commands::register_client_bridge,
             commands::desktop_chat,
+            commands::cancel_desktop_chat,
+            commands::get_personal_test,
+            commands::set_personal_test,
             commands::export_desktop_chat,
             commands::scan_client_usage,
+            commands::start_client_usage_job,
+            commands::get_client_usage_job,
+            commands::get_current_client_usage_job,
+            commands::cancel_client_usage_job,
+            commands::resume_client_usage_job,
             commands::get_unified_key,
             commands::rotate_unified_key,
             commands::list_remote_access_keys,
+            commands::get_remote_key_budget_snapshot,
             commands::create_remote_access_key,
             commands::update_remote_access_key,
             commands::delete_remote_access_key,
             commands::list_sessions,
+            commands::list_sessions_page,
             commands::get_session_messages,
             commands::get_session_messages_page,
             commands::delete_session,
@@ -431,10 +523,16 @@ pub fn run() {
             commands::stats_overview,
             commands::recent_requests,
             commands::query_requests,
+            commands::get_request_feedback,
+            commands::get_feedback_coverage,
+            commands::get_conversation_feedback,
+            commands::get_conversation_requests,
+            commands::set_request_feedback,
             commands::export_requests,
             commands::export_capabilities,
             commands::capability_pareto,
             commands::explain_routing,
+            commands::preview_routing_request,
             commands::list_agent_runtimes,
             commands::list_agent_adapters,
             commands::save_agent_runtime,
@@ -467,6 +565,7 @@ pub fn run() {
             commands::run_gateway_self_check,
             commands::refresh_pricing,
             commands::pricing_status,
+            commands::price_observations,
             commands::list_token_calibrations,
             commands::clear_token_calibrations,
             commands::list_local_runtimes,
@@ -474,8 +573,10 @@ pub fn run() {
             commands::register_local_model,
             commands::pull_local_model,
             commands::get_search_settings,
+            commands::recover_stack_overflow_unsent,
             commands::update_search_settings,
             commands::test_search_backend,
+            commands::cancel_search_backend,
             commands::classify_preview,
             commands::jev_probe,
             commands::calibrate_classifier,
@@ -493,6 +594,24 @@ pub fn run() {
         .run(|app, event| {
             if matches!(&event, tauri::RunEvent::Exit) {
                 if let Some(state) = app.try_state::<AppState>() {
+                    if let Ok(jobs) = &state.client_usage_jobs {
+                        if tauri::async_runtime::block_on(jobs.shutdown()).is_err() {
+                            tracing::error!("退出时完整历史任务未能安全停止");
+                        }
+                    }
+                    // Stop only this application's listener and await its audit writes.
+                    // A failed drain is visible; it is never called a clean commit.
+                    match tauri::async_runtime::block_on(state.gateway_service.set_enabled(false)) {
+                        Ok(status) => {
+                            if let Some(error) = status.last_error {
+                                tracing::error!("退出时网关关闭报告异常: {error}");
+                            }
+                        }
+                        Err(error) => tracing::error!("退出时网关未能安全停止: {error}"),
+                    }
+                    if let Err(error) = state.system_proxy.shutdown_restore_owned() {
+                        tracing::error!("退出时恢复本软件系统代理失败：{error}");
+                    }
                     state.vpn.shutdown_blocking();
                     state.bridges.shutdown_blocking();
                     state.xray.shutdown_blocking();
@@ -535,7 +654,16 @@ fn should_start_hidden() -> bool {
 fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
     let show = MenuItemBuilder::with_id("show", "打开控制面板").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "退出").build(app)?;
-    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+    let gateway = CheckMenuItemBuilder::with_id("gateway-proxy", "LLM 网关服务")
+        .enabled(false)
+        .build(app)?;
+    let system = CheckMenuItemBuilder::with_id("system-proxy", "系统网络代理")
+        .enabled(false)
+        .build(app)?;
+    let menu = MenuBuilder::new(app)
+        .items(&[&show, &gateway, &system, &quit])
+        .build()?;
+    app.manage(ProxyTray { gateway, system });
 
     let handle = app.clone();
     TrayIconBuilder::with_id("main")
@@ -568,6 +696,39 @@ fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
                     let _ = w.unminimize();
                     let _ = w.set_focus();
                 }
+            }
+            "gateway-proxy" | "system-proxy" => {
+                let app = handle.clone();
+                let gateway = ev.id().as_ref() == "gateway-proxy";
+                if let Some(tray) = app.try_state::<ProxyTray>() {
+                    let _ = tray.gateway.set_enabled(false);
+                    let _ = tray.system.set_enabled(false);
+                }
+                tauri::async_runtime::spawn(async move {
+                    let Some(state) = app.try_state::<AppState>() else {
+                        return;
+                    };
+                    let status = proxy_control::status(&state).await;
+                    let result = if gateway {
+                        proxy_control::set_gateway(&app, !status.gateway.running).await
+                    } else if let Some(enabled) = status.system.enabled {
+                        proxy_control::set_system(&app, !enabled).await
+                    } else {
+                        Err("系统网络代理状态读取失败".into())
+                    };
+                    match result {
+                        Err(error) => {
+                            let _ = app.emit("proxy-control-error", error);
+                        }
+                        Ok(status) if gateway => {
+                            if let Some(error) = status.gateway.last_error {
+                                let _ = app.emit("proxy-control-error", error);
+                            }
+                        }
+                        Ok(_) => {}
+                    }
+                    proxy_control::publish(&app, &proxy_control::status(&state).await);
+                });
             }
             "quit" => handle.exit(0),
             _ => {}

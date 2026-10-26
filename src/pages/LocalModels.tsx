@@ -1,3 +1,5 @@
+import { MdnReferenceCard, mdnReferenceStatus, parseMdnReference } from "../components/MdnReference";
+import { StackOverflowProtection, parseStackOverflowState, stackOverflowErrorText } from "../components/StackOverflowProtection";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -8,8 +10,10 @@ import {
   JevProbeResult,
   LocalModelInfo,
   ProbeOutcome,
+  FreeSearchLocale,
   SearchOutcome,
   SearchSettingsView,
+  SEARCH_BACKEND_LABEL,
   TASK_CLASS_LABEL,
   TaskClass,
   TaskIntent,
@@ -995,14 +999,112 @@ function CalibrationCard({
 
 /* ----------------------------- 联网搜索 ----------------------------- */
 
+function searchResultHref(raw: string): string | undefined {
+  try {
+    const url = new URL(raw);
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? url.href : undefined;
+  } catch { return undefined; }
+}
+
+function searchSourceLabel(source: string): string {
+  return source === "stack_overflow" ? "Stack Overflow" : source === "bing_rss" ? "Bing RSS" : source === "duckduckgo" ? "DuckDuckGo" : source === "npm_registry" ? "npm 软件包" : source === "hacker_news" ? "Hacker News 讨论" : "搜索来源";
+}
+
+function searchResourceStats(value: unknown): NonNullable<SearchSettingsView["resources"]> | null {
+  if(!value || typeof value!=="object" || Array.isArray(value))return null;
+  const s=value as NonNullable<SearchSettingsView["resources"]>;
+  return s.schema_version===1&&[s.entries,s.inflight,s.cache_hits,s.cache_misses,s.coalesced,s.queries_started,s.rejected].every(n=>Number.isSafeInteger(n)&&n>=0)&&s.entries<=128&&s.inflight<=32?s:null;
+}
+
+function searchProtection(value:unknown,scope:SearchSettingsView["free_search_scope"]):NonNullable<SearchSettingsView["source_protection"]>|null {
+  if(!value||typeof value!=="object"||Array.isArray(value))return null;
+  const v=value as NonNullable<SearchSettingsView["source_protection"]>;
+  if(scope!==undefined&&scope!=="web"&&scope!=="npm_packages"&&scope!=="hacker_news")return null;
+  const expected=scope==="npm_packages"?["npm_registry"]:scope==="hacker_news"?["hacker_news"]:["bing_rss","duckduckgo"];
+  if(v.schema_version!==1||!Array.isArray(v.sources)||v.sources.length!==expected.length||new Set(v.sources.map(s=>s?.source)).size!==expected.length)return null;
+  return v.sources.every(s=>s&&expected.includes(s.source)&&["cooldown","cooldown_pending","not_blocked_locally","unavailable"].includes(s.state)&&(s.not_before_utc===null||typeof s.not_before_utc==="string"&&Number.isFinite(Date.parse(s.not_before_utc)))&&(["cooldown","cooldown_pending"].includes(s.state)?s.not_before_utc!==null:true)&&(s.state==="unavailable"?s.not_before_utc===null:true))?v:null;
+}
+
+function selectableSearchScopes(settings:SearchSettingsView):Array<NonNullable<SearchSettingsView["free_search_scope"]>>|null {
+  const values=settings.free_search_scopes;
+  if(values===undefined)return settings.free_search_scope==="web"||settings.free_search_scope==="npm_packages"?["web","npm_packages"]:null;
+  const known=["web","npm_packages","hacker_news","stack_overflow"] as const;
+  return Array.isArray(values)&&values.length>0&&values.length<=4&&new Set(values).size===values.length&&values.every(v=>known.includes(v))&&values.includes(settings.free_search_scope!)?values:null;
+}
+
+const SEARCH_LOCALE_LABEL:Record<FreeSearchLocale,string>={source_default:"来源默认",cn_zh:"中国中文",us_en:"美国英文",gb_en:"英国英文"};
+function selectableSearchLocales(settings:SearchSettingsView):FreeSearchLocale[]|null {
+  const values=settings.free_search_locales;
+  return Array.isArray(values)&&values.length>0&&values.length<=4&&new Set(values).size===values.length&&values.every(v=>Object.prototype.hasOwnProperty.call(SEARCH_LOCALE_LABEL,v))&&values.includes(settings.free_search_locale!)?values:null;
+}
+function searchLocaleLabel(value:unknown):string {
+  return typeof value==="string"&&Object.prototype.hasOwnProperty.call(SEARCH_LOCALE_LABEL,value)?SEARCH_LOCALE_LABEL[value as FreeSearchLocale]:"未知（接口未提供可用偏好）";
+}
+
+function searchProxyValid(raw:string):boolean {
+  const text=raw.trim();if(text==="")return true;
+  if(text.length>2048||/[\s\u0000-\u001f\u007f-\u009f]/.test(text)||text.includes('@'))return false;
+  try {const u=new URL(text);if(!["http:","socks5h:"].includes(u.protocol)||!u.hostname||u.username||u.password||!["","/"].includes(u.pathname)||u.search||u.hash||u.port==="0")return false;
+    if(u.protocol==="socks5h:"){const ipv4=u.hostname.split('.');return u.hostname.startsWith('[')&&u.hostname.endsWith(']')||ipv4.length===4&&ipv4.every(p=>/^\d+$/.test(p)&&Number(p)<=255&&String(Number(p))===p);}
+    return true;
+  } catch {return false;}
+}
+
+// Source/deadline/partial-result design: docs/wiki/search.md.
+type SearchProbeJob = { id: string | null; ticket: number; ready: boolean; leaving: boolean; cancelPending: boolean; cancelAccepted: boolean };
 function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig) => Promise<AppConfig> }) {
   const [settings, setSettings] = useState<SearchSettingsView | null>(null);
+  const [readLoading, setReadLoading] = useState(true);
+  const [readError, setReadError] = useState<string | null>(null);
+  const readFlight = useRef<number | null>(null);
+  const readOrigin = useRef<HTMLElement | null>(null);
+  const queryInput = useRef<HTMLInputElement | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const [clearKey, setClearKey] = useState(false);
   const [probeText, setProbeText] = useState("Rust 1.99 最近有什么新特性");
   const [outcome, setOutcome] = useState<SearchOutcome | null>(null);
+  const [outcomeInput, setOutcomeInput] = useState<string | null>(null);
+  const [outcomeUnconfirmed, setOutcomeUnconfirmed] = useState(false);
+  const [probeCancelled, setProbeCancelled] = useState(false);
+  const [probe, setProbe] = useState<SearchProbeJob | null>(null);
+  const probeJob = useRef<SearchProbeJob | null>(null);
   const [busy, setBusy] = useState(false);
+  const locked = busy || readError !== null;
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [cacheDraft,setCacheDraft]=useState("");
+  const [intervalDraft,setIntervalDraft]=useState("");
+  const [proxyDraft,setProxyDraft]=useState("");
+  const [resourcesReceivedAt,setResourcesReceivedAt]=useState<string|null>(null);
+  const cacheDirty=useRef(false),alive=useRef(false),saving=useRef(false),sequence=useRef(0);
+  const intervalDirty=useRef(false);
+  const proxyDirty=useRef(false);
+  const returnFocus=useRef<HTMLElement|null>(null);
+  useEffect(() => {
+    if (readLoading || !readOrigin.current) return;
+    const origin = readOrigin.current; readOrigin.current = null;
+    if (document.activeElement === document.body || document.activeElement === origin) {
+      if (origin.isConnected) origin.focus(); else queryInput.current?.focus();
+    }
+  }, [readLoading]);
+  const currentProbe = (job: SearchProbeJob) => alive.current && probeJob.current === job && sequence.current === job.ticket;
+  const cancelProbe = async (job: SearchProbeJob | null) => {
+    if (!job?.id || !job.ready || job.cancelPending || job.cancelAccepted) return;
+    job.cancelPending = true;
+    if (currentProbe(job)) setProbe({ ...job });
+    try {
+      const accepted = await api.cancelSearchBackend(job.id);
+      if (!currentProbe(job)) return;
+      job.cancelAccepted = accepted;
+      setMessage({ kind: "ok", text: accepted ? "已请求取消，等待检索结果确认。" : "未接受取消，继续等待检索结果。" });
+    } catch (error) {
+      // Unmount is best-effort: no false terminal claim or automatic retry.
+      if (currentProbe(job)) setMessage({ kind: "err", text: `取消请求失败：${errorMessage(error)}；检索仍在进行。` });
+    } finally {
+      job.cancelPending = false;
+      if (currentProbe(job)) setProbe({ ...job });
+    }
+  };
+  useEffect(()=>{if(!busy&&returnFocus.current){const origin=returnFocus.current;returnFocus.current=null;if(!origin.isConnected&&origin.dataset.stackRecovery==="true"&&document.activeElement===document.body){queryInput.current?.focus();}else if(origin.isConnected&&(document.activeElement===document.body||document.activeElement===origin)){const group=origin.closest("fieldset");const preferred=origin.dataset.focusReturn?document.getElementById(origin.dataset.focusReturn):null;const target=origin.matches(":disabled")?(preferred??group?.querySelector<HTMLElement>('input[type="number"]:not(:disabled)')??group?.querySelector<HTMLElement>('input:not(:disabled)')):origin;target?.focus();}}});
   /**
    * 「用户当下正在选的后端」，与**已保存**的 `settings.backend` 分开。
    *
@@ -1020,20 +1122,44 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
   const shownSearxngUrl = pendingBackend === "sear_xng" ? settings?.searxng_url ?? "" : settings?.searxng_url ?? "";
 
   const load = useCallback(async () => {
+    if(!alive.current || saving.current || readFlight.current !== null)return;
+    const ticket=++sequence.current;
+    readFlight.current=ticket;setReadLoading(true);
     try {
-      setSettings(await api.getSearchSettings());
+      const value=await api.getSearchSettings();
+      if(alive.current&&ticket===sequence.current){setSettings(value);setReadError(null);setResourcesReceivedAt(new Date().toISOString());if(!cacheDirty.current)setCacheDraft(value.query_cache_ttl_secs===undefined?"":String(value.query_cache_ttl_secs));if(!intervalDirty.current)setIntervalDraft(value.source_min_interval_ms===undefined?"":String(value.source_min_interval_ms));if(!proxyDirty.current)setProxyDraft(typeof value.free_proxy_url==="string"?value.free_proxy_url:"");}
     } catch (error) {
-      setMessage({ kind: "err", text: errorMessage(error) });
+      if(alive.current&&ticket===sequence.current)setReadError(`读取搜索设置失败：${errorMessage(error)}`);
+    } finally {
+      if(readFlight.current===ticket)readFlight.current=null;
+      if(alive.current&&ticket===sequence.current)setReadLoading(false);
     }
   }, []);
 
-  useEffect(() => {
+  const reread = () => {
+    if (saving.current || readFlight.current !== null) return;
+    readOrigin.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     void load();
+  };
+
+  useEffect(() => {
+    alive.current=true;
+    void load();
+    return()=>{
+      alive.current=false;++sequence.current;readFlight.current=null;readOrigin.current=null;
+      const job=probeJob.current;
+      if(job){job.leaving=true;void cancelProbe(job);probeJob.current=null;}
+    };
   }, [load]);
 
   const save = async (next: Partial<SearchSettingsView>) => {
     const current = settings;
-    if (!current) return;
+    if (!current || saving.current || readError !== null) return;
+    // A user mutation supersedes a healthy background read; its late result
+    // cannot publish over the newer commit or clear another read owner.
+    readFlight.current=null;readOrigin.current=null;setReadLoading(false);
+    saving.current=true;const ticket=++sequence.current;
+    returnFocus.current=document.activeElement instanceof HTMLElement?document.activeElement:null;
     setBusy(true);
     setMessage(null);
     try {
@@ -1044,19 +1170,37 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
         max_results: next.max_results ?? current.max_results,
         timeout_ms: next.timeout_ms ?? current.timeout_ms,
         inject_as: next.inject_as ?? current.inject_as,
+        query_cache_ttl_secs: next.query_cache_ttl_secs ?? (Number.isSafeInteger(current.query_cache_ttl_secs)&&current.query_cache_ttl_secs!==undefined&&current.query_cache_ttl_secs>=0&&current.query_cache_ttl_secs<=3600?current.query_cache_ttl_secs:undefined),
+        coalesce_queries: next.coalesce_queries ?? (typeof current.coalesce_queries==="boolean"?current.coalesce_queries:undefined),
+        source_min_interval_ms: next.source_min_interval_ms ?? (Number.isSafeInteger(current.source_min_interval_ms)&&current.source_min_interval_ms!==undefined&&current.source_min_interval_ms>=0&&current.source_min_interval_ms<=3600000?current.source_min_interval_ms:undefined),
+        free_search_scope: "free_search_scope" in next?next.free_search_scope:undefined,
+        free_search_locale: "free_search_locale" in next?next.free_search_locale:undefined,
+        // Only an explicit endpoint save may change transport; another window
+        // may have committed a newer route since this view was loaded.
+        free_proxy_url: "free_proxy_url" in next?next.free_proxy_url:undefined,
+        page_text_enabled: "page_text_enabled" in next?next.page_text_enabled:undefined,
         api_key: keyInput.trim().length > 0 ? keyInput.trim() : null,
         clear_api_key: clearKey,
       });
+      if(!alive.current||ticket!==sequence.current)return;
       setSettings(saved);
+      setResourcesReceivedAt(new Date().toISOString());
+      if(next.query_cache_ttl_secs!==undefined){cacheDirty.current=false;setCacheDraft(String(saved.query_cache_ttl_secs));}
+      else if(!cacheDirty.current)setCacheDraft(saved.query_cache_ttl_secs===undefined?"":String(saved.query_cache_ttl_secs));
+      if(next.source_min_interval_ms!==undefined){intervalDirty.current=false;setIntervalDraft(saved.source_min_interval_ms===undefined?"":String(saved.source_min_interval_ms));}
+      else if(!intervalDirty.current)setIntervalDraft(saved.source_min_interval_ms===undefined?"":String(saved.source_min_interval_ms));
+      if("free_proxy_url" in next){proxyDirty.current=false;setProxyDraft(typeof saved.free_proxy_url==="string"?saved.free_proxy_url:"");}
+      else if(!proxyDirty.current)setProxyDraft(typeof saved.free_proxy_url==="string"?saved.free_proxy_url:"");
+      setOutcome(null); setOutcomeInput(null); setOutcomeUnconfirmed(false);
       setKeyInput("");
       setClearKey(false);
       // 搜索开关与结果条数也影响网关运行时行为，必须落回 config。
       const nextCfg = await api.getConfig();
-      setCfgThroughParent(nextCfg);
+      if(alive.current&&ticket===sequence.current)await setCfgThroughParent(nextCfg);
     } catch (error) {
-      setMessage({ kind: "err", text: errorMessage(error) });
+      if(alive.current&&ticket===sequence.current)setMessage({ kind: "err", text: errorMessage(error) });
     } finally {
-      setBusy(false);
+      saving.current=false;if(alive.current&&ticket===sequence.current)setBusy(false);
     }
   };
 
@@ -1066,16 +1210,108 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
     await onSave(next);
   };
 
+  const recoverStack = async () => {
+    if(saving.current||readError!==null||!settings||settings.backend!=="free_aggregate"||settings.free_search_scope!=="stack_overflow"
+      ||parseStackOverflowState(settings.stack_overflow_state)?.state!=="reserved")return;
+    readFlight.current=null;readOrigin.current=null;setReadLoading(false);
+    saving.current=true;const ticket=++sequence.current;
+    returnFocus.current=document.activeElement instanceof HTMLElement?document.activeElement:null;
+    setBusy(true);setMessage(null);
+    try{
+      const raw=await api.recoverStackOverflowUnsent();
+      if(!alive.current||ticket!==sequence.current)return;
+      const status=parseStackOverflowState(raw);
+      setSettings(v=>v?.backend==="free_aggregate"&&v.free_search_scope==="stack_overflow"?{...v,stack_overflow_state:status??undefined}:v);
+      setMessage(status?{kind:"ok",text:"本机预留状态已确认，原等待限制保留；未发送检索。"}:{kind:"err",text:"恢复回执未确认，请重新读取本机状态；不自动重试。"});
+    }catch{
+      if(alive.current&&ticket===sequence.current){
+        setSettings(v=>v?{...v,stack_overflow_state:undefined}:v);
+        setMessage({kind:"err",text:"恢复结果未确认，请重新读取本机状态；不自动重试或重置。"});
+      }
+    }finally{saving.current=false;if(alive.current&&ticket===sequence.current)setBusy(false);}
+  };
+
+  const startProbe = async () => {
+    if (saving.current || readError !== null) return;
+    if(settings?.backend==="free_aggregate"&&settings.free_search_scope==="stack_overflow"
+      &&(shownBackend!=="free_aggregate"||parseStackOverflowState(settings.stack_overflow_state)?.state!=="ready"))return;
+    readFlight.current=null;readOrigin.current=null;setReadLoading(false);
+    const controlled = settings?.manual_search_cancel_supported === true;
+    if (controlled && typeof crypto.randomUUID !== "function") {
+      setMessage({ kind: "err", text: "当前环境无法创建安全请求标识，未发起检索。" }); return;
+    }
+    saving.current = true;
+    const job: SearchProbeJob = { id: controlled ? crypto.randomUUID() : null, ticket: ++sequence.current, ready: false, leaving: false, cancelPending: false, cancelAccepted: false };
+    probeJob.current = job; setProbe(controlled ? { ...job } : null);
+    returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setBusy(true); setMessage(null); setProbeCancelled(false); setOutcomeUnconfirmed(true);
+    const submittedInput = probeText;
+    try {
+      const result = await api.testSearchBackend(submittedInput, job.id ? {
+        requestId: job.id,
+        onReady: ready => {
+          if (!ready || ready.request_id !== job.id) return;
+          job.ready = true;
+          if (job.leaving) { void cancelProbe(job); return; }
+          if (currentProbe(job)) setProbe({ ...job });
+        },
+      } : undefined);
+      if (!currentProbe(job)) return;
+      setOutcome(result); setOutcomeInput(submittedInput); setOutcomeUnconfirmed(false);
+      setMessage(result.error ? { kind: "err", text: settings?.backend==="free_aggregate"&&settings.free_search_scope==="stack_overflow"?stackOverflowErrorText(result.error):result.error } : { kind: result.unstructured_reference != null && !parseMdnReference(result.unstructured_reference) ? "err" : "ok", text: mdnReferenceStatus(result.unstructured_reference) ?? `命中 ${result.hits} 条` });
+    } catch (error) {
+      if (!currentProbe(job)) return;
+      if (error === "search_backend_cancelled") {
+        setProbeCancelled(true);
+        setMessage({ kind: "ok", text: "本次检索已取消，输入已保留。" });
+      } else setMessage({ kind: "err", text: settings?.backend==="free_aggregate"&&settings.free_search_scope==="stack_overflow"?stackOverflowErrorText(errorMessage(error)):errorMessage(error) });
+    } finally {
+      if(currentProbe(job)&&settings?.backend==="free_aggregate"&&settings.free_search_scope==="stack_overflow"){
+        try{
+          const read=await api.getSearchSettings();
+          if(currentProbe(job))setSettings(v=>v?.backend==="free_aggregate"&&v.free_search_scope==="stack_overflow"?{...v,stack_overflow_state:read.backend==="free_aggregate"&&read.free_search_scope==="stack_overflow"?read.stack_overflow_state:undefined}:v);
+        }catch{
+          if(currentProbe(job)){
+            setSettings(v=>v?{...v,stack_overflow_state:undefined}:v);
+            setMessage({kind:"err",text:"检索结果保留；本机保护状态读取失败，重新读取后再尝试。"});
+          }
+        }
+      }
+      if (probeJob.current === job) {
+        probeJob.current = null; saving.current = false;
+        if (alive.current && job.ticket === sequence.current) { setProbe(null); setBusy(false); }
+      }
+    }
+  };
+
   if (!settings) {
     return (
       <div className="card">
-        <div className="empty">正在读取搜索设置…</div>
+        <h3>联网搜索</h3>
+        {readLoading && <div className="empty" role="status">正在读取搜索设置…</div>}
+        {readError && <div className="msg err" role="alert">{readError}。当前设置尚未确认。</div>}
+        <button type="button" disabled={readLoading || busy} onClick={reread}>重试读取搜索设置</button>
       </div>
     );
   }
 
+  const resourceFields=Number.isSafeInteger(settings.query_cache_ttl_secs)&&settings.query_cache_ttl_secs!==undefined&&settings.query_cache_ttl_secs>=0&&settings.query_cache_ttl_secs<=3600&&typeof settings.coalesce_queries==="boolean";
+  const ttl=Number(cacheDraft),validTtl=cacheDraft.trim()!==""&&Number.isSafeInteger(ttl)&&ttl>=0&&ttl<=3600;
+  const interval=Number(intervalDraft),validInterval=intervalDraft.trim()!==""&&Number.isSafeInteger(interval)&&interval>=0&&interval<=3600000;
+  const intervalField=Number.isSafeInteger(settings.source_min_interval_ms)&&settings.source_min_interval_ms!==undefined&&settings.source_min_interval_ms>=0&&settings.source_min_interval_ms<=3600000;
+  const resourceStats=searchResourceStats(settings.resources);
+  const protection=searchProtection(settings.source_protection,settings.free_search_scope);
+  const stackSelected=shownBackend==="free_aggregate"&&settings.free_search_scope==="stack_overflow";
+  const stackProbeBlocked=settings.backend==="free_aggregate"&&settings.free_search_scope==="stack_overflow"&&(shownBackend!=="free_aggregate"||parseStackOverflowState(settings.stack_overflow_state)?.state!=="ready");
+  const availableScopes=selectableSearchScopes(settings);
+  const availableLocales=selectableSearchLocales(settings);
+  const proxySupported=settings.free_proxy_url===null||typeof settings.free_proxy_url==="string"&&settings.free_proxy_url!==""&&searchProxyValid(settings.free_proxy_url);
+  const validProxy=searchProxyValid(proxyDraft);
+
   return (
     <>
+      {readLoading && <p role="status">正在读取搜索设置；当前显示上次读取结果。</p>}
+      {readError && <div className="msg err" role="alert">{readError}。保留上次读取结果，当前设置尚未确认。<button type="button" disabled={readLoading || busy} onClick={reread}>重试读取搜索设置</button></div>}
       <div className="card">
         <div className="row">
           <div>
@@ -1086,7 +1322,7 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
             </p>
           </div>
           <label className="field-inline">
-            <input type="checkbox" checked={settings.enabled} disabled={busy} onChange={(e) => void save({ enabled: e.target.checked })} />
+            <input type="checkbox" checked={settings.enabled} disabled={locked} onChange={(e) => void save({ enabled: e.target.checked })} />
             启用联网搜索
           </label>
         </div>
@@ -1094,7 +1330,7 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
         <div className="grid2">
           <label className="field">
             <span>后端</span>
-            <select value={shownBackend ?? ""} disabled={busy} onChange={(e) => {
+            <select value={shownBackend ?? ""} disabled={locked} onChange={(e) => {
               const next = e.target.value as SearchSettingsView["backend"];
               setPendingBackend(next);
               // SearXNG 必须延后到地址填好再提交：直接保存会被后端 validate 拒绝，
@@ -1103,6 +1339,8 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
               void save({ backend: next });
             }}>
               <option value="bing_cn">必应中国（免 Key，国内可达）</option>
+              <option value="free_aggregate">{settings.free_search_scope==="stack_overflow"?"免费检索（Stack Overflow 问题）":settings.free_search_scope==="npm_packages"?"免费检索（npm 软件包范围）":settings.free_search_scope==="hacker_news"?"免费检索（Hacker News 范围）":"免费聚合（Bing RSS + DuckDuckGo）"}</option>
+              <option value="mdn_mcp">MDN 实验性 MCP（无需 Key）</option>
               <option value="tavily">Tavily（需 API Key）</option>
               <option value="brave">Brave（需 Subscription Token）</option>
               <option value="sear_xng">SearXNG（自建实例，免 Key）</option>
@@ -1110,13 +1348,13 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
             </select>
           </label>
           <label className="field">
-            <span>结果条数（1–10）</span>
+            <span>{shownBackend === "mdn_mcp" ? "文档数未提供" : "结果条数（1–10）"}</span>
             <input
               type="number"
               min={1}
               max={10}
-              value={settings.max_results}
-              disabled={busy}
+              value={shownBackend === "mdn_mcp" ? "" : settings.max_results}
+              disabled={locked || shownBackend === "mdn_mcp"}
               onChange={(e) => void save({ max_results: Number(e.target.value) })}
             />
           </label>
@@ -1127,13 +1365,13 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
               min={500}
               max={60000}
               value={settings.timeout_ms}
-              disabled={busy}
+              disabled={locked}
               onChange={(e) => void save({ timeout_ms: Number(e.target.value) })}
             />
           </label>
           <label className="field">
             <span>注入身份</span>
-            <select value={settings.inject_as} disabled={busy} onChange={(e) => void save({ inject_as: e.target.value as SearchSettingsView["inject_as"] })}>
+            <select value={shownBackend === "mdn_mcp" ? "user" : settings.inject_as} disabled={locked || shownBackend === "mdn_mcp"} onChange={(e) => void save({ inject_as: e.target.value as SearchSettingsView["inject_as"] })}>
               <option value="system">system 消息（推荐）</option>
               <option value="user">user 消息</option>
             </select>
@@ -1143,7 +1381,7 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
               <span>SearXNG 实例地址</span>
               <input
                 value={shownSearxngUrl}
-                disabled={busy}
+                disabled={locked}
                 placeholder="http://127.0.0.1:8888"
                 onChange={(e) => {
                   const url = e.target.value;
@@ -1165,6 +1403,13 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
           )}
         </div>
 
+        {shownBackend === "mdn_mcp" && <p role="note" className="sub">
+          实验来源直接向 mcp.mdn.mozilla.net 发送检索词，仅用于公开文档查询，请勿提交私密内容；不携带账号 Key 或 Cookie。
+          服务可能留存查询；第一方分析退出头不是不记录的保证。费用与配额尚未独立核验，服务可用性无保证。
+          每次最多三个固定协议 POST，服务内部可能继续读取文档元数据；无自动工具扩展、不自动回落或重试。
+          结果为不可信文本，文档数未知，始终以 user 资料消息注入；条数、正文读取与通用网页代理设置不适用。
+        </p>}
+
         {/* 与 SearXNG 地址框同一个道理：`backend_needs_key` 是**已保存**配置的回传值，
             刚选中 Tavily/Brave 时它还是旧值，Key 框要等保存成功才出现。改用
             `shownBackend` 直接判断，让输入框跟着用户意图出现，不用等一次往返。 */}
@@ -1175,32 +1420,84 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
               <input
                 type="password"
                 value={keyInput}
-                disabled={busy}
+                disabled={locked}
                 placeholder={settings.api_key_masked ?? "尚未配置"}
                 onChange={(event) => setKeyInput(event.target.value)}
               />
             </label>
             <label className="field-inline">
-              <input type="checkbox" checked={clearKey} disabled={busy} onChange={(event) => setClearKey(event.target.checked)} />
+              <input type="checkbox" checked={clearKey} disabled={locked} onChange={(event) => setClearKey(event.target.checked)} />
               保存时删除已存 Key
             </label>
-            <button className="button" disabled={busy || (keyInput.trim().length === 0 && !clearKey)} onClick={() => void save({})}>
+            <button className="button" disabled={locked || (keyInput.trim().length === 0 && !clearKey)} onClick={() => void save({})}>
               保存 Key
             </button>
           </>
         )}
 
+        {shownBackend === "free_aggregate" && <>
+          {availableScopes?<label className="field"><span>免费聚合检索范围</span><select aria-label="免费聚合检索范围" value={settings.free_search_scope} disabled={locked} onChange={e=>void save({free_search_scope:e.target.value as NonNullable<SearchSettingsView["free_search_scope"]>})}>{availableScopes.map(value=><option key={value} value={value}>{{web:"通用网页（Bing RSS + DuckDuckGo）",npm_packages:"npm 软件包（仅 npm）",hacker_news:"Hacker News 技术讨论（仅 HN）",stack_overflow:"Stack Overflow 问题（仅问题元数据）"}[value]}</option>)}</select></label>:<p role="note">当前后端未提供可用的检索范围设置；检索范围能力不可用，不能推断支持新的来源。</p>}
+          {availableLocales?<label className="field"><span>网页地区／语言请求偏好</span><select aria-label="网页地区／语言请求偏好" value={settings.free_search_locale} disabled={locked||shownBackend!=="free_aggregate"||settings.free_search_scope!=="web"} onChange={e=>void save({free_search_locale:e.target.value as FreeSearchLocale})}>{availableLocales.map(v=><option key={v} value={v}>{SEARCH_LOCALE_LABEL[v]}</option>)}</select></label>:<p role="note">当前后端未确认地区／语言请求偏好能力；旧值保持未知。</p>}
+          <p className="sub">仅免费聚合的通用网页使用此请求偏好，不保证结果严格按地区或语言过滤。其他后端、npm 和 Hacker News 不应用；切换偏好不会清除来源等待。</p>
+          {settings.free_search_scope==="hacker_news"&&<p className="sub">检索词只发送到 Hacker News 搜索服务，不混发网页／npm；需编程、数据库、open source、Show HN等明确技术查询，仅搜索story元数据，不读取讨论／目标网页正文。至少360毫秒本机接口间隔，较长用户间隔或Retry-After仍优先；不证明共享IP额度或真实可用性。</p>}
+          {settings.free_search_scope==="stack_overflow"?<p className="sub">查询只发给 Stack Exchange API 的 Stack Overflow 站点，只取问题元数据；不抓取正文、不携带模型或账号凭据。至少保留一分钟本机间隔，并遵守更长设置、上游等待与共享 IP 限制。</p>:settings.free_search_scope==="npm_packages"?<p className="sub">检索词只发送到 npm 注册表，不发送给 Bing／DuckDuckGo；仅接受 npm package、npm 包、package.json 等明确包查询，普通中英文本会在发送前拒绝。不安装或执行软件包，结果不代表包安全性或推荐质量。</p>:settings.free_search_scope===undefined||settings.free_search_scope==="web"?<p className="sub">检索词将直接发送给 Bing RSS 和 DuckDuckGo；至少一源成功时保留结果。</p>:<p role="note">未知检索范围，无法确认目标；请读取兼容设置。</p>}
+        </>}
+        {shownBackend === "free_aggregate" && <fieldset aria-label="搜索独立出口" disabled={locked}>
+          <legend>搜索独立出口</legend>
+          {proxySupported?<>
+            <label className="field"><span>搜索专用出口 URL（留空直连，不含认证）</span><input id="search-free-proxy" value={proxyDraft} autoComplete="off" spellCheck={false} placeholder="http://127.0.0.1:8080 或 socks5h://127.0.0.1:1080" onChange={e=>{proxyDirty.current=true;setProxyDraft(e.target.value);}}/></label>
+            <button type="button" className="button" data-focus-return="search-free-proxy" disabled={!validProxy||proxyDraft.trim()===(settings.free_proxy_url??"")} onClick={()=>void save({free_proxy_url:proxyDraft.trim()||null})}>保存搜索专用出口</button>
+            {proxyDirty.current&&!validProxy&&<p role="alert">出口须为不含认证、路径或参数的HTTP／SOCKS5h地址；SOCKS代理端点须使用IP，尚未保存。</p>}
+            <p role="status" aria-live="polite">{busy?"正在保存搜索设置；当前显示已保存出口。 ":""}{settings.free_proxy_url===null?"已保存：直连":"已保存：自定义出口 "+settings.free_proxy_url}</p>
+          </>:<p role="note">当前后端未提供可用的搜索出口设置，不能推断为直连或已配置。</p>}
+          <small>仅免费检索范围使用，不修改模型／系统代理或读取其凭据。失败不改用直连；已发出的请求保留原出口，切换不清除源等待。SOCKS5h目标域名交由代理解析；不在此测试外网可用性。</small>
+        </fieldset>}
+        {shownBackend === "free_aggregate" && <p className="sub">免费聚合整体最多等待 10 秒；设置更短期限时按更短期限执行。</p>}
+        {shownBackend === "free_aggregate" && <fieldset aria-label="公开结果正文" disabled={locked}>
+          <legend>公开结果正文（默认关闭）</legend>
+          {typeof settings.page_text_enabled === "boolean" ? <label className="field-inline"><input type="checkbox" checked={settings.page_text_enabled} onChange={e=>void save({page_text_enabled:e.target.checked})}/>可选读取公开结果正文</label> : <p role="note">当前后端未提供正文开关状态，不能推断已启用；其他设置保存不会改变它。</p>}
+          <p className="sub">仅通用网页范围；正文摘录作为不可信引用发送给所选模型。最多2页／4秒且不超过剩余搜索期限，每页256KiB，只读公开HTTPS／UTF-8，不执行网页脚本。</p>
+          <p className="sub">摘录仅用于本次请求，不写入查询缓存／审计／会话。来源等待仍优先；配置搜索代理时不读取正文，不降级直连。软件包／HN范围不读取目标正文。读取时间不是发布时间或实时保证。</p>
+          <p role="status" aria-live="polite">{busy?"正在保存；当前显示已保存的正文开关。":""}</p>
+        </fieldset>}
+        {shownBackend === "free_aggregate" && <fieldset aria-label="本机检索复用" disabled={locked}>
+          <legend>本机检索复用（默认关闭）</legend>
+          {busy&&<p role="status" aria-live="polite">正在处理搜索操作；设置以成功回传为准，当前显示已保存值。</p>}
+          {resourceFields?<>
+            <label className="field-inline"><input type="checkbox" checked={settings.coalesce_queries??false} onChange={e=>void save({coalesce_queries:e.target.checked})}/>合并相同的在途免费检索</label>
+            <label className="field"><span>本机检索缓存有效期（秒，0关闭）</span><input id="search-cache-ttl" type="number" min={0} max={3600} step={1} value={cacheDraft} onChange={e=>{cacheDirty.current=true;setCacheDraft(e.target.value);}}/></label>
+            <button className="button" data-focus-return="search-cache-ttl" disabled={!validTtl||ttl===settings.query_cache_ttl_secs} onClick={()=>void save({query_cache_ttl_secs:ttl})}>保存检索缓存有效期</button>
+            {cacheDirty.current&&!validTtl&&<p role="alert">有效期须为0到3600之间的整数，尚未保存。</p>}
+          </>:<p role="note">当前后端未提供可用的检索复用设置；原有搜索设置仍可使用。</p>}
+          {intervalField?<>
+            <label className="field"><span>每个免费源的发送预留间隔（毫秒，0不设新间隔）</span><input id="source-min-interval" type="number" min={0} max={3600000} step={1} value={intervalDraft} onChange={e=>{intervalDirty.current=true;setIntervalDraft(e.target.value);}}/></label>
+            <button className="button" data-focus-return="source-min-interval" disabled={!validInterval||interval===settings.source_min_interval_ms} onClick={()=>void save({source_min_interval_ms:interval})}>保存源发送预留间隔</button>
+            {intervalDirty.current&&!validInterval&&<p role="alert">源发送预留间隔须为0到3600000之间的整数毫秒，尚未保存。</p>}
+          </>:<p role="note">当前后端未提供可用的源发送预留间隔设置，不能推断为0。</p>}
+          <p className="sub">这是用户设定的本机准入间隔，不是供应商额度或精确网络发送时刻保证。发送前先提交时间预留；取消不退回时间，设为0不清除已有等待。较晚的服务端 Retry-After 仍优先。</p>
+          <p className="sub">仅免费聚合使用；缓存最多128条完整非空成功结果，部分／失败／取消不缓存。新设置不接收旧查询的迟到回填；单个调用取消不影响其他等待者，全部取消才撤销自有检索。内存状态不会跨重启保留。</p>
+          <button type="button" className="button ghost" disabled={readLoading || busy} onClick={reread}>刷新本机检索计数</button>
+          {resourceStats?<p role="status" aria-live="polite">上次本机返回 {resourcesReceivedAt?new Date(resourcesReceivedAt).toLocaleString():"时间未知"} · 非实时监测。缓存 {resourceStats.entries} 条 · 共享项 {resourceStats.inflight} · 命中 {resourceStats.cache_hits} · 未命中 {resourceStats.cache_misses} · 合并等待 {resourceStats.coalesced} · 协调启动 {resourceStats.queries_started} · 上限拒绝 {resourceStats.rejected}</p>:<p role="note">当前后端未提供可用的检索复用计数，不能当作零。</p>}
+          <small>这些是本机复用计数，不证明网页实时性或外网可用。“搜索一次”不读取本机查询缓存，仍遵守源保护，可能在发起请求前拒绝。</small>
+          {!stackSelected&&<section aria-label="免费源等待状态">
+            <p>源保护只表示已记录的本机等待，不是厂商额度／外网可用性证明；设置更换或重启不会清除已提交期限。</p>
+            {protection?<ul>{protection.sources.map(s=><li key={s.source}>{searchSourceLabel(s.source)}：{s.state==="unavailable"?"保护状态不可读取，不能据此放行新源请求":s.state==="not_blocked_locally"?"当前没有本机等待阻止（未探测源可用性）":`本机等待至 ${new Date(s.not_before_utc!).toISOString()}${s.state==="cooldown_pending"?"（写入尚未确认，不称已持久化）":"（已提交）"}${s.reason==="local_interval"?" · 用户设置的发送预留间隔":s.reason==="retry_after"?" · 服务端 Retry-After":s.reason==="service_policy"?" · 接口保护间隔（不代表共享IP额度）":" · 等待来源未提供"}`}</li>)}</ul>:<p role="note">当前后端未提供可用的源保护快照，不能推断源可用性。</p>}
+          </section>}
+          {stackSelected&&<StackOverflowProtection raw={settings.stack_overflow_state} readDisabled={busy||readLoading} allowRecovery={!locked&&!readLoading} onRead={reread} onRecover={()=>void recoverStack()}/>}
+        </fieldset>}
         <p className="sub">
           Key 返回 401/403 时<strong>不会</strong>自动回落到免 Key 后端——那会用错误的凭据反复打别人的服务。
           搜索失败也不会阻断请求，响应头 <code>X-Route-Search: failed</code> 会如实说明。
         </p>
-        {message && <div className={`msg ${message.kind}`}>{message.text}</div>}
+        {message && <div role={message.kind === "err" ? "alert" : "status"} className={`msg ${message.kind}`}>{message.text}</div>}
       </div>
 
       <div className="card">
         <h3>测试后端</h3>
         <div className="row">
           <input
+            aria-label="检索输入"
+            ref={queryInput}
             className="field-grow"
             value={probeText}
             onChange={(event) => setProbeText(event.target.value)}
@@ -1208,33 +1505,33 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
           />
           <button
             className="button"
-            disabled={busy || probeText.trim().length === 0}
-            onClick={async () => {
-              setBusy(true);
-              setMessage(null);
-              try {
-                const result = await api.testSearchBackend(probeText);
-                setOutcome(result);
-                setMessage(
-                  result.error
-                    ? { kind: "err", text: result.error }
-                    : { kind: "ok", text: `命中 ${result.hits} 条` }
-                );
-              } catch (error) {
-                setMessage({ kind: "err", text: errorMessage(error) });
-              } finally {
-                setBusy(false);
-              }
-            }}
+            disabled={locked || stackProbeBlocked || probeText.trim().length === 0}
+            onClick={() => void startProbe()}
           >
             搜索一次
           </button>
+          {probe && <button type="button" disabled={!probe.ready || probe.cancelPending || probe.cancelAccepted} onClick={() => void cancelProbe(probeJob.current)}>取消本次检索</button>}
         </div>
+        {settings.manual_search_cancel_supported !== true && <p className="sub">当前后端的单请求取消能力尚未确认。</p>}
         {outcome && (
           <div className="local-result">
+            <section aria-label="检索结果事实" className="sub breakable">
+              {outcomeUnconfirmed && <p role="status">上次已完成检索结果；{probeCancelled ? "本次检索已取消，结果未更新。" : busy ? "本次检索尚未确认，等待返回或取消。" : "本次检索尚未确认，可显式重试。"}</p>}
+              <p>提交的检索输入：{outcomeInput?.slice(0,512)??"未知"}{outcomeInput&&outcomeInput.length>512?"（截断展示）":""}。这是提交输入，不代表远端规范化检索词。</p>
+              <p>本机检索元数据完成时间：{typeof outcome.retrieved_at_utc==="string"&&Number.isFinite(Date.parse(outcome.retrieved_at_utc))?outcome.retrieved_at_utc:"时间未知（接口未提供可用时间）"}。</p>
+              <p>{outcome.reuse==="fresh"?"本机新执行":outcome.reuse==="cached"?"本机查询缓存，保留原完成时间":outcome.reuse==="shared"?"共享在途检索，保留原完成时间":outcome.reuse==="bypass"?"未使用本机复用":"复用状态未知"}；后端：{outcome.backend==="free_aggregate"?"免费聚合检索":SEARCH_BACKEND_LABEL[outcome.backend]??"未知"}。</p>
+              <p>当次网页请求偏好：{searchLocaleLabel(outcome.requested_locale)}。</p>
+              <p>不是网页发布时间或源站实时性证明；此时间不包含可选正文读取。草稿编辑不会改变已有结果的提交输入。</p>
+            </section>
+            {outcome.results.length > 0 && (outcome.failed_sources?.length ?? 0) > 0 && <p className="sub" role="status" data-testid="search-partial-status">部分来源不可用：{outcome.failed_sources!.map(searchSourceLabel).join("、")}；已保留其他来源结果。</p>}
+            {outcome.page_text && <section aria-label="本次公开正文读取"><p className="sub">仅显示当次读取状态；正文不另行保存，读取时间不是发布时间。</p>
+              {outcome.page_text.pages.length===0 ? <p>{outcome.page_text.state==="destination_verification_unavailable"?"搜索使用代理，无法验证正文目标，未读取且未降级直连。":outcome.page_text.state==="scope_unavailable"?"当前检索范围不读取正文。":outcome.page_text.state==="busy"?"正文读取繁忙，本次保留标题与摘要。":"本次未读取正文，保留标题与摘要。"}</p> : outcome.page_text.pages.map(p=><p key={p.result_index} className="sub">结果{p.result_index+1}：{p.state==="available"?`已读取 · ${p.read_at_utc??"读取时间未知"}`:p.state==="source_wait"?"来源要求等待，本次未读取":p.state==="deadline"?"已到搜索期限，本次未读完":"正文不可用，保留原标题与摘要"}</p>)}
+            </section>}
+            {!outcome.error && <MdnReferenceCard value={outcome.unstructured_reference} />}
             {outcome.results.map((item, index) => (
               <div key={item.url} className="sub">
-                {index + 1}. {item.title} — {item.url}
+                <span data-testid="search-source-label">{outcome.result_sources?.[index] ? searchSourceLabel(outcome.result_sources[index]) : SEARCH_BACKEND_LABEL[outcome.backend]}</span>{" · "}
+                {index + 1}. {searchResultHref(item.url) ? <a href={searchResultHref(item.url)} target="_blank" rel="noopener noreferrer">{item.title}</a> : item.title} — {item.url}
                 {item.snippet ? `　${item.snippet.slice(0, 120)}` : ""}
               </div>
             ))}

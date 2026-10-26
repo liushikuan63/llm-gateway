@@ -73,6 +73,7 @@ impl AgentReply {
     /// 「换个 Provider 客户端就解析不了」。
     pub fn into_chat_response(self, model: impl Into<String>) -> crate::domain::ChatResponse {
         crate::domain::ChatResponse {
+            reported_usage_evidence: Default::default(),
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             // 先取 transport —— 下面的 `content: self.text` 会把 `self` 的字段移走。
             // 它是**适配器如实回报**的值（假适配器报 "fake"、真适配器报 "L3"），

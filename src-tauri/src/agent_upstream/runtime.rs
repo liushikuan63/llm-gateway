@@ -16,9 +16,14 @@ pub struct ResolvedRuntime {
 }
 
 pub enum ChatRuntime {
+    Trae {
+        id: String,
+        options: TraeRuntimeOptions,
+    },
     Agent(ResolvedRuntime),
     WorkBuddy {
         id: String,
+        region: crate::workbuddy_auth::WorkBuddyRegion,
         account_id: String,
         aliases: BTreeMap<String, String>,
     },
@@ -39,9 +44,34 @@ pub fn qoder_options(
         .ok_or("Qoder直连需要本机账号和区域绑定")?;
     let region = serde_json::from_value(object.remove("region").ok_or("Qoder直连缺少明确区域")?)
         .map_err(|_| "Qoder直连区域必须为global或cn")?;
+    // Presentation metadata never participates in account resolution or wire routing.
+    object.remove("model_display_names");
     let (account, aliases) = workbuddy_options(Some(&Value::Object(object)))
         .map_err(|e| e.replace("WorkBuddy", "Qoder"))?;
     Ok((region, account, aliases))
+}
+
+pub(crate) fn model_display_names(options: Option<&Value>) -> BTreeMap<String, String> {
+    options
+        .and_then(|o| o.get("model_display_names"))
+        .and_then(Value::as_object)
+        .filter(|names| names.len() <= 512)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|(id, name)| {
+                    let name = name.as_str()?;
+                    (!id.is_empty()
+                        && id.len() <= 512
+                        && !id.chars().any(char::is_control)
+                        && !name.trim().is_empty()
+                        && name.len() <= 256
+                        && !name.chars().any(char::is_control))
+                    .then(|| (id.clone(), name.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn workbuddy_options(
@@ -74,6 +104,30 @@ pub fn workbuddy_options(
     Ok((account.into(), aliases))
 }
 
+pub fn workbuddy_region_options(
+    options: Option<&Value>,
+) -> Result<
+    (
+        crate::workbuddy_auth::WorkBuddyRegion,
+        String,
+        BTreeMap<String, String>,
+    ),
+    String,
+> {
+    let mut object = options
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or("WorkBuddy直连需要本机账号和区域绑定")?;
+    let region = match object.remove("region") {
+        Some(value) => {
+            serde_json::from_value(value).map_err(|_| "WorkBuddy直连区域必须为global或cn")?
+        }
+        None => crate::workbuddy_auth::WorkBuddyRegion::Global,
+    };
+    let (account, aliases) = workbuddy_options(Some(&Value::Object(object)))?;
+    Ok((region, account, aliases))
+}
+
 pub async fn resolve_chat_runtime(
     pool: &SqlitePool,
     registry: &AdapterRegistry,
@@ -87,10 +141,17 @@ pub async fn resolve_chat_runtime(
         if !runtime.enabled {
             return Err("账号运行时已停用".into());
         }
+        if runtime.kind == "trae-model" {
+            return Ok(ChatRuntime::Trae {
+                id: runtime.id,
+                options: trae_options(runtime.options.as_ref())?,
+            });
+        }
         if runtime.kind == "workbuddy-model" {
-            let (account_id, aliases) = workbuddy_options(runtime.options.as_ref())?;
+            let (region, account_id, aliases) = workbuddy_region_options(runtime.options.as_ref())?;
             return Ok(ChatRuntime::WorkBuddy {
                 id: runtime.id,
+                region,
                 account_id,
                 aliases,
             });
@@ -173,7 +234,239 @@ pub async fn resolve_runtime(
 
 type RuntimeOptions = (Option<String>, BTreeMap<String, String>);
 
-fn parse_options(options: Option<&Value>) -> Result<RuntimeOptions, String> {
+/// Persisted native metadata is a snapshot, never a claim of live model support.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraeRuntimeOptions {
+    pub region: String,
+    pub account_id: String,
+    pub principal_hash: String,
+    pub profile_id: String,
+    pub model_selections: BTreeMap<String, TraeModelSelection>,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraeModelSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_model: Option<crate::proxy::trae::profile::RawModelIdentity>,
+    pub source_function: String,
+    pub selector_id: String,
+    pub config_name: String,
+    pub display_name: String,
+    pub prompt_max_tokens: Option<u32>,
+    pub max_tokens: Option<u32>,
+    pub declared_vision: Option<bool>,
+    pub declared_tools: Option<bool>,
+    pub declared_thinking: Option<bool>,
+    pub reasoning_effort_options: Vec<String>,
+    pub protocol_carriers: TraeProtocolCarriers,
+    pub account_model_evidence: String,
+    pub catalog_revision: String,
+    pub fetched_at_ms: i64,
+    #[serde(default)]
+    pub allow_undeclared_images: bool,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraeProtocolCarriers {
+    pub text: bool,
+    pub tools: bool,
+    pub images: bool,
+    pub audio: bool,
+    pub video: bool,
+}
+impl TraeRuntimeOptions {
+    pub(crate) fn binding(&self) -> crate::proxy::trae::profile::TraeModelBinding {
+        use crate::proxy::trae::profile::*;
+        // Saved consumers validate through trae_options before binding.
+        let profile_id = match self.profile_id.as_str() {
+            "cn-web-raw-v1" => TraeProfileId::CnWebRawV1,
+            "global-web-raw-sg-v1" => TraeProfileId::GlobalWebRawSgV1,
+            _ => TraeProfileId::CnOrdinary343Aicc20260212V1,
+        };
+        TraeModelBinding {
+            region: profile_id.region(),
+            account_id: self.account_id.clone(),
+            principal_hash: self.principal_hash.clone(),
+            profile_id,
+        }
+    }
+}
+impl TraeModelSelection {
+    pub(crate) fn from_ticket(
+        ticket: &crate::proxy::trae::NativeCatalogTicket,
+        allow_undeclared_images: bool,
+    ) -> Self {
+        let entry = ticket.entry();
+        let carriers = &entry.protocol_carriers;
+        Self {
+            raw_model: entry.raw_model.clone(),
+            source_function: ticket.source_function().as_str().into(),
+            selector_id: entry.selector_id.clone(),
+            config_name: entry.config_name.clone(),
+            display_name: entry.display_name.clone(),
+            prompt_max_tokens: entry.prompt_max_tokens,
+            max_tokens: entry.max_tokens,
+            declared_vision: entry.declared_vision,
+            declared_tools: entry.declared_tools,
+            declared_thinking: entry.declared_thinking,
+            reasoning_effort_options: entry.reasoning_effort_options.clone(),
+            protocol_carriers: TraeProtocolCarriers {
+                text: carriers.text,
+                tools: carriers.tools,
+                images: carriers.images,
+                audio: carriers.audio,
+                video: carriers.video,
+            },
+            account_model_evidence: entry.account_model_evidence.into(),
+            catalog_revision: ticket.catalog_revision().into(),
+            fetched_at_ms: ticket.fetched_at_ms(),
+            allow_undeclared_images,
+        }
+    }
+    pub(crate) fn view(&self) -> crate::proxy::trae::catalog::TraeNativeModelView {
+        use crate::proxy::trae::catalog::*;
+        let c = &self.protocol_carriers;
+        TraeNativeModelView {
+            raw_model: self.raw_model.clone(),
+            selector_id: self.selector_id.clone(),
+            config_name: self.config_name.clone(),
+            display_name: self.display_name.clone(),
+            prompt_max_tokens: self.prompt_max_tokens,
+            max_tokens: self.max_tokens,
+            declared_vision: self.declared_vision,
+            declared_tools: self.declared_tools,
+            declared_thinking: self.declared_thinking,
+            reasoning_effort_options: self.reasoning_effort_options.clone(),
+            protocol_carriers: ProtocolCarriers {
+                text: c.text,
+                tools: c.tools,
+                images: c.images,
+                audio: c.audio,
+                video: c.video,
+            },
+            account_model_evidence: "unverified",
+        }
+    }
+}
+pub fn trae_options(options: Option<&Value>) -> Result<TraeRuntimeOptions, String> {
+    use crate::proxy::trae::profile::*;
+    let invalid = "native_runtime_options_invalid";
+    let value = options.ok_or(invalid)?;
+    if serde_json::to_vec(value).map_err(|_| invalid)?.len() > 1024 * 1024 {
+        return Err(invalid.into());
+    }
+    let parsed: TraeRuntimeOptions = serde_json::from_value(value.clone()).map_err(|_| invalid)?;
+    let profile: TraeProfileId =
+        serde_json::from_value(serde_json::json!(parsed.profile_id)).map_err(|_| invalid)?;
+    if parsed.region
+        != match profile.region() {
+            TraeRegion::Cn => "cn",
+            TraeRegion::Global => "global",
+        }
+    {
+        return Err("native_device_bootstrap_unavailable".into());
+    }
+    let id_valid = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    };
+    let hash_valid = |s: &str| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if !id_valid(&parsed.account_id)
+        || !hash_valid(&parsed.principal_hash)
+        || parsed.model_selections.is_empty()
+        || parsed.model_selections.len() > 512
+    {
+        return Err(invalid.into());
+    }
+    for (alias, selected) in &parsed.model_selections {
+        let c = &selected.protocol_carriers;
+        if !crate::config::is_explicit_model_name(alias)
+            || alias.trim() != alias
+            || alias.len() > 128
+            || alias
+                .bytes()
+                .any(|b| !b.is_ascii_alphanumeric() && !b"-_.".contains(&b))
+            || selected.source_function != profile.function().as_str()
+            || selected.config_name.is_empty()
+            || selected.config_name.chars().count() > 256
+            || selected.config_name.chars().any(char::is_control)
+            || selected.config_name.contains(['<', '>'])
+            || selected.display_name.is_empty()
+            || selected.display_name.chars().count() > 256
+            || selected.display_name.chars().any(char::is_control)
+            || if profile.is_web() {
+                selected.raw_model.as_ref().map_or(true, |raw| {
+                    !raw.valid()
+                        || selected.selector_id
+                            != crate::proxy::trae::catalog::web::selector(
+                                profile,
+                                profile.function(),
+                                &selected.config_name,
+                                raw,
+                            )
+                })
+            } else {
+                selected.raw_model.is_some()
+                    || selected.selector_id
+                        != crate::proxy::trae::catalog::selector_id(
+                            profile,
+                            profile.function(),
+                            &selected.config_name,
+                        )
+            }
+            || uuid::Uuid::parse_str(&selected.catalog_revision).is_err()
+            || chrono::DateTime::from_timestamp_millis(selected.fetched_at_ms).is_none()
+            || selected.fetched_at_ms <= 0
+            || selected.account_model_evidence != "unverified"
+            || !c.text
+            || !c.tools
+            || !c.images
+            || (selected.allow_undeclared_images && selected.declared_vision.is_some())
+            || c.audio
+            || c.video
+            || selected.reasoning_effort_options.len() > 5
+            || selected
+                .reasoning_effort_options
+                .iter()
+                .any(|v| !["minimal", "low", "medium", "high", "xhigh"].contains(&v.as_str()))
+            || selected
+                .reasoning_effort_options
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != selected.reasoning_effort_options.len()
+            || [selected.prompt_max_tokens, selected.max_tokens]
+                .iter()
+                .flatten()
+                .any(|v| *v == 0 || *v > 16_777_216)
+        {
+            return Err(invalid.into());
+        }
+        // No native declaration fields have been established for this profile.
+        // A saved local policy may allow an unknown image candidate, never create evidence.
+        if [
+            selected.declared_vision,
+            selected.declared_tools,
+            selected.declared_thinking,
+        ]
+        .iter()
+        .flatten()
+        .any(|v| *v)
+        {
+            return Err(invalid.into());
+        }
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn parse_options(options: Option<&Value>) -> Result<RuntimeOptions, String> {
     let Some(options) = options else {
         return Ok((None, BTreeMap::new()));
     };

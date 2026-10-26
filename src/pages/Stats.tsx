@@ -1,13 +1,24 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import ClientUsagePanel from "./ClientUsagePanel";
-import { api, AttemptRecord, AuditFilter, formatMoney, RequestLog, SpendBucket, SpendByDimension, SpendDaily, StatsOverview, TokenCalibration } from "../api";
+import RequestTimingSummary from "./RequestTimingSummary";
+import RequestGenerationSummary from "./RequestGenerationSummary";
+import RequestObservationContext from "./RequestObservationContext";
+import RequestTimingDetails, { projectRequestTiming } from "./RequestTiming";
+import RequestControlModes from "./RequestControlModes";
+import RequestGeneration from "./RequestGeneration";
+import NativeUsagePanel, { isUnverifiedPersonalUsage, NativeRequestUsage, NativeScalarCoverage } from "./NativeUsagePanel";
+import RequestFeedback from "./RequestFeedback";
+import RequestDecision from "./RequestDecision";
+import FeedbackCoverage from "./FeedbackCoverage";
+import ConversationFeedback from "./ConversationFeedback";
+import { api, AttemptRecord, AuditFilter, AuditRow, FeedbackCoverage as Coverage, formatMoney, SpendBucket, SpendByDimension, SpendDaily, StatsOverview, TokenCalibration } from "../api";
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function formatNumber(value: number) {
-  return new Intl.NumberFormat("zh-CN").format(value);
+function formatNumber(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value) ? "未知" : new Intl.NumberFormat("zh-CN").format(value);
 }
 
 function formatTime(timestamp: number) {
@@ -43,7 +54,19 @@ function dimensionRows(rows: SpendByDimension[], showModel: boolean) {
 }
 
 function attemptStatus(record: AttemptRecord) {
-  if (record.ok) return <span className="tag ok">成功</span>;
+  const timing = projectRequestTiming(record.timing);
+  if (timing) {
+    if (timing.terminal === "completed") {
+      // An observed HTTP completion does not override a failed outer attempt.
+      if (!record.ok) return <span className="tag err">{record.status == null ? "失败" : `${record.status} · 失败`}</span>;
+      return <span className="tag ok">完成</span>;
+    }
+    if (timing.terminal === "failed") return <span className="tag err">失败</span>;
+    if (timing.terminal === "cancelled") return <span className="tag warn">已取消</span>;
+    if (timing.terminal === "incomplete") return <span className="tag err">未完整结束</span>;
+    return <span className="tag warn">观察未结束</span>;
+  }
+  if (record.ok) return <span className="tag ok">选路成功</span>;
   if (record.status === null) return <span className="tag err">失败</span>;
   return <span className="tag err">{record.status}</span>;
 }
@@ -59,9 +82,13 @@ function attemptList(attempts: AttemptRecord[] | null) {
           <span className="attempt-index">{index + 1}</span>
           <span className="attempt-target mono breakable">{record.provider} · {record.model}</span>
           {attemptStatus(record)}
-          <span className="muted">{record.latency_ms}ms</span>
+          <span className="muted">记录耗时 {record.latency_ms}ms</span>
           {record.reason && <span className="muted breakable attempt-reason">{record.reason}</span>}
           {!record.ok && !record.retryable && <span className="tag warn">已停止降级</span>}
+          <RequestTimingDetails value={record.timing}/>
+          <RequestGeneration value={record.generation} attemptOk={record.ok} completed={projectRequestTiming(record.timing)?.terminal === "completed"} mode={projectRequestTiming(record.timing)?.mode ?? null}/>
+          <RequestControlModes value={record.wire_modes}/>
+          <RequestObservationContext value={record.observation_context} providerId={record.provider_id}/>
         </li>
       ))}
     </ol>
@@ -70,9 +97,9 @@ function attemptList(attempts: AttemptRecord[] | null) {
 
 export default function StatsPage() {
   const [stats, setStats] = useState<StatsOverview | null>(null);
-  const [rows, setRows] = useState<RequestLog[]>([]);
+  const [rows, setRows] = useState<AuditRow[]>([]);
   const [calibrations, setCalibrations] = useState<TokenCalibration[]>([]);
-  const [expanded, setExpanded] = useState<number | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: "err" | "ok"; text: string } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -87,6 +114,8 @@ export default function StatsPage() {
   // 用 `queryRequests` 而不是 `recentRequests`：后者是固定窗口，
   // 加不了条件也拿不到总数。
   const [filter, setFilter] = useState<AuditFilter>({});
+  const [coverage, setCoverage] = useState<{value: Coverage | null; scope: string; error: string | null}>({value:null,scope:"",error:null});
+  const coverageScope = JSON.stringify({...filter,limit:undefined,offset:undefined});
   const [total, setTotal] = useState(0);
   const [truncated, setTruncated] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -139,8 +168,13 @@ export default function StatsPage() {
           api.listTokenCalibrations(),
         ] as const;
         // A rejected summary must not release the polling guard while audit IPC is pending.
-        await Promise.allSettled(requests);
+        const feedbackRequest = api.feedbackCoverage(filter);
+        const settled = await Promise.allSettled([...requests, feedbackRequest] as const);
         if (!active) return;
+        // Coverage owns its scoped success/error; unrelated panel rejection
+        // must not discard this settled result or leave stale success visible.
+        const result = settled[3];
+        setCoverage({value:result.status === "fulfilled" ? result.value : null,scope:coverageScope,error:result.status === "rejected" ? "人工反馈覆盖读取失败；未显示为零。" : null});
         const [overview, page, calibrationRows] = await Promise.all(requests);
         if (!active) return;
         setStats(overview);
@@ -222,6 +256,11 @@ export default function StatsPage() {
       {msg && <div role={msg.kind === "err" ? "alert" : "status"} className={`msg ${msg.kind}`}>{msg.text}</div>}
 
       <ClientUsagePanel/>
+      <NativeUsagePanel usage={stats?.native_usage} byModel={stats?.native_usage_by_model}/>
+      <RequestTimingSummary value={stats?.request_timings}/>
+      <RequestGenerationSummary value={stats?.request_timings}/>
+      <FeedbackCoverage value={coverage.scope === coverageScope ? coverage.value : null} loading={refreshing} error={coverage.scope === coverageScope ? coverage.error : null}/>
+      <ConversationFeedback filter={filter}/>
       <div className="grid4" style={{ marginBottom: 14 }}>
         <div className="stat">
           <div className="k">近 24 小时请求</div>
@@ -236,7 +275,8 @@ export default function StatsPage() {
         <div className="stat">
           <div className="k">平均延迟</div>
           <div className="v">{stats ? `${formatNumber(stats.avg_latency_ms)}ms` : "-"}</div>
-          <div className="muted stat-detail">近 24 小时请求均值</div>
+          <div className="muted stat-detail">均值 · 有效样本 {formatNumber(stats?.latency_sample_count ?? 0)}</div>
+          <div className="muted stat-detail">P50 {stats?.latency_p50_ms == null ? "未知" : `${formatNumber(stats.latency_p50_ms)}ms`} · P95 {stats?.latency_p95_ms == null ? "未知" : `${formatNumber(stats.latency_p95_ms)}ms`}</div>
         </div>
         <div className="stat">
           <div className="k">故障转移</div>
@@ -250,16 +290,17 @@ export default function StatsPage() {
       <div className="grid2" style={{ marginBottom: 14 }}>
         <div className="stat">
           <div className="k">输入 token</div>
-          <div className="v">{formatNumber(stats?.total_prompt_tokens ?? 0)}</div>
+          <div className="v"><NativeScalarCoverage value={stats?.total_prompt_tokens ?? 0} coverage={stats?.native_usage?.prompt_tokens} legacyRequests={stats?.native_usage?.legacy_requests}/></div>
           <div className="muted stat-detail">近 24 小时 prompt tokens</div>
         </div>
         <div className="stat">
           <div className="k">输出 token</div>
-          <div className="v">{formatNumber(stats?.total_completion_tokens ?? 0)}</div>
+          <div className="v"><NativeScalarCoverage value={stats?.total_completion_tokens ?? 0} coverage={stats?.native_usage?.completion_tokens} legacyRequests={stats?.native_usage?.legacy_requests}/></div>
           <div className="muted stat-detail">近 24 小时 completion tokens</div>
         </div>
       </div>
 
+      {(stats?.native_usage?.native_requests ?? 0) > 0 && <p className="sub">下方花费沿用本地日聚合口径，不代表平台完整账单；独立调用的已知 API 参考费用及未知覆盖见上方最近 24 小时专节。</p>}
       <div className="grid3 spend-cards">
         <div className="stat">
           <div className="k">今日花费</div>
@@ -281,7 +322,7 @@ export default function StatsPage() {
         <div className="spend-note muted">
           {spend.note}
           {spend.unpriced_requests_30d > 0 && (
-            <span className="unpriced-hint"> 近 30 天还有 {formatNumber(spend.unpriced_requests_30d)} 个请求的模型未配置价格，未计入花费；可在「供应商 → 编辑模型」中按官方价目表填写。</span>
+            <span className="unpriced-hint"> 近 30 天还有 {formatNumber(spend.unpriced_requests_30d)} 个请求未计入本地花费：可能缺少价格、缺少用量，或独立账号实际账单未知。本节不包含独立账号的 API 参考费用，详见请求明细。调整模型价格仅影响后续请求，历史记录不会自动重算。</span>
           )}
         </div>
       )}
@@ -340,8 +381,8 @@ export default function StatsPage() {
                   <td>{provider.provider}</td>
                   <td>{formatNumber(provider.requests)}</td>
                   <td>{formatNumber(provider.successful_requests)}</td>
-                  <td>{formatNumber(provider.prompt_tokens)}</td>
-                  <td>{formatNumber(provider.completion_tokens)}</td>
+                  <td><NativeScalarCoverage value={provider.prompt_tokens} coverage={provider.native_usage?.prompt_tokens} legacyRequests={provider.native_usage?.legacy_requests}/></td>
+                  <td><NativeScalarCoverage value={provider.completion_tokens} coverage={provider.native_usage?.completion_tokens} legacyRequests={provider.native_usage?.legacy_requests}/></td>
                   <td>{formatNumber(provider.fallback_attempts)}</td>
                 </tr>
               ))}
@@ -608,13 +649,16 @@ export default function StatsPage() {
               </thead>
               <tbody>
                 {rows.map((request, index) => {
-                  const isExpanded = expanded === index;
+                  const validId = Number.isSafeInteger(request.id) && request.id > 0;
+                  const rowKey = validId ? `audit-${request.id}` : `legacy-${request.ts}-${index}`;
+                  const isExpanded = expanded === rowKey;
                   const hasAttempts = (request.attempts?.length ?? 0) > 0;
+                  const personalUnverified = isUnverifiedPersonalUsage(request.native_usage);
                   return (
-                    <Fragment key={`${request.ts}-${index}`}>
+                    <Fragment key={rowKey}>
                       <tr
-                        className={hasAttempts ? "request-row clickable" : "request-row"}
-                        onClick={() => hasAttempts && setExpanded(isExpanded ? null : index)}
+                        className={hasAttempts || validId ? "request-row clickable" : "request-row"}
+                        onClick={() => (hasAttempts || validId) && setExpanded(isExpanded ? null : rowKey)}
                       >
                         <td className="muted" style={{ fontSize: 11 }}>{formatTime(request.ts)}</td>
                         <td className="mono muted">{request.client ?? "-"}</td>
@@ -631,22 +675,23 @@ export default function StatsPage() {
                         </td>
                         <td>{request.latency_ms === null ? "-" : `${request.latency_ms}ms`}</td>
                         <td>
-                          {formatNumber(request.prompt_tokens)} / {formatNumber(request.completion_tokens)}
+                          {formatNumber(personalUnverified ? null : request.native_usage ? request.native_usage.prompt_tokens : request.prompt_tokens)} / {formatNumber(personalUnverified ? null : request.native_usage ? request.native_usage.completion_tokens : request.completion_tokens)}
                           {request.estimated_prompt_tokens !== null && (
                             <span className="muted" style={{ fontSize: 10 }} title="本地估算值；与左侧实际值对比即可看出估算偏差">
                               {" "}（估 {formatNumber(request.estimated_prompt_tokens)}）
                             </span>
                           )}
+                          {request.native_usage && <NativeRequestUsage usage={request.native_usage}/>}
                         </td>
                         <td>
-                          {request.cost === null || request.currency === null
+                          {personalUnverified ? <span className="muted">用量／费用未核验</span> : request.native_usage ? <span className="muted">API 参考费用见用量明细</span> : request.cost === null || request.currency === null
                             ? <span className="muted">未计价</span>
                             : formatMoney(request.cost, request.currency)}
                         </td>
-                        <td className="muted breakable" style={{ fontSize: 11 }}>{request.rate_label ?? "基础价"}</td>
+                        <td className="muted breakable" style={{ fontSize: 11 }}>{personalUnverified ? "无可信用量或费用收据" : request.native_usage ? "请求时参考单价" : request.rate_label ?? "基础价"}</td>
                         <td>
-                          {hasAttempts ? (
-                            <button type="button" className="ghost attempt-toggle" aria-expanded={isExpanded}>
+                          {hasAttempts || validId ? (
+                            <button type="button" className="ghost attempt-toggle" aria-expanded={isExpanded} aria-label={validId ? `任务反馈与请求明细 ${request.id}` : undefined}>
                               {request.fallback_attempts} · {isExpanded ? "收起" : "明细"}
                             </button>
                           ) : request.fallback_attempts}
@@ -658,6 +703,10 @@ export default function StatsPage() {
                           <td colSpan={11}>
                             <div className="attempt-title">降级链（按尝试顺序）</div>
                             {attemptList(request.attempts)}
+                            <RequestDecision value={request.route_decision}/>
+                            {validId ? <RequestFeedback requestId={request.id} onDiscard={() => {
+                              if (mounted.current) setMsg({kind: "err", text: "详情已关闭，未保存的反馈未写入；原记录未改。"});
+                            }}/> : <p className="muted">该记录没有可安全编辑的请求编号，不能保存反馈。</p>}
                           </td>
                         </tr>
                       )}

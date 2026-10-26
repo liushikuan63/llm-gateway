@@ -631,3 +631,88 @@ fn 能力账本与_d1_的数据类型能对上() {
     );
     assert_eq!(set.covered_dimensions(), 2);
 }
+
+#[tokio::test]
+async fn s1_observation_file_reopen_identity_and_old_shape_boundaries() {
+    use llm_gateway_lib::db::{repo, Db};
+    let root =
+        std::env::temp_dir().join(format!("llmgw-owned-s1-evidence-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("evidence.sqlite");
+    let db = Db::connect_path(&path).await.unwrap();
+    seed_model(&db).await;
+    let (ledger, _) = CapabilitySet::import_json(r#"{"coding":{"manual":{"value":0.75,"observed_at":"2020-01-01T08:00:00+08:00","sample_count":0},"catalog":0.5},"math":{"measured":{"value":0.8,"sample_count":12}}}"#).unwrap();
+    assert!(
+        repo::write_capability_ledger(db.pool(), "p1", "m1", &ledger)
+            .await
+            .unwrap()
+    );
+    let resolved = repo::read_model_capabilities(db.pool(), "p1", "m1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.coding, Some(0.75));
+    assert_ne!(
+        resolved.updated_at.unwrap().to_rfc3339(),
+        "2020-01-01T00:00:00+00:00"
+    );
+    let mut provider = repo::list_providers(db.pool()).await.unwrap().remove(0);
+    provider.note = Some("owned note only".into());
+    repo::upsert_provider_config(db.pool(), &provider)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo::read_capability_ledger(db.pool(), "p1", "m1")
+            .await
+            .unwrap(),
+        Some(ledger.clone())
+    );
+    db.pool().close().await;
+    drop(db);
+    let reopened = Db::connect_path(&path).await.unwrap();
+    let back = repo::read_capability_ledger(reopened.pool(), "p1", "m1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back, ledger);
+    assert_eq!(
+        repo::read_model_capabilities(reopened.pool(), "p1", "m1")
+            .await
+            .unwrap()
+            .unwrap()
+            .coding,
+        Some(0.75)
+    );
+    // An exact old-field projection can still read scores but drops evidence;
+    // this is not an assertion that downgrading a real installed binary is safe.
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct OldValue {
+        value: f32,
+        source: CapabilitySource,
+    }
+    let encoded = serde_json::to_value(&back).unwrap();
+    let old: OldValue =
+        serde_json::from_value(encoded["values"]["coding"]["manual"].clone()).unwrap();
+    let old = serde_json::to_value(old).unwrap();
+    assert_eq!(old["value"], 0.75);
+    assert!(old.get("observed_at").is_none());
+    assert_eq!(encoded["values"]["coding"]["manual"]["sample_count"], 0);
+    provider.models[0].upstream = "different-physical-model".into();
+    repo::upsert_provider_config(reopened.pool(), &provider)
+        .await
+        .unwrap();
+    assert!(repo::read_capability_ledger(reopened.pool(), "p1", "m1")
+        .await
+        .unwrap()
+        .is_none());
+    reopened.pool().close().await;
+    drop(reopened);
+    // Preserve this owned fixture for audit. A Windows file-release race during
+    // recursive cleanup must not discard the persistence/identity evidence.
+    let temp = std::env::temp_dir().canonicalize().unwrap();
+    assert_eq!(root.canonicalize().unwrap().parent(), Some(temp.as_path()));
+    eprintln!(
+        "owned S1 evidence fixture retained for audit: {}",
+        root.display()
+    );
+}

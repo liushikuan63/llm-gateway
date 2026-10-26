@@ -50,14 +50,24 @@ use crate::domain::Content;
 /// `system` 消息提到顶层 `instructions`：Responses 把它单独放，
 /// 塞进 `input` 会被当成一条普通用户消息。
 pub fn to_responses_body(req: &ChatRequest, model: &str) -> Value {
+    to_responses_body_with_instruction(req, model, false)
+}
+
+/// Only the request-scoped instruction inserted at index zero opts out of the
+/// legacy blank-system filter. Ordinary input systems retain their old behavior.
+pub(crate) fn to_responses_body_with_instruction(
+    req: &ChatRequest,
+    model: &str,
+    preserve_instruction: bool,
+) -> Value {
     let mut instructions: Vec<String> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
 
-    for message in &req.messages {
+    for (index, message) in req.messages.iter().enumerate() {
         match message.role {
             Role::System => {
                 let t = plain_text(message);
-                if !t.trim().is_empty() {
+                if (preserve_instruction && index == 0) || !t.trim().is_empty() {
                     instructions.push(t);
                 }
             }
@@ -91,6 +101,10 @@ pub fn to_responses_body(req: &ChatRequest, model: &str) -> Value {
     }
 
     let mut body = json!({ "model": model, "input": input });
+
+    if let Some(reasoning) = crate::protocol::reasoning::responses_value(req) {
+        body["reasoning"] = reasoning;
+    }
 
     if !instructions.is_empty() {
         body["instructions"] = json!(instructions.join("\n\n"));
@@ -249,6 +263,7 @@ pub fn from_responses_response(v: &Value, model: &str) -> ChatResponse {
     });
 
     ChatResponse {
+        reported_usage_evidence: Default::default(),
         // 普通 API 上游没有「传输」这个概念（A6 判据 1 只对账号型上游有意义）。
         transport: None,
         id: v

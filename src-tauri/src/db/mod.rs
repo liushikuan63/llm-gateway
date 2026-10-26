@@ -2,8 +2,15 @@
 //! 选 SQLite 的理由：单文件、零运维、便于快照整体拷贝（这是 CC Switch 与
 //! FreeLLMAPI 的共同选择），并通过 WAL + 原子写入避免配置写坏。
 
+mod benefit_principal_schema;
+pub(crate) mod budget_archive_schema;
+mod budget_schema;
+mod capability_declaration_schema;
+mod catalog_schema;
+mod entitlement_schema;
 pub mod migrations;
 pub mod repo;
+mod request_feedback_schema;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;

@@ -294,6 +294,108 @@ const LONG_PROMPT: &str =
     "帮我看看这个函数为什么不工作，它在生产环境里偶发返回空值，日志里什么都看不到";
 
 #[tokio::test]
+async fn refine_usage_unknown_is_not_zero_but_explicit_zero_is_preserved() {
+    use serde_json::{json, Value};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    for dialect in [Dialect::OpenAI, Dialect::Anthropic] {
+        let reply = Arc::new(Mutex::new(Value::Null));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let body = reply.clone();
+        let hits = seen.clone();
+        let path = if dialect == Dialect::Anthropic {
+            "/v1/messages"
+        } else {
+            "/v1/chat/completions"
+        };
+        let app = Router::new().route(
+            path,
+            axum::routing::post(move || {
+                let body = body.clone();
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(body.lock().unwrap().clone())
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut selected = target(&base);
+        selected.dialect = dialect;
+        let (input, output) = if dialect == Dialect::Anthropic {
+            ("input_tokens", "output_tokens")
+        } else {
+            ("prompt_tokens", "completion_tokens")
+        };
+        let mut cases = vec![
+            (None, None),
+            (Some(json!({})), None),
+            (Some(json!({input:1})), None),
+            (Some(json!({input:null,output:2})), None),
+            (Some(json!({input:-1,output:2})), None),
+            (Some(json!({input:1.5,output:2})), None),
+            (Some(json!({input:4294967296u64,output:0})), None),
+            (Some(json!({input:4294967295u64,output:1})), None),
+            (Some(json!({input:0,output:0})), Some((0, 0, 0))),
+            (Some(json!({input:3,output:2})), Some((3, 2, 5))),
+        ];
+        if dialect == Dialect::OpenAI {
+            cases.extend([
+                (Some(json!({input:3,output:2,"total_tokens":4})), None),
+                (Some(json!({input:3,output:2,"total_tokens":null})), None),
+                (
+                    Some(json!({input:3,output:2,"total_tokens":5})),
+                    Some((3, 2, 5)),
+                ),
+            ]);
+        }
+        cases.push((Some(Value::Null), None));
+        if dialect == Dialect::Anthropic {
+            cases.extend([(Some(json!({input:3,output:2,"cache_read_input_tokens":null})),None),(Some(json!({input:3,output:2,"cache_creation_input_tokens":4294967296u64})),None),(Some(json!({input:3,output:4,"cache_read_input_tokens":1,"cache_creation_input_tokens":2})),Some((6,4,10)))]);
+        } else {
+            cases.extend([(Some(json!({input:3,output:2,"prompt_tokens_details":null})),None),(Some(json!({input:3,output:2,"prompt_tokens_details":{"cached_tokens":-1}})),None),(Some(json!({input:3,output:2,"prompt_tokens_details":{"cached_tokens":4}})),None),(Some(json!({input:3,output:2,"completion_tokens_details":{"reasoning_tokens":3}})),None),(Some(json!({input:3,output:2,"prompt_tokens_details":{"cached_tokens":1,"cache_write_tokens":1}})),Some((3,2,5)))]);
+        }
+        for (index, (usage, expected)) in cases.into_iter().enumerate() {
+            let text = "请逐步分析生产环境偶发空返回的触发条件，给出可复现的诊断步骤和验证方案";
+            let mut value = if dialect == Dialect::Anthropic {
+                json!({"content":[{"type":"text","text":text}]})
+            } else {
+                json!({"choices":[{"message":{"content":text}}]})
+            };
+            if let Some(usage) = usage {
+                value["usage"] = usage;
+            }
+            *reply.lock().unwrap() = value;
+            let outcome = refine::refine(&http(), &selected, None, LONG_PROMPT, &cfg()).await;
+            assert!(
+                outcome.applied,
+                "usage interpretation must not discard a valid rewrite"
+            );
+            let actual = outcome
+                .usage
+                .as_ref()
+                .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens));
+            assert_eq!(
+                actual, expected,
+                "dialect={dialect:?},case={index}: unknown primary usage is not known zero"
+            );
+            assert_eq!(
+                seen.load(Ordering::SeqCst),
+                index + 1,
+                "one invocation is exactly one owned POST"
+            );
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn 改写成功时提示词被替换() {
     let (base, hits) = spawn_upstream(Upstream::Text(
         "分析该函数在生产环境偶发返回空值的原因，给出可复现的排查步骤",

@@ -15,8 +15,11 @@ import {
   TakeoverResult,
 } from "../api";
 import PetCard from "./PetCard";
+import ProxyControls from "./ProxyControls";
+import RemoteKeyBudgetStatus from "../components/RemoteKeyBudgetStatus";
 
 type Message = { kind: "ok" | "err"; text: string };
+type CliReadback = Pick<CliToolReport, "id" | "label"> & { output: string };
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error);
@@ -87,24 +90,160 @@ export default function SettingsPage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [takeoverResults, setTakeoverResults] = useState<TakeoverResult[]>([]);
   const [cliTools, setCliTools] = useState<CliToolReport[]>([]);
+  const [cliReadback, setCliReadback] = useState<CliReadback | null>(null);
+  const [cliReadFailed, setCliReadFailed] = useState(false);
   const [selfCheck, setSelfCheck] = useState<SelfCheckResult | null>(null);
   // 原始远程 Key 不进入 React state，关闭一次性展示窗口后立即清除。
   const oneTimeSecretRef = useRef<string | null>(null);
+  const oneTimeGeneration = useRef(0);
+  const oneTimeDialogRef = useRef<HTMLDivElement>(null);
+  const oneTimeReturnFocus = useRef<HTMLElement | null>(null);
+  const remoteKeyCreationInput = useRef<HTMLInputElement>(null);
   const mounted = useRef(false);
   const loadVersion = useRef(0);
+  const cliLoadVersion = useRef(0);
   const controlsLocked = busy !== null || loading;
+
+  const remoteKeyDialogRef = useRef<HTMLDivElement>(null);
+  const remoteKeyReturnFocus = useRef<HTMLElement | null>(null);
+  const remoteKeyLocked = useRef(controlsLocked);
+  remoteKeyLocked.current = controlsLocked;
+  const remoteKeyFocusable = () => Array.from(remoteKeyDialogRef.current?.querySelectorAll<HTMLElement>(
+    'button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]',
+  ) ?? []).filter(node => node.getClientRects().length > 0);
+
+  useEffect(() => {
+    if (!editingRemoteKey) return;
+    remoteKeyReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const contain = (event: FocusEvent) => {
+      if (event.target instanceof Node && !remoteKeyDialogRef.current?.contains(event.target)) {
+        (remoteKeyFocusable()[0] ?? remoteKeyDialogRef.current)?.focus();
+      }
+    };
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault(); event.stopPropagation();
+        if (!remoteKeyLocked.current) setEditingRemoteKey(null);
+      } else if (event.key === "Tab") {
+        const nodes = remoteKeyFocusable(), first = nodes[0], last = nodes[nodes.length - 1];
+        const active = document.activeElement;
+        if (!first || !remoteKeyDialogRef.current?.contains(active) || active === remoteKeyDialogRef.current
+          || active?.matches(":disabled") || event.shiftKey && active === first || !event.shiftKey && active === last) {
+          event.preventDefault(); (event.shiftKey ? last ?? remoteKeyDialogRef.current : first ?? remoteKeyDialogRef.current)?.focus();
+        }
+      }
+    };
+    document.addEventListener("focusin", contain); document.addEventListener("keydown", keydown);
+    return () => { document.removeEventListener("focusin", contain); document.removeEventListener("keydown", keydown); };
+  }, [editingRemoteKey?.id]);
+
+  useEffect(() => {
+    if (editingRemoteKey) {
+      const active = document.activeElement;
+      if (!remoteKeyDialogRef.current?.contains(active) || active?.matches(":disabled")) {
+        (remoteKeyFocusable()[0] ?? remoteKeyDialogRef.current)?.focus();
+      }
+    } else if (!controlsLocked && mounted.current) {
+      // A successful mutation reloads and temporarily disables its trigger.
+      // Restore only after that read settles, never while leaving Settings.
+      if (remoteKeyReturnFocus.current?.isConnected) remoteKeyReturnFocus.current.focus();
+      remoteKeyReturnFocus.current = null;
+    }
+  }, [editingRemoteKey?.id, controlsLocked]);
+
+
+  useEffect(() => {
+    if (!oneTimeSecretLabel) return;
+    const focusable = () => Array.from(oneTimeDialogRef.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? []);
+    const contain = (event: FocusEvent) => {
+      if (event.target instanceof Node && !oneTimeDialogRef.current?.contains(event.target)) (focusable()[0] ?? oneTimeDialogRef.current)?.focus();
+    };
+    const keydown = (event: KeyboardEvent) => {
+      // This one-time result still requires its explicit acknowledgement.
+      // Escape must not silently discard the only displayed value.
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); }
+      if (event.key !== "Tab") return;
+      const nodes = focusable(), first = nodes[0], last = nodes[nodes.length - 1], active = document.activeElement;
+      if (!first || !oneTimeDialogRef.current?.contains(active) || active === oneTimeDialogRef.current
+        || event.shiftKey && active === first || !event.shiftKey && active === last) {
+        event.preventDefault(); (event.shiftKey ? last ?? oneTimeDialogRef.current : first ?? oneTimeDialogRef.current)?.focus();
+      }
+    };
+    document.addEventListener("focusin", contain); document.addEventListener("keydown", keydown);
+    return () => { document.removeEventListener("focusin", contain); document.removeEventListener("keydown", keydown); };
+  }, [oneTimeSecretLabel]);
+
+  useEffect(() => {
+    if (oneTimeSecretLabel && !oneTimeDialogRef.current?.contains(document.activeElement)) {
+      (oneTimeDialogRef.current?.querySelector<HTMLElement>("button:not(:disabled)") ?? oneTimeDialogRef.current)?.focus();
+    } else if (!oneTimeSecretLabel && !controlsLocked && mounted.current && oneTimeReturnFocus.current) {
+      const previous = oneTimeReturnFocus.current;
+      const target = previous?.isConnected && !previous.matches(":disabled") ? previous : remoteKeyCreationInput.current;
+      if (target?.isConnected && !target.matches(":disabled")) target.focus();
+      oneTimeReturnFocus.current = null;
+    }
+  }, [oneTimeSecretLabel, controlsLocked]);
+
+  const remoteConfirmationRef = useRef<HTMLDivElement>(null);
+  const lanConfirmationRef = useRef<HTMLDivElement>(null);
+  const confirmationReturnFocus = useRef<HTMLElement | null>(null);
+  const confirmationKind = remoteConfirmationOpen ? "remote" : lanConfirmationOpen ? "lan" : null;
+  const confirmationElement = () => confirmationKind === "remote" ? remoteConfirmationRef.current : lanConfirmationRef.current;
+  const confirmationButtons = () => Array.from(confirmationElement()?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? []);
+
+  useEffect(() => {
+    if (!confirmationKind) return;
+    confirmationReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const contain = (event: FocusEvent) => {
+      if (event.target instanceof Node && !confirmationElement()?.contains(event.target)) (confirmationButtons()[0] ?? confirmationElement())?.focus();
+    };
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault(); event.stopPropagation();
+        if (confirmationKind === "remote") setRemoteConfirmationOpen(false);
+        else setLanConfirmationOpen(false);
+      } else if (event.key === "Tab") {
+        const nodes = confirmationButtons(), first = nodes[0], last = nodes[nodes.length - 1], active = document.activeElement;
+        if (!first || !confirmationElement()?.contains(active) || active === confirmationElement()
+          || event.shiftKey && active === first || !event.shiftKey && active === last) {
+          event.preventDefault(); (event.shiftKey ? last ?? confirmationElement() : first ?? confirmationElement())?.focus();
+        }
+      }
+    };
+    document.addEventListener("focusin", contain); document.addEventListener("keydown", keydown);
+    return () => { document.removeEventListener("focusin", contain); document.removeEventListener("keydown", keydown); };
+  }, [confirmationKind]);
+
+  useEffect(() => {
+    if (confirmationKind && !confirmationElement()?.contains(document.activeElement)) {
+      // The first button is Cancel: opening or pressing Enter must never grant consent.
+      (confirmationButtons()[0] ?? confirmationElement())?.focus();
+    } else if (!confirmationKind && !controlsLocked && mounted.current && confirmationReturnFocus.current) {
+      const previous = confirmationReturnFocus.current;
+      if (previous.isConnected && !previous.matches(":disabled")) previous.focus();
+      confirmationReturnFocus.current = null;
+    }
+  }, [confirmationKind, controlsLocked]);
 
   const notifyConfigChanged = (config: AppConfig) => {
     window.dispatchEvent(new CustomEvent<AppConfig>("llm-gateway-config-changed", { detail: config }));
   };
 
-  const load = async (propagateError = false) => {
+  const load = async (committedMessage?: string, publishImportedConfig = false) => {
     if (!mounted.current) return false;
     const version = ++loadVersion.current;
     const isCurrent = () => mounted.current && version === loadVersion.current;
     setLoading(true);
     setMsg(null);
     try {
+      // Import already committed before this read. Keep its preparatory read
+      // under the same owner/version and partial-success handling as the reload.
+      if (publishImportedConfig) {
+        const imported = await api.getConfig();
+        if (!isCurrent()) return false;
+        setCfg(imported);
+        notifyConfigChanged(imported);
+      }
       const [config, key, snapshots, keys, providerList] = await Promise.all([
         api.getConfig(),
         api.getUnifiedKey(),
@@ -122,11 +261,47 @@ export default function SettingsPage() {
       return true;
     } catch (error) {
       if (!isCurrent()) return false;
-      setMsg({ kind: "err", text: `加载设置失败：${errorText(error)}` });
-      if (propagateError) throw new Error(`操作已完成，但设置刷新失败：${errorText(error)}`);
+      if (committedMessage) {
+        // Acknowledged mutations are never retried to recover a read failure.
+        // Hide stale controls, but keep the separately owned one-time result.
+        setKeyInfo(null);
+        const summary = committedMessage.endsWith("。") ? committedMessage : `${committedMessage}。`;
+        setMsg({ kind: "err", text: `${summary}但设置刷新失败：${errorText(error)}。请重试加载设置确认最新状态，不要重复执行操作。` });
+      } else {
+        setMsg({ kind: "err", text: `加载设置失败：${errorText(error)}` });
+      }
       return false;
     } finally {
       if (isCurrent()) setLoading(false);
+    }
+  };
+
+  const detectCli = async (completed: CliReadback | null = cliReadback, owner?: number) => {
+    const version = owner ?? ++cliLoadVersion.current;
+    const isCurrent = () => mounted.current && version === cliLoadVersion.current;
+    if (!isCurrent()) return;
+    setBusy("cli-detect");
+    try {
+      const reports = await api.detectCliTools();
+      if (!isCurrent()) return;
+      setCliTools(reports);
+      setCliReadback(null);
+      setCliReadFailed(false);
+      if (completed) {
+        const stillMissing = !reports.find(item => item.id === completed.id)?.installed;
+        setMsg({
+          kind: stillMissing ? "err" : "ok",
+          text: `${completed.label} 安装命令已执行${stillMissing ? "，但本机仍未检测到该命令；请按下方输出或官方文档检查 PATH" : ""}。输出：${completed.output || "（无输出）"}`,
+        });
+      } else setMsg({ kind: "ok", text: `已检测 ${reports.length} 个工具` });
+    } catch (error) {
+      if (!isCurrent()) return;
+      setCliReadFailed(true);
+      setMsg({ kind: "err", text: completed
+        ? `${completed.label} 安装命令已执行，但本机检测失败：${errorText(error)}。请重试本机 CLI 检测，不会重复安装。`
+        : `检测失败：${errorText(error)}` });
+    } finally {
+      if (isCurrent()) setBusy(null);
     }
   };
 
@@ -136,6 +311,8 @@ export default function SettingsPage() {
     return () => {
       mounted.current = false;
       loadVersion.current++;
+      cliLoadVersion.current++;
+      oneTimeGeneration.current++;
       oneTimeSecretRef.current = null;
     };
   }, []);
@@ -161,7 +338,17 @@ export default function SettingsPage() {
       if (!isCurrent()) return;
       setCfg(result.config);
       notifyConfigChanged(result.config);
-      const key = await api.getUnifiedKey();
+      let key: Record<string, string>;
+      try {
+        key = await api.getUnifiedKey();
+      } catch (error) {
+        if (!isCurrent()) return;
+        // The mutation already committed. Hide the unconfirmed connection
+        // snapshot; the existing retry only reads and must not repeat the save.
+        setKeyInfo(null);
+        setMsg({ kind: "err", text: `${restartMessage(result)}但统一接入信息刷新失败：${errorText(error)}。请重试加载设置确认最新接入信息。` });
+        return;
+      }
       if (!isCurrent()) return;
       setKeyInfo(key);
       setMsg({ kind: "ok", text: restartMessage(result) });
@@ -192,6 +379,7 @@ export default function SettingsPage() {
   };
 
   const closeOneTimeSecret = () => {
+    oneTimeGeneration.current++;
     oneTimeSecretRef.current = null;
     setOneTimeSecretLabel(null);
   };
@@ -207,15 +395,17 @@ export default function SettingsPage() {
       return;
     }
 
+    oneTimeReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setBusy("remote-key-create");
     try {
       const result = await api.createRemoteAccessKey({ label, rpm_limit: remoteKeyRpmLimit });
       // 只在内存引用中短暂保留，列表和任何可持久化 state 都不会保存 secret。
+      oneTimeGeneration.current++;
       oneTimeSecretRef.current = result.secret;
       setOneTimeSecretLabel(result.key.label);
       setRemoteKeyLabel("");
       setRemoteKeyRpmLimit(60);
-      if (!await load(true)) return;
+      if (!await load(`已创建“${result.key.label}”的远程访问 Key，请立即保存一次性 secret`)) return;
       setMsg({ kind: "ok", text: `已创建“${result.key.label}”的远程访问 Key，请立即保存一次性 secret。` });
     } catch (error) {
       setMsg({ kind: "err", text: `创建远程访问 Key 失败：${errorText(error)}` });
@@ -264,7 +454,7 @@ export default function SettingsPage() {
     try {
       await api.updateRemoteAccessKey({ id: key.id, ...changes, label: changes.label.trim() });
       setEditingRemoteKey(null);
-      if (!await load(true)) return;
+      if (!await load(`已更新远程访问 Key“${changes.label.trim()}”`)) return;
       setMsg({ kind: "ok", text: `已更新远程访问 Key“${changes.label.trim()}”` });
     } catch (error) {
       setMsg({ kind: "err", text: `更新远程访问 Key 失败：${errorText(error)}` });
@@ -287,7 +477,7 @@ export default function SettingsPage() {
     setBusy(`remote-key-${key.id}`);
     try {
       await api.deleteRemoteAccessKey(key.id);
-      if (!await load(true)) return;
+      if (!await load(`已删除远程访问 Key“${key.label}”`)) return;
       setMsg({ kind: "ok", text: `已删除远程访问 Key“${key.label}”` });
     } catch (error) {
       setMsg({ kind: "err", text: `删除远程访问 Key 失败：${errorText(error)}` });
@@ -383,12 +573,53 @@ export default function SettingsPage() {
     }
   };
 
+  const oneTimeSecretDialog = oneTimeSecretLabel && (
+        <div className="modal-mask">
+          <div className="modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="one-time-key-title" ref={oneTimeDialogRef} tabIndex={-1}>
+            <h3 id="one-time-key-title">保存新的远程访问 Key</h3>
+            <p className="confirm-lead">
+              “{oneTimeSecretLabel}”的原始 Key 只会在此处显示一次。关闭此窗口后，应用无法再次查看或恢复它。
+            </p>
+            <div className="code">{oneTimeSecretRef.current ?? "Key 已清除"}</div>
+            <div className="msg err" style={{ marginTop: 12 }}>
+              请立即保存到受信任的密码管理器。不要截图、写入日志或共享给他人。
+            </div>
+            <div className="row end" style={{ marginTop: 18 }}>
+              <button
+                onClick={() => {
+                  const generation = oneTimeGeneration.current;
+                  const secret = oneTimeSecretRef.current;
+                  if (!secret) {
+                    setMsg({ kind: "err", text: "原始 Key 已清除，无法复制。" });
+                    return;
+                  }
+                  void (async () => {
+                    try {
+                      await navigator.clipboard.writeText(secret);
+                      if (!mounted.current || generation !== oneTimeGeneration.current) return;
+                      setMsg({ kind: "ok", text: "已复制一次性远程访问 Key，请安全保存。" });
+                    } catch (error) {
+                      if (!mounted.current || generation !== oneTimeGeneration.current) return;
+                      setMsg({ kind: "err", text: `复制 Key 失败：${errorText(error)}` });
+                    }
+                  })();
+                }}
+              >
+                复制 Key
+              </button>
+              <button className="primary" onClick={closeOneTimeSecret}>我已安全保存</button>
+            </div>
+          </div>
+        </div>
+      );
+
   if (!cfg || !keyInfo) return <div>
     <h2>设置</h2>
-    {msg && <div role="alert" className="msg err">{msg.text}</div>}
+    {msg && <div role={msg.kind === "err" ? "alert" : "status"} className={`msg ${msg.kind}`}>{msg.text}</div>}
     {loading
       ? <div className="empty" role="status">加载设置中</div>
       : <button onClick={() => void load()}>重试加载设置</button>}
+    {oneTimeSecretDialog}
   </div>;
 
   const enabledRemoteKeyCount = remoteKeys.filter((key) => key.enabled).length;
@@ -396,6 +627,7 @@ export default function SettingsPage() {
   return (
     <div>
       <h2>设置</h2>
+      <ProxyControls />
       <div className="sub">
         当前保存的监听地址为 <span className="mono">{cfg.bind}:{cfg.port}</span>。
         {cfg.remote_mode.enabled ? " 远程 HTTPS 反代模式已配置，网关仅监听本机回环地址。" : " 默认仅监听本机回环地址。"}
@@ -448,7 +680,7 @@ ${keyInfo.ollama_endpoint}`}
                 setBusy("rotate-key");
                 try {
                   await api.rotateUnifiedKey();
-                  if (!await load(true)) return;
+                  if (!await load("统一 Key 已轮换，请更新已接入的客户端")) return;
                   setMsg({ kind: "ok", text: "统一 Key 已轮换，请更新已接入的客户端" });
                 } catch (error) {
                   setMsg({ kind: "err", text: `轮换失败：${errorText(error)}` });
@@ -581,7 +813,8 @@ ${keyInfo.ollama_endpoint}`}
           <div className="field">
             <label>新访问 Key 名称</label>
             <input
-              value={remoteKeyLabel}
+              ref={remoteKeyCreationInput}
+                  value={remoteKeyLabel}
               disabled={controlsLocked}
               maxLength={64}
               placeholder="例如 我的笔记本"
@@ -638,9 +871,7 @@ ${keyInfo.ollama_endpoint}`}
                     </td>
                     <td>{key.rpm_limit}</td>
                     <td className="muted">
-                      {key.monthly_budget_micros > 0
-                        ? `${key.monthly_budget_micros / 1_000_000} ${key.budget_currency.toUpperCase() || "—"}`
-                        : "不限"}
+                      <RemoteKeyBudgetStatus accessKey={key} />
                     </td>
                     <td className="muted" style={{ fontSize: 11 }}>
                       {key.allowed_models.length > 0
@@ -954,31 +1185,23 @@ ${keyInfo.ollama_endpoint}`}
         <div className="row">
           <button
             disabled={controlsLocked}
-            onClick={() => {
-              void (async () => {
-                setBusy("cli-detect");
-                try {
-                  const reports = await api.detectCliTools();
-                  setCliTools(reports);
-                  setMsg({ kind: "ok", text: `已检测 ${reports.length} 个工具` });
-                } catch (error) {
-                  setMsg({ kind: "err", text: `检测失败：${errorText(error)}` });
-                } finally {
-                  setBusy(null);
-                }
-              })();
-            }}
+            onClick={() => void detectCli()}
           >
-            {busy === "cli-detect" ? "检测中…" : "检测本机 CLI"}
+            {busy === "cli-detect" ? "检测中…" : cliReadback ? "重试本机 CLI 检测" : "检测本机 CLI"}
           </button>
           <button
             disabled={controlsLocked}
             onClick={() => {
               void (async () => {
+                const version = ++cliLoadVersion.current;
+                const isCurrent = () => mounted.current && version === cliLoadVersion.current;
                 setBusy("cli-check");
                 try {
                   const reports = await api.detectCliToolsWithUpdates();
+                  if (!isCurrent()) return;
                   setCliTools(reports);
+                  setCliReadback(null);
+                  setCliReadFailed(false);
                   const updatable = reports.filter((report) => report.update_available).length;
                   const failed = reports.filter((report) => report.check_error).length;
                   setMsg({
@@ -988,9 +1211,12 @@ ${keyInfo.ollama_endpoint}`}
                     }`,
                   });
                 } catch (error) {
-                  setMsg({ kind: "err", text: `检查更新失败：${errorText(error)}` });
+                  if (isCurrent()) {
+                    setCliReadFailed(true);
+                    setMsg({ kind: "err", text: `检查更新失败：${errorText(error)}` });
+                  }
                 } finally {
-                  setBusy(null);
+                  if (isCurrent()) setBusy(null);
                 }
               })();
             }}
@@ -998,8 +1224,12 @@ ${keyInfo.ollama_endpoint}`}
             {busy === "cli-check" ? "查询中…" : "检测并检查更新"}
           </button>
         </div>
+        {cliReadback && <div className="msg" role="status">
+          {cliReadback.label} 安装命令已执行，本机检测尚未确认。输出：{cliReadback.output || "（无输出）"}
+        </div>}
         {cliTools.length > 0 && (
           <div style={{ marginTop: 12 }}>
+            {cliReadFailed && <div className="msg" role="status">CLI 列表为上次检测结果，当前状态未确认；请重新检测后再安装或更新。</div>}
             {cliTools.some((tool) => tool.source === "npm" && !tool.can_install) && (
               <div className="msg" role="status">未检测到 npm：npm 类工具无法一键安装或更新，请先安装 Node.js。</div>
             )}
@@ -1053,28 +1283,30 @@ ${keyInfo.ollama_endpoint}`}
                     <td>
                       <button
                         className="ghost"
-                        disabled={controlsLocked || !actionEnabled}
-                        title={actionTitle}
+                        disabled={controlsLocked || cliReadFailed || !actionEnabled}
+                        title={cliReadFailed ? "当前检测未确认，请先重新检测" : actionTitle}
                         onClick={() => {
                           const lead = isScript
                             ? `将执行官方安装脚本：\n${report.install_command}\n\n这会从官方地址下载并执行 ${report.label} 的安装脚本（始终安装最新版）。确定继续吗？`
                             : `将执行：\n${report.install_command}\n\n这会通过 npm 全局${actionLabel} ${report.label}。确定继续吗？`;
                           if (!window.confirm(lead)) return;
                           void (async () => {
+                            const version = ++cliLoadVersion.current;
+                            const isCurrent = () => mounted.current && version === cliLoadVersion.current;
                             setBusy(`cli-install-${report.id}`);
                             try {
                               const output = await api.installCliTool(report.id);
-                              const refreshed = await api.detectCliTools();
-                              setCliTools(refreshed);
-                              const stillMissing = !refreshed.find((item) => item.id === report.id)?.installed;
-                              setMsg({
-                                kind: stillMissing ? "err" : "ok",
-                                text: `${report.label} 安装命令已执行${stillMissing ? "，但本机仍未检测到该命令；请按下方输出或官方文档检查 PATH" : ""}。输出：${output.slice(0, 300) || "（无输出）"}`,
-                              });
+                              if (!isCurrent()) return;
+                              const completed = { id: report.id, label: report.label, output: output.slice(0, 300) };
+                              // The command completed; a failed read must not
+                              // invite reinstalling from the old status/actions.
+                              setCliReadback(completed);
+                              setCliTools([]);
+                              await detectCli(completed, version);
                             } catch (error) {
-                              setMsg({ kind: "err", text: `${report.label} 安装失败：${errorText(error)}` });
+                              if (isCurrent()) setMsg({ kind: "err", text: `${report.label} 安装失败：${errorText(error)}` });
                             } finally {
-                              setBusy(null);
+                              if (isCurrent()) setBusy(null);
                             }
                           })();
                         }}
@@ -1250,7 +1482,7 @@ ${keyInfo.ollama_endpoint}`}
                 try {
                   await api.createSnapshot(snapName.trim());
                   setSnapName("");
-                  if (!await load(true)) return;
+                  if (!await load("已保存当前配置快照")) return;
                   setMsg({ kind: "ok", text: "已保存当前配置快照" });
                 } catch (error) {
                   setMsg({ kind: "err", text: `保存快照失败：${errorText(error)}` });
@@ -1296,7 +1528,7 @@ ${keyInfo.ollama_endpoint}`}
                               const result = await api.applySnapshot(snapshot.id);
                               setCfg(result.config);
                               notifyConfigChanged(result.config);
-                              if (!await load(true)) return;
+                              if (!await load(`已应用快照“${snapshot.name}”。${restartMessage(result)}`)) return;
                               setMsg({ kind: "ok", text: `已应用快照“${snapshot.name}”。${restartMessage(result)}` });
                             } catch (error) {
                               setMsg({ kind: "err", text: `应用快照失败：${errorText(error)}` });
@@ -1357,17 +1589,15 @@ ${keyInfo.ollama_endpoint}`}
                   if (!window.confirm(`导入会用 ${dir} 中的配置替换当前 Provider 与模型配置。导入前会自动备份当前数据目录。确定继续吗？`)) return;
                   setBusy("bundle-import");
                   const outcome = await api.importBundle(dir);
-                  const imported = await api.getConfig();
-                  setCfg(imported);
-                  notifyConfigChanged(imported);
-                  if (!await load(true)) return;
                   const { result } = outcome;
                   const missing = result.providers_missing_key.length
                     ? `。以下 Provider 的 Key 需要用本机主密钥重新填写：${result.providers_missing_key.join("、")}`
                     : "";
+                  const summary = `已导入 ${result.providers_imported} 个 Provider、${result.models_imported} 个模型；配置${result.config_imported ? "已应用" : "未包含"}。导入前备份：${outcome.backup_dir}${missing}`;
+                  if (!await load(summary, true)) return;
                   setMsg({
                     kind: result.providers_missing_key.length ? "err" : "ok",
-                    text: `已导入 ${result.providers_imported} 个 Provider、${result.models_imported} 个模型；配置${result.config_imported ? "已应用" : "未包含"}。导入前备份：${outcome.backup_dir}${missing}`,
+                    text: summary,
                   });
                 } catch (error) {
                   setMsg({ kind: "err", text: `导入失败：${errorText(error)}` });
@@ -1382,51 +1612,17 @@ ${keyInfo.ollama_endpoint}`}
         </div>
       </div>
 
-      {oneTimeSecretLabel && (
-        <div className="modal-mask">
-          <div className="modal confirm-modal">
-            <h3>保存新的远程访问 Key</h3>
-            <p className="confirm-lead">
-              “{oneTimeSecretLabel}”的原始 Key 只会在此处显示一次。关闭此窗口后，应用无法再次查看或恢复它。
-            </p>
-            <div className="code">{oneTimeSecretRef.current ?? "Key 已清除"}</div>
-            <div className="msg err" style={{ marginTop: 12 }}>
-              请立即保存到受信任的密码管理器。不要截图、写入日志或共享给他人。
-            </div>
-            <div className="row end" style={{ marginTop: 18 }}>
-              <button
-                onClick={() => {
-                  const secret = oneTimeSecretRef.current;
-                  if (!secret) {
-                    setMsg({ kind: "err", text: "原始 Key 已清除，无法复制。" });
-                    return;
-                  }
-                  void (async () => {
-                    try {
-                      await navigator.clipboard.writeText(secret);
-                      setMsg({ kind: "ok", text: "已复制一次性远程访问 Key，请安全保存。" });
-                    } catch (error) {
-                      setMsg({ kind: "err", text: `复制 Key 失败：${errorText(error)}` });
-                    }
-                  })();
-                }}
-              >
-                复制 Key
-              </button>
-              <button className="primary" onClick={closeOneTimeSecret}>我已安全保存</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {oneTimeSecretDialog}
 
       {editingRemoteKey && (
-        <div className="modal-mask" onClick={() => setEditingRemoteKey(null)}>
-          <div className="modal" onClick={(event) => event.stopPropagation()}>
-            <h3>编辑远程访问 Key</h3>
+        <div className="modal-mask" onClick={() => { if (!controlsLocked) setEditingRemoteKey(null); }}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="remote-key-editor-title" aria-busy={controlsLocked} ref={remoteKeyDialogRef} tabIndex={-1} onClick={(event) => event.stopPropagation()}>
+            <h3 id="remote-key-editor-title">编辑远程访问 Key</h3>
             {msg?.kind === "err" && <div role="alert" className="msg err">{msg.text}</div>}
             <div className="field">
-              <label>名称</label>
+              <label htmlFor="remote-key-editor-label">名称</label>
               <input
+                id="remote-key-editor-label"
                 value={editingRemoteKeyLabel}
                 maxLength={64}
                 disabled={controlsLocked}
@@ -1434,11 +1630,12 @@ ${keyInfo.ollama_endpoint}`}
               />
             </div>
             <div className="field">
-              <label>每分钟请求上限（1-100000）</label>
+              <label htmlFor="remote-key-editor-rpm">每分钟请求上限（1-100000）</label>
               <input
                 type="number"
                 min={1}
                 max={100000}
+                id="remote-key-editor-rpm"
                 value={editingRemoteKeyRpmLimit}
                 disabled={controlsLocked}
                 onChange={(event) => setEditingRemoteKeyRpmLimit(Number(event.target.value))}
@@ -1523,8 +1720,8 @@ ${keyInfo.ollama_endpoint}`}
 
       {remoteConfirmationOpen && (
         <div className="modal-mask" onClick={() => setRemoteConfirmationOpen(false)}>
-          <div className="modal confirm-modal" onClick={(event) => event.stopPropagation()}>
-            <h3>确认启用远程 HTTPS 反代</h3>
+          <div className="modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="remote-confirmation-title" ref={remoteConfirmationRef} tabIndex={-1} onClick={(event) => event.stopPropagation()}>
+            <h3 id="remote-confirmation-title">确认启用远程 HTTPS 反代</h3>
             <p className="confirm-lead">
               将通过 <span className="mono">{cfg.remote_mode.public_url?.trim()}</span> 接受远程客户端请求。请确认以下边界都已满足：
             </p>
@@ -1562,8 +1759,8 @@ ${keyInfo.ollama_endpoint}`}
 
       {lanConfirmationOpen && (
         <div className="modal-mask" onClick={() => setLanConfirmationOpen(false)}>
-          <div className="modal confirm-modal" onClick={(event) => event.stopPropagation()}>
-            <h3>确认开启局域网访问</h3>
+          <div className="modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="lan-confirmation-title" ref={lanConfirmationRef} tabIndex={-1} onClick={(event) => event.stopPropagation()}>
+            <h3 id="lan-confirmation-title">确认开启局域网访问</h3>
             <p className="confirm-lead">
               此操作会在下次重启后将网关绑定到 <span className="mono">0.0.0.0</span>。请确认下列边界均已满足：
             </p>

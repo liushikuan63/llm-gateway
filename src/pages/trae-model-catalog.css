@@ -1,0 +1,13 @@
+.trae-model-catalog { min-width: 0; max-width: 100%; padding-top: 16px; border-top: 1px solid var(--border); }
+.trae-model-catalog h4 { margin: 0 0 8px; }
+.trae-model-catalog p, .trae-model-catalog li { overflow-wrap: anywhere; }
+.trae-model-catalog p { font-size: 12px; line-height: 1.65; }
+.trae-model-catalog__group { min-width: 0; max-width: 100%; }
+.trae-model-catalog__group h5, .trae-model-catalog__warnings h5 { margin: 14px 0 8px; }
+.trae-model-catalog__scroll { max-width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
+.trae-model-catalog table { border-collapse: collapse; width: 100%; min-width: 520px; font-size: 12px; }
+.trae-model-catalog th, .trae-model-catalog td { padding: 8px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); max-width: 240px; overflow-wrap: anywhere; }
+.trae-model-catalog code { white-space: normal; overflow-wrap: anywhere; }
+.trae-model-catalog [role="alert"] { color: var(--danger, #b42318); }
+.trae-model-catalog__warnings { font-size: 12px; }
+ .trae-model-catalog button[aria-disabled="true"] { opacity: .6; cursor: not-allowed; }

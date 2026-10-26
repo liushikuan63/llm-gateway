@@ -1,7 +1,11 @@
-import { useEffect, useState } from "react";
-import { api, CandidateExplanation, CapabilitySet, formatPricePerMillion, ParetoView, ProviderView } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { api, CandidateExplanation, CapabilitySet, PriceObservationView, TpsReference, formatPricePerMillion, ParetoView, ProviderView } from "../api";
 import { errorText } from "./providerPresets";
 import "./capabilities.css";
+import CapabilityTransfer from "../components/CapabilityTransfer";
+import PriceObservation from "../components/PriceObservation";
+import CapabilityEvidence, { SourceEvidenceItem } from "../components/CapabilityEvidence";
+import ModelCapabilityDeclaration, { usesChatDeclaration } from "../components/ModelCapabilityDeclaration";
 
 /** 七个打分维度的中文名。**只是标签** —— 判定逻辑不在前端。 */
 const FACTOR_LABEL: Record<string, string> = {
@@ -16,7 +20,7 @@ const FACTOR_LABEL: Record<string, string> = {
  * 只给胜出者的话，用户看到「我填的没生效」时没有任何线索 ——
  * 他既不知道还有谁说过话，也不知道谁赢了。
  *
- * 【为什么是只读页】写入路径在 `ProviderEditor`。一个既能看冲突、
+ * 【冲突视图只读】单模型写入路径在 `ProviderEditor`。文件迁移另有独立显式入口。一个既能看冲突、
  * 又能就地改值的页面会让人分不清「我刚改的是哪个来源」，
  * 而来源正是这个功能唯一的解释对象。
  */
@@ -37,7 +41,7 @@ const TRUST_ORDER = ["measured", "manual", "community", "catalog"];
 
 interface DimensionRow {
   dimension: string;
-  items: Array<{ source: string; value: number }>;
+  items: SourceEvidenceItem[];
   conflict: boolean;
 }
 
@@ -51,9 +55,13 @@ function rowsOf(set: CapabilitySet | undefined): DimensionRow[] {
         // 导出文件可能来自更老的版本。
         .map(([source, raw]) => ({
           source,
-          value: typeof raw === "number" ? raw : Number(raw?.value ?? 0),
+          value: typeof raw === "number" ? raw : raw?.value,
+          observed_at: typeof raw === "number" ? undefined : raw?.observed_at,
+          sample_count: typeof raw === "number" ? undefined : raw?.sample_count,
         }))
-        .filter((item) => Number.isFinite(item.value))
+        .filter((item): item is { source: string; value: number; observed_at: string | null | undefined; sample_count: number | null | undefined } =>
+          typeof item.value === "number" && Number.isFinite(item.value)
+          && item.value >= 0 && item.value <= 1 && TRUST_ORDER.includes(item.source))
         .sort((a, b) => TRUST_ORDER.indexOf(a.source) - TRUST_ORDER.indexOf(b.source));
       // 冲突 = **不止一个来源，且它们说的不全一样**。
       // 两个来源给出同一个值是互相印证，不是冲突。
@@ -65,7 +73,21 @@ function rowsOf(set: CapabilitySet | undefined): DimensionRow[] {
     .sort((a, b) => Number(b.conflict) - Number(a.conflict));
 }
 
+/** Labels the read snapshot; UI does not run a wall-clock expiry or infer freshness. */
+function TpsFreshness({ reference }: { reference?: TpsReference | null }) {
+  if (!reference || reference.schema_version !== 1) return <small className="muted" data-testid="tps-reference">时效信息未知</small>;
+  const labels: Record<TpsReference["state"], string> = {
+    no_sample: "暂无有效样本", current: "参考当前", expired: "已过期：参考未知",
+    source_mismatch: "来源不符：参考未知", clock_unknown: "时钟未知：参考未知",
+  };
+  const count = reference.state !== "source_mismatch" && reference.cohort_sample_count != null
+    ? `；代次累计${reference.cohort_sample_count}` : "";
+  const age = reference.age_seconds == null ? "" : `；最近有效样本距本次读取${reference.age_seconds}秒`;
+  return <small className="muted" data-testid="tps-reference">{labels[reference.state] ?? "时效信息未知"}{age}{count}</small>;
+}
+
 export default function CapabilitiesPage() {
+  const [priceObservations, setPriceObservations] = useState<PriceObservationView[] | null>(null);
   const [ledger, setLedger] = useState<Record<string, CapabilitySet> | null>(null);
   const [pareto, setPareto] = useState<ParetoView | null>(null);
   const [explain, setExplain] = useState<CandidateExplanation[] | null>(null);
@@ -75,33 +97,54 @@ export default function CapabilitiesPage() {
   const [providers, setProviders] = useState<ProviderView[] | null>(null);
   const [query, setQuery] = useState("");
   const [factsPage, setFactsPage] = useState(1);
+  // Explain is a readonly snapshot for one normalized query, not the editable draft.
+  const canonical = (value: string) => value.trim() || "auto";
+  const modelDraft = useRef(explainModel);
+  const loadVersion = useRef(0);
+  const mounted = useRef(true);
+  const [explainQuery, setExplainQuery] = useState<string | null>(null);
+  const [pendingQuery, setPendingQuery] = useState<string | null>(null);
+
 
   const load = async (model = explainModel) => {
+    const requestId = ++loadVersion.current;
+    const query = canonical(model);
+    const isCurrent = () => mounted.current && requestId === loadVersion.current;
+    setPendingQuery(query);
     setBusy(true);
     setError(null);
     try {
-      const [raw, view, ranking, facts] = await Promise.allSettled([
+      const [raw, view, ranking, facts, observations] = await Promise.allSettled([
         api.exportCapabilities().then(value => JSON.parse(value) as Record<string, CapabilitySet>),
         api.capabilityPareto(),
         api.explainRouting(model.trim() || undefined),
         api.listProviders(),
+        api.priceObservations().then(value => { if (!Array.isArray(value)) throw new Error("价格来源记录形状未确认"); return value; }),
       ]);
+      if (!isCurrent()) return;
       if (raw.status === "fulfilled") setLedger(raw.value);
       if (view.status === "fulfilled") setPareto(view.value);
-      if (ranking.status === "fulfilled") setExplain(ranking.value);
+      const matchesDraft = canonical(modelDraft.current) === query;
+      if (ranking.status === "fulfilled" && matchesDraft) {
+        setExplain(ranking.value);
+        setExplainQuery(query);
+      }
       if (facts.status === "fulfilled") setProviders(facts.value);
-      const failures = [raw, view, ranking, facts].flatMap((result, index) =>
-        result.status === "rejected" ? [`${["质量来源", "比较", "路由解释", "模型事实"][index]}：${errorText(result.reason)}`] : []);
+      if (observations.status === "fulfilled") setPriceObservations(observations.value);
+      const failures = [raw, view, ranking, facts, observations].flatMap((result, index) =>
+        result.status === "rejected" && (index !== 2 || matchesDraft) ? [`${["质量来源", "比较", `路由解释（${query}）`, "模型事实", "价格来源记录"][index]}：${errorText(result.reason)}`] : []);
       if (failures.length) setError(`${failures.join("；")}。其他结果仍可查看；失败区域如有旧内容，保留上次成功读取的结果。`);
     } catch (cause) {
-      setError(errorText(cause));
+      if (isCurrent()) setError(errorText(cause));
     } finally {
-      setBusy(false);
+      if (isCurrent()) { setBusy(false); setPendingQuery(null); }
     }
   };
 
   useEffect(() => {
+    mounted.current = true;
     void load();
+    return () => { mounted.current = false; ++loadVersion.current; };
   }, []);
 
   const entries = Object.entries(ledger ?? {}).map(([key, set]) => ({ key, rows: rowsOf(set) }));
@@ -127,28 +170,29 @@ export default function CapabilitiesPage() {
 
       {error && <div className="capability-error" role="alert">部分数据读取失败：{error}</div>}
 
+      <CapabilityTransfer disabled={busy} onImported={() => void load()} />
+
       {providers !== null && <section className="capability-facts" data-testid="capability-facts" aria-labelledby="capability-facts-title">
-        <div className="facts-heading"><div><h3 id="capability-facts-title">模型事实与覆盖</h3><p className="capability-hint">价格来自当前配置；声明支持不等于账号已实测。未列为支持的能力可能尚未确认，也可能不支持。没有质量数据时显示默认回退说明。</p></div>
+        <div className="facts-heading"><div><h3 id="capability-facts-title">模型事实与覆盖</h3><p className="capability-hint">价格来自当前配置；声明支持不等于账号已实测。覆盖只计有效数值和已知来源，缺失／无效不补0。非聊天端点不套用聊天能力／质量口径；类型专用向量尚未定义，未改变评分。</p></div>
           <label>搜索模型事实<input value={query} onChange={event => { setQuery(event.target.value); setFactsPage(1); }} placeholder="模型、上游名或供应商" /></label>
         </div>
         <div className="facts-table-scroll" tabIndex={0} role="region" aria-label="模型事实表格，可横向滚动"><table className="facts-table">
-          <thead><tr><th>模型 / 供应商</th><th>价格与来源</th><th>上下文 / 用途</th><th>已配置支持</th><th>质量覆盖</th></tr></thead>
+          <thead><tr><th>模型 / 供应商</th><th>价格与来源</th><th>上下文 / 用途</th><th>声明 / 适用范围</th><th>质量覆盖</th></tr></thead>
           <tbody>{visibleFacts.map(({ provider, model, rows }) => {
-            const declared = [[model.supports_tools, "工具"], [model.supports_thinking, "思考"], [model.supports_vision, "图像"], [model.supports_audio, "音频"], [model.supports_video, "视频"], [model.supports_stream, "流式"]] as const;
-            const supported = declared.filter(([value]) => value).map(([, label]) => label);
-            const unknown = declared.filter(([value]) => !value).map(([, label]) => label);
+            const chatDeclaration = usesChatDeclaration(model);
+            const contextKnown = Number.isSafeInteger(model.context_window) && model.context_window > 0;
             const covered = rows.filter(row => DIMENSION_LABEL[row.dimension]).length;
             const configuredQuality = Object.keys(DIMENSION_LABEL).filter(dimension => {
               const value = model.capabilities?.[dimension as "coding" | "reasoning" | "knowledge" | "math"];
-              return typeof value === "number" && Number.isFinite(value);
+              return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
             });
             const price = model.price;
             return <tr key={`${provider.id}/${model.alias}`}>
               <td><strong>{model.alias}</strong><small>{provider.name}{!provider.enabled || !model.enabled ? " · 已停用" : ""}</small>{model.alias !== model.upstream && <small>上游：{model.upstream}</small>}</td>
-              <td>{price ? <><span>{formatPricePerMillion(price)}</span><small>{price.currency.toUpperCase()} · {price.source === "manual" ? "手工配置" : "目录参考价"}</small><small>缓存读 / 写：{price.cache_read ?? price.prompt} / {price.cache_creation ?? price.prompt} 每 100 万</small>{(price.tiers.length > 0 || price.rules.length > 0) && <small>含分档 / 时段条件，实际费用按请求计算</small>}<small>来源时间尚未记录</small></> : <span className="missing">未配置价格；费用未知</span>}</td>
-              <td>{model.context_window.toLocaleString()} tokens<small>{{ chat: "聊天", embedding: "Embedding", image: "图像生成", speech: "语音合成" }[model.model_type]}</small><small>配置值，未自动探测</small></td>
-              <td><span>{supported.join("、") || "暂无声明"}</span>{unknown.length > 0 && <small>未声明或不支持：{unknown.join("、")}</small>}</td>
-              <td>{ledger === null ? <span className="missing">质量来源尚未读取</span> : <><span>{covered} / 4 质量维度有来源</span><small>{covered > 0 ? rows.filter(row => DIMENSION_LABEL[row.dimension]).map(row => DIMENSION_LABEL[row.dimension]).join("、") : configuredQuality.length > 0 ? `${configuredQuality.length} / 4 维度有配置分值，无多来源账本` : `供应商默认回退 ${provider.intelligence}/100，非质量实测`}</small></>}{model.capabilities?.updated_at && <small>质量记录时间：{model.capabilities.updated_at}</small>}<small>延迟 / 任务匹配 / 效率：持续补充使用样本</small></td>
+              <td>{price ? <><span>{formatPricePerMillion(price)}</span><small>{price.currency.toUpperCase()} · {price.source === "manual" ? "手工配置" : "目录参考价"}</small><small>缓存读 / 写：{price.cache_read ?? price.prompt} / {price.cache_creation ?? price.prompt} 每 100 万</small>{(price.tiers.length > 0 || price.rules.length > 0) && <small>含分档 / 时段条件，实际费用按请求计算</small>}<PriceObservation provider={provider} model={model} observations={priceObservations} />{!chatDeclaration && <small>token参考配置，是否适用于此类型计价尚未核验</small>}</> : <span className="missing">未配置价格；费用未知</span>}</td>
+              <td>{contextKnown ? `${chatDeclaration ? "" : "旧窗口配置："}${model.context_window.toLocaleString()} tokens` : "上下文未声明，不代表0"}<small>{{ chat: "聊天", embedding: "Embedding", image: "图像生成", speech: "语音合成" }[model.model_type] ?? "类型未确认"}</small><small>{chatDeclaration ? "配置值，未自动探测" : "本类型端点未按聊天窗口验证"}</small></td>
+              <td><ModelCapabilityDeclaration model={model} declaration={provider.capability_declarations?.[model.alias]} /></td>
+              <td>{!chatDeclaration && <strong style={{ display: "block", marginBottom: 4 }}>专用质量口径未定义</strong>}{ledger === null ? <span className="missing">质量来源尚未读取</span> : <><span>{chatDeclaration ? `${covered} / 4 质量维度有来源` : `原通用资料：${covered} / 4 维度有有效分值`}</span><small>{covered > 0 ? rows.filter(row => DIMENSION_LABEL[row.dimension]).map(row => DIMENSION_LABEL[row.dimension]).join("、") : configuredQuality.length > 0 ? `${configuredQuality.length} / 4 维度有配置分值，无多来源账本` : chatDeclaration ? `供应商默认回退 ${provider.intelligence}/100，非质量实测` : "不以缺少聊天质量分推断本类型能力低"}</small></>}{model.capabilities?.updated_at && <small>{chatDeclaration ? "质量记录时间" : "通用质量记录时间"}：{model.capabilities.updated_at}</small>}{ledger !== null && <CapabilityEvidence rows={rows} />}<small>延迟 / 任务匹配 / 效率：持续补充使用样本</small></td>
             </tr>;
           })}</tbody>
         </table></div>
@@ -164,18 +208,23 @@ export default function CapabilitiesPage() {
         <section className="explain-section">
           <h3>为什么选了它</h3>
           <p className="capability-hint">
-            每个候选的七个维度都摊开：原始值、权重、以及它贡献进乘积的那个因子。
-            分数与真实排序用的是同一个函数，所以这里看到的顺序就是实际会用的顺序。
+            {explain.some(item => item.free_weight) ? "免费模式先核验费用、健康和额度，再展示同源相对权重。实际轮转和合格会话粘性会影响下一次首选，预演不推进轮次或占执行许可。" : "每个候选展示该次读取的原始值、权重和贡献项，复用排序函数。这里是模型名的只读解释；实际分派还会应用当时的请求约束、健康和会话策略，不保证后续请求顺序。"}
           </p>
           <div className="explain-input">
             <input
               aria-label="解释哪个模型"
               placeholder="模型名（留空按 auto 解释）"
               value={explainModel}
-              onChange={(e) => setExplainModel(e.target.value)}
+              onChange={(e) => { modelDraft.current = e.target.value; setExplainModel(e.target.value); }}
             />
             <button type="button" disabled={busy} onClick={() => void load()}>重新解释</button>
           </div>
+          <p className="capability-hint" role="status" aria-live="polite" data-testid="capability-explain-state">
+            显示结果：{explainQuery ?? "未读取"}。
+            {busy && pendingQuery && `正在读取：${pendingQuery}。`}
+            {canonical(explainModel) !== explainQuery && `当前输入 ${canonical(explainModel)} 尚未重新解释。`}
+            这是该次读取的只读解释，不是历史请求证据或后续请求的分派保证。
+          </p>
           {explain.length === 0 && (
             <p className="capability-hint">没有解析出候选 —— 检查模型名是否存在于已启用的供应商里。</p>
           )}
@@ -188,7 +237,7 @@ export default function CapabilitiesPage() {
                   <span className="tag ineligible-tag">不参与：{item.ineligible_reason}</span>
                 )}
               </summary>
-              <table className="explain-table">
+              {item.free_weight ? <p className="capability-hint">免费相对权重 {item.free_weight.value.toFixed(4)}；有效用量/耗时样本 {item.free_weight.usable_completion_samples}/{item.free_weight.minimum_samples}，{item.free_weight.metrics_used ? "采用被动 EWMA" : "保持中性指标起点"}；本地限流余量 {(item.free_weight.local_quota_headroom * 100).toFixed(0)}%。费用观察截至 {item.free_eligibility?.expires_at == null ? "未知" : new Date(item.free_eligibility.expires_at).toLocaleString()}。</p> : <table className="explain-table">
                 <thead>
                   <tr><th>维度</th><th>原始值</th><th>权重</th><th>贡献</th><th>说明</th></tr>
                 </thead>
@@ -210,10 +259,11 @@ export default function CapabilitiesPage() {
                     <td />
                   </tr>
                 </tbody>
-              </table>
+              </table>}
+              <p className="capability-hint"><TpsFreshness reference={item.tps_reference} /></p>
               <p className="capability-hint">
-                实际发往上游的模型名：<code>{item.upstream}</code>
-                {item.upstream !== item.model && "（与别名不同 —— 上游报「模型不存在」时差的就是这个名字）"}
+                配置的上游模型名：<code>{item.upstream}</code>
+                {item.upstream !== item.model && "（与别名不同；不表示已实际调用或完成账号端别名解析）"}
               </p>
             </details>
           ))}
@@ -237,7 +287,7 @@ export default function CapabilitiesPage() {
             <>
               <table className="pareto-table">
                 <thead>
-                  <tr><th>候选</th><th>质量</th><th>速度</th><th>价格</th><th>结论</th></tr>
+                  <tr><th>候选</th><th>质量</th><th>旧调用窗速率</th><th>价格</th><th>结论</th></tr>
                 </thead>
                 <tbody>
                   {pareto.points.map((pt) => {
@@ -248,7 +298,7 @@ export default function CapabilitiesPage() {
                       <tr key={pt.id} className={onFront ? "on-front" : "dominated"}>
                         <td>{pt.label}</td>
                         <td>{pt.quality === null ? <span className="missing">数据不足</span> : pt.quality.toFixed(2)}</td>
-                        <td>{pt.speed === null ? <span className="missing">数据不足</span> : `${pt.speed.toFixed(1)} tok/s`}</td>
+                        <td>{pt.speed === null ? <span className="missing">数据不足</span> : `${pt.speed.toFixed(1)} tok/s`}<br /><TpsFreshness reference={pt.speed_reference} /></td>
                         <td>{pt.unit_price === null ? <span className="missing">无价格</span> : `${pt.unit_price} ${pt.currency ?? ""}`}</td>
                         <td>
                           {onFront
@@ -261,8 +311,9 @@ export default function CapabilitiesPage() {
                 </tbody>
               </table>
               <p className="capability-hint">
-                速度按实测 tok/s，<strong>样本不足的显示「数据不足」而不是 0</strong> ——
+                此处仍是既有调用窗输出速率，可能含等待和本地开销，不等于供应商纯生成速率；新原生报告没有接入该前沿或评分。<strong>样本不足的显示「数据不足」而不是 0</strong> ——
                 0 在约定里表示「没有样本」，把它当成最慢会让刚接入的模型立刻被判成被支配。
+                24小时无有效TPS样本会空闲失效，不是滚动24小时统计窗口；下一有效样本重新累计，仍须满足配置的最小样本数。时效为本次只读快照，重新读取更新；旧后端缺元数据时显示未知。
                 价格取的是参考单价（分档价与峰谷价都会生效）。
               </p>
             </>
@@ -272,9 +323,9 @@ export default function CapabilitiesPage() {
 
       {ledger !== null && withData.length === 0 && !error && (
         <div className="capability-empty">
-          <strong>尚无质量来源账本</strong>
+          <strong>尚无有效质量来源分值</strong>
           <p>
-            已有价格、上下文和声明能力仍在上方展示。质量维度（代码 / 推理 / 知识 / 数学）需要有来源的评测或手工标定，
+            已有来源条目也可能缺值或无效，未将它们补为0。价格、上下文和声明能力仍在上方展示。质量维度（代码 / 推理 / 知识 / 数学）需要有来源的评测或手工标定，
             可在「供应商」里导入能力集；成功返回本身不代表任务质量。
           </p>
           <p>

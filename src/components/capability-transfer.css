@@ -1,0 +1,7 @@
+.capability-transfer > summary { cursor: pointer; font-weight: 600; }
+.capability-transfer fieldset { min-width: 0; margin: 12px 0; border: 0; padding: 0; display: grid; gap: 8px; }
+.capability-transfer legend { margin-bottom: 8px; font-weight: 600; }
+.capability-transfer textarea { width: 100%; min-width: 0; box-sizing: border-box; resize: vertical; white-space: pre-wrap; overflow-wrap: anywhere; font-family: ui-monospace, Consolas, monospace; color: var(--text); background: var(--panel); }
+.capability-transfer input[type="file"] { max-width: 100%; min-width: 0; }
+.capability-transfer .transfer-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.capability-transfer [role="status"], .capability-transfer [role="alert"] { margin: 10px 0; }

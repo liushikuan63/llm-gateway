@@ -239,7 +239,15 @@ CREATE TABLE IF NOT EXISTS app_secrets (
 ];
 
 pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
-    for (name, sql) in SCHEMA {
+    super::budget_archive_schema::preflight(pool).await?;
+    for (name, sql) in SCHEMA
+        .iter()
+        .chain(super::catalog_schema::SCHEMA.iter())
+        .chain(super::entitlement_schema::SCHEMA.iter())
+        .chain(super::benefit_principal_schema::SCHEMA.iter())
+        .chain(super::request_feedback_schema::SCHEMA.iter())
+        .chain(super::budget_schema::SCHEMA.iter())
+    {
         sqlx::raw_sql(sql)
             .execute(pool)
             .await
@@ -281,6 +289,8 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_column(pool, "requests", "rate_label", "TEXT").await?;
     ensure_column(pool, "requests", "estimated_prompt_tokens", "INTEGER").await?;
     ensure_column(pool, "requests", "attempts_json", "TEXT").await?;
+    // Additive, no backfill. NULL means unobserved, not an empty plan.
+    ensure_column(pool, "requests", "route_decision_json", "TEXT").await?;
     ensure_column(pool, "requests", "route_intent", "TEXT").await?;
     ensure_column(pool, "requests", "route_classifier", "TEXT").await?;
     ensure_column(pool, "requests", "route_search", "TEXT").await?;
@@ -377,6 +387,16 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
     migrate_usage_daily_currency(pool).await?;
+    ensure_column(
+        pool,
+        "catalog_scan_state",
+        "runtime_pending",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    super::catalog_schema::finish(pool).await?;
+    super::budget_archive_schema::migrate(pool).await?;
+    super::capability_declaration_schema::migrate(pool).await?;
     Ok(())
 }
 

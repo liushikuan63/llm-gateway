@@ -81,6 +81,21 @@ impl Dimension {
 pub struct SourcedValue {
     pub value: f32,
     pub source: CapabilitySource,
+    /// Source-claimed observation time, not this machine's write/import time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Source-claimed sample count. Unknown is None; explicit zero stays zero.
+    /// Neither this field nor a measured tag authenticates a measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_count: Option<u32>,
+}
+
+#[derive(Default, Deserialize)]
+struct Observation {
+    #[serde(default)]
+    observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    sample_count: Option<u32>,
 }
 
 /// 一个模型的能力账本：每个维度最多保留**各来源各一条**。
@@ -118,6 +133,17 @@ impl CapabilitySet {
         source: CapabilitySource,
         value: f32,
     ) -> WriteOutcome {
+        // A new value without matching evidence must not inherit old evidence.
+        self.insert_observation(dimension, source, value, Observation::default())
+    }
+
+    fn insert_observation(
+        &mut self,
+        dimension: Dimension,
+        source: CapabilitySource,
+        value: f32,
+        observation: Observation,
+    ) -> WriteOutcome {
         let per_source = self.values.entry(dimension).or_default();
         let outcome = if per_source.contains_key(&source) {
             WriteOutcome::Updated
@@ -130,6 +156,8 @@ impl CapabilitySet {
             SourcedValue {
                 value: value.clamp(0.0, 1.0),
                 source,
+                observed_at: observation.observed_at,
+                sample_count: observation.sample_count,
             },
         );
         outcome
@@ -250,6 +278,15 @@ impl CapabilitySet {
                     report.skipped_sources.push(source_name.clone());
                     continue;
                 };
+                // Validate known-source evidence even when the score is absent.
+                // Otherwise a malformed claim could bypass atomic import rejection.
+                let observation = if entry.is_object() {
+                    serde_json::from_value::<Observation>(entry.clone()).map_err(|e| {
+                        format!("{dim_name}.{source_name}: invalid observation: {e}")
+                    })?
+                } else {
+                    Observation::default()
+                };
                 // 取值既接受 `{"value":0.9,"source":"manual"}` 也接受裸数字 ——
                 // 手写的导出文件常常只写数字。
                 let value = match entry {
@@ -261,7 +298,7 @@ impl CapabilitySet {
                 };
                 match value {
                     Some(v) => {
-                        set.insert(dimension, source, v);
+                        set.insert_observation(dimension, source, v, observation);
                         report.imported += 1;
                     }
                     None => report
@@ -311,6 +348,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn s1_observation_metadata_roundtrip_and_legacy_unknowns() {
+        let raw = r#"{"values":{"coding":{"manual":{"value":0.75,"source":"manual","observed_at":"2026-10-01T18:00:00+08:00","sample_count":0},"catalog":0.5},"math":{"measured":{"value":0.8,"source":"measured","observed_at":null,"sample_count":12}}}}"#;
+        let (set, report) = CapabilitySet::import_json(raw).unwrap();
+        assert_eq!(report.imported, 3);
+        let text = set.export_json().unwrap();
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            out["values"]["coding"]["manual"]["observed_at"],
+            "2026-10-01T10:00:00Z"
+        );
+        assert_eq!(out["values"]["coding"]["manual"]["sample_count"], 0);
+        assert!(out["values"]["coding"]["catalog"]
+            .get("observed_at")
+            .is_none());
+        assert!(out["values"]["coding"]["catalog"]
+            .get("sample_count")
+            .is_none());
+        assert!(out["values"]["math"]["measured"]
+            .get("observed_at")
+            .is_none());
+        assert_eq!(out["values"]["math"]["measured"]["sample_count"], 12);
+        assert_eq!(CapabilitySet::import_json(&text).unwrap().0, set);
+        assert_eq!(
+            set.resolve(Dimension::Coding).unwrap().source,
+            CapabilitySource::Manual
+        );
+        let old = r#"{"values":{"coding":{"catalog":{"value":0.5,"source":"catalog"}}}}"#;
+        let (legacy, _) = CapabilitySet::import_json(old).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&legacy.export_json().unwrap()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(old).unwrap()
+        );
+    }
+
+    #[test]
+    fn s1_value_replacement_clears_only_its_old_observation() {
+        let (mut set, _) = CapabilitySet::import_json(r#"{"coding":{"manual":{"value":0.7,"observed_at":"2026-10-01T10:00:00Z","sample_count":10},"measured":{"value":0.8,"observed_at":"2026-09-01T10:00:00Z","sample_count":20}}}"#).unwrap();
+        set.insert(Dimension::Coding, CapabilitySource::Manual, 0.9);
+        let out: serde_json::Value = serde_json::from_str(&set.export_json().unwrap()).unwrap();
+        assert!(out["values"]["coding"]["manual"]
+            .get("observed_at")
+            .is_none());
+        assert!(out["values"]["coding"]["manual"]
+            .get("sample_count")
+            .is_none());
+        assert_eq!(out["values"]["coding"]["measured"]["sample_count"], 20);
+        assert_eq!(
+            out["values"]["coding"]["measured"]["observed_at"],
+            "2026-09-01T10:00:00Z"
+        );
+        assert_eq!(set.resolve(Dimension::Coding).unwrap().value, 0.8);
+    }
+
+    #[test]
+    fn s1_invalid_observation_is_rejected_without_policy_inference() {
+        for entry in [
+            serde_json::json!({"observed_at":"2026-10-01"}),
+            serde_json::json!({"observed_at":"not-a-time"}),
+            serde_json::json!({"observed_at":42}),
+            serde_json::json!({"sample_count":-1}),
+            serde_json::json!({"sample_count":1.5}),
+            serde_json::json!({"sample_count":4294967296_u64}),
+            serde_json::json!({"sample_count":"12"}),
+        ] {
+            let missing_score = serde_json::json!({"coding":{"manual":entry.clone()}});
+            assert!(CapabilitySet::import_json(&missing_score.to_string()).is_err());
+            let mut null_score = entry.clone();
+            null_score["value"] = serde_json::Value::Null;
+            assert!(CapabilitySet::import_json(
+                &serde_json::json!({"coding":{"manual":null_score}}).to_string()
+            )
+            .is_err());
+            let mut value = entry;
+            value["value"] = serde_json::json!(0.7);
+            let raw = serde_json::json!({"coding":{"manual":value}}).to_string();
+            assert!(
+                CapabilitySet::import_json(&raw).is_err(),
+                "invalid metadata accepted: {raw}"
+            );
+        }
+        // Future observations are retained as claims, not accepted as fresh.
+        let (set, _) = CapabilitySet::import_json(r#"{"coding":{"manual":{"value":0.7,"observed_at":"2099-01-01T00:00:00Z","sample_count":4294967295}}}"#).unwrap();
+        let out: serde_json::Value = serde_json::from_str(&set.export_json().unwrap()).unwrap();
+        assert_eq!(
+            out["values"]["coding"]["manual"]["sample_count"],
+            4294967295_u64
+        );
+    }
+
+    #[test]
     fn 空账本_每一维都是_none() {
         let set = CapabilitySet::new();
         for d in Dimension::ALL {
@@ -341,7 +468,9 @@ mod tests {
                 set.resolve(d),
                 Some(SourcedValue {
                     value: 0.0,
-                    source: CapabilitySource::Catalog
+                    source: CapabilitySource::Catalog,
+                    observed_at: None,
+                    sample_count: None,
                 })
             );
         }

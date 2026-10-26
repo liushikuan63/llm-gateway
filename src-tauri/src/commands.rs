@@ -17,6 +17,76 @@ use crate::domain::{
 use crate::model_catalog;
 use crate::proxy::server::GatewayState;
 use crate::AppState;
+#[path = "commands/trae_registration.rs"]
+mod trae_registration;
+use trae_registration::{NativeRegistrationResult, NativeSelectionInput};
+#[path = "commands/benefit_auto_claim.rs"]
+pub mod benefit_auto_claim;
+#[cfg(test)]
+#[path = "commands/benefit_auto_claim_commit_tests.rs"]
+mod benefit_auto_claim_commit_tests;
+#[path = "commands/benefit_settings.rs"]
+mod benefit_settings;
+#[path = "commands/catalog_maintenance.rs"]
+pub mod catalog_maintenance;
+#[cfg(all(test, feature = "ipc-tests"))]
+#[path = "commands/feedback_ipc_tests.rs"]
+mod feedback_ipc_tests;
+#[path = "commands/free_routing.rs"]
+pub mod free_routing;
+#[path = "commands/qoder_labels.rs"]
+mod qoder_labels;
+
+#[tauri::command]
+pub async fn get_proxy_control_status(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::proxy_control::ProxyControlStatus, String> {
+    let _guard = state.proxy_commands.lock().await;
+    let current = crate::proxy_control::status(&state).await;
+    crate::proxy_control::sync_tray(&app, &current);
+    Ok(current)
+}
+
+#[tauri::command]
+pub async fn set_gateway_proxy_enabled(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<crate::proxy_control::ProxyControlStatus, String> {
+    crate::proxy_control::set_gateway(&app, enabled).await
+}
+
+#[tauri::command]
+pub async fn set_system_proxy_enabled(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<crate::proxy_control::ProxyControlStatus, String> {
+    crate::proxy_control::set_system(&app, enabled).await
+}
+
+#[tauri::command]
+pub async fn save_proxy_startup_options(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    options: crate::config::ProxyControlConfig,
+) -> Result<crate::proxy_control::ProxyControlStatus, String> {
+    let _guard = state.proxy_commands.lock().await;
+    let mut options = options;
+    options.system_proxy_server = options
+        .system_proxy_server
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    if let Some(server) = options.system_proxy_server.as_deref() {
+        for port in crate::proxy_control::gateway_ports(&state) {
+            crate::proxy_control::system::validate_server(server, port)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    commit_config(&state, ConfigCommit::ProxyControls(&options))?;
+    let current = crate::proxy_control::status(&state).await;
+    crate::proxy_control::publish(&app, &current);
+    Ok(current)
+}
 
 fn qoder_login_service(state: &AppState) -> Result<crate::qoder_auth::QoderAuth, String> {
     state
@@ -38,6 +108,173 @@ fn trae_login_service(state: &AppState) -> Result<crate::trae_auth::TraeAuth, St
     Ok(service)
 }
 
+fn require_trae_catalog_account(
+    config: &crate::benefit_config::BenefitsConfig,
+    account: &str,
+) -> Result<(), String> {
+    let matches: Vec<_> = config.accounts.iter().filter(|v| v.id == account).collect();
+    if !config.enabled
+        || matches.len() != 1
+        || !matches[0].enabled
+        || crate::benefits::ClaimPlatform::parse(&matches[0].platform)
+            != Some(crate::benefits::ClaimPlatform::TraeCn)
+    {
+        return Err("Trae模型目录需要已启用的国内权益账号".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod trae_catalog_metadata_tests {
+    use super::require_trae_catalog_account;
+    use crate::benefit_config::{BenefitAccount, BenefitsConfig};
+    #[test]
+    fn catalog_requires_enabled_unique_cn_account_and_global_switch() {
+        let mut config = BenefitsConfig {
+            enabled: true,
+            accounts: vec![BenefitAccount {
+                id: "test".into(),
+                platform: "trae_cn".into(),
+                label: "Fixture".into(),
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        assert!(require_trae_catalog_account(&config, "test").is_ok());
+        assert!(require_trae_catalog_account(&config, "missing").is_err());
+        config.enabled = false;
+        assert!(require_trae_catalog_account(&config, "test").is_err());
+        config.enabled = true;
+        config.accounts[0].enabled = false;
+        assert!(require_trae_catalog_account(&config, "test").is_err());
+        config.accounts[0].enabled = true;
+        config.accounts[0].platform = "qoder".into();
+        assert!(require_trae_catalog_account(&config, "test").is_err());
+        config.accounts[0].platform = "trae_cn".into();
+        config.accounts.push(config.accounts[0].clone());
+        assert!(require_trae_catalog_account(&config, "test").is_err());
+        config.accounts.clear();
+        assert!(require_trae_catalog_account(&config, "test").is_err());
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn trae_native_model_catalog(
+    state: State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+    account_id: String,
+    source_function: String,
+) -> Result<crate::proxy::trae::catalog::TraeNativeCatalogView, String> {
+    trae_registration::validate_ipc(request.body(), &["accountId", "sourceFunction"])?;
+    trae_registration::catalog(&state.gateway, &state.config, &account_id, &source_function).await
+}
+#[tauri::command]
+pub(crate) async fn register_trae_provider(
+    state: State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+    account_id: String,
+    profile_id: String,
+    catalog_revision: String,
+    selections: Vec<NativeSelectionInput>,
+) -> Result<NativeRegistrationResult, String> {
+    trae_registration::validate_ipc(
+        request.body(),
+        &["accountId", "profileId", "catalogRevision", "selections"],
+    )?;
+    trae_registration::register(
+        &state.gateway,
+        &state.config,
+        &account_id,
+        &profile_id,
+        &catalog_revision,
+        selections,
+    )
+    .await
+}
+#[tauri::command]
+pub(crate) async fn trae_web_model_catalog(
+    state: tauri::State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+    account_id: String,
+    region: crate::trae_auth::WebRegion,
+) -> Result<crate::proxy::trae::catalog::TraeNativeCatalogView, String> {
+    trae_registration::validate_ipc(request.body(), &["accountId", "region"])?;
+    trae_registration::web_catalog(&state.gateway, &state.config, &account_id, region).await
+}
+
+#[tauri::command]
+pub async fn trae_model_catalog(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::trae_auth::TraeModelCatalogView, String> {
+    require_trae_catalog_account(&state.config.read().benefits, &account_id)?;
+    let view = trae_login_service(&state)?
+        .model_catalog(&account_id)
+        .await?;
+    require_trae_catalog_account(&state.config.read().benefits, &account_id)?;
+    Ok(view)
+}
+
+#[tauri::command]
+pub async fn trae_web_login_start(
+    state: State<'_, AppState>,
+    region: crate::trae_auth::WebRegion,
+    account_id: String,
+    consent: bool,
+    request_id: Option<String>,
+) -> Result<crate::trae_auth::LoginStart, String> {
+    trae_login_service(&state)?
+        .web_start_bound(region, &account_id, consent, request_id.as_deref())
+        .await
+}
+
+#[tauri::command]
+pub async fn trae_web_login_refresh(
+    state: State<'_, AppState>,
+    region: crate::trae_auth::WebRegion,
+    account_id: String,
+    consent: bool,
+) -> Result<crate::trae_auth::WebLoginStatus, String> {
+    trae_login_service(&state)?
+        .web_refresh(region, &account_id, consent)
+        .await
+}
+
+#[tauri::command]
+pub async fn trae_web_login_status(
+    state: State<'_, AppState>,
+    region: crate::trae_auth::WebRegion,
+    account_id: String,
+) -> Result<crate::trae_auth::WebLoginStatus, String> {
+    trae_login_service(&state)?
+        .web_status(region, &account_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn trae_web_login_poll(
+    state: State<'_, AppState>,
+    region: crate::trae_auth::WebRegion,
+    account_id: String,
+    login_id: String,
+) -> Result<crate::trae_auth::WebLoginStatus, String> {
+    trae_login_service(&state)?
+        .web_poll(region, &account_id, &login_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn trae_web_login_cancel(
+    state: State<'_, AppState>,
+    region: crate::trae_auth::WebRegion,
+    account_id: String,
+    login_id: String,
+) -> Result<crate::trae_auth::WebLoginStatus, String> {
+    trae_login_service(&state)?
+        .web_cancel(region, &account_id, &login_id)
+        .await
+}
+
 #[tauri::command]
 pub async fn trae_login_start(
     state: State<'_, AppState>,
@@ -48,13 +285,15 @@ pub async fn trae_login_start(
         return Err("Trae首次独立登录需要明确同意设备公钥登记；尚未发起登录".into());
     }
     let config = state.config.read().benefits.clone();
-    let session = state
-        .gateway
-        .benefits
-        .session_for_native(&config, &account_id)
-        .await?;
     trae_login_service(&state)?
-        .start(&account_id, &session, true)
+        .start_with_session_resolver(
+            &account_id,
+            true,
+            state
+                .gateway
+                .benefits
+                .session_for_native(&config, &account_id),
+        )
         .await
 }
 
@@ -74,6 +313,34 @@ pub async fn trae_login_poll(
 ) -> Result<crate::trae_auth::LoginStatus, String> {
     trae_login_service(&state)?
         .poll(&account_id, &login_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn trae_login_recovery(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::trae_auth::RecoveryView, String> {
+    state
+        .gateway
+        .trae_auth
+        .as_ref()
+        .map_err(Clone::clone)?
+        .recovery(&account_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn trae_login_cancel_recovery(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<(), String> {
+    state
+        .gateway
+        .trae_auth
+        .as_ref()
+        .map_err(Clone::clone)?
+        .cancel_recovery(&account_id)
         .await
 }
 
@@ -184,6 +451,16 @@ pub async fn qoder_job_prepare(
         .await
 }
 #[tauri::command]
+pub async fn qoder_job_reissue(
+    state: State<'_, AppState>,
+    region: crate::qoder_auth::Region,
+    account_id: String,
+) -> Result<crate::qoder_auth::JobStatus, String> {
+    qoder_login_service(&state)?
+        .job_reissue(region, &account_id)
+        .await
+}
+#[tauri::command]
 pub async fn qoder_job_refresh(
     state: State<'_, AppState>,
     region: crate::qoder_auth::Region,
@@ -206,42 +483,54 @@ pub async fn qoder_job_cancel(
 
 fn workbuddy_login_service(
     state: &AppState,
+    region: crate::workbuddy_auth::WorkBuddyRegion,
 ) -> Result<crate::workbuddy_auth::WorkBuddyAuth, String> {
-    state
-        .gateway
-        .workbuddy_auth
-        .as_ref()
-        .map_err(Clone::clone)?
-        .with_proxy(state.config.read().http_proxy.as_deref())
+    match region {
+        crate::workbuddy_auth::WorkBuddyRegion::Global => &state.gateway.workbuddy_auth,
+        crate::workbuddy_auth::WorkBuddyRegion::Cn => &state.gateway.workbuddy_cn_auth,
+    }
+    .as_ref()
+    .map_err(Clone::clone)?
+    .with_proxy(state.config.read().http_proxy.as_deref())
 }
 
 #[tauri::command]
 pub async fn workbuddy_login_start(
     state: State<'_, AppState>,
     account_id: String,
+    region: Option<crate::workbuddy_auth::WorkBuddyRegion>,
 ) -> Result<crate::workbuddy_auth::LoginStart, String> {
-    workbuddy_login_service(&state)?.start(&account_id).await
+    workbuddy_login_service(&state, region.unwrap_or_default())?
+        .start(&account_id)
+        .await
 }
 #[tauri::command]
 pub async fn workbuddy_login_poll(
     state: State<'_, AppState>,
     login_id: String,
+    region: Option<crate::workbuddy_auth::WorkBuddyRegion>,
 ) -> Result<crate::workbuddy_auth::LoginStatus, String> {
-    workbuddy_login_service(&state)?.poll(&login_id).await
+    workbuddy_login_service(&state, region.unwrap_or_default())?
+        .poll(&login_id)
+        .await
 }
 #[tauri::command]
 pub async fn workbuddy_login_cancel(
     state: State<'_, AppState>,
     login_id: String,
+    region: Option<crate::workbuddy_auth::WorkBuddyRegion>,
 ) -> Result<(), String> {
-    workbuddy_login_service(&state)?.cancel(&login_id).await
+    workbuddy_login_service(&state, region.unwrap_or_default())?
+        .cancel(&login_id)
+        .await
 }
 #[tauri::command]
 pub async fn workbuddy_login_status(
     state: State<'_, AppState>,
     account_id: String,
+    region: Option<crate::workbuddy_auth::WorkBuddyRegion>,
 ) -> Result<crate::workbuddy_auth::LoginStatus, String> {
-    workbuddy_login_service(&state)?
+    workbuddy_login_service(&state, region.unwrap_or_default())?
         .session_status(&account_id)
         .await
 }
@@ -249,8 +538,39 @@ pub async fn workbuddy_login_status(
 pub async fn workbuddy_login_refresh(
     state: State<'_, AppState>,
     account_id: String,
+    region: Option<crate::workbuddy_auth::WorkBuddyRegion>,
 ) -> Result<crate::workbuddy_auth::LoginStatus, String> {
-    workbuddy_login_service(&state)?.refresh(&account_id).await
+    workbuddy_login_service(&state, region.unwrap_or_default())?
+        .refresh(&account_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn workbuddy_checkin_status(
+    state: State<'_, AppState>,
+    account_id: String,
+    region: crate::workbuddy_auth::WorkBuddyRegion,
+) -> Result<crate::workbuddy_auth::WorkBuddyCheckinStatus, String> {
+    if !state.config.read().benefits.enabled {
+        return Err("请先启用账号权益；未向平台发送查询".into());
+    }
+    workbuddy_login_service(&state, region)?
+        .checkin_status_for_use(&account_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn workbuddy_account_quota(
+    state: State<'_, AppState>,
+    account_id: String,
+    region: crate::workbuddy_auth::WorkBuddyRegion,
+) -> Result<crate::workbuddy_auth::WorkBuddyQuota, String> {
+    if !state.config.read().benefits.enabled {
+        return Err("请先启用账号权益；未向平台发送查询".into());
+    }
+    workbuddy_login_service(&state, region)?
+        .quota_for_use(&account_id)
+        .await
 }
 
 #[derive(Serialize)]
@@ -289,7 +609,14 @@ pub async fn register_qoder_provider(
         }
     );
     let mut runtime = crate::domain::AgentRuntime::new(&runtime_id, "qoder-model", &label);
-    runtime.options = Some(serde_json::json!({"region":region,"account_id":account_id}));
+    let model_display_names: std::collections::BTreeMap<_, _> = catalog
+        .models
+        .iter()
+        .map(|model| (model.id.clone(), model.name.clone()))
+        .collect();
+    runtime.options = Some(
+        serde_json::json!({"region":region,"account_id":account_id,"model_display_names":model_display_names}),
+    );
     let now = chrono::Utc::now();
     let provider = Provider {
         id: provider_id.clone(),
@@ -349,28 +676,41 @@ pub async fn register_qoder_provider(
 pub async fn register_workbuddy_provider(
     state: State<'_, AppState>,
     account_id: String,
+    region: Option<crate::workbuddy_auth::WorkBuddyRegion>,
 ) -> Result<WorkBuddyRegistration, String> {
-    let client = state.gateway.workbuddy.as_ref().map_err(Clone::clone)?;
+    let region = region.unwrap_or_default();
+    let client = state.gateway.workbuddy_client(region)?;
     // Explicit catalog discovery; no model completion or test prompt is sent.
     let catalog = client.discover_models(&account_id).await?;
     if catalog.models.is_empty() {
         return Err("该账号暂未返回可接入的模型".into());
     }
-    let suffix = sha256_hex(&account_id);
+    let suffix = sha256_hex(
+        &if region == crate::workbuddy_auth::WorkBuddyRegion::Global {
+            account_id.clone()
+        } else {
+            format!("cn\0{account_id}")
+        },
+    );
     let runtime_id = format!("workbuddy-model-{}", &suffix[..16]);
     let provider_id = format!("workbuddy-direct-{}", &suffix[..16]);
-    let mut runtime = crate::domain::AgentRuntime::new(
-        &runtime_id,
-        "workbuddy-model",
-        format!("WorkBuddy · {account_id}"),
+    let label = format!(
+        "{} · {account_id}",
+        if region == crate::workbuddy_auth::WorkBuddyRegion::Cn {
+            "WorkBuddy CN"
+        } else {
+            "WorkBuddy"
+        }
     );
-    runtime.options = Some(serde_json::json!({"account_id":account_id}));
+    let mut runtime =
+        crate::domain::AgentRuntime::new(&runtime_id, "workbuddy-model", label.clone());
+    runtime.options = Some(serde_json::json!({"account_id":account_id,"region":region}));
     let now = chrono::Utc::now();
     let provider = Provider {
         id: provider_id.clone(),
-        name: format!("WorkBuddy · {account_id}"),
+        name: label,
         dialect: Dialect::OpenAI,
-        base_url: crate::workbuddy_auth::WorkBuddyAuth::issuer().into(),
+        base_url: crate::workbuddy_auth::WorkBuddyAuth::issuer_for_region(region).into(),
         api_key_enc: String::new(),
         enabled: true,
         priority: 100,
@@ -633,6 +973,74 @@ pub async fn benefits_overview(
 }
 
 #[tauri::command]
+pub async fn benefit_auth_source(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<crate::benefits::BenefitAuthSourceView, String> {
+    let cfg = state.config.read().clone();
+    state
+        .gateway
+        .benefits
+        .benefit_auth_source(&cfg.benefits, &account_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn bind_trae_benefit_auth(
+    state: State<'_, AppState>,
+    account_id: String,
+    expected_revision: String,
+    expected_principal_hash: String,
+) -> Result<crate::benefits::BenefitAuthSourceView, String> {
+    let cfg = state.config.read().clone();
+    state
+        .gateway
+        .benefits
+        .bind_trae_benefit_auth(
+            &cfg.benefits,
+            cfg.http_proxy.as_deref(),
+            &account_id,
+            &expected_revision,
+            &expected_principal_hash,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn bind_workbuddy_benefit_auth(
+    state: State<'_, AppState>,
+    account_id: String,
+    login_account_id: String,
+    expected_revision: String,
+) -> Result<crate::benefits::BenefitAuthSourceView, String> {
+    let cfg = state.config.read().clone();
+    state
+        .gateway
+        .benefits
+        .bind_workbuddy_benefit_auth(
+            &cfg.benefits,
+            &account_id,
+            &login_account_id,
+            &expected_revision,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn restore_benefit_auth(
+    state: State<'_, AppState>,
+    account_id: String,
+    expected_revision: String,
+) -> Result<crate::benefits::BenefitAuthSourceView, String> {
+    let cfg = state.config.read().clone();
+    state
+        .gateway
+        .benefits
+        .restore_benefit_auth(&cfg.benefits, &account_id, &expected_revision)
+        .await
+}
+
+#[tauri::command]
 pub async fn claim_benefit_now(
     state: State<'_, AppState>,
     account_id: String,
@@ -687,7 +1095,51 @@ pub async fn benefit_runs(
 
 /* ------------------------------- Provider ------------------------------- */
 
-/// Snapshot known client logs only; no arbitrary path, background watcher or credential access.
+async fn client_usage_price_references(
+    state: &AppState,
+) -> Result<Vec<crate::client_usage::UsagePriceReference>, String> {
+    let providers = repo::list_providers(state.db.pool())
+        .await
+        .map_err(|_| "无法读取本机参考价格")?;
+    let prices: Vec<_> = providers
+        .iter()
+        .flat_map(|p| {
+            p.models.iter().flat_map(|m| {
+                let mut names = vec![p.name.clone(), p.id.clone()];
+                if reqwest::Url::parse(&p.base_url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_owned))
+                    .as_deref()
+                    == Some("api.openai.com")
+                {
+                    names.push("openai".into());
+                }
+                names.sort();
+                names.dedup();
+                names.into_iter().filter_map(move |provider| {
+                    m.price
+                        .clone()
+                        .map(|price| crate::client_usage::UsagePriceReference {
+                            provider,
+                            models: vec![m.alias.clone(), m.upstream.clone()],
+                            price,
+                        })
+                })
+            })
+        })
+        .collect();
+    Ok(prices)
+}
+
+fn client_usage_jobs(state: &AppState) -> Result<&crate::client_usage::jobs::UsageJobs, String> {
+    state
+        .client_usage_jobs
+        .as_ref()
+        .map(AsRef::as_ref)
+        .map_err(|_| "完整历史任务存储不可用，仍可使用快速读取".to_owned())
+}
+
+/// Snapshot known client logs only; no arbitrary path, watcher or credential access.
 #[tauri::command]
 pub async fn scan_client_usage(
     state: State<'_, AppState>,
@@ -695,34 +1147,68 @@ pub async fn scan_client_usage(
     to_day: String,
 ) -> Result<crate::client_usage::ClientUsageReport, String> {
     static SCAN: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let permit = state
+        .client_usage_jobs
+        .as_ref()
+        .ok()
+        .map(|jobs| jobs.quick_permit())
+        .transpose()?;
     let home = dirs::home_dir().ok_or("无法定位本机用户目录")?;
-    let providers = repo::list_providers(state.db.pool())
-        .await
-        .map_err(|_| "无法读取本机参考价格")?;
-    let prices: Vec<_> = providers
-        .iter()
-        .flat_map(|p| {
-            p.models.iter().filter_map(|m| {
-                m.price
-                    .clone()
-                    .map(|price| crate::client_usage::UsagePriceReference {
-                        provider: p.name.clone(),
-                        models: vec![m.alias.clone(), m.upstream.clone()],
-                        price,
-                    })
-            })
-        })
-        .collect();
+    let prices = client_usage_price_references(&state).await?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
         let _guard = SCAN
             .try_lock()
             .ok_or("已有本地用量扫描正在执行，请稍后重试")?;
-        let mut report = crate::client_usage::scan_from_home(&home, &from_day, &to_day)?;
-        crate::client_usage::apply_reference_prices(&mut report, &prices);
-        Ok(report)
+        crate::client_usage::scan_from_home_with_prices(&home, &from_day, &to_day, &prices)
     })
     .await
     .map_err(|_| "本地用量扫描未能完成".to_owned())?
+}
+
+#[tauri::command]
+pub async fn start_client_usage_job(
+    state: State<'_, AppState>,
+    from_day: String,
+    to_day: String,
+) -> Result<crate::client_usage::jobs::JobView, String> {
+    let home = dirs::home_dir().ok_or("无法定位本机用户目录")?;
+    let prices = client_usage_price_references(&state).await?;
+    client_usage_jobs(&state)?
+        .start(home, from_day, to_day, prices)
+        .await
+}
+#[tauri::command]
+pub async fn get_current_client_usage_job(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::client_usage::jobs::JobView>, String> {
+    // An unavailable service cannot own a worker in this application. Keep the
+    // legacy quick path usable; an explicit full start returns its static error.
+    match state.client_usage_jobs.as_ref() {
+        Ok(jobs) => jobs.current().await,
+        Err(_) => Ok(None),
+    }
+}
+#[tauri::command]
+pub async fn get_client_usage_job(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<crate::client_usage::jobs::JobView, String> {
+    client_usage_jobs(&state)?.status(&job_id).await
+}
+#[tauri::command]
+pub async fn cancel_client_usage_job(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<crate::client_usage::jobs::JobView, String> {
+    client_usage_jobs(&state)?.cancel(&job_id).await
+}
+#[tauri::command]
+pub async fn resume_client_usage_job(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<crate::client_usage::jobs::JobView, String> {
+    client_usage_jobs(&state)?.resume(&job_id).await
 }
 
 /// 显式绑定或解除账号上游；普通供应商保存继续保留已有绑定。
@@ -747,9 +1233,10 @@ pub async fn set_provider_runtime(
         )
         .await?;
         let official = match resolved {
-            crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { .. } => {
-                Some(("WorkBuddy", crate::workbuddy_auth::WorkBuddyAuth::issuer()))
-            }
+            crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { region, .. } => Some((
+                "WorkBuddy",
+                crate::workbuddy_auth::WorkBuddyAuth::issuer_for_region(region),
+            )),
             crate::agent_upstream::runtime::ChatRuntime::Qoder { region, .. } => {
                 Some(("Qoder", region.model_origin()))
             }
@@ -786,6 +1273,11 @@ pub async fn set_provider_runtime(
 /// 前端提交的 provider 表单。api_key 是明文，落库前加密。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderInput {
+    #[serde(
+        default,
+        deserialize_with = "crate::capability_declarations::unique_map"
+    )]
+    pub capability_declarations: crate::capability_declarations::Patches,
     pub id: Option<String>,
     pub name: String,
     pub dialect: Dialect,
@@ -802,6 +1294,7 @@ pub struct ProviderInput {
 /// 返回给前端的 provider（密钥只给掩码，永不外传明文）
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderView {
+    pub capability_declarations: crate::capability_declarations::Views,
     pub id: String,
     pub name: String,
     pub dialect: Dialect,
@@ -823,6 +1316,8 @@ pub struct ProviderView {
     /// 却完全不知道请求其实**没走 HTTP**，那个 Key 是摆设。
     /// 账号型上游的登录态由各家 CLI 自己管，网关不读不存（卡片红线）。
     pub runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_display_names: std::collections::BTreeMap<String, String>,
 }
 
 impl ProviderView {
@@ -856,6 +1351,8 @@ impl ProviderView {
             health,
             is_active,
             runtime_id: p.runtime_id,
+            model_display_names: Default::default(),
+            capability_declarations: Default::default(),
         }
     }
 }
@@ -870,16 +1367,28 @@ pub fn get_boot_state(
 
 #[tauri::command]
 pub async fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderView>, String> {
-    let list = repo::list_providers(state.db.pool())
+    let list = crate::capability_declarations::list_provider_views(state.db.pool())
         .await
         .map_err(|e| e.to_string())?;
     let gw = state.gateway.clone();
     let active_id = gw.active.read().clone();
+    let runtimes = repo::list_agent_runtimes(state.db.pool())
+        .await
+        .map_err(|_| "无法读取账号模型显示名")?;
     Ok(list
         .into_iter()
-        .map(|p| {
+        .map(|(p, declarations)| {
             let h = p.models.first().map(|m| gw.health.get(&p.id, &m.upstream));
-            ProviderView::from(p, h, active_id.as_deref())
+            let names = p
+                .runtime_id
+                .as_ref()
+                .and_then(|id| runtimes.iter().find(|r| &r.id == id))
+                .map(|runtime| qoder_labels::labels(&p, runtime))
+                .unwrap_or_default();
+            let mut view = ProviderView::from(p, h, active_id.as_deref());
+            view.model_display_names = names;
+            view.capability_declarations = declarations;
+            view
         })
         .collect())
 }
@@ -906,6 +1415,20 @@ pub async fn discover_provider_models(
         .as_ref()
         .and_then(|provider| provider.runtime_id.as_deref())
     {
+        if let Some(runtime) = repo::get_agent_runtime(state.db.pool(), id)
+            .await
+            .map_err(|_| "native_runtime_read_failed")?
+        {
+            if runtime.kind == "trae-model" {
+                return trae_registration::saved_discovery(
+                    &input,
+                    saved_provider
+                        .as_ref()
+                        .ok_or("native_provider_unavailable")?,
+                    &runtime,
+                );
+            }
+        }
         let runtime = crate::agent_upstream::runtime::resolve_chat_runtime(
             state.db.pool(),
             &state.adapters,
@@ -933,19 +1456,20 @@ pub async fn discover_provider_models(
                 .discover_models(region, account_id)
                 .await;
         }
-        if let crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { account_id, .. } = runtime {
+        if let crate::agent_upstream::runtime::ChatRuntime::WorkBuddy {
+            region, account_id, ..
+        } = runtime
+        {
             if !input.api_key.is_empty()
                 || input.dialect != Dialect::OpenAI
                 || model_catalog::normalize_base_url(input.dialect, &input.base_url)?
-                    != crate::workbuddy_auth::WorkBuddyAuth::issuer()
+                    != crate::workbuddy_auth::WorkBuddyAuth::issuer_for_region(region)
             {
                 return Err("WorkBuddy 账号目录使用官方地址和本软件已登录账号，请保留官方地址并清空 API Key".into());
             }
             return state
                 .gateway
-                .workbuddy
-                .as_ref()
-                .map_err(Clone::clone)?
+                .workbuddy_client(region)?
                 .discover_models(&account_id)
                 .await;
         }
@@ -976,7 +1500,22 @@ pub async fn upsert_provider(
                 .map_err(|_| "无法读取账号绑定")?;
             // The fixed target remains part of the binding while it is disabled.
             let official = match runtime.as_ref().map(|r| r.kind.as_str()) {
-                Some("workbuddy-model") => Some(crate::workbuddy_auth::WorkBuddyAuth::issuer()),
+                Some("workbuddy-model") => {
+                    Some(crate::workbuddy_auth::WorkBuddyAuth::issuer_for_region(
+                        crate::agent_upstream::runtime::workbuddy_region_options(
+                            runtime.as_ref().and_then(|r| r.options.as_ref()),
+                        )?
+                        .0,
+                    ))
+                }
+                Some("trae-model") => Some(
+                    crate::agent_upstream::runtime::trae_options(
+                        runtime.as_ref().and_then(|r| r.options.as_ref()),
+                    )?
+                    .binding()
+                    .profile_id
+                    .origin(),
+                ),
                 Some("qoder-model") => Some(
                     crate::agent_upstream::runtime::qoder_options(
                         runtime.as_ref().and_then(|r| r.options.as_ref()),
@@ -1075,9 +1614,13 @@ pub async fn upsert_provider(
         updated_at: now,
     };
 
-    repo::upsert_provider_config(state.db.pool(), &p)
-        .await
-        .map_err(|e| e.to_string())?;
+    repo::upsert_provider_config_with_declarations(
+        state.db.pool(),
+        &p,
+        &input.capability_declarations,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     // 内核缓存要同步刷新，否则新加的 provider 不会立刻进路由表
     state
         .gateway
@@ -1121,11 +1664,24 @@ pub async fn test_provider(
         .find(|p| p.id == id)
         .ok_or_else(|| "provider 不存在".to_string())?;
 
-    let model = p
-        .models
-        .first()
-        .map(|m| m.upstream.clone())
-        .unwrap_or_else(|| "auto".into());
+    if let Some(runtime_id) = p.runtime_id.as_deref() {
+        let runtime = repo::get_agent_runtime(state.db.pool(), runtime_id)
+            .await
+            .map_err(|_| "无法读取账号运行时")?;
+        if runtime.is_some_and(|r| r.kind == "trae-model") {
+            return Err("native_exact_does_not_allow_model_health_probes".into());
+        }
+    }
+
+    // This endpoint sends a chat probe; other model kinds require their own
+    // explicit contract. Do not reinterpret them or silently choose a sibling.
+    let model = match p.models.first() {
+        Some(model) if model.model_type != crate::domain::ModelType::Chat => {
+            return Err("连接测试仅支持配置列表首项的聊天模型；未发送请求。".into());
+        }
+        Some(model) => model.upstream.clone(),
+        None => "auto".into(),
+    };
 
     let req = crate::domain::ChatRequest {
         model: model.clone(),
@@ -1181,10 +1737,25 @@ pub struct ConfigUpdateResult {
 }
 
 enum ConfigCommit<'a> {
+    SearchSettings(
+        &'a AppConfig,
+        Option<bool>,
+        Option<crate::config::FreeSearchLocale>,
+    ),
+    ProxyControls(&'a crate::config::ProxyControlConfig),
+    CatalogMaintenance(&'a crate::config::CatalogMaintenanceConfig),
+    FreeRouting(&'a crate::config::FreeRoutingConfig),
+    AccountAutoClaim(&'a crate::benefit_config::AccountAutoClaimChange),
     Save(&'a AppConfig),
     RotateKey,
-    ProxyRebind { previous: &'a str, next: &'a str },
-    ProxySet { managed: &'a str, enabled: bool },
+    ProxyRebind {
+        previous: &'a str,
+        next: &'a str,
+    },
+    ProxySet {
+        managed: &'a str,
+        enabled: bool,
+    },
 }
 
 /// 无 await 的配置提交临界区；锁序始终是 AppState.config -> GatewayState.cfg。
@@ -1197,10 +1768,49 @@ fn commit_config_with(
 ) -> Result<AppConfig, String> {
     let mut current = config.write();
     let next = match change {
-        ConfigCommit::Save(cfg) => {
+        ConfigCommit::ProxyControls(options) => {
+            let mut next = current.clone();
+            next.proxy_control = options.clone();
+            next
+        }
+        ConfigCommit::CatalogMaintenance(settings) => {
+            settings.validate().map_err(|error| error.to_string())?;
+            let mut next = current.clone();
+            next.catalog_maintenance = settings.clone();
+            next
+        }
+        ConfigCommit::FreeRouting(settings) => {
+            let mut next = current.clone();
+            next.free_routing = settings.clone();
+            next
+        }
+        ConfigCommit::AccountAutoClaim(change) => {
+            let mut next = current.clone();
+            next.benefits.apply_account_auto_claim_change(change)?;
+            next
+        }
+        ConfigCommit::Save(cfg) | ConfigCommit::SearchSettings(cfg, _, _) => {
             let mut next = cfg.clone();
             // 普通保存、快照与导入可能来自旧快照，统一继承提交时的最新 Key。
             next.unified_key = current.unified_key.clone();
+            next.proxy_control = current.proxy_control.clone();
+            // The catalog panel owns this section through a narrow commit;
+            // an unrelated stale settings/editor snapshot cannot reset it.
+            next.catalog_maintenance = current.catalog_maintenance.clone();
+            next.free_routing = current.free_routing.clone();
+            // Only the narrow opt-in command owns this newly approved setting.
+            // Stale full snapshots and omitted old inputs cannot toggle it.
+            next.search.page_text_enabled = match change {
+                ConfigCommit::SearchSettings(_, Some(enabled), _) => enabled,
+                _ => current.search.page_text_enabled,
+            };
+            // Missing old inputs and unrelated full saves inherit under this lock.
+            next.search.free_search_locale = match change {
+                ConfigCommit::SearchSettings(_, _, Some(locale)) => locale,
+                _ => current.search.free_search_locale,
+            };
+            next.benefits
+                .preserve_account_auto_claim_from(&current.benefits);
             next
         }
         ConfigCommit::RotateKey => {
@@ -1250,11 +1860,161 @@ fn commit_config(state: &AppState, change: ConfigCommit<'_>) -> Result<AppConfig
 
 #[cfg(test)]
 mod config_commit_tests {
+    #[test]
+    fn locale_narrow_commit_owns_latest_value_and_failure_is_atomic() {
+        use crate::config::FreeSearchLocale as Locale;
+        let lock = parking_lot::RwLock::new(AppConfig::default());
+        let stale = lock.read().clone();
+        commit_config_with(
+            &lock,
+            ConfigCommit::SearchSettings(&stale, None, Some(Locale::UsEn)),
+            |_| Ok(()),
+            |_| {},
+        )
+        .unwrap();
+        // A stale input captured before another window's commit must inherit at commit time.
+        let saved = commit_config_with(
+            &lock,
+            ConfigCommit::SearchSettings(&stale, None, None),
+            |_| Ok(()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(saved.search.free_search_locale, Locale::UsEn);
+        assert_eq!(
+            commit_config_with(&lock, ConfigCommit::Save(&stale), |_| Ok(()), |_| {})
+                .unwrap()
+                .search
+                .free_search_locale,
+            Locale::UsEn
+        );
+        assert!(commit_config_with(
+            &lock,
+            ConfigCommit::SearchSettings(&stale, None, Some(Locale::GbEn)),
+            |_| Err("owned persistence failure".into()),
+            |_| panic!("must not publish")
+        )
+        .is_err());
+        assert_eq!(lock.read().search.free_search_locale, Locale::UsEn);
+        assert_eq!(
+            commit_config_with(
+                &lock,
+                ConfigCommit::SearchSettings(&stale, None, Some(Locale::SourceDefault)),
+                |_| Ok(()),
+                |_| {}
+            )
+            .unwrap()
+            .search
+            .free_search_locale,
+            Locale::SourceDefault
+        );
+    }
     use super::{commit_config_with, ConfigCommit};
     use crate::config::AppConfig;
     use parking_lot::RwLock;
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
+
+    #[test]
+    fn catalog_scope_commit_is_narrow_failed_save_is_atomic_and_old_settings_cannot_reset_it() {
+        let initial = AppConfig::default();
+        let config = RwLock::new(initial.clone());
+        let settings = crate::config::CatalogMaintenanceConfig {
+            enabled: true,
+            provider_ids: vec!["owned".into()],
+        };
+        assert!(commit_config_with(
+            &config,
+            ConfigCommit::CatalogMaintenance(&settings),
+            |_| Err("disk full".into()),
+            |_| panic!("must not publish")
+        )
+        .is_err());
+        assert!(!config.read().catalog_maintenance.enabled);
+        let published = RefCell::new(None);
+        let saved = commit_config_with(
+            &config,
+            ConfigCommit::CatalogMaintenance(&settings),
+            |_| Ok(()),
+            |next| *published.borrow_mut() = Some(next.catalog_maintenance.clone()),
+        )
+        .unwrap();
+        assert_eq!(published.into_inner(), Some(settings.clone()));
+        assert_eq!(saved.unified_key, initial.unified_key);
+        let stale =
+            commit_config_with(&config, ConfigCommit::Save(&initial), |_| Ok(()), |_| {}).unwrap();
+        assert_eq!(stale.catalog_maintenance, settings);
+    }
+
+    #[test]
+    fn free_policy_commit_is_narrow_atomic_and_stale_full_save_cannot_disable_it() {
+        let initial = AppConfig::default();
+        let config = RwLock::new(initial.clone());
+        let settings = crate::config::FreeRoutingConfig { enabled: true };
+        assert!(commit_config_with(
+            &config,
+            ConfigCommit::FreeRouting(&settings),
+            |_| Err("disk full".into()),
+            |_| panic!("must not publish")
+        )
+        .is_err());
+        assert!(!config.read().free_routing.enabled);
+        let saved = commit_config_with(
+            &config,
+            ConfigCommit::FreeRouting(&settings),
+            |_| Ok(()),
+            |next| assert!(next.free_routing.enabled),
+        )
+        .unwrap();
+        assert_eq!(saved.catalog_maintenance, initial.catalog_maintenance);
+        assert_eq!(saved.unified_key, initial.unified_key);
+        let stale =
+            commit_config_with(&config, ConfigCommit::Save(&initial), |_| Ok(()), |_| {}).unwrap();
+        assert!(stale.free_routing.enabled);
+        let inherited = crate::cost_policy::RequestCostPolicy::resolve(&stale, "named-model");
+        assert!(
+            inherited.strengthen(&initial).is_free(),
+            "turning off global mode cannot downgrade a request already accepted as free"
+        );
+    }
+
+    #[test]
+    fn proxy_startup_save_preserves_other_fields_and_failed_save_does_not_publish() {
+        let config = RwLock::new(AppConfig::default());
+        config.write().cache.capacity = 777;
+        let options = crate::config::ProxyControlConfig {
+            start_gateway_on_launch: true,
+            start_system_proxy_on_launch: false,
+            system_proxy_server: Some("127.0.0.1:7890".into()),
+        };
+        assert!(commit_config_with(
+            &config,
+            ConfigCommit::ProxyControls(&options),
+            |_| Err("disk full".into()),
+            |_| panic!("must not publish")
+        )
+        .is_err());
+        assert!(!config.read().proxy_control.start_gateway_on_launch);
+        let saved = commit_config_with(
+            &config,
+            ConfigCommit::ProxyControls(&options),
+            |_| Ok(()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(saved.cache.capacity, 777);
+        let stale = AppConfig::default();
+        let latest =
+            commit_config_with(&config, ConfigCommit::Save(&stale), |_| Ok(()), |_| {}).unwrap();
+        assert_eq!(latest.proxy_control, options);
+        let roundtrip: AppConfig = toml::from_str(&toml::to_string(&latest).unwrap()).unwrap();
+        assert_eq!(roundtrip.proxy_control, options);
+        let legacy: AppConfig = toml::from_str("port = 15721").unwrap();
+        assert_eq!(
+            legacy.proxy_control,
+            crate::config::ProxyControlConfig::default()
+        );
+    }
 
     #[test]
     fn proxy_patch_preserves_latest_changes_and_only_rebinds_its_own_proxy() {
@@ -1618,8 +2378,11 @@ pub async fn update_config(
     state: State<'_, AppState>,
     cfg: AppConfig,
 ) -> Result<ConfigUpdateResult, String> {
+    let _benefits_gate = state.benefit_settings_commands.lock().await;
     let previous = state.config.read().clone();
     let mut cfg = cfg;
+    cfg.benefits
+        .preserve_account_auto_claim_from(&previous.benefits);
     cfg.http_proxy = crate::outbound::validate_proxy(cfg.http_proxy.as_deref())?;
     // 远程反代与局域网直连是互斥的暴露模型。配置层会把二者规范化为
     // 0.0.0.0 或 127.0.0.1，不能信任前端或手工编辑传来的 bind 值。
@@ -1636,31 +2399,7 @@ pub async fn update_config(
         return Err("启用远程 HTTPS 反代模式前，必须先创建并启用至少一个独立访问 Key".into());
     }
     let restart_reasons = listener_restart_reasons(&previous, &cfg);
-    let scheduler_change = previous.benefits != cfg.benefits
-        && (previous.benefits.scheduler_mode == "windows_task"
-            || cfg.benefits.scheduler_mode == "windows_task");
-    if scheduler_change {
-        crate::benefit_task::register(
-            &cfg.benefits,
-            &crate::config::app_data_dir(),
-            &crate::benefit_login::resource_root()?,
-        )
-        .await?;
-    }
-    let cfg = match commit_config(&state, ConfigCommit::Save(&cfg)) {
-        Ok(cfg) => cfg,
-        Err(error) => {
-            if scheduler_change {
-                let _ = crate::benefit_task::register(
-                    &previous.benefits,
-                    &crate::config::app_data_dir(),
-                    &crate::benefit_login::resource_root()?,
-                )
-                .await;
-            }
-            return Err(error);
-        }
-    };
+    let cfg = benefit_settings::commit(&state, ConfigCommit::Save(&cfg), &cfg.benefits).await?;
     Ok(ConfigUpdateResult {
         config: cfg,
         restart_required: !restart_reasons.is_empty(),
@@ -1678,15 +2417,128 @@ pub async fn list_models(state: State<'_, AppState>) -> Result<Vec<PublicModel>,
 
 #[tauri::command]
 pub async fn desktop_chat(
+    window: tauri::Window,
+    webview: tauri::Webview,
     state: State<'_, AppState>,
     input: crate::desktop_chat::ChatInput,
-) -> Result<crate::desktop_chat::ChatResult, String> {
+    request_id: Option<String>,
+    on_ready: Option<tauri::ipc::JavaScriptChannelId>,
+    on_event: Option<tauri::ipc::JavaScriptChannelId>,
+) -> Result<crate::desktop_chat::ChatResult, crate::desktop_chat::CommandError> {
+    // Own the channel before any fallible validation/registration. Its Drop
+    // sends end even when no ready message was sent, releasing the JS callback.
+    let on_ready =
+        on_ready.map(|id| id.channel_on::<_, crate::desktop_chat::RequestReady>(webview.clone()));
+    let on_event =
+        on_event.map(|id| id.channel_on::<_, crate::desktop_chat::stream::StreamEvent>(webview));
+    let error = |message: String| {
+        crate::desktop_chat::CommandError::before_dispatch(input.personal_test, message)
+    };
+    crate::desktop_chat::validate(&input).map_err(error)?;
+    if on_event.is_some() && (request_id.is_none() || input.personal_test) {
+        return Err(error(
+            "desktop_stream_requires_controlled_ordinary_request".into(),
+        ));
+    }
     let cfg = state.gateway.cfg_snapshot();
     let listener = state
         .gateway
         .listener_snapshot()
-        .ok_or_else(|| "网关尚未开始监听，请在诊断页检查启动状态".to_string())?;
-    crate::desktop_chat::send(&cfg, listener.bound_addr, input).await
+        .ok_or_else(|| error("LLM 网关服务未开启，请在设置页或托盘开启后发送".to_string()))?;
+    if let Some(id) = request_id {
+        let request = state
+            .desktop_chat_controls
+            .register(window.label(), &id)
+            .map_err(error)?;
+        if let Some(channel) = on_ready {
+            channel
+                .send(request.ready())
+                .map_err(|_| error("聊天请求就绪通知未送达".to_owned()))?;
+        }
+        let trace = request.id();
+        if let Some(channel) = on_event {
+            return request
+                .run(crate::desktop_chat::stream::send(
+                    &cfg,
+                    listener.bound_addr,
+                    input,
+                    trace,
+                    move |event| {
+                        channel
+                            .send(event)
+                            .map_err(|_| "desktop_stream_delivery_failed".to_owned())
+                    },
+                ))
+                .await
+                .map_err(Into::into);
+        }
+        if input.personal_test {
+            return crate::desktop_chat::send_controlled_personal(
+                &state.gateway,
+                window.label(),
+                request,
+                input,
+            )
+            .await
+            .map_err(Into::into);
+        }
+        request
+            .run(crate::desktop_chat::send_with_trace(
+                &cfg,
+                listener.bound_addr,
+                input,
+                Some(trace),
+            ))
+            .await
+            .map_err(Into::into)
+    } else {
+        if input.personal_test {
+            return Err(error("个人测试必须使用归属请求UUID".into()));
+        }
+        crate::desktop_chat::send(&cfg, listener.bound_addr, input)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_desktop_chat(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<bool, String> {
+    state
+        .desktop_chat_controls
+        .cancel(window.label(), &request_id)
+}
+
+#[tauri::command]
+pub fn get_personal_test(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+) -> crate::personal_test::Status {
+    state.gateway.personal_tests.status(window.label())
+}
+
+#[tauri::command]
+pub async fn set_personal_test(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    enabled: bool,
+    target: Option<String>,
+) -> Result<crate::personal_test::Status, String> {
+    if enabled && target.is_none() {
+        return Err("个人测试必须明确选择一个 Codex CLI 模型".into());
+    }
+    state
+        .gateway
+        .personal_tests
+        .configure(
+            window.label(),
+            if enabled { target.as_deref() } else { None },
+            &state.gateway,
+        )
+        .await
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1807,6 +2659,35 @@ mod desktop_chat_export_tests {
                 .is_err()
         );
     }
+
+    #[tokio::test]
+    async fn export_keeps_refusal_separate_and_accepts_old_snapshots_without_it() {
+        let mut data = transcript();
+        // Existing schema-1 input intentionally has no refusal field.
+        assert!(data.turns[1].result.as_ref().unwrap().refusal.is_none());
+        let result = data.turns[1].result.as_mut().unwrap();
+        result.content.clear();
+        result.reasoning = None;
+        result.refusal = Some("无法满足请求。<img src=x onerror=alert(1)>".into());
+        data.turns[1].content.clear();
+        let path = std::env::temp_dir().join(format!(
+            "llmgw-refusal-export-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        export_desktop_chat(path.to_string_lossy().into_owned(), data)
+            .await
+            .unwrap();
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(actual["turns"][1]["content"], "");
+        assert_eq!(actual["turns"][1]["result"]["content"], "");
+        assert_eq!(
+            actual["turns"][1]["result"]["refusal"],
+            "无法满足请求。<img src=x onerror=alert(1)>"
+        );
+        assert!(actual["turns"][1]["result"]["reasoning"].is_null());
+    }
 }
 
 #[tauri::command]
@@ -1917,6 +2798,17 @@ fn sha256_hex(value: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[tauri::command]
+pub async fn get_remote_key_budget_snapshot(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<crate::budget::observation::Snapshot, String> {
+    let observation = crate::budget::observation::read(state.db.pool(), &id, chrono::Utc::now())
+        .await
+        .map_err(str::to_owned)?;
+    Ok(observation.with_policy(state.gateway.cfg.read().budget.enabled))
 }
 
 #[tauri::command]
@@ -2078,6 +2970,16 @@ pub struct SessionView {
     #[serde(flatten)]
     pub session: Session,
     pub message_count: i64,
+}
+
+#[tauri::command]
+pub async fn list_sessions_page(
+    state: State<'_, AppState>,
+    input: repo::session_list::Input,
+) -> Result<repo::session_list::Page, String> {
+    repo::session_list::read(state.db.pool(), input)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2260,6 +3162,9 @@ async fn replace_snapshot_providers(
 
     // 不使用 upsert 叠加旧数据。快照代表完整项目配置，列表中不存在的
     // Provider/模型必须同步移除，二者放在同一个事务中避免半成品状态。
+    repo::price_observation::clear_all_on(&mut tx)
+        .await
+        .map_err(|e| e.to_string())?;
     sqlx::query("DELETE FROM models")
         .execute(&mut *tx)
         .await
@@ -2395,6 +3300,7 @@ pub async fn apply_snapshot(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<SnapshotApplyResult, String> {
+    let _benefits_gate = state.benefit_settings_commands.lock().await;
     let snap = repo::get_snapshot(state.db.pool(), &id)
         .await
         .map_err(|e| e.to_string())?
@@ -2440,6 +3346,9 @@ pub async fn apply_snapshot(
     // 安全边界，不允许通过项目快照覆盖。
     cfg.unified_key = previous.unified_key.clone();
     cfg.remote_mode = previous.remote_mode.clone();
+    // Plan the same slot permissions that the final whole-config commit owns.
+    cfg.benefits
+        .preserve_account_auto_claim_from(&previous.benefits);
     cfg.http_proxy = crate::outbound::validate_proxy(cfg.http_proxy.as_deref())?;
     cfg.normalize_custom_rules();
     cfg.validate_custom_rules().map_err(|e| e.to_string())?;
@@ -2456,7 +3365,7 @@ pub async fn apply_snapshot(
     let restart_reasons = listener_restart_reasons(&previous, &cfg);
 
     replace_snapshot_providers(state.db.pool(), &providers).await?;
-    let cfg = commit_config(&state, ConfigCommit::Save(&cfg))?;
+    let cfg = benefit_settings::commit(&state, ConfigCommit::Save(&cfg), &cfg.benefits).await?;
     state
         .gateway
         .reload_providers()
@@ -2480,6 +3389,10 @@ pub async fn apply_snapshot(
 
 /* -------------------------------- 统计 -------------------------------- */
 
+#[cfg(test)]
+#[path = "commands/native_usage_tests.rs"]
+mod native_usage_tests;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderUsage {
     pub provider_id: Option<String>,
@@ -2489,6 +3402,8 @@ pub struct ProviderUsage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub fallback_attempts: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2499,6 +3414,12 @@ pub struct StatsOverview {
     pub today_requests: i64,
     pub success_rate: f64,
     pub avg_latency_ms: i64,
+    /// 有明确非负 latency 的请求数；缺失/非法值不当作 0。
+    pub latency_sample_count: i64,
+    pub latency_p50_ms: Option<i64>,
+    pub latency_p95_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timings: Option<serde_json::Value>,
     pub total_fallbacks: i64,
     pub fallback_request_count: i64,
     pub fallback_rate: f64,
@@ -2506,6 +3427,10 @@ pub struct StatsOverview {
     pub total_completion_tokens: i64,
     pub provider_distribution: Vec<ProviderUsage>,
     pub spend: SpendOverview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_usage: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_usage_by_model: Option<serde_json::Value>,
 }
 
 /// 本地花费估算。数据来自 `usage_daily`（按 UTC 自然日聚合），只统计配置了价格的
@@ -2589,9 +3514,20 @@ async fn spend_overview(pool: &sqlx::SqlitePool) -> Result<SpendOverview, String
 
 #[tauri::command]
 pub async fn stats_overview(state: State<'_, AppState>) -> Result<StatsOverview, String> {
-    let since = chrono::Utc::now().timestamp() - 24 * 60 * 60;
+    stats_overview_from_pool(
+        state.db.pool(),
+        chrono::Utc::now().timestamp() - 24 * 60 * 60,
+    )
+    .await
+}
+
+/// Shared actual IPC implementation, also exercised against owned SQLite fixtures.
+async fn stats_overview_from_pool(
+    pool: &sqlx::SqlitePool,
+    since: i64,
+) -> Result<StatsOverview, String> {
     let total_row = sqlx::query("SELECT COUNT(*) AS total_requests FROM requests")
-        .fetch_one(state.db.pool())
+        .fetch_one(pool)
         .await
         .map_err(|e| e.to_string())?;
     let overview_row = sqlx::query(
@@ -2599,16 +3535,28 @@ pub async fn stats_overview(state: State<'_, AppState>) -> Result<StatsOverview,
                   SUM(CASE WHEN COALESCE(status, 0) < 400 THEN 1 ELSE 0 END) AS successful_requests,
                   AVG(COALESCE(latency_ms, 0)) AS avg_latency_ms,
                   SUM(COALESCE(fallback_attempts, 0)) AS total_fallbacks,
-                  SUM(CASE WHEN COALESCE(fallback_attempts, 0) > 0 THEN 1 ELSE 0 END) AS fallback_request_count,
-                  SUM(COALESCE(prompt_tokens, 0)) AS total_prompt_tokens,
-                  SUM(COALESCE(completion_tokens, 0)) AS total_completion_tokens
+                  SUM(CASE WHEN COALESCE(fallback_attempts, 0) > 0 THEN 1 ELSE 0 END) AS fallback_request_count
            FROM requests
            WHERE ts >= ?"#,
     )
     .bind(since)
-    .fetch_one(state.db.pool())
+    .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
+
+    let latency_values = sqlx::query(
+        "SELECT latency_ms FROM requests WHERE ts >= ? AND latency_ms IS NOT NULL AND latency_ms >= 0 ORDER BY latency_ms ASC",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|row| row.get::<i64, _>("latency_ms"))
+    .collect::<Vec<_>>();
+    let latency_sample_count = latency_values.len() as i64;
+    let latency_p50_ms = latency_percentile(&latency_values, 1, 2);
+    let latency_p95_ms = latency_percentile(&latency_values, 19, 20);
 
     let today_requests = overview_row.get::<i64, _>("today_requests");
     let successful_requests = overview_row
@@ -2622,8 +3570,6 @@ pub async fn stats_overview(state: State<'_, AppState>) -> Result<StatsOverview,
                   COALESCE(p.name, r.routed_provider, '未路由') AS provider,
                   COUNT(*) AS requests,
                   SUM(CASE WHEN COALESCE(r.status, 0) < 400 THEN 1 ELSE 0 END) AS successful_requests,
-                  SUM(COALESCE(r.prompt_tokens, 0)) AS prompt_tokens,
-                  SUM(COALESCE(r.completion_tokens, 0)) AS completion_tokens,
                   SUM(COALESCE(r.fallback_attempts, 0)) AS fallback_attempts
            FROM requests r
            LEFT JOIN providers p ON p.id = r.routed_provider
@@ -2632,22 +3578,31 @@ pub async fn stats_overview(state: State<'_, AppState>) -> Result<StatsOverview,
            ORDER BY requests DESC, provider ASC"#,
     )
     .bind(since)
-    .fetch_all(state.db.pool())
+    .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
+    let usage = repo::native_usage::rolling_usage(pool, since)
+        .await
+        .map_err(|e| e.to_string())?;
     let provider_distribution = distribution_rows
         .iter()
-        .map(|row| ProviderUsage {
-            provider_id: row.get("provider_id"),
-            provider: row.get("provider"),
-            requests: row.get("requests"),
-            successful_requests: row
-                .get::<Option<i64>, _>("successful_requests")
-                .unwrap_or(0),
-            prompt_tokens: row.get::<Option<i64>, _>("prompt_tokens").unwrap_or(0),
-            completion_tokens: row.get::<Option<i64>, _>("completion_tokens").unwrap_or(0),
-            fallback_attempts: row.get::<Option<i64>, _>("fallback_attempts").unwrap_or(0),
+        .map(|row| {
+            let provider_id: Option<String> = row.get("provider_id");
+            let empty = repo::native_usage::UsageTotals::default();
+            let totals = usage.providers.get(&provider_id).unwrap_or(&empty);
+            ProviderUsage {
+                provider_id: row.get("provider_id"),
+                provider: row.get("provider"),
+                requests: row.get("requests"),
+                successful_requests: row
+                    .get::<Option<i64>, _>("successful_requests")
+                    .unwrap_or(0),
+                prompt_tokens: totals.prompt,
+                completion_tokens: totals.completion,
+                fallback_attempts: row.get::<Option<i64>, _>("fallback_attempts").unwrap_or(0),
+                native_usage: totals.native_json(),
+            }
         })
         .collect();
 
@@ -2664,6 +3619,14 @@ pub async fn stats_overview(state: State<'_, AppState>) -> Result<StatsOverview,
             .get::<Option<f64>, _>("avg_latency_ms")
             .unwrap_or(0.0)
             .round() as i64,
+        latency_sample_count,
+        latency_p50_ms,
+        latency_p95_ms,
+        request_timings: Some(serde_json::json!(repo::request_timing::rolling(
+            pool, since
+        )
+        .await
+        .map_err(|e| e.to_string())?)),
         total_fallbacks: overview_row
             .get::<Option<i64>, _>("total_fallbacks")
             .unwrap_or(0),
@@ -2673,15 +3636,30 @@ pub async fn stats_overview(state: State<'_, AppState>) -> Result<StatsOverview,
         } else {
             fallback_request_count as f64 / today_requests as f64
         },
-        total_prompt_tokens: overview_row
-            .get::<Option<i64>, _>("total_prompt_tokens")
-            .unwrap_or(0),
-        total_completion_tokens: overview_row
-            .get::<Option<i64>, _>("total_completion_tokens")
-            .unwrap_or(0),
+        total_prompt_tokens: usage.totals.prompt,
+        total_completion_tokens: usage.totals.completion,
+        native_usage: usage.totals.native_json(),
+        native_usage_by_model: usage.models_json(),
         provider_distribution,
-        spend: spend_overview(state.db.pool()).await?,
+        spend: spend_overview(pool).await?,
     })
+}
+
+/// Nearest-rank percentile over an already sorted, validated latency list.
+/// Integer arithmetic keeps the result deterministic and avoids inventing a
+/// value between observed samples. `numerator/denominator` is in (0, 1].
+fn latency_percentile(values: &[i64], numerator: usize, denominator: usize) -> Option<i64> {
+    if values.is_empty() || numerator == 0 || numerator > denominator {
+        return None;
+    }
+    let rank = values
+        .len()
+        .checked_mul(numerator)?
+        .checked_add(denominator - 1)?
+        / denominator;
+    values
+        .get(rank.saturating_sub(1).min(values.len() - 1))
+        .copied()
 }
 
 #[tauri::command]
@@ -2721,6 +3699,49 @@ pub async fn query_requests(
         total,
         truncated,
     })
+}
+
+#[tauri::command]
+pub async fn get_request_feedback(
+    state: State<'_, AppState>,
+    request_id: i64,
+) -> Result<repo::request_feedback::RequestFeedback, repo::request_feedback::FeedbackError> {
+    repo::request_feedback::get(state.db.pool(), request_id).await
+}
+
+#[tauri::command]
+pub async fn get_feedback_coverage(
+    state: State<'_, AppState>,
+    filter: crate::audit::RequestFilter,
+) -> Result<repo::request_feedback::FeedbackCoverage, repo::request_feedback::FeedbackError> {
+    repo::request_feedback::coverage(state.db.pool(), &filter).await
+}
+
+#[tauri::command]
+pub async fn get_conversation_feedback(
+    state: State<'_, AppState>,
+    filter: crate::audit::RequestFilter,
+    page: Option<repo::conversation_feedback::TaskPage>,
+) -> Result<repo::conversation_feedback::TaskSummary, repo::conversation_feedback::TaskError> {
+    repo::conversation_feedback::summary(state.db.pool(), &filter, page).await
+}
+#[tauri::command]
+pub async fn get_conversation_requests(
+    state: State<'_, AppState>,
+    task: repo::conversation_feedback::TaskRef,
+    filter: crate::audit::RequestFilter,
+    after_id: Option<i64>,
+    limit: Option<u32>,
+) -> Result<repo::conversation_feedback::TaskRequests, repo::conversation_feedback::TaskError> {
+    repo::conversation_feedback::requests(state.db.pool(), &task, &filter, after_id, limit).await
+}
+
+#[tauri::command]
+pub async fn set_request_feedback(
+    state: State<'_, AppState>,
+    input: repo::request_feedback::FeedbackInput,
+) -> Result<repo::request_feedback::RequestFeedback, repo::request_feedback::FeedbackError> {
+    repo::request_feedback::set(state.db.pool(), input).await
 }
 
 #[derive(Debug, Serialize)]
@@ -2808,17 +3829,25 @@ pub async fn explain_routing(
     state: State<'_, AppState>,
     model: Option<String>,
 ) -> Result<Vec<crate::router::CandidateExplanation>, String> {
-    let cfg = state.gateway.cfg_snapshot();
-    let providers = repo::list_providers(state.db.pool())
-        .await
-        .map_err(|e| e.to_string())?;
     let requested = model
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| "auto".into());
     state
         .gateway
-        .router
-        .explain_candidates(&providers, &cfg, &requested)
+        .explain_routing(&requested)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn preview_routing_request(
+    state: State<'_, AppState>,
+    input: crate::proxy::server::RequestPreviewInput,
+) -> Result<crate::proxy::server::RequestPreview, String> {
+    state
+        .gateway
+        .preview_routing_request(input)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -2893,8 +3922,24 @@ pub async fn save_agent_runtime(
     state: State<'_, AppState>,
     runtime: crate::domain::AgentRuntime,
 ) -> Result<(), String> {
-    if runtime.kind == "workbuddy-model" {
-        crate::agent_upstream::runtime::workbuddy_options(runtime.options.as_ref())?;
+    let native_changed =
+        runtime.kind == "trae-model" || state.gateway.is_native_runtime(&runtime.id);
+    if native_changed {
+        let existing = repo::get_agent_runtime(state.db.pool(), &runtime.id)
+            .await
+            .map_err(|_| "native_runtime_read_failed")?
+            .ok_or("native_runtime_requires_explicit_registration")?;
+        if existing.kind != "trae-model"
+            || runtime.kind != "trae-model"
+            || existing.options != runtime.options
+        {
+            return Err("native_runtime_identity_edit_denied".into());
+        }
+    }
+    if runtime.kind == "trae-model" {
+        crate::agent_upstream::runtime::trae_options(runtime.options.as_ref())?;
+    } else if runtime.kind == "workbuddy-model" {
+        crate::agent_upstream::runtime::workbuddy_region_options(runtime.options.as_ref())?;
     } else if runtime.kind == "qoder-model" {
         crate::agent_upstream::runtime::qoder_options(runtime.options.as_ref())?;
     } else if state.adapters.get(runtime.kind.trim()).is_none() {
@@ -2905,11 +3950,25 @@ pub async fn save_agent_runtime(
             state.adapters.ids().join("、")
         ));
     }
-    repo::upsert_agent_runtime(state.db.pool(), &runtime)
-        .await
-        .map_err(|e| e.to_string())?;
+    if native_changed {
+        repo::trae_registration::save_native_runtime_settings(state.db.pool(), &runtime)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        repo::upsert_agent_runtime(state.db.pool(), &runtime)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     // 可执行文件、别名或启停变更后，旧账号响应不能继续命中缓存。
-    state.gateway.cache.invalidate_all();
+    if native_changed {
+        state
+            .gateway
+            .reload_providers()
+            .await
+            .map_err(|_| "运行时已保存但网关重载失败".to_string())?;
+    } else {
+        state.gateway.cache.invalidate_all();
+    }
     Ok(())
 }
 
@@ -2944,6 +4003,18 @@ pub async fn delete_agent_runtime(state: State<'_, AppState>, id: String) -> Res
 
 /* --------------------------- D2 能力集导出 / 导入 --------------------------- */
 
+#[cfg(test)]
+tokio::task_local! {
+    static CAPABILITY_EXPORT_READ_BARRIER: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+#[cfg(test)]
+async fn capability_export_read_barrier() {
+    if let Ok((arrived, proceed)) = CAPABILITY_EXPORT_READ_BARRIER.try_with(Clone::clone) {
+        arrived.notify_one();
+        proceed.notified().await;
+    }
+}
+
 /// 导出**全部**模型的多来源能力账本。
 ///
 /// 形态：`{ "<provider_id>/<alias>": { ...CapabilitySet... }, ... }`
@@ -2955,22 +4026,11 @@ pub async fn delete_agent_runtime(state: State<'_, AppState>, id: String) -> Res
 /// 否则 diff 与快照都没法用。
 #[tauri::command]
 pub async fn export_capabilities(state: State<'_, AppState>) -> Result<String, String> {
-    let providers = repo::list_providers(state.db.pool())
+    let out = repo::read_capability_ledgers_snapshot(state.db.pool())
         .await
         .map_err(|e| e.to_string())?;
-    let mut out: std::collections::BTreeMap<String, crate::capability::CapabilitySet> =
-        std::collections::BTreeMap::new();
-    for provider in providers {
-        for model in &provider.models {
-            if let Some(ledger) =
-                repo::read_capability_ledger(state.db.pool(), &provider.id, &model.alias)
-                    .await
-                    .map_err(|e| e.to_string())?
-            {
-                out.insert(format!("{}/{}", provider.id, model.alias), ledger);
-            }
-        }
-    }
+    #[cfg(test)]
+    capability_export_read_barrier().await;
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
@@ -3017,7 +4077,7 @@ pub async fn import_capabilities(
         })
         .collect();
 
-    let mut written = 0usize;
+    let mut plan = Vec::new();
     let mut skipped = Vec::new();
     let mut skipped_dimensions = Vec::new();
     let mut skipped_sources = Vec::new();
@@ -3034,18 +4094,27 @@ pub async fn import_capabilities(
         let (ledger, report) = crate::capability::CapabilitySet::import_json(&raw.to_string())?;
         skipped_dimensions.extend(report.skipped_dimensions);
         skipped_sources.extend(report.skipped_sources);
-        let hit = repo::write_capability_ledger(state.db.pool(), provider_id, alias, &ledger)
-            .await
-            .map_err(|e| e.to_string())?;
+        plan.push((provider_id.to_string(), alias.to_string(), ledger));
+    }
+
+    // Validate every known model first; then commit the complete plan or none.
+    // A later parse/write error must not leave earlier models replaced. Reload
+    // remains after commit: if it fails, report an unconfirmed result rather
+    // than claiming that committed storage was rolled back.
+    let hits = repo::write_capability_ledgers_atomic(state.db.pool(), &plan)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut written = 0usize;
+    for ((provider_id, alias, _), hit) in plan.iter().zip(hits) {
         if hit {
             written += 1;
         } else {
-            skipped.push(key.clone());
+            skipped.push(format!("{provider_id}/{alias}"));
         }
     }
 
-    // 导入改了**路由实际用的定值** ⇒ 两把锁都要刷（CLAUDE.md 铁律 7：
-    // 只改 AppState.config 会让界面显示「保存成功」而运行时毫无变化）。
+    // 已提交的新定值必须进入已启用模型的运行路由，并沿原 reload 失效缓存。
+    // 价格、启停与全局配置不由能力集导入改变。
     state
         .gateway
         .reload_providers()
@@ -5133,7 +6202,20 @@ pub async fn get_search_settings(
             .and_then(|key| crate::search::mask_key(&key)),
         _ => None,
     };
+    let stack_overflow_state = if cfg.search.backend
+        == crate::config::SearchBackendKind::FreeAggregate
+        && cfg.search.free_search_scope == crate::config::FreeSearchScope::StackOverflow
+    {
+        match state.gateway.search_resources.stack_exchange() {
+            Some(source) => Some(source.state().await),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let free_search_scopes = state.gateway.search_resources.supported_scopes();
     Ok(crate::search::SearchSettingsView {
+        manual_search_cancel_supported: true,
         enabled: cfg.search.enabled,
         backend: cfg.search.backend,
         // 先算再挪：`searxng_url` 是 `Option<String>`，移走之后
@@ -5147,6 +6229,32 @@ pub async fn get_search_settings(
             cfg.search.backend,
             crate::config::SearchBackendKind::Tavily | crate::config::SearchBackendKind::Brave
         ),
+        query_cache_ttl_secs: cfg.search.query_cache_ttl_secs,
+        coalesce_queries: cfg.search.coalesce_queries,
+        source_min_interval_ms: cfg.search.source_min_interval_ms,
+        page_text_enabled: cfg.search.page_text_enabled,
+        free_search_scope: cfg.search.free_search_scope,
+        free_search_locale: cfg.search.free_search_locale,
+        free_search_locales: vec![
+            crate::config::FreeSearchLocale::SourceDefault,
+            crate::config::FreeSearchLocale::CnZh,
+            crate::config::FreeSearchLocale::UsEn,
+            crate::config::FreeSearchLocale::GbEn,
+        ],
+        free_search_scopes,
+        stack_overflow_state,
+        free_proxy_url: cfg.search.free_proxy_url.clone(),
+        resources: state.gateway.search_resources.stats(),
+        source_protection: if cfg.search.backend == crate::config::SearchBackendKind::FreeAggregate
+        {
+            state
+                .gateway
+                .search_resources
+                .source_protection(cfg.search.free_search_scope)
+                .await
+        } else {
+            None
+        },
     })
 }
 
@@ -5163,6 +6271,9 @@ pub async fn update_search_settings(
     //      界面上看起来「保存成功了」——这种假成功最难查。
     //   ② 就地改会在校验或落盘失败时留下一个被拒绝的内存值。
     {
+        // A search-only full snapshot must not race a benefits task-plan await.
+        // Release this gate before the independent secret I/O below.
+        let _benefits_gate = state.benefit_settings_commands.lock().await;
         let guard = state.config.read();
         let mut next = guard.clone();
         drop(guard);
@@ -5172,9 +6283,30 @@ pub async fn update_search_settings(
         next.search.max_results = input.max_results;
         next.search.timeout_ms = input.timeout_ms;
         next.search.inject_as = input.inject_as;
+        if let Some(ttl) = input.query_cache_ttl_secs {
+            next.search.query_cache_ttl_secs = ttl;
+        }
+        if let Some(coalesce) = input.coalesce_queries {
+            next.search.coalesce_queries = coalesce;
+        }
+        if let Some(enabled) = input.page_text_enabled {
+            next.search.page_text_enabled = enabled;
+        }
+        if let Some(interval) = input.source_min_interval_ms {
+            next.search.source_min_interval_ms = interval;
+        }
+        if let Some(scope) = input.free_search_scope {
+            next.search.free_search_scope = scope;
+        }
+        if let Some(proxy) = &input.free_proxy_url {
+            next.search.free_proxy_url = proxy.clone();
+        }
         next.normalize_local();
         crate::search::validate(&next.search).map_err(|e| e.to_string())?;
-        commit_config(&state, ConfigCommit::Save(&next))?;
+        commit_config(
+            &state,
+            ConfigCommit::SearchSettings(&next, input.page_text_enabled, input.free_search_locale),
+        )?;
     }
     if input.clear_api_key {
         repo::delete_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY)
@@ -5197,20 +6329,92 @@ pub async fn update_search_settings(
 
 /// 实跑一次搜索后端，不注入上下文。用于「测试后端」按钮。
 #[tauri::command]
-pub async fn test_search_backend(
+pub async fn test_search_backend<R: tauri::Runtime>(
+    window: tauri::Window<R>,
+    webview: tauri::Webview<R>,
     state: State<'_, AppState>,
+    text: String,
+    request_id: Option<String>,
+    on_ready: Option<tauri::ipc::JavaScriptChannelId>,
+) -> Result<crate::search::executor::SearchOutcome, String> {
+    // Own the channel before any fallible preparation, including registration.
+    let channel = on_ready.map(|id| id.channel_on::<_, crate::search::SearchRequestReady>(webview));
+    match (request_id, channel) {
+        (None, None) => test_search_backend_inner(&state, text).await,
+        (Some(id), Some(channel)) => {
+            let request = state
+                .manual_search_controls
+                .register(window.label(), &id)
+                .map_err(|e| e.replace("聊天", "检索"))?;
+            channel
+                .send(crate::search::SearchRequestReady {
+                    request_id: request.id().to_string(),
+                })
+                .map_err(|_| "检索请求就绪通知未送达".to_owned())?;
+            // Include config/key/DB waits, not just the final HTTP future.
+            request
+                .run(test_search_backend_inner(&state, text))
+                .await
+                .map_err(|e| {
+                    if e == crate::desktop_chat::CANCELLED {
+                        "search_backend_cancelled".into()
+                    } else {
+                        e
+                    }
+                })
+        }
+        _ => Err("检索请求控制参数不完整".into()),
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_search_backend<R: tauri::Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<bool, String> {
+    state
+        .manual_search_controls
+        .cancel(window.label(), &request_id)
+        .map_err(|e| e.replace("聊天", "检索"))
+}
+
+async fn test_search_backend_inner(
+    state: &AppState,
     text: String,
 ) -> Result<crate::search::executor::SearchOutcome, String> {
     let cfg = state.config.read().clone();
     if !cfg.search.enabled {
         return Err("联网搜索尚未启用".into());
     }
+    if cfg.search.backend == crate::config::SearchBackendKind::MdnMcp {
+        let query = crate::search::SearchQuery {
+            text: crate::search::query_from(
+                &text,
+                crate::search::mdn_mcp_contract::MAX_QUERY_CHARS,
+            ),
+            max_results: cfg.search.normalized_max_results(),
+        };
+        return Ok(crate::search::mdn_transport::execute(
+            &cfg.search,
+            &query,
+            &state.gateway.search_resources,
+        )
+        .await);
+    }
     let key = match repo::get_secret(state.db.pool(), repo::SECRET_SEARCH_API_KEY).await {
         Ok(Some(encoded)) => crypto::decrypt(&encoded).ok(),
         _ => None,
     };
     let http = crate::outbound::search_client(cfg.http_proxy.as_deref())?;
-    Ok(crate::search::test_backend(&http, &cfg.search, key.as_deref(), &text).await)
+    Ok(crate::search::executor::test_backend_with_resources(
+        &http,
+        &cfg.search,
+        key.as_deref(),
+        &text,
+        &state.gateway.search_resources,
+    )
+    .await)
 }
 
 /// 分类器试跑。走**完整链路**（硬规则 → Jev → 启发式），与线上同一份代码。
@@ -5222,6 +6426,23 @@ pub async fn classify_preview(
     has_tools: bool,
 ) -> Result<crate::intellect::TaskIntent, String> {
     let cfg = state.config.read().clone();
+    classify_preview_with_config(
+        &cfg,
+        state.gateway.cost_gate.clone(),
+        text,
+        has_image,
+        has_tools,
+    )
+    .await
+}
+
+async fn classify_preview_with_config(
+    cfg: &AppConfig,
+    gate: std::sync::Arc<crate::cost_policy::CostGate>,
+    text: String,
+    has_image: bool,
+    has_tools: bool,
+) -> Result<crate::intellect::TaskIntent, String> {
     let messages = vec![crate::domain::Message::user(text)];
     let media = crate::media::Media {
         image: has_image,
@@ -5233,14 +6454,97 @@ pub async fn classify_preview(
         has_tools,
         requested_model: "auto",
     };
-    let jev = crate::intellect::JevClient::new(
-        &cfg.smart_routing.jev.base_url,
-        &cfg.smart_routing.jev.model,
-        cfg.smart_routing.jev.timeout_ms,
-        cfg.smart_routing.jev.max_state_chars,
-    )
-    .ok();
+    let jev = if cfg.free_routing.enabled {
+        None
+    } else {
+        crate::intellect::JevClient::new(
+            &cfg.smart_routing.jev.base_url,
+            &cfg.smart_routing.jev.model,
+            cfg.smart_routing.jev.timeout_ms,
+            cfg.smart_routing.jev.max_state_chars,
+        )
+        .ok()
+        .map(|client| {
+            client.with_cost_policy(gate, crate::cost_policy::RequestCostPolicy::Unrestricted)
+        })
+    };
     Ok(crate::intellect::classify(&input, &cfg.smart_routing, jev.as_ref()).await)
+}
+
+#[cfg(test)]
+mod free_classifier_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn classifier_preview_and_jev_health_recheck_live_policy_without_auxiliary_posts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = axum::Router::new().route(
+            "/v1/systemone",
+            axum::routing::post(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"answers":{"alive":{"type":"noul","noul":1.0}}}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        struct Cleanup(tokio::task::JoinHandle<()>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _cleanup = Cleanup(server);
+        let db = crate::db::Db::connect_in_memory().await.unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.smart_routing.jev.base_url = endpoint.clone();
+        cfg.smart_routing.classifier = crate::config::SmartClassifier::Jev;
+        let live = Arc::new(parking_lot::RwLock::new(cfg.clone()));
+        let gate = Arc::new(crate::cost_policy::CostGate::new(db, live.clone()));
+        let client = crate::intellect::JevClient::new(&endpoint, "owned", 1000, 256)
+            .unwrap()
+            .with_cost_policy(
+                gate.clone(),
+                crate::cost_policy::RequestCostPolicy::Unrestricted,
+            );
+        classify_preview_with_config(
+            &cfg,
+            gate.clone(),
+            "owned short prompt".into(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "non-free preview remains a real decision request"
+        );
+        assert!(client.health().await);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        live.write().free_routing.enabled = true;
+        // The command's old snapshot and the previously built client are stale.
+        // Both still reject at their final transport consumer with live policy.
+        classify_preview_with_config(&cfg, gate, "owned next prompt".into(), false, false)
+            .await
+            .unwrap();
+        assert!(!client.health().await);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        live.write().free_routing.enabled = false;
+        assert!(client.health().await);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
 }
 
 /// 决策端点健康检查 + 一道题的原始分布。界面上用它解释「为什么没走 Jev」。
@@ -5250,18 +6554,33 @@ pub async fn jev_probe(
     text: String,
 ) -> Result<serde_json::Value, String> {
     let cfg = state.config.read().clone();
+    if cfg.free_routing.enabled {
+        return Err("严格免费模式下决策端点费用未确证，未发送探针".into());
+    }
     let client = crate::intellect::JevClient::new(
         &cfg.smart_routing.jev.base_url,
         &cfg.smart_routing.jev.model,
         cfg.smart_routing.jev.timeout_ms,
         cfg.smart_routing.jev.max_state_chars,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    .with_cost_policy(
+        state.gateway.cost_gate.clone(),
+        crate::cost_policy::RequestCostPolicy::Unrestricted,
+    );
     let body = serde_json::json!({
         "model": client.model_name(),
         "state": { "prompt": client.truncate_state(&text) },
         "questions": crate::intellect::jev::preview_questions(),
     });
+    if state
+        .gateway
+        .cost_gate
+        .effective(crate::cost_policy::RequestCostPolicy::Unrestricted)
+        .is_free()
+    {
+        return Err("严格免费政策已生效，未发送决策请求".into());
+    }
     match client.decide(body).await {
         Ok(result) => {
             let rows = crate::intellect::jev::preview(
@@ -5304,15 +6623,23 @@ pub async fn calibrate_classifier(
         return Err(format!("一次最多校准 200 条，收到 {}", samples.len()));
     }
     let cfg = state.config.read().clone();
-    // 配置无效时仍然可以校准——结果会全部落到「弃权」，
-    // 那本身就是有用信息（告诉用户端点还没配好）。
+    if cfg.free_routing.enabled {
+        return Err("严格免费模式下决策端点费用未确证，未发送校准请求".into());
+    }
+    // 配置无效时仍然可以校准——结果全部弃权，提示端点尚未配好。
     let jev = crate::intellect::JevClient::new(
         &cfg.smart_routing.jev.base_url,
         &cfg.smart_routing.jev.model,
         cfg.smart_routing.jev.timeout_ms,
         cfg.smart_routing.jev.max_state_chars,
     )
-    .ok();
+    .ok()
+    .map(|client| {
+        client.with_cost_policy(
+            state.gateway.cost_gate.clone(),
+            crate::cost_policy::RequestCostPolicy::Unrestricted,
+        )
+    });
     let smart = cfg.smart_routing.clone();
     Ok(crate::intellect::calibrate::calibrate(samples, smart, jev.as_ref()).await)
 }
@@ -5379,6 +6706,15 @@ pub async fn refresh_pricing(
 
 /// 最近一次定价刷新摘要；从未刷新过时为 null。
 #[tauri::command]
+pub async fn price_observations(
+    state: State<'_, AppState>,
+) -> Result<Vec<repo::price_observation::PriceObservationView>, String> {
+    repo::price_observation::snapshot(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn pricing_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     crate::pricing_refresh::status(&state.gateway).await
 }
@@ -5438,6 +6774,7 @@ pub async fn import_bundle(
     state: State<'_, AppState>,
     src: String,
 ) -> Result<ImportBundleOutcome, String> {
+    let _benefits_gate = state.benefit_settings_commands.lock().await;
     let src_dir = std::path::Path::new(&src);
     // 1) 先只读解析，任何一步失败都在改动本机数据之前返回。
     let contents = crate::bundle::read_bundle(src_dir).await?;
@@ -5476,12 +6813,14 @@ pub async fn import_bundle(
         preserved_security_fields.push("远程 HTTPS 模式".to_string());
         cfg.unified_key = previous.unified_key.clone();
         cfg.remote_mode = previous.remote_mode.clone();
+        cfg.benefits
+            .preserve_account_auto_claim_from(&previous.benefits);
         cfg.http_proxy = crate::outbound::validate_proxy(cfg.http_proxy.as_deref())?;
         cfg.normalize_custom_rules();
         cfg.validate_custom_rules().map_err(|e| e.to_string())?;
         cfg.normalize_listener();
         cfg.validate_remote_mode().map_err(|e| e.to_string())?;
-        commit_config(&state, ConfigCommit::Save(&cfg))?;
+        benefit_settings::commit(&state, ConfigCommit::Save(&cfg), &cfg.benefits).await?;
         config_imported = true;
     }
 
@@ -5638,4 +6977,90 @@ pub async fn delete_models(
         .map_err(|e| format!("删除模型失败：{e}"))?;
     tracing::info!(供应商 = %provider_id, 删除数量 = removed, "已删除失效模型");
     Ok(removed)
+}
+
+#[cfg(test)]
+mod s6_declaration_contract_tests {
+    use super::ProviderInput;
+    use serde_json::json;
+    #[test]
+    fn s6_declaration_legacy_payload_works_but_invalid_state_is_rejected() {
+        let old = json!({"id":null,"name":"owned declarations","dialect":"openai",
+        "base_url":"http://127.0.0.1:1","api_key":"","enabled":true,"priority":100,
+        "rpm_limit":0,"intelligence":50,"note":null,
+        "models":[{"alias":"m","upstream":"physical","context_window":8192,
+            "supports_tools":false,"supports_vision":false,"supports_stream":true}]});
+        assert!(serde_json::from_value::<ProviderInput>(old.clone()).is_ok());
+        let mut invalid = old;
+        invalid["capability_declarations"] = json!({"m":{"revision":"new","binding":"new",
+        "fields":{"tools":"supplier_verified"}}});
+        assert!(
+            serde_json::from_value::<ProviderInput>(invalid).is_err(),
+            "an invalid local declaration state must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn s6_declaration_rejects_duplicate_alias_field_and_claimed_sources() {
+        let base = json!({"id":null,"name":"owned","dialect":"openai","base_url":"http://127.0.0.1:1","api_key":"","enabled":true,"priority":1,"models":[],"rpm_limit":0,"intelligence":50,"note":null});
+        let prefix = serde_json::to_string(&base).unwrap();
+        let valid = format!(
+            "{},\"capability_declarations\":{}}}",
+            &prefix[..prefix.len() - 1],
+            r#"{"m":{"binding":"new","revision":"new","fields":{"tools":"unknown"}}}"#
+        );
+        assert!(
+            serde_json::from_str::<ProviderInput>(&valid).is_ok(),
+            "negative fixtures must retain a valid JSON/DTO positive control"
+        );
+        for patch in [
+            r#"{"m":{"binding":"new","revision":"new","fields":{"tools":"unknown","tools":"supported"}}}"#,
+            r#"{"m":{"binding":"new","revision":"new","fields":{"tools":"unknown"}},"m":{"binding":"new","revision":"new","fields":{"tools":"unsupported"}}}"#,
+            r#"{"m":{"binding":"new","revision":"new","fields":{"quality":"supported"}}}"#,
+            r#"{"m":{"binding":"new","revision":"new","fields":{"tools":"supported"},"origin":"supplier_verified"}}"#,
+        ] {
+            let raw = format!(
+                "{},\"capability_declarations\":{}}}",
+                &prefix[..prefix.len() - 1],
+                patch
+            );
+            assert!(serde_json::from_str::<ProviderInput>(&raw).is_err());
+        }
+    }
+}
+
+/// Explicit local no-send recovery; no query, reset, fallback or automatic retry.
+/// Timeout is an unknown outcome: supervised CAS may still settle; read state first.
+#[tauri::command]
+pub async fn recover_stack_overflow_unsent(
+    state: State<'_, AppState>,
+) -> Result<crate::search::stack_exchange_scope::StatusView, String> {
+    let cfg = state.config.read().search.clone();
+    if cfg.backend != crate::config::SearchBackendKind::FreeAggregate
+        || cfg.free_search_scope != crate::config::FreeSearchScope::StackOverflow
+    {
+        return Err("stack_overflow_scope_not_active".into());
+    }
+    let resources = &state.gateway.search_resources;
+    if !resources.captures_current(&cfg) {
+        return Err("stack_overflow_configuration_changed".into());
+    }
+    let source = resources
+        .stack_exchange()
+        .ok_or("stack_overflow_storage_required")?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        if !source.state().await.can_recover_unsent {
+            return Err("stack_overflow_recovery_not_proven".to_owned());
+        }
+        source
+            .recover_unsent(cfg.free_proxy_url.as_deref(), cfg.source_min_interval_ms)
+            .await
+            .map_err(|_| "stack_overflow_recovery_not_proven".to_owned())?;
+        if !resources.captures_current(&cfg) {
+            return Err("stack_overflow_configuration_changed".to_owned());
+        }
+        Ok(source.state().await)
+    })
+    .await
+    .map_err(|_| "stack_overflow_recovery_outcome_unknown".to_owned())?
 }

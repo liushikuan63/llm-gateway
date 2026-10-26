@@ -655,6 +655,25 @@ pub enum Health {
     Error,
 }
 
+/// Read-only process-local TPS freshness, never a persisted source claim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TpsReferenceState {
+    NoSample,
+    Current,
+    Expired,
+    SourceMismatch,
+    ClockUnknown,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TpsReference {
+    pub schema_version: u8,
+    pub state: TpsReferenceState,
+    pub max_idle_seconds: u64,
+    pub age_seconds: Option<u64>,
+    pub cohort_sample_count: Option<u32>,
+}
+
 /// 运行时健康记录
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderHealth {
@@ -671,6 +690,8 @@ pub struct ProviderHealth {
     pub avg_tps: f32,
     /// 已累计的吞吐样本数。
     pub tps_samples: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tps_reference: Option<TpsReference>,
     pub last_error: Option<String>,
     pub last_checked_at: i64,
 }

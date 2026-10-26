@@ -3,6 +3,7 @@ import { api, BridgeOptions, BridgeStatus, CandidateExplanation, ProviderView } 
 import WorkBuddyLogin from "./WorkBuddyLogin";
 import QoderLogin from "./QoderLogin";
 import TraeLogin from "./TraeLogin";
+import TraeWebLogin from "./TraeWebLogin";
 
 const NAMES: Record<string, string> = { qoder: "Qoder", workbuddy: "WorkBuddy", trae: "Trae CN" };
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/https?:\/\/[^\s]+/gi, "[地址已隐藏]");
@@ -65,11 +66,13 @@ export default function ClientsPage() {
   return <div data-testid="clients-page">
     <div className="page-title"><div><h2>账号与客户端接入</h2><div className="sub">登录账号或连接现有客户端，将可用模型接入统一网关。</div></div><button disabled={busy} onClick={() => void run(load, "客户端状态已刷新")}>刷新客户端状态</button></div>
     {message && <div className={`msg ${message.error ? "err" : "ok"}`} role={message.error ? "alert" : "status"}>{message.text}</div>}
-    <WorkBuddyLogin onChanged={() => { void load().catch(() => {}); }}/>
+    <WorkBuddyLogin region="global" onChanged={() => { void load().catch(() => {}); }}/>
+    <WorkBuddyLogin region="cn" onChanged={() => { void load().catch(() => {}); }}/>
     <QoderLogin region="global" onChanged={() => { void load().catch(() => {}); }}/>
     <QoderLogin region="cn" onChanged={() => { void load().catch(() => {}); }}/>
+    <TraeWebLogin/>
     <TraeLogin/>
-    <div className="card"><strong>已有客户端接入</strong><ol><li>安装并登录要连接的客户端。WorkBuddy 国际版也可使用上方独立网页登录。</li><li>选择客户端 EXE、保存设置，再点「启动客户端」。若已普通启动，请先自行退出，调试参数才能生效。</li><li>启动内置桥接，刷新到「已就绪」后点「接入网关」。到供应商页选择模型；真实请求可能消耗账号额度。</li></ol><div className="sub">桥接只监听本机；退出软件会停止软件自己启动的桥接，客户端及外部服务继续运行。就绪表示接口可访问，尚未发送模型请求。原有接入配置保留，可按账号逐步改用直连。</div></div>
+    <div className="card"><strong>已有客户端接入</strong><ol><li>安装并登录要连接的客户端。WorkBuddy 国际版与 CN 可分别使用上方独立网页登录。</li><li>选择客户端 EXE、保存设置，再点「启动客户端」。若已普通启动，请先自行退出，调试参数才能生效。</li><li>启动内置桥接，刷新到「已就绪」后点「接入网关」。到供应商页选择模型；真实请求可能消耗账号额度。</li></ol><div className="sub">桥接只监听本机；退出软件会停止软件自己启动的桥接，客户端及外部服务继续运行。就绪表示接口可访问，尚未发送模型请求。原有接入配置保留，可按账号逐步改用直连。</div></div>
     {!statuses.length && <div className="card">正在读取状态，或读取失败；可点击刷新重试。</div>}
     {statuses.map(s => {
       const d = drafts[s.kind] ?? s.options;

@@ -299,7 +299,7 @@ async fn unused_loopback_port() -> u16 {
 }
 
 async fn wait_for_gateway(base_url: &str) {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     for _ in 0..80 {
         if client
             .get(format!("{base_url}/healthz"))
@@ -1066,7 +1066,7 @@ async fn non_chat_model_types_route_to_their_dedicated_openai_endpoints() {
     image.models[0].model_type = llm_gateway_lib::domain::ModelType::Image;
     let mut speech = provider("speech", upstream_url, Dialect::OpenAI, 3);
     speech.models[0].model_type = llm_gateway_lib::domain::ModelType::Speech;
-    let (_db, config, gateway_task, base_url) = spawn_gateway(vec![embedding, image, speech]).await;
+    let (db, config, gateway_task, base_url) = spawn_gateway(vec![embedding, image, speech]).await;
     let client = reqwest::Client::new();
 
     let embedding_response = client
@@ -1117,11 +1117,47 @@ async fn non_chat_model_types_route_to_their_dedicated_openai_endpoints() {
         b"ID3mock-audio"
     );
 
-    let requests = state.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    assert_eq!(requests[0]["model"], "integration-model");
-    assert_eq!(requests[1]["prompt"], "a cat");
-    assert_eq!(requests[2]["voice"], "alloy");
+    {
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["model"], "integration-model");
+        assert_eq!(requests[1]["prompt"], "a cat");
+        assert_eq!(requests[2]["voice"], "alloy");
+    }
+    let rows = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = repo::query_requests(db.pool(), &Default::default())
+                .await
+                .unwrap()
+                .0;
+            if rows.len() == 3 {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for (provider_id, phase) in [
+        ("embedding", "embeddings_plan"),
+        ("image", "image_generation_plan"),
+        ("speech", "speech_plan"),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.routed_provider.as_deref() == Some(provider_id))
+            .unwrap()
+            .to_json();
+        assert_eq!(
+            row["route_decision"]["state"], "recorded",
+            "a typed request needs its own actual plan, not a chat reconstruction"
+        );
+        let plan = &row["route_decision"]["snapshot"];
+        assert_eq!(plan["phase"], phase);
+        assert_eq!(plan["total_candidates"], 1);
+        assert_eq!(plan["candidates"][0]["target"]["provider_id"], provider_id);
+        assert_eq!(plan["score_state"], "not_recorded");
+    }
 
     gateway_task.abort();
     upstream_task.abort();
@@ -1893,4 +1929,120 @@ async fn context_ineligible_candidates_do_not_disable_cost_routing() {
         assert_eq!(cheap_state.hits.load(Ordering::SeqCst), 1);
         assert_eq!(strong_state.hits.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn responses_instructions_h1_exact_http_wire() {
+    let (upstream_url, state, upstream_task) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("fixed reply")).await;
+    let (_db, config, gateway_task, base_url) = spawn_gateway_with(
+        vec![provider("instructions", upstream_url, Dialect::OpenAI, 1)],
+        |cfg| {
+            cfg.cache.enabled = false;
+            cfg.dedup.mode = llm_gateway_lib::proxy::dedup::DedupMode::Off;
+            cfg.smart_routing.enabled = false;
+            cfg.search.enabled = false;
+            cfg.compact_threshold_tokens = u32::MAX;
+        },
+    )
+    .await;
+    let instruction = "  系统约束 α\r\n保留原文\t  ";
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{base_url}/v1/responses"))
+        .bearer_auth(&config.unified_key)
+        .json(
+            &serde_json::json!({"model":"integration-model", "instructions":instruction,
+            "input":"use the responses interface", "max_output_tokens":42}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(response["status"], "completed");
+    assert_eq!(state.hits.load(Ordering::SeqCst), 1);
+    let wire = state.requests.lock().unwrap()[0].clone();
+    eprintln!("H1 captured real HTTP upstream body: {wire}");
+    gateway_task.abort();
+    upstream_task.abort();
+    assert_eq!(wire["messages"][0]["role"], "system");
+    assert_eq!(wire["messages"][0]["content"], instruction);
+    assert_eq!(
+        wire["messages"][1]["content"],
+        "use the responses interface"
+    );
+    assert_eq!(wire["max_tokens"], 42);
+}
+
+#[path = "support/responses_instructions.rs"]
+mod instructions_regressions;
+
+#[path = "support/timing_observations.rs"]
+mod timing_observations;
+
+#[path = "support/audit_durability.rs"]
+mod audit_durability;
+
+#[path = "support/first_byte_observations.rs"]
+mod first_byte_observations;
+
+#[path = "support/wire_mode_contracts.rs"]
+mod wire_mode_contracts;
+
+#[path = "support/control_observations.rs"]
+mod control_observations;
+
+#[path = "support/responses_reasoning.rs"]
+mod responses_reasoning;
+
+#[path = "support/auxiliary_observation.rs"]
+mod auxiliary_observation;
+#[path = "support/buffered_usage_accounting.rs"]
+mod buffered_usage_accounting;
+#[path = "support/request_decision.rs"]
+mod request_decision;
+#[path = "support/timing_failure_cache.rs"]
+mod timing_failure_cache;
+
+// Real public ingress and the existing durable audit, without external services.
+#[tokio::test]
+async fn request_decision_plan_is_saved_on_the_same_successful_audit_row() {
+    let (upstream, observed, worker) =
+        spawn_openai_upstream(OpenAiBehavior::Complete("owned plan")).await;
+    let (db, cfg, gateway, url) =
+        spawn_gateway(vec![provider("owned-plan", upstream, Dialect::OpenAI, 1)]).await;
+    let response = reqwest::Client::new().post(format!("{url}/v1/chat/completions"))
+        .bearer_auth(&cfg.unified_key)
+        .json(&serde_json::json!({"model":"owned-plan:integration-model","messages":[{"role":"user","content":"owned route decision"}]}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.text().await.unwrap();
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        rows = repo::query_requests(db.pool(), &Default::default())
+            .await
+            .unwrap()
+            .0;
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(rows.len(), 1);
+    assert_eq!(observed.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(rows[0].status, Some(200));
+    let row = rows[0].to_json();
+    assert_eq!(
+        row["route_decision"]["state"], "recorded",
+        "a successful public request must preserve its actual plan with its audit"
+    );
+    assert_eq!(
+        row["route_decision"]["snapshot"]["candidates"][0]["target"]["provider_id"],
+        "owned-plan"
+    );
+    gateway.abort();
+    worker.abort();
 }

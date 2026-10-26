@@ -51,28 +51,13 @@ fn provider_with(models: Vec<ModelRef>) -> Provider {
 }
 
 async fn pool() -> sqlx::SqlitePool {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    // Provider saves also validate runtime bindings; use the production migrations
+    // rather than a partial hand-maintained providers/models schema.
+    llm_gateway_lib::db::Db::connect_in_memory()
         .await
-        .expect("内存库");
-    // 手写建表：**加列时要跟着改这里**。
-    // D1 加了 `capabilities_json`，漏加会让 upsert 报
-    // "table models has no column named capabilities_json" ——
-    // 而这个文件里的两条用例与能力分无关，报错完全指不到原因。
-    sqlx::query("CREATE TABLE models (id TEXT PRIMARY KEY, provider_id TEXT, alias TEXT, upstream TEXT, context_window INTEGER, supports_tools INTEGER, supports_vision INTEGER, supports_audio INTEGER, supports_video INTEGER, supports_thinking INTEGER, supports_stream INTEGER, model_type TEXT, upstream_path TEXT, enabled INTEGER NOT NULL DEFAULT 1, price_json TEXT, overrides_json TEXT, local_json TEXT, capabilities_json TEXT, capability_sources_json TEXT)")
-        .execute(&pool)
-        .await
-        .expect("建表");
-    // 手写建表：**加列时要跟着改这里**。
-    // D1 加了 `capabilities_json`、任务卡二 A5 加了 `runtime_id`，
-    // 漏加会让 upsert 报 "table providers has no column named runtime_id"
-    // —— 而这个文件里的用例与账号型上游无关，报错完全指不到原因。
-    sqlx::query("CREATE TABLE providers (id TEXT PRIMARY KEY, name TEXT, dialect TEXT, base_url TEXT, api_key_enc TEXT, enabled INTEGER, priority INTEGER, rpm_limit INTEGER, intelligence INTEGER, note TEXT, runtime_id TEXT, created_at TEXT, updated_at TEXT)")
-        .execute(&pool)
-        .await
-        .expect("建表");
-    pool
+        .expect("完整隔离内存库")
+        .pool()
+        .clone()
 }
 
 /// 反向判据：字段必须有默认值。

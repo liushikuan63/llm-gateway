@@ -194,12 +194,20 @@ pub fn to_upstream_body(req: &ChatRequest, model: &str) -> serde_json::Value {
     if let Some(th) = &req.thinking {
         body["thinking"] = th.clone();
     }
+    if let Some(effort) = crate::protocol::reasoning::chat_effort(req) {
+        body["reasoning_effort"] = effort.clone();
+    }
     if req.stream {
         body["stream_options"] = json!({ "include_usage": true });
     }
 
     // 未识别字段原样透传：网关不该成为新特性的瓶颈
     for (k, v) in &req.extra {
+        // The Responses object is encoded above using this dialect's field.
+        // Actual HTTP validates non-representable keys before sending anything.
+        if k == "reasoning" {
+            continue;
+        }
         if !body.as_object().unwrap().contains_key(k) {
             body[k] = v.clone();
         }

@@ -25,6 +25,467 @@ use llm_gateway_lib::search::parse::{decode, duckduckgo_lite, render};
 use axum::routing::any;
 use axum::Router;
 
+/* Bounded free aggregate: all HTTP fixtures are loopback only. */
+use llm_gateway_lib::search::free_aggregate::{
+    parse_bing_rss, FreeAggregateBackend, MAX_BODY_BYTES, MAX_QUERY_CHARS,
+};
+
+const FREE_RSS: &str = r#"<?xml version="1.0"?><rss version="2.0"><channel>
+<title>Bing</title><link>https://cn.bing.com</link>
+<item><title><![CDATA[Rust &amp; C++]]></title><link>https://example.org/a%20b?q=x%26y&amp;k=1#first</link><description><![CDATA[<b>Guide</b> &amp; text]]></description></item>
+<item><title>Other topic</title><link>https://example.org/a%20b?q=x%26y&amp;k=1#second</link></item>
+<item><title>Unsafe</title><link>javascript:alert(1)</link></item>
+</channel></rss>"#;
+const FREE_DDG: &str = r#"<a rel="nofollow" href="https://example.org/a%20b?q=x%26y&amp;k=1" class="result-link">Duplicate</a>
+<td class="result-snippet">Duplicate</td>
+<a rel="nofollow" href="https://example.org/weather" class="result-link">Paris weather</a>
+<td class="result-snippet">Forecast</td>"#;
+
+#[test]
+fn free_aggregate_xml_whitespace_entities_preserve_valid_titles_but_not_urls() {
+    let xml="<rss><channel><item><title>A&#9;B&#10;C&#13;D</title><link>https://example.org/</link></item></channel></rss>";
+    assert_eq!(parse_bing_rss(xml, 10).unwrap()[0].title, "A B C D");
+    let invalid = xml.replace("https://example.org/", "https://example.org/a&#9;b");
+    assert!(parse_bing_rss(&invalid, 10).is_err());
+    assert!(parse_bing_rss(&xml.replace("&#9;", "&#0;"), 10).is_err());
+}
+
+#[test]
+fn free_aggregate_selection_is_explicit_and_preserves_legacy_defaults_and_config() {
+    let mut serialized = serde_json::to_value(SearchConfig::default()).unwrap();
+    assert_eq!(serialized["query_cache_ttl_secs"], 0);
+    assert_eq!(serialized["coalesce_queries"], false);
+    let old: SearchConfig =
+        serde_json::from_value(serde_json::json!({"backend":"free_aggregate"})).unwrap();
+    assert_eq!(old.query_cache_ttl_secs, 0);
+    assert!(!old.coalesce_queries);
+    assert_eq!(serialized["backend"], "duck_duck_go");
+    assert!(!serialized["enabled"].as_bool().unwrap());
+    serialized["backend"] = serde_json::json!("free_aggregate");
+    let selected: SearchConfig = serde_json::from_value(serialized)
+        .expect("free aggregator must be explicitly selectable in production config");
+    assert_eq!(
+        llm_gateway_lib::search::backend_code(selected.backend),
+        "free_aggregate"
+    );
+    let mut enabled = selected.clone();
+    enabled.query_cache_ttl_secs = 10;
+    enabled.coalesce_queries = true;
+    let roundtrip: SearchConfig = toml::from_str(&toml::to_string(&enabled).unwrap()).unwrap();
+    assert_eq!(roundtrip, enabled);
+    enabled.query_cache_ttl_secs = 3601;
+    assert!(llm_gateway_lib::search::validate(&enabled).is_err());
+    for legacy in ["tavily", "brave", "sear_xng", "bing_cn", "duck_duck_go"] {
+        let kind: SearchBackendKind = serde_json::from_value(serde_json::json!(legacy)).unwrap();
+        assert_eq!(llm_gateway_lib::search::backend_serde_value(&kind), legacy);
+    }
+}
+
+#[test]
+fn free_aggregate_xml_closing_tag_whitespace_is_valid_but_mismatch_is_not() {
+    let xml="<rss><channel><item><title>Valid</title ><link>https://example.org/</link></item ></channel ></rss >";
+    assert_eq!(parse_bing_rss(xml, 10).unwrap()[0].title, "Valid");
+    assert!(parse_bing_rss(&xml.replace("</item >", "</title >"), 10).is_err());
+}
+
+#[tokio::test]
+async fn free_aggregate_streamed_body_cap_finishes_before_source_deadline() {
+    use axum::{body::Body, http::Response};
+    use futures_util::StreamExt;
+    let app = Router::new()
+        .route(
+            "/search",
+            any(|| async {
+                let chunks = futures_util::stream::iter([
+                    Ok::<_, std::convert::Infallible>(vec![b'x'; 200 * 1024]),
+                    Ok(vec![b'x'; 100 * 1024]),
+                ])
+                .chain(futures_util::stream::pending());
+                Response::builder()
+                    .header("Content-Type", "application/rss+xml")
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        )
+        .route("/lite/", any(|| async { FREE_DDG }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let backend = FreeAggregateBackend {
+        bing_base_url: origin.clone(),
+        ddg_base_url: origin,
+        timeout: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(750),
+        backend.search(
+            &client,
+            &SearchQuery {
+                text: "fixture".into(),
+                max_results: 5,
+            },
+        ),
+    )
+    .await;
+    server.abort();
+    let report = result
+        .expect("chunk cap must reject before waiting for final bytes or 3s deadline")
+        .unwrap();
+    assert_eq!(report.failed_sources, vec!["bing_rss"]);
+    assert!(!report.results.is_empty());
+}
+
+#[test]
+fn free_aggregate_rss_cdata_entities_encoded_urls_and_stable_dedup() {
+    let hits = parse_bing_rss(FREE_RSS, 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    // CDATA is literal XML text: an entity in CDATA is not XML-decoded twice.
+    assert_eq!(hits[0].title, "Rust &amp; C++");
+    assert_eq!(hits[0].url, "https://example.org/a%20b?q=x%26y&k=1#first");
+    assert_eq!(hits[0].snippet, "Guide & text");
+    assert_eq!(parse_bing_rss(FREE_RSS, 0).unwrap().len(), 0);
+    assert_eq!(parse_bing_rss(FREE_RSS, 1).unwrap().len(), 1);
+}
+
+#[test]
+fn free_aggregate_rss_rejects_challenge_malformed_doctype_and_oversize() {
+    for xml in ["<html>captcha</html>", "<rss><channel><item></channel></rss>",
+        "<!DOCTYPE rss [<!ENTITY x SYSTEM 'file:///private'>]><rss><channel/></rss>",
+        "<rss><channel><item><title>x</title><link>https://u:p@example.org</link></item></channel></rss>"] {
+        assert!(parse_bing_rss(xml, 10).is_err(), "must fail closed: {xml}");
+    }
+    assert!(parse_bing_rss(&"x".repeat(MAX_BODY_BYTES + 1), 10).is_err());
+    assert!(
+        parse_bing_rss("<rss><channel/></rss>", 10).is_err(),
+        "empty is not a confirmed search"
+    );
+}
+
+async fn free_fixture(
+    delay_ms: u64,
+    status: u16,
+    rss: String,
+    ddg: String,
+) -> (
+    String,
+    reqwest::Client,
+    std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let app = Router::new().fallback(any(
+        move |method: axum::http::Method, uri: axum::http::Uri, body: String| {
+            let captured = captured.clone();
+            let rss = rss.clone();
+            let ddg = ddg.clone();
+            async move {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), uri.to_string(), body));
+                if uri.path() == "/lite/" {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                let code = if uri.path() == "/lite/" { status } else { 200 };
+                (
+                    axum::http::StatusCode::from_u16(code).unwrap(),
+                    if uri.path() == "/search" { rss } else { ddg },
+                )
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        base,
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        seen,
+    )
+}
+
+#[tokio::test]
+async fn free_aggregate_ddg_result_words_are_not_challenges() {
+    for (index, text) in [
+        "CAPTCHA integration guide",
+        "What anomaly.js does",
+        "Understanding anomaly-modal markup",
+        "Why sites say verify you are human",
+        "&lt;form id=\"captcha\"&gt; is an escaped documentation example",
+        "Guide <!-- <form id='captcha'> --> text",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let body = format!(
+            "<script>const example = \"<form id='captcha'>\";</script><title>CAPTCHA at DuckDuckGo</title><a class=\"result-link\" href=\"https://example.org/owned-guide-{index}\">{text}</a><td class=\"result-snippet\">A normal technical result about verification.</td>"
+        );
+        let (base, http, seen) = free_fixture(0, 200, FREE_RSS.into(), body).await;
+        let backend = FreeAggregateBackend {
+            bing_base_url: base.clone(),
+            ddg_base_url: base,
+            timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let result = backend
+            .search(
+                &http,
+                &SearchQuery {
+                    text: "CAPTCHA integration".into(),
+                    max_results: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.failed_sources.is_empty(),
+            "normal result words are not challenge controls: {text}"
+        );
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.result_sources, vec!["bing_rss", "duckduckgo"]);
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one GET plus one POST, no replay");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|x| x.0 == "GET" && x.1.starts_with("/search?"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|x| x.0 == "POST" && x.1 == "/lite/" && x.2 == "q=CAPTCHA+integration")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn free_aggregate_ddg_challenge_controls_reject_incidental_results() {
+    for control in [
+        "<form action=\"/anomaly.js?owned=1\"></form>",
+        "<FORM ACTION = 'https://duckduckgo.com/anomaly.js?owned=1'></FORM>",
+        "<div class=\"other anomaly-modal__mask\"></div>",
+        "<form ID = 'challenge-form'></form>",
+        "<div class='other g-recaptcha'></div>",
+        "<section id=captcha></section>",
+        "<h1>Verify you are human</h1>",
+    ] {
+        let body = format!("{control}<a class=\"result-link\" href=\"https://example.org/stray\">Incidental link</a>");
+        let (base, http, seen) = free_fixture(0, 200, FREE_RSS.into(), body).await;
+        let backend = FreeAggregateBackend {
+            bing_base_url: base.clone(),
+            ddg_base_url: base,
+            timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let result = backend
+            .search(
+                &http,
+                &SearchQuery {
+                    text: "owned guide".into(),
+                    max_results: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.failed_sources,
+            vec!["duckduckgo"],
+            "challenge controls cannot be rescued by incidental anchors: {control}"
+        );
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.result_sources, vec!["bing_rss"]);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn free_aggregate_http_contract_query_bounds_and_no_technical_injection() {
+    let (base, http, seen) = free_fixture(0, 200, FREE_RSS.into(), FREE_DDG.into()).await;
+    let backend = FreeAggregateBackend {
+        bing_base_url: base.clone(),
+        ddg_base_url: base,
+        timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let report = backend
+        .search(
+            &http,
+            &SearchQuery {
+                text: "Paris weather & tea".into(),
+                max_results: 10,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(report.failed_sources.is_empty());
+    assert_eq!(report.results.len(), 2);
+    assert_eq!(
+        report.results[0].title, "Rust &amp; C++",
+        "stable source order rather than race order"
+    );
+    assert_eq!(report.results[1].title, "Paris weather");
+    {
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().any(|(m, u, _)| m == "GET"
+            && u.starts_with("/search?")
+            && u.contains("format=rss")
+            && u.contains("q=Paris+weather+%26+tea")));
+        assert!(requests
+            .iter()
+            .any(|(m, u, b)| m == "POST" && u == "/lite/" && b == "q=Paris+weather+%26+tea"));
+    }
+    let before = seen.lock().unwrap().len();
+    for q in [
+        SearchQuery {
+            text: "".into(),
+            max_results: 1,
+        },
+        SearchQuery {
+            text: "a".repeat(MAX_QUERY_CHARS + 1),
+            max_results: 1,
+        },
+        SearchQuery {
+            text: "weather".into(),
+            max_results: 0,
+        },
+        SearchQuery {
+            text: "weather".into(),
+            max_results: 11,
+        },
+    ] {
+        assert!(backend.search(&http, &q).await.is_err());
+    }
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        before,
+        "invalid requests never sent"
+    );
+}
+
+#[tokio::test]
+async fn free_aggregate_partial_http_errors_auth_errors_and_total_failure() {
+    for status in [401, 403, 429, 500] {
+        let (base, http, seen) = free_fixture(0, status, FREE_RSS.into(), "challenge".into()).await;
+        let backend = FreeAggregateBackend {
+            bing_base_url: base.clone(),
+            ddg_base_url: base,
+            timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let report = backend.search(&http, &query(2)).await.unwrap();
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.failed_sources, vec!["duckduckgo"]);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "no retry or third provider after 401/403"
+        );
+    }
+    let (base, http, _) = free_fixture(0, 500, "<html>captcha</html>".into(), "".into()).await;
+    let backend = FreeAggregateBackend {
+        bing_base_url: base.clone(),
+        ddg_base_url: base,
+        timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    assert!(backend.search(&http, &query(2)).await.is_err());
+}
+
+#[tokio::test]
+async fn free_aggregate_deadline_retains_finished_source_and_bounds_body() {
+    let (base, http, _) = free_fixture(500, 200, FREE_RSS.into(), FREE_DDG.into()).await;
+    let backend = FreeAggregateBackend {
+        bing_base_url: base.clone(),
+        ddg_base_url: base,
+        timeout: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let report = backend.search(&http, &query(2)).await.unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.failed_sources, vec!["duckduckgo"]);
+    assert!(started.elapsed() < Duration::from_millis(400));
+    let (base, http, _) = free_fixture(0, 500, "x".repeat(MAX_BODY_BYTES + 1), "".into()).await;
+    let backend = FreeAggregateBackend {
+        bing_base_url: base.clone(),
+        ddg_base_url: base,
+        timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    assert!(backend.search(&http, &query(2)).await.is_err());
+}
+
+#[test]
+fn free_aggregate_field_limits_and_significant_query_values_remain_distinct() {
+    assert!(parse_bing_rss("<rss><channel><item><title>&unknown;</title><link>https://example.org</link></item></channel></rss>",10).is_err());
+    let mixed = "<rss><channel><item><title>A <![CDATA[<item>literal</item>]]> &#x4E2D; &amp; B</title><link>https://example.org/?x=1&amp;y=%26</link></item></channel></rss>";
+    let mixed_hits = parse_bing_rss(mixed, 10).unwrap();
+    assert_eq!(mixed_hits[0].title, "A <item>literal</item> 中 & B");
+    let xml = format!("<rss><channel><item><title>{}</title><link>https://example.org/?a=x%26y</link><description>{}</description></item><item><title>Distinct</title><link>https://example.org/?a=x&amp;y=</link></item></channel></rss>", "中".repeat(500), "文".repeat(1800));
+    let hits = parse_bing_rss(&xml, 10).unwrap();
+    assert_eq!(
+        hits.len(),
+        2,
+        "decoded %26 changes URL meaning and must not merge"
+    );
+    assert_eq!(hits[0].title.chars().count(), 256);
+    assert_eq!(hits[0].snippet.chars().count(), 1200);
+    assert_eq!(hits[0].url, "https://example.org/?a=x%26y");
+    assert_eq!(hits[1].url, "https://example.org/?a=x&y=");
+    let too_long = format!("<rss><channel><item><title>Long URL</title><link>https://example.org/{}</link></item></channel></rss>", "a".repeat(4096));
+    assert!(parse_bing_rss(&too_long, 10).is_err());
+    assert!(parse_bing_rss(
+        "<rss><channel><item><title>Navigation</title><link>#top</link></item></channel></rss>",
+        10
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn free_aggregate_two_sources_start_concurrently_and_caller_can_cancel() {
+    let (base, http, seen) = free_fixture(1000, 200, FREE_RSS.into(), FREE_DDG.into()).await;
+    let backend = FreeAggregateBackend {
+        bing_base_url: base.clone(),
+        ddg_base_url: base,
+        timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let q = query(2);
+    let pending = backend.search(&http, &q);
+    assert!(tokio::time::timeout(Duration::from_millis(150), pending)
+        .await
+        .is_err());
+    let captured = seen.lock().unwrap().clone();
+    assert_eq!(
+        captured.len(),
+        2,
+        "both requests started before the delayed source completed"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "no detached retry after caller cancellation"
+    );
+}
+
 /* ---------------------------- mock 辅助 ---------------------------- */
 
 /// 起一个本地 HTTP 服务并返回 `(base_url, 直连 client)`。
@@ -750,4 +1211,21 @@ fn searxng_只有它自己要求地址_对照组() {
         ..SearchConfig::default()
     };
     assert!(llm_gateway_lib::search::validate(&searx).is_err());
+}
+
+#[test]
+fn page_text_opt_in_default_and_toml_roundtrip() {
+    let default = serde_json::to_value(SearchConfig::default()).unwrap();
+    assert_eq!(
+        default.get("page_text_enabled"),
+        Some(&serde_json::json!(false)),
+        "body access must be an explicit persisted opt-in"
+    );
+    let chosen: SearchConfig =
+        serde_json::from_value(serde_json::json!({"page_text_enabled": true})).unwrap();
+    let roundtrip: SearchConfig = toml::from_str(&toml::to_string(&chosen).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(roundtrip).unwrap()["page_text_enabled"],
+        true
+    );
 }

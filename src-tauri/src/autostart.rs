@@ -68,11 +68,107 @@ mod imp {
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
+    #[cfg(test)]
+    thread_local! {
+        static TEST_REGISTRY_PATH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+    #[cfg(test)]
+    const TEST_KEY_PREFIX: &str = r"Software\LLMGatewayTests\Autostart\";
+    #[cfg(test)]
+    pub(super) fn test_registry_path() -> Option<String> {
+        TEST_REGISTRY_PATH.with(|path| path.borrow().clone())
+    }
+    #[cfg(test)]
+    fn owned_test_key(path: &str) -> bool {
+        path.strip_prefix(TEST_KEY_PREFIX)
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+    }
+    #[cfg(test)]
+    pub(super) struct TestRegistryScope {
+        path: String,
+        previous: Option<String>,
+        _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+    #[cfg(test)]
+    impl TestRegistryScope {
+        pub(super) fn new() -> Result<Self, String> {
+            use windows_sys::Win32::System::Registry::{
+                RegCreateKeyExW, REG_CREATED_NEW_KEY, REG_OPTION_NON_VOLATILE,
+            };
+            let path = format!("{TEST_KEY_PREFIX}{}", uuid::Uuid::new_v4());
+            if !owned_test_key(&path) {
+                return Err("invalid owned autostart test key".into());
+            }
+            let mut key = std::ptr::null_mut();
+            let mut disposition = 0;
+            let encoded = wide(&path);
+            // SAFETY: only a freshly generated UUID subkey under the dedicated
+            // HKCU test prefix is created. Production Run is never redirected.
+            let code = unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    encoded.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_QUERY_VALUE | KEY_SET_VALUE,
+                    std::ptr::null(),
+                    &mut key,
+                    &mut disposition,
+                )
+            };
+            if code != ERROR_SUCCESS {
+                return Err(format!("create owned autostart key failed: {code}"));
+            }
+            unsafe { RegCloseKey(key) };
+            if disposition != REG_CREATED_NEW_KEY {
+                return Err("autostart UUID test key already exists".into());
+            }
+            let previous = TEST_REGISTRY_PATH.with(|current| current.replace(Some(path.clone())));
+            Ok(Self {
+                path,
+                previous,
+                _thread_bound: std::marker::PhantomData,
+            })
+        }
+    }
+    #[cfg(test)]
+    impl Drop for TestRegistryScope {
+        fn drop(&mut self) {
+            TEST_REGISTRY_PATH.with(|current| {
+                current.replace(self.previous.take());
+            });
+            // Fail closed: neither a parent prefix nor any unrelated key is a
+            // deletion target, even if a future test mutates this scope's path.
+            if !owned_test_key(&self.path) {
+                return;
+            }
+            let encoded = wide(&self.path);
+            let code = unsafe {
+                windows_sys::Win32::System::Registry::RegDeleteTreeW(
+                    HKEY_CURRENT_USER,
+                    encoded.as_ptr(),
+                )
+            };
+            if !matches!(code, ERROR_SUCCESS | ERROR_FILE_NOT_FOUND) {
+                eprintln!("owned_autostart_key_cleanup_failed: {code}");
+            }
+        }
+    }
 
     /// 用当前用户的 Run 项做读写。`KEY_SET_VALUE | KEY_QUERY_VALUE` 一次开够，
     /// 免得读和写开两次句柄。
     fn open_key(access: REG_SAM_FLAGS) -> Result<HKEY, String> {
         let mut key: HKEY = std::ptr::null_mut();
+        #[cfg(test)]
+        let path = wide(
+            &test_registry_path()
+                .filter(|path| owned_test_key(path))
+                .ok_or_else(|| {
+                    "autostart registry test requires an owned thread scope".to_owned()
+                })?,
+        );
+        #[cfg(not(test))]
         let path = wide(RUN_KEY_PATH);
         // SAFETY: `path` 与 `key` 都是有效的本地值；`RegOpenKeyExW` 只写 `key`。
         let code = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut key) };
@@ -222,20 +318,24 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    /// 串行化**所有**读写注册表的测试。
-    ///
-    /// 为什么必须用文件锁而不是 `Mutex`：这些测试改的是**同一个注册表键**，
-    /// 而 `cargo test` 会把不同测试二进制并行跑（lib 与 tests/* 各一个进程），
-    /// 进程内的 `Mutex` 跨不过去。实测症状是串行 7 全过、并行稳定 1 条失败
-    /// ——`读回的值末尾不得有多余字符` 与 `读写状态必须自洽` 互相把键删掉。
-    ///
-    /// 判据：加锁后**默认并行**也必须全绿；只跑 `--test-threads=1` 是掩盖。
-    fn lock() -> MutexGuard<'static, ()> {
+    struct TestGuard {
+        #[cfg(windows)]
+        _registry: imp::TestRegistryScope,
+        _lock: MutexGuard<'static, ()>,
+    }
+    /// Each mutable test gets a dedicated thread-local UUID registry key.
+    /// The existing mutex still serializes its surrounding assertions.
+    fn lock() -> TestGuard {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let m = LOCK.get_or_init(|| Mutex::new(()));
         // 锁被 poison 说明上一个持锁的测试 panic 了；这里必须继续往下走，
         // 否则一次失败会让后续所有自启测试永久失败。
-        m.lock().unwrap_or_else(|e| e.into_inner())
+        let guard = m.lock().unwrap_or_else(|e| e.into_inner());
+        TestGuard {
+            #[cfg(windows)]
+            _registry: imp::TestRegistryScope::new().expect("create isolated autostart registry"),
+            _lock: guard,
+        }
     }
 
     #[test]
@@ -246,6 +346,80 @@ mod tests {
             parts,
             vec!["Software", "Microsoft", "Windows", "CurrentVersion", "Run"]
         );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn 注册表测试目标必须隔离于真实启动项() {
+        let _guard = lock();
+        let path = imp::test_registry_path().expect("owned test key");
+        assert_ne!(
+            path, RUN_KEY_PATH,
+            "tests must never target the real startup key"
+        );
+        assert!(path.starts_with(r"Software\LLMGatewayTests\Autostart\"));
+        assert_eq!(
+            std::thread::spawn(imp::test_registry_path).join().unwrap(),
+            None,
+            "the override must be visible only to this test's thread"
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn 未持有线程作用域时拒绝打开注册表() {
+        assert!(imp::test_registry_path().is_none());
+        assert!(status().unwrap_err().contains("owned thread scope"));
+    }
+    #[cfg(windows)]
+    fn assert_owned_key_deleted(path: &str) {
+        use windows_sys::Win32::{
+            Foundation::ERROR_FILE_NOT_FOUND,
+            System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_QUERY_VALUE},
+        };
+        let id = path
+            .strip_prefix(r"Software\LLMGatewayTests\Autostart\")
+            .expect("dedicated HKCU test prefix");
+        uuid::Uuid::parse_str(id).expect("one UUID leaf key");
+        let encoded: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut handle = std::ptr::null_mut();
+        let code = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                encoded.as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut handle,
+            )
+        };
+        if !handle.is_null() {
+            unsafe { RegCloseKey(handle) };
+        }
+        assert_eq!(
+            code, ERROR_FILE_NOT_FOUND,
+            "owned UUID leaf must be removed"
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn 私有键正常退出和异常展开都恢复线程状态并清理() {
+        for unwind in [false, true] {
+            let previous = imp::test_registry_path();
+            let mut owned_path = String::new();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = imp::TestRegistryScope::new().unwrap();
+                owned_path = imp::test_registry_path().unwrap();
+                enable(Some("isolated-roundtrip-fixture".into())).unwrap();
+                assert_eq!(
+                    status().unwrap().as_deref(),
+                    Some("isolated-roundtrip-fixture")
+                );
+                if unwind {
+                    panic!("intentional owned registry fixture unwind");
+                }
+            }));
+            assert_eq!(result.is_err(), unwind);
+            assert_eq!(imp::test_registry_path(), previous);
+            assert_owned_key_deleted(&owned_path);
+        }
     }
 
     #[test]
@@ -283,8 +457,8 @@ mod tests {
     #[test]
     fn 读写状态必须自洽() {
         let _guard = lock();
-        // 真写注册表：先关再开，确认 status 与实际写入的命令一致，
-        // 最后恢复原状 —— 测试绝不能把用户的开机自启留在改动后的状态。
+        // Only the guard's private UUID key is written; the production Run key
+        // is never used as a test fixture.
         let original = status().expect("读注册表");
         disable().expect("关闭自启");
         assert_eq!(status().expect("关闭后读状态"), None, "关闭后不该读到值");

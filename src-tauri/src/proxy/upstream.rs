@@ -15,21 +15,159 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::pin::Pin;
 use std::time::Duration;
 
+use super::timing::{
+    observation::{HttpObservationGuard, ObservedStream},
+    TimingMode,
+};
 use crate::crypto;
 use crate::domain::{ChatRequest, ChatResponse, Dialect, ModelOverrides, Provider, Usage};
 use crate::error::{GatewayError, Result};
 
-/// 取该 provider 下指定 upstream 模型的覆盖配置。模型未配置覆盖时返回 `None`。
+// Owned Windows TLS fixture trust is task-scoped and absent from product builds.
+// It extends the normal factory's trust roots; no certificate/hostname checks
+// are disabled, and no machine trust store or global client is changed.
+#[cfg(all(test, windows))]
+tokio::task_local! {static OWNED_NETWORK_TEST_ROOT: reqwest::Certificate;}
+#[cfg(all(test, windows))]
+tokio::task_local! {static OWNED_NETWORK_TEST_RESOLVE: (String, std::net::SocketAddr);}
+#[cfg(all(test, windows))]
+#[path = "upstream/network_tests.rs"]
+mod network_tests;
+
+// reqwest 0.12.28 has no resolved charset feature: text() uses UTF-8
+// replacement on its decoded body. Retain that decoding and error behavior.
+async fn observed_text(
+    response: reqwest::Response,
+    observation: Option<&HttpObservationGuard>,
+) -> std::result::Result<String, reqwest::Error> {
+    use futures_util::StreamExt;
+    let Some(observation) = observation else {
+        return response.text().await;
+    };
+    let observer = observation.body_observer();
+    let mut chunks = response.bytes_stream();
+    let mut full = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        observer.received(chunk.len());
+        full.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&full).into_owned())
+}
+
+/// Standard HTTP uses the exact failover candidate. Direct callers without a
+/// dispatch scope retain their legacy first-match lookup. A selected None is
+/// authoritative: never borrow a sibling alias's body, headers or capabilities.
+pub(crate) fn selected_model(
+    model: &str,
+    p: &Provider,
+) -> Option<std::sync::Arc<crate::domain::ModelRef>> {
+    super::dispatch_target::selected(&p.id, model).or_else(|| {
+        p.models
+            .iter()
+            .find(|candidate| candidate.upstream == model)
+            .cloned()
+            .map(std::sync::Arc::new)
+    })
+}
 fn overrides(model: &str, p: &Provider) -> Option<ModelOverrides> {
-    p.models
-        .iter()
-        .find(|candidate| candidate.upstream == model)
+    selected_model(model, p)
         .and_then(|candidate| candidate.overrides.clone())
         .filter(|overrides| !overrides.is_empty())
 }
 
+fn apply_thinking_capability(body: &mut serde_json::Value, model: &str, p: &Provider) {
+    if !selected_model(model, p).is_some_and(|model| model.supports_thinking) {
+        crate::protocol::convert::strip_thinking(body);
+    }
+}
+
+/// Private transport policy; never serialized into ChatRequest or provider extras.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RequestWireOptions {
+    pub entitlement_purpose: &'static str,
+    pub preserve_instruction: bool,
+    pub cost_policy: crate::cost_policy::RequestCostPolicy,
+    pub normalized_ingress: Option<super::control_modes::ControlSet>,
+    pub caller: Option<super::control_modes::CallerControls>,
+}
+
+/// Response decoding and inherited cost policy stay together at passthrough's
+/// private wire boundary; neither option can be supplied through provider JSON.
+#[derive(Clone, Copy)]
+pub(crate) struct PassthroughWireOptions {
+    pub expect_json: bool,
+    pub cost_policy: crate::cost_policy::RequestCostPolicy,
+}
+
+const INSTRUCTION_OVERRIDE_CONFLICT: &str =
+    "extra_body.instructions conflicts with current request instructions";
+
+fn instruction_override_conflict() -> GatewayError {
+    GatewayError::CapabilityUnavailable {
+        kind: INSTRUCTION_OVERRIDE_CONFLICT.into(),
+    }
+}
+
+/// This is a local request-policy rejection, not an upstream health failure.
+/// Require both private strict provenance and the exact typed error identity.
+pub(crate) fn is_instruction_override_conflict(
+    error: &GatewayError,
+    options: RequestWireOptions,
+) -> bool {
+    options.preserve_instruction
+        && matches!(error, GatewayError::CapabilityUnavailable { kind } if kind == INSTRUCTION_OVERRIDE_CONFLICT)
+}
+
+pub(crate) fn is_local_request_policy_rejection(
+    error: &GatewayError,
+    options: RequestWireOptions,
+) -> bool {
+    matches!(error, GatewayError::RequestControlUnavailable { .. })
+        || is_instruction_override_conflict(error, options)
+}
+
+/// The actual Responses HTTP transport can replace the encoded
+/// instruction through this model override. Use the same effective override
+/// lookup as serialization/application, including duplicate upstream mappings.
+/// Key presence is a conflict even for null, blank or identical configured text.
+pub(crate) fn validate_instruction_override(
+    provider: &Provider,
+    model: &str,
+    options: RequestWireOptions,
+) -> Result<()> {
+    validate_model_instruction_override(
+        provider.dialect,
+        overrides(model, provider).as_ref(),
+        options,
+    )
+}
+
+/// Shared pure validation for the pre-dispatch exact candidate and actual wire.
+pub(crate) fn validate_model_instruction_override(
+    dialect: Dialect,
+    overrides: Option<&ModelOverrides>,
+    options: RequestWireOptions,
+) -> Result<()> {
+    if options.preserve_instruction
+        && dialect == Dialect::Responses
+        && overrides
+            .and_then(|value| value.extra_body.as_ref())
+            .and_then(|value| {
+                value
+                    .as_object()
+                    .map(|object| object.contains_key("instructions"))
+            })
+            .unwrap_or(false)
+    {
+        return Err(instruction_override_conflict());
+    }
+    Ok(())
+}
+
 pub struct UpstreamClient {
     http: parking_lot::RwLock<std::result::Result<reqwest::Client, String>>,
+    cost_gate: parking_lot::RwLock<Option<std::sync::Arc<crate::cost_policy::CostGate>>>,
 }
 
 pub enum PassthroughResponse {
@@ -50,7 +188,57 @@ impl UpstreamClient {
     pub fn new() -> Self {
         Self {
             http: parking_lot::RwLock::new(Self::build_http(None)),
+            cost_gate: parking_lot::RwLock::new(None),
         }
+    }
+
+    pub(crate) fn set_cost_gate(&self, gate: std::sync::Arc<crate::cost_policy::CostGate>) {
+        *self.cost_gate.write() = Some(gate);
+    }
+
+    async fn authorize_wire(
+        &self,
+        p: &Provider,
+        model: &str,
+        body: &serde_json::Value,
+        policy: crate::cost_policy::RequestCostPolicy,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let gate = { self.cost_gate.read().clone() };
+        match gate {
+            Some(gate) => gate.before_wire(p, model, body, policy).await,
+            None if policy.is_free() => Err(crate::cost_policy::rejected("free_guard_unavailable")),
+            None => Ok(None),
+        }
+    }
+
+    async fn refresh_budget_admission(
+        &self,
+        p: &Provider,
+        model: &str,
+        body: &serde_json::Value,
+        policy: crate::cost_policy::RequestCostPolicy,
+        budget: &Option<crate::budget::holds::Permit>,
+        free_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let Some(budget) = budget else {
+            return Ok(free_permit);
+        };
+        // Budget persistence added an await after the original free admission.
+        // Release that semaphore before reusing the authoritative gate; do not
+        // acquire two permits or turn FreeOnly into Unrestricted.
+        drop(free_permit);
+        let permit = match self.authorize_wire(p, model, body, policy).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                budget.release_known_not_sent().await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = budget.check_final(p, policy, permit.is_some()) {
+            budget.release_known_not_sent().await?;
+            return Err(error);
+        }
+        Ok(permit)
     }
 
     fn build_http(proxy: Option<&str>) -> std::result::Result<reqwest::Client, String> {
@@ -64,7 +252,18 @@ impl UpstreamClient {
             .redirect(reqwest::redirect::Policy::none())
             .gzip(true)
             .brotli(true);
-        crate::outbound::apply_proxy(builder, proxy)?
+        let builder = crate::outbound::apply_proxy(builder, proxy)?;
+        #[cfg(all(test, windows))]
+        let builder = match OWNED_NETWORK_TEST_ROOT.try_with(Clone::clone) {
+            Ok(root) => builder.add_root_certificate(root),
+            Err(_) => builder,
+        };
+        #[cfg(all(test, windows))]
+        let builder = match OWNED_NETWORK_TEST_RESOLVE.try_with(Clone::clone) {
+            Ok((host, addr)) => builder.resolve(&host, addr),
+            Err(_) => builder,
+        };
+        builder
             .build()
             .map_err(|_| "无法创建上游代理连接".to_string())
     }
@@ -212,6 +411,16 @@ impl UpstreamClient {
         model: &str,
         defaults: &crate::config::OllamaOptionsConfig,
     ) -> serde_json::Value {
+        Self::build_body_with_options(p, req, model, defaults, RequestWireOptions::default())
+    }
+
+    fn build_body_with_options(
+        p: &Provider,
+        req: &ChatRequest,
+        model: &str,
+        defaults: &crate::config::OllamaOptionsConfig,
+        options: RequestWireOptions,
+    ) -> serde_json::Value {
         // Apply canonical overrides before converting: each dialect stores these
         // fields in a different location. The shared failover request stays intact.
         let mut effective;
@@ -236,7 +445,11 @@ impl UpstreamClient {
             }
             Dialect::Gemini => crate::protocol::gemini::to_gemini_body(req),
             Dialect::Ollama => crate::protocol::ollama::to_ollama_body(req, model, Some(defaults)),
-            Dialect::Responses => crate::protocol::responses::to_responses_body(req, model),
+            Dialect::Responses => crate::protocol::responses::to_responses_body_with_instruction(
+                req,
+                model,
+                options.preserve_instruction,
+            ),
         }
     }
 
@@ -249,62 +462,156 @@ impl UpstreamClient {
         timeout: Duration,
         defaults: &crate::config::OllamaOptionsConfig,
     ) -> Result<ChatResponse> {
-        let url = Self::build_url(p, model, false)?;
-        let key = decrypt_provider_key(p)?;
-        let mut body = Self::build_body(p, req, model, defaults);
-        if p.dialect != Dialect::Gemini && body.get("stream").is_none() {
-            body["stream"] = serde_json::Value::Bool(false);
+        self.call_with_options(
+            p,
+            req,
+            model,
+            timeout,
+            defaults,
+            RequestWireOptions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn call_with_options(
+        &self,
+        p: &Provider,
+        req: &ChatRequest,
+        model: &str,
+        timeout: Duration,
+        defaults: &crate::config::OllamaOptionsConfig,
+        options: RequestWireOptions,
+    ) -> Result<ChatResponse> {
+        let mut observation = None;
+        let result: Result<ChatResponse> = async {
+            validate_instruction_override(p, model, options)?;
+            crate::protocol::reasoning::validate(
+                req,
+                p.dialect,
+                selected_model(model, p).is_some_and(|m| m.supports_thinking),
+            )?;
+            let url = Self::build_url(p, model, false)?;
+            let key = decrypt_provider_key(p)?;
+            let mut body = Self::build_body_with_options(p, req, model, defaults, options);
+            if p.dialect != Dialect::Gemini && body.get("stream").is_none() {
+                body["stream"] = serde_json::Value::Bool(false);
+            }
+            Self::apply_overrides(&mut body, overrides(model, p).as_ref());
+            // Unknown/false remains unsupported even after explicit extra-body merging.
+            apply_thinking_capability(&mut body, model, p);
+
+            let url = with_gemini_key(url, p.dialect, &key)?;
+
+            let mut headers = Self::headers_for(p, &key)?;
+            Self::apply_extra_headers(&mut headers, overrides(model, p).as_ref())?;
+
+            let _free_permit = self
+                .authorize_wire(p, model, &body, options.cost_policy)
+                .await?;
+            let observation_context = super::observation_context::Snapshot::capture(p, &url, &body);
+            let outgoing = self
+                .client()?
+                .post(url)
+                .timeout(timeout)
+                .headers(headers)
+                .json(&body);
+            let budget = crate::budget::holds::before_http(p, model, &body).await?;
+            let _free_permit = self
+                .refresh_budget_admission(
+                    p,
+                    model,
+                    &body,
+                    options.cost_policy,
+                    &budget,
+                    _free_permit,
+                )
+                .await?;
+            observation = HttpObservationGuard::begin_with_projection(
+                TimingMode::Buffered,
+                Some(super::control_modes::WireModeSnapshot::observe(
+                    p.dialect,
+                    selected_model(model, p).map(|m| m.supports_thinking),
+                    options.caller,
+                    options.normalized_ingress,
+                    req,
+                    &body,
+                )),
+                observation_context,
+            );
+            let resp = outgoing
+                .send()
+                .await
+                .map_err(|e| map_reqwest_err(&p.name, model, e))?;
+            if let Some(observation) = &observation {
+                observation.headers();
+            }
+
+            let status = resp.status();
+            let text = match observed_text(resp, observation.as_ref()).await {
+                Ok(text) => text,
+                // A successful response whose body hits the deadline is a
+                // transport timeout, not empty/invalid JSON. A known HTTP error
+                // remains authoritative even if reading its diagnostic fails.
+                Err(error) if status.is_success() && error.is_timeout() => {
+                    return Err(map_reqwest_err(&p.name, model, error));
+                }
+                // Preserve the prior bad-body/HTTP-error classification for
+                // other read failures; do not introduce new replay eligibility.
+                Err(_) => String::new(),
+            };
+
+            if !status.is_success() {
+                return Err(Self::classify_upstream_error(
+                    p,
+                    model,
+                    status.as_u16(),
+                    &text,
+                ));
+            }
+
+            // HTTP 200 并不等于上游真的成功：反向代理、WAF 和过载节点常会返回
+            // HTML 或截断 JSON。它属于可换 Provider 的上游坏响应，而不是客户端
+            // 请求的协议错误，因此映射为可重试的 502。
+            let v: serde_json::Value =
+                serde_json::from_str(&text).map_err(|_| GatewayError::Upstream {
+                    provider: p.name.clone(),
+                    model: model.into(),
+                    status: 502,
+                    body: truncate(&text, 800),
+                })?;
+            ensure_successful_response(&v, p, model, &text)?;
+            if let Some(generation) = observation
+                .as_ref()
+                .and_then(HttpObservationGuard::generation_observer)
+            {
+                generation.observe(&v);
+            }
+
+            let mut response = match p.dialect {
+                Dialect::OpenAI => crate::protocol::convert::openai_response_to_internal(&v),
+                Dialect::Anthropic => crate::protocol::anthropic::anthropic_to_internal(&v),
+                Dialect::Gemini => crate::protocol::gemini::from_gemini_response(&v),
+                Dialect::Ollama => crate::protocol::ollama::from_ollama_response(&v),
+                Dialect::Responses => {
+                    crate::protocol::responses::from_responses_response(&v, model)
+                }
+            };
+            response.reported_usage_evidence =
+                super::reported_usage::observe(&v, p.dialect, response.usage.as_ref());
+            if let Some(budget) = budget {
+                budget.settle(response.reference_cost_usage()).await?;
+            }
+            Ok(response)
         }
-        // 上游不支持 thinking 时剥掉，否则 DeepSeek/GLM 直接 400
-        crate::protocol::convert::strip_thinking(&mut body);
-        Self::apply_overrides(&mut body, overrides(model, p).as_ref());
-
-        let url = with_gemini_key(url, p.dialect, &key)?;
-
-        let mut headers = Self::headers_for(p, &key)?;
-        Self::apply_extra_headers(&mut headers, overrides(model, p).as_ref())?;
-
-        let resp = self
-            .client()?
-            .post(url)
-            .timeout(timeout)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| map_reqwest_err(&p.name, model, e))?;
-
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            return Err(Self::classify_upstream_error(
-                p,
-                model,
-                status.as_u16(),
-                &text,
-            ));
+        .await;
+        if let Some(observation) = &observation {
+            observation.finish_result(result.is_ok());
         }
-
-        // HTTP 200 并不等于上游真的成功：反向代理、WAF 和过载节点常会返回
-        // HTML 或截断 JSON。它属于可换 Provider 的上游坏响应，而不是客户端
-        // 请求的协议错误，因此映射为可重试的 502。
-        let v: serde_json::Value =
-            serde_json::from_str(&text).map_err(|_| GatewayError::Upstream {
-                provider: p.name.clone(),
-                model: model.into(),
-                status: 502,
-                body: truncate(&text, 800),
-            })?;
-        ensure_successful_response(&v, p, model, &text)?;
-
-        Ok(match p.dialect {
-            Dialect::OpenAI => crate::protocol::convert::openai_response_to_internal(&v),
-            Dialect::Anthropic => crate::protocol::anthropic::anthropic_to_internal(&v),
-            Dialect::Gemini => crate::protocol::gemini::from_gemini_response(&v),
-            Dialect::Ollama => crate::protocol::ollama::from_ollama_response(&v),
-            Dialect::Responses => crate::protocol::responses::from_responses_response(&v, model),
-        })
+        if crate::budget::holds::active() {
+            result.map_err(GatewayError::no_replay)
+        } else {
+            result
+        }
     }
 
     /// 非聊天端点（Embedding / 图片 / TTS）的原生转发。
@@ -320,6 +627,36 @@ impl UpstreamClient {
         timeout: Duration,
         expect_json: bool,
     ) -> Result<PassthroughResponse> {
+        self.call_passthrough_with_policy(
+            p,
+            model,
+            path_segments,
+            body,
+            timeout,
+            PassthroughWireOptions {
+                expect_json,
+                cost_policy: Default::default(),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn call_passthrough_with_policy(
+        &self,
+        p: &Provider,
+        model: &str,
+        path_segments: &[&str],
+        body: &serde_json::Value,
+        timeout: Duration,
+        options: PassthroughWireOptions,
+    ) -> Result<PassthroughResponse> {
+        // Enforce the existing typed bound contract at the common wire entry:
+        // the Gateway calls this policy-aware path directly, not the public shim.
+        if crate::budget::holds::active() {
+            return Err(crate::budget::holds::rejected(
+                "passthrough_reference_bound_unverified",
+            ));
+        }
         // Responses 也放行：它是 OpenAI 系，只是请求体结构不同
         // （见 protocol::responses）。拦掉它会让自定义上游路径对
         // Responses 方言失效。
@@ -355,6 +692,9 @@ impl UpstreamClient {
             }
         }
 
+        let _free_permit = self
+            .authorize_wire(p, model, &body, options.cost_policy)
+            .await?;
         let resp = self
             .client()?
             .post(url)
@@ -381,11 +721,11 @@ impl UpstreamClient {
             ));
         }
 
-        if expect_json {
+        if options.expect_json {
             let bytes = resp
                 .bytes()
                 .await
-                .map_err(|error| GatewayError::Other(anyhow::anyhow!(error.to_string())))?;
+                .map_err(|error| map_typed_body_error(&p.name, model, error))?;
             let value: serde_json::Value =
                 serde_json::from_slice(&bytes).map_err(|_| GatewayError::Upstream {
                     provider: p.name.clone(),
@@ -398,7 +738,7 @@ impl UpstreamClient {
             let body = resp
                 .bytes()
                 .await
-                .map_err(|error| GatewayError::Other(anyhow::anyhow!(error.to_string())))?;
+                .map_err(|error| map_typed_body_error(&p.name, model, error))?;
             Ok(PassthroughResponse::Bytes { body, content_type })
         }
     }
@@ -412,54 +752,100 @@ impl UpstreamClient {
         timeout: Duration,
         defaults: &crate::config::OllamaOptionsConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UpstreamEvent>> + Send>>> {
+        self.call_stream_with_options(
+            p,
+            req,
+            model,
+            timeout,
+            defaults,
+            RequestWireOptions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn call_stream_with_options(
+        &self,
+        p: &Provider,
+        req: &ChatRequest,
+        model: &str,
+        timeout: Duration,
+        defaults: &crate::config::OllamaOptionsConfig,
+        options: RequestWireOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<UpstreamEvent>> + Send>>> {
         use futures_util::StreamExt;
 
+        let mut observation = None;
+        let result: Result<Pin<Box<dyn Stream<Item = Result<UpstreamEvent>> + Send>>> = async {
+        validate_instruction_override(p, model, options)?;
+        crate::protocol::reasoning::validate(req, p.dialect, selected_model(model, p).is_some_and(|m| m.supports_thinking))?;
         let url = Self::build_url(p, model, true)?;
         let key = decrypt_provider_key(p)?;
-        let mut body = Self::build_body(p, req, model, defaults);
+        let mut body = Self::build_body_with_options(p, req, model, defaults, options);
         if p.dialect != Dialect::Gemini {
             body["stream"] = serde_json::Value::Bool(true);
         }
-        crate::protocol::convert::strip_thinking(&mut body);
         Self::apply_overrides(&mut body, overrides(model, p).as_ref());
+        apply_thinking_capability(&mut body, model, p);
 
         let url = with_gemini_key(url, p.dialect, &key)?;
 
         let mut headers = Self::headers_for(p, &key)?;
         Self::apply_extra_headers(&mut headers, overrides(model, p).as_ref())?;
 
-        let resp = self
-            .client()?
-            .post(url)
-            .timeout(timeout)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| map_reqwest_err(&p.name, model, e))?;
+        let free_permit = self
+            .authorize_wire(p, model, &body, options.cost_policy)
+            .await?;
+        let observation_context = super::observation_context::Snapshot::capture(p, &url, &body);
+        let outgoing = self.client()?.post(url).timeout(timeout).headers(headers).json(&body);
+        // Only the private raw report, not legacy normalized stream usage, can
+        // release a reference hold after a protocol terminal event.
+        let budget = crate::budget::holds::before_http(p, model, &body).await?;
+        let free_permit=self.refresh_budget_admission(p,model,&body,options.cost_policy,&budget,free_permit).await?;
+        observation = HttpObservationGuard::begin_with_projection(TimingMode::Streaming, Some(
+                super::control_modes::WireModeSnapshot::observe(
+                    p.dialect, selected_model(model, p).map(|m|m.supports_thinking),
+                    options.caller, options.normalized_ingress, req, &body,
+                ),
+            ), observation_context);
+        let resp = outgoing.send().await.map_err(|e| map_reqwest_err(&p.name, model, e))?;
+        if let Some(observation) = &observation { observation.headers(); }
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let text = resp.text().await.unwrap_or_default();
+            let text = observed_text(resp, observation.as_ref()).await.unwrap_or_default();
             return Err(Self::classify_upstream_error(p, model, status, &text));
         }
 
         let dialect = p.dialect;
+        let byte_observer = observation.as_ref().map(HttpObservationGuard::body_observer);
+        let generation = observation.as_ref().and_then(HttpObservationGuard::generation_observer);
         let mut bytes = resp.bytes_stream();
+        // Body deadlines must keep the same typed error as header deadlines.
+        // Capture this actual invocation's identity before returning the stream;
+        // polling must never consult a later candidate or task-local scope.
+        let body_provider = p.name.clone();
+        let body_model = model.to_owned();
         let stream = async_stream::stream! {
+            let _free_permit=free_permit;
+            let mut budget_report=crate::budget::holds::StreamReport::default();
             let mut buffer = Vec::new();
 
             while let Some(chunk) = bytes.next().await {
                 match chunk {
                     Ok(chunk) => {
+                        if budget.is_some() { budget_report.ingest(&chunk, dialect); }
+                        if let Some(observer) = &byte_observer { observer.received(chunk.len()); }
                         buffer.extend_from_slice(&chunk);
                         let events = match dialect {
-                            Dialect::Ollama => drain_ollama_lines(&mut buffer),
+                            Dialect::Ollama => drain_ollama_lines(&mut buffer, generation.as_ref()),
                             _ => drain_sse_blocks(dialect, &mut buffer),
                         };
                         for event in events {
-                            let terminal = dialect == Dialect::Responses
-                                && (event.is_err() || matches!(&event, Ok(UpstreamEvent::Done { .. })));
+                            if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
+                                if let Some(budget)=&budget { if let Err(error)=budget.settle(budget_report.usage()).await { yield Err(error); return; } }
+                            }
+                            let terminal = event.is_err() || (dialect == Dialect::Responses
+                                && matches!(&event, Ok(UpstreamEvent::Done { .. })));
                             yield event;
                             if terminal {
                                 return;
@@ -467,7 +853,7 @@ impl UpstreamClient {
                         }
                     }
                     Err(e) => {
-                        yield Err(GatewayError::Other(anyhow::anyhow!(e.to_string())));
+                        yield Err(map_reqwest_err(&body_provider, &body_model, e));
                         return;
                     }
                 }
@@ -476,12 +862,15 @@ impl UpstreamClient {
             // 有些实现不会在最后一个 SSE 事件后补空行；EOF 时仍需消费完整残留。
             if !buffer.is_empty() {
                 let events = match dialect {
-                    Dialect::Ollama => parse_ollama_line(&buffer),
+                    Dialect::Ollama => parse_ollama_line(&buffer, generation.as_ref()),
                     _ => parse_sse_block(dialect, &buffer),
                 };
                 for event in events {
-                        let terminal = dialect == Dialect::Responses
-                            && (event.is_err() || matches!(&event, Ok(UpstreamEvent::Done { .. })));
+                    if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
+                        if let Some(budget)=&budget { if let Err(error)=budget.settle(budget_report.usage()).await { yield Err(error); return; } }
+                    }
+                        let terminal = event.is_err() || (dialect == Dialect::Responses
+                            && matches!(&event, Ok(UpstreamEvent::Done { .. })));
                     yield event;
                         if terminal {
                             return;
@@ -490,7 +879,31 @@ impl UpstreamClient {
             }
         };
 
-        Ok(Box::pin(stream))
+        Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<UpstreamEvent>> + Send>>)
+        }.await;
+        match result {
+            Ok(stream) => {
+                let protected = crate::budget::holds::active();
+                let stream = stream.map(move |event| {
+                    if protected {
+                        event.map_err(GatewayError::no_replay)
+                    } else {
+                        event
+                    }
+                });
+                Ok(ObservedStream::wrap(Box::pin(stream), observation))
+            }
+            Err(error) => {
+                if let Some(observation) = &observation {
+                    observation.finish_result(false);
+                }
+                if crate::budget::holds::active() {
+                    Err(error.no_replay())
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 }
 
@@ -512,6 +925,8 @@ pub enum UpstreamEvent {
     /// 独立用量事件。某些上游（特别是 OpenAI `include_usage`）会以
     /// `choices: []` 的最后一个 chunk 单独发送它。
     Usage(Usage),
+    /// Private numeric field-presence evidence; ignored by legacy consumers.
+    UsageObservation(serde_json::Value),
     /// 结束：携带 usage 与 finish_reason
     Done {
         finish_reason: Option<String>,
@@ -533,11 +948,14 @@ fn drain_sse_blocks(dialect: Dialect, buffer: &mut Vec<u8>) -> Vec<Result<Upstre
 }
 
 /// Ollama 使用 newline-delimited JSON，而不是 SSE。每一行都是独立事件。
-fn drain_ollama_lines(buffer: &mut Vec<u8>) -> Vec<Result<UpstreamEvent>> {
+fn drain_ollama_lines(
+    buffer: &mut Vec<u8>,
+    generation: Option<&super::generation::SharedGeneration>,
+) -> Vec<Result<UpstreamEvent>> {
     let mut out = Vec::new();
     while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
         let line: Vec<u8> = buffer.drain(..=end).collect();
-        out.extend(parse_ollama_line(&line));
+        out.extend(parse_ollama_line(&line, generation));
     }
     out
 }
@@ -574,7 +992,9 @@ pub fn parse_sse_block(dialect: Dialect, bytes: &[u8]) -> Vec<Result<UpstreamEve
     }
     if data == "[DONE]" {
         return vec![Ok(UpstreamEvent::Done {
-            finish_reason: Some("stop".into()),
+            // A transport terminator is not a reported generation reason.
+            // Public protocol encoders keep their compatibility defaults.
+            finish_reason: None,
             usage: None,
         })];
     }
@@ -586,14 +1006,22 @@ pub fn parse_sse_block(dialect: Dialect, bytes: &[u8]) -> Vec<Result<UpstreamEve
     parse_event_value(dialect, event_name, v)
 }
 
-fn parse_ollama_line(bytes: &[u8]) -> Vec<Result<UpstreamEvent>> {
+fn parse_ollama_line(
+    bytes: &[u8],
+    generation: Option<&super::generation::SharedGeneration>,
+) -> Vec<Result<UpstreamEvent>> {
     let text = String::from_utf8_lossy(bytes);
     let line = text.trim();
     if line.is_empty() {
         return Vec::new();
     }
     match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(v) => parse_event_value(Dialect::Ollama, None, v),
+        Ok(v) => {
+            if let Some(generation) = generation {
+                generation.observe(&v);
+            }
+            parse_event_value(Dialect::Ollama, None, v)
+        }
         // 截断或厂商自定义诊断行不应导致代理 panic；后续完整行仍可继续输出。
         Err(_) => Vec::new(),
     }
@@ -604,6 +1032,29 @@ fn parse_event_value(
     event_name: Option<&str>,
     v: serde_json::Value,
 ) -> Vec<Result<UpstreamEvent>> {
+    // A successful HTTP header is not a successful model result. Native
+    // error envelopes must not disappear behind a later DONE/stop/done:true.
+    // Do not reflect arbitrary upstream messages or interpret their code as
+    // verified HTTP status, zero usage or a refund/replay entitlement. This
+    // POST already happened, so fail closed before or after visible content.
+    if dialect != Dialect::Responses
+        && (event_name == Some("error") || v.get("error").is_some_and(|error| !error.is_null()))
+    {
+        let provider = match dialect {
+            Dialect::OpenAI => "OpenAI",
+            Dialect::Anthropic => "Anthropic",
+            Dialect::Gemini => "Gemini",
+            Dialect::Ollama => "Ollama",
+            Dialect::Responses => unreachable!(),
+        };
+        return vec![Err(GatewayError::Upstream {
+            provider: provider.into(),
+            model: String::new(),
+            status: 502,
+            body: format!("{provider} stream reported an inline error"),
+        }
+        .no_replay())];
+    }
     let mut out = Vec::new();
     match dialect {
         Dialect::OpenAI => parse_openai_chunk(v, &mut out),
@@ -619,6 +1070,22 @@ fn parse_openai_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
     let usage = openai_usage(&v);
     let choice = v.get("choices").and_then(|c| c.get(0));
     if let Some(c) = choice {
+        // Preserve existing normalized reasoning/refusal channels for compatible
+        // HTTP streams; neither channel is a user-visible text token sample.
+        if let Some(text) = c
+            .pointer("/delta/reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            out.push(Ok(UpstreamEvent::ReasoningDelta(text.to_owned())));
+        }
+        if let Some(text) = c
+            .pointer("/delta/refusal")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            out.push(Ok(UpstreamEvent::RefusalDelta(text.to_owned())));
+        }
         if let Some(d) = c
             .get("delta")
             .and_then(|d| d.get("content"))
@@ -644,6 +1111,68 @@ fn parse_openai_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
     if let Some(usage) = usage {
         out.push(Ok(UpstreamEvent::Usage(usage)));
     }
+    if let Some(raw) = v.get("usage") {
+        out.push(Ok(UpstreamEvent::UsageObservation(desktop_openai_usage(
+            raw,
+        ))));
+    }
+}
+
+/// Optional display evidence, never a billing input. Only allowlisted numeric
+/// usage fields cross the desktop boundary; arbitrary upstream error/secret
+/// extensions are not reflected. Missing/invalid counters are not filled in.
+fn desktop_openai_usage(raw: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let Some(raw) = raw.as_object() else {
+        return Value::Null;
+    };
+    let mut output = Map::new();
+    let count = |value: &Value| value.as_u64().is_some_and(|n| n <= u64::from(u32::MAX));
+    for name in [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_write_tokens",
+    ] {
+        if let Some(value) = raw.get(name).filter(|value| count(value)) {
+            output.insert(name.into(), value.clone());
+        }
+    }
+    if let Some(value) = raw
+        .get("credit")
+        .filter(|value| value.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0))
+    {
+        output.insert("credit".into(), value.clone());
+    }
+    for name in [
+        "prompt_tokens_details",
+        "completion_tokens_details",
+        "input_tokens_details",
+        "output_tokens_details",
+    ] {
+        if let Some(details) = raw.get(name).and_then(Value::as_object) {
+            let mut kept = Map::new();
+            for field in [
+                "cached_tokens",
+                "cache_write_tokens",
+                "cache_creation_tokens",
+                "reasoning_tokens",
+            ] {
+                if let Some(value) = details.get(field).filter(|value| count(value)) {
+                    kept.insert(field.into(), value.clone());
+                }
+            }
+            if !kept.is_empty() {
+                output.insert(name.into(), Value::Object(kept));
+            }
+        }
+    }
+    Value::Object(output)
 }
 
 fn openai_usage(v: &serde_json::Value) -> Option<Usage> {
@@ -651,17 +1180,97 @@ fn openai_usage(v: &serde_json::Value) -> Option<Usage> {
     Some(Usage::from_openai(usage))
 }
 
+fn responses_envelope_error() -> GatewayError {
+    GatewayError::Upstream {
+        provider: "Responses".into(),
+        model: String::new(),
+        status: 502,
+        body: "Responses stream event envelope is invalid".into(),
+    }
+    .no_replay()
+}
+
+fn responses_terminal_valid(v: &serde_json::Value, kind: &str) -> bool {
+    let expected = if kind == "response.completed" {
+        "completed"
+    } else {
+        "incomplete"
+    };
+    let Some(response) = v.get("response").filter(|r| r.is_object()) else {
+        return false;
+    };
+    v.get("type").map_or(true, |t| t.as_str() == Some(kind))
+        && v.get("error").map_or(true, serde_json::Value::is_null)
+        && response.get("status").and_then(|s| s.as_str()) == Some(expected)
+        && response
+            .get("error")
+            .map_or(true, serde_json::Value::is_null)
+        && response
+            .get("output")
+            .and_then(|o| o.as_array())
+            .is_some_and(|items| {
+                items.iter().all(|item| {
+                    item.is_object()
+                        && item
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|t| !t.is_empty())
+                })
+            })
+        && if expected == "completed" {
+            response
+                .get("incomplete_details")
+                .map_or(true, serde_json::Value::is_null)
+        } else {
+            response
+                .get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| !r.trim().is_empty())
+        }
+}
+
+// Stream events can express wholly unknown usage without inventing scalar0.
+// Keep the existing converter and its buffered/ordinary compatibility intact.
+fn responses_stream_usage_known(response: &serde_json::Value) -> bool {
+    let Some(usage) = response.get("usage").filter(|u| u.is_object()) else {
+        return false;
+    };
+    let Some((input, output)) = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .zip(usage.get("output_tokens").and_then(|v| v.as_u64()))
+    else {
+        return false;
+    };
+    let limit = u64::from(u32::MAX);
+    input <= limit
+        && output <= limit
+        && input + output <= limit
+        && usage
+            .get("total_tokens")
+            .map_or(true, |v| v.as_u64() == Some(input + output))
+}
+
 fn parse_responses_chunk(
     event_name: Option<&str>,
     v: serde_json::Value,
     out: &mut Vec<Result<UpstreamEvent>>,
 ) {
-    match v
+    let kind = v
         .get("type")
         .and_then(|value| value.as_str())
         .or(event_name)
-        .unwrap_or("")
+        .unwrap_or("");
+    if event_name
+        .filter(|name| name.starts_with("response.") || *name == "error")
+        .zip(v.get("type").and_then(|t| t.as_str()))
+        .is_some_and(|(declared, actual)| declared != actual)
     {
+        out.push(Err(responses_envelope_error()));
+        return;
+    }
+    match kind {
         "response.output_text.delta" => {
             if let Some(text) = v
                 .get("delta")
@@ -703,41 +1312,32 @@ fn parse_responses_chunk(
             }
         }
         "response.completed" | "response.incomplete" => {
-            if let Some(response) = v.get("response") {
-                let response = crate::protocol::responses::from_responses_response(response, "");
+            if responses_terminal_valid(&v, kind) {
+                let payload = &v["response"];
+                let mut response = crate::protocol::responses::from_responses_response(payload, "");
+                if !responses_stream_usage_known(payload) {
+                    response.usage = None;
+                }
                 out.push(Ok(UpstreamEvent::Done {
                     finish_reason: response.finish_reason,
                     usage: response.usage,
                 }));
             } else {
-                out.push(Err(GatewayError::Protocol(
-                    "Responses terminal event is missing response".into(),
-                )));
+                out.push(Err(responses_envelope_error()));
             }
         }
         "response.failed" | "error" => {
-            let error = v
-                .get("response")
-                .and_then(|response| response.get("error"))
-                .or_else(|| v.get("error"))
-                .unwrap_or(&v);
+            // Same already-dispatched unknown boundary as native inline errors.
+            // A failed Responses event is not a zero-cost/replay receipt. Keep
+            // arbitrary response.model/message out of every parser consumer;
+            // actual candidate identity remains in the dispatch/attempt trace.
             out.push(Err(GatewayError::Upstream {
                 provider: "Responses".into(),
-                model: v
-                    .get("response")
-                    .and_then(|response| response.get("model"))
-                    .and_then(|model| model.as_str())
-                    .unwrap_or_default()
-                    .to_owned(),
+                model: String::new(),
                 status: 502,
-                body: truncate(
-                    error
-                        .get("message")
-                        .and_then(|message| message.as_str())
-                        .unwrap_or("Responses stream failed"),
-                    800,
-                ),
-            }));
+                body: "Responses stream reported an inline error".into(),
+            }
+            .no_replay()));
         }
         // Item/argument done events repeat the complete content. Deltas already
         // carry it, so replaying these snapshots would duplicate text/arguments.
@@ -818,14 +1418,23 @@ fn parse_anthropic_chunk(
                 .get("delta")
                 .and_then(|d| d.get("stop_reason"))
                 .and_then(|x| x.as_str());
-            out.push(Ok(UpstreamEvent::Done {
-                finish_reason: fr.map(normalize_anthropic_finish_reason),
-                usage,
-            }));
+            // Message-level updates precede message_stop. They can carry the
+            // final reason/usage without proving a complete transport stream.
+            // Retain them just like OpenAI Finish + Usage; EOF or an error
+            // before message_stop must still take the incomplete-stream path.
+            if let Some(reason) = fr {
+                out.push(Ok(UpstreamEvent::Finish {
+                    finish_reason: Some(normalize_anthropic_finish_reason(reason)),
+                }));
+            }
+            if let Some(usage) = usage {
+                out.push(Ok(UpstreamEvent::Usage(usage)));
+            }
         }
         "message_stop" => {
             out.push(Ok(UpstreamEvent::Done {
-                finish_reason: Some("stop".into()),
+                // message_delta owns the reported stop_reason, if any.
+                finish_reason: None,
                 usage: None,
             }));
         }
@@ -915,13 +1524,13 @@ fn parse_ollama_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
             ..Default::default()
         });
         out.push(Ok(UpstreamEvent::Done {
-            finish_reason: Some(if has_tool_calls {
-                "tool_calls".into()
+            finish_reason: if has_tool_calls {
+                Some("tool_calls".into())
             } else {
                 normalize_ollama_finish_reason(
                     v.get("done_reason").and_then(|reason| reason.as_str()),
                 )
-            }),
+            },
             usage,
         }));
     }
@@ -989,12 +1598,11 @@ fn normalize_anthropic_finish_reason(reason: &str) -> String {
     }
 }
 
-fn normalize_ollama_finish_reason(reason: Option<&str>) -> String {
-    match reason {
-        Some("length") => "length".into(),
-        Some("tool_calls") => "tool_calls".into(),
-        _ => "stop".into(),
-    }
+fn normalize_ollama_finish_reason(reason: Option<&str>) -> Option<String> {
+    // Keep absence and unknown reported reasons; done=true alone is not stop.
+    reason
+        .filter(|reason| !reason.trim().is_empty())
+        .map(str::to_owned)
 }
 
 fn push_gemini_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) -> bool {
@@ -1172,11 +1780,7 @@ fn is_ipv6_unique_local(address: Ipv6Addr) -> bool {
 }
 
 fn custom_upstream_path(p: &Provider, model: &str) -> Result<Option<String>> {
-    let Some(model_ref) = p
-        .models
-        .iter()
-        .find(|candidate| candidate.upstream == model)
-    else {
+    let Some(model_ref) = selected_model(model, p) else {
         return Ok(None);
     };
     model_ref
@@ -1360,6 +1964,16 @@ pub fn parse_context_length_error(body: &str) -> Option<(u32, u32)> {
     }
 }
 
+// A typed successful response can hit its deadline while reading the body.
+// Preserve the existing non-timeout classification/retry contract verbatim.
+fn map_typed_body_error(provider: &str, model: &str, error: reqwest::Error) -> GatewayError {
+    if error.is_timeout() {
+        map_reqwest_err(provider, model, error)
+    } else {
+        GatewayError::Other(anyhow::anyhow!(error.to_string()))
+    }
+}
+
 fn map_reqwest_err(provider: &str, model: &str, e: reqwest::Error) -> GatewayError {
     if e.is_timeout() {
         GatewayError::Timeout(format!("{provider}/{model} 请求超时"))
@@ -1423,5 +2037,229 @@ mod url_validation_tests {
             assert!(matches!(error, GatewayError::Protocol(_)));
             assert!(!error.retryable());
         }
+    }
+}
+
+#[cfg(test)]
+mod instruction_override_transport_tests {
+    use super::*;
+    use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+    use futures_util::StreamExt;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    fn provider(base_url: String) -> Provider {
+        let now = chrono::Utc::now();
+        serde_json::from_value(json!({"id":"owned","name":"owned","dialect":"responses","base_url":base_url,"api_key_enc":"","enabled":true,"priority":1,"rpm_limit":0,"intelligence":50,"created_at":now,"updated_at":now,
+            "models":[{"alias":"fixture","upstream":"fixture","context_window":16384,"supports_tools":true,"supports_vision":false,"supports_thinking":false,"supports_stream":true,"overrides":{"extra_body":{"instructions":"configured-B"}}}]})).unwrap()
+    }
+    async fn receive(
+        State(capture): State<Arc<Mutex<Vec<Value>>>>,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        capture.lock().unwrap().push(body.clone());
+        let value = json!({"id":"direct","model":"fixture","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"direct answer"}]}]});
+        if body["stream"] == true {
+            let delta = json!({"type":"response.output_text.delta","delta":"direct answer"});
+            let done = json!({"type":"response.completed","response":value});
+            return (
+                [("content-type", "text/event-stream")],
+                format!("data: {delta}\n\ndata: {done}\n\n"),
+            )
+                .into_response();
+        }
+        Json(value).into_response()
+    }
+    fn assert_conflict(error: GatewayError) {
+        assert!(matches!(error, GatewayError::CapabilityUnavailable { .. }));
+        assert_eq!(error.http_status(), 400);
+        assert!(!error.retryable());
+        let text = error.public_message();
+        assert!(text.contains("extra_body.instructions"));
+        assert!(!text.contains("configured-B"));
+        assert!(!text.contains("current-A"));
+    }
+    #[tokio::test]
+    async fn responses_instructions_r3_direct_http_normal_and_stream_defend_before_post() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let capture = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route("/responses", post(receive))
+            .with_state(capture.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        struct Abort(tokio::task::JoinHandle<()>);
+        impl Drop for Abort {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _guard = Abort(task);
+        let mut p = provider(origin);
+        let req:ChatRequest=serde_json::from_value(json!({"model":"fixture","messages":[{"role":"system","content":"current-A"},{"role":"user","content":"U"}],"stream":false,"max_tokens":42})).unwrap();
+        let client = UpstreamClient::new();
+        let defaults = crate::config::OllamaOptionsConfig::default();
+        let strict = RequestWireOptions {
+            preserve_instruction: true,
+            ..Default::default()
+        };
+        for (index, value) in [
+            Value::Null,
+            json!(""),
+            json!("configured-B"),
+            json!("current-A"),
+            json!({}),
+            json!([]),
+            json!(true),
+            json!(17),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            p.models[0].overrides.as_mut().unwrap().extra_body =
+                Some(json!({"instructions":value}));
+            p.models[0].overrides.as_ref().unwrap().validate().unwrap();
+            // The HTTP transport defends itself independently of server metadata.
+            p.runtime_id = Some("metadata-must-not-disable-http-defense".into());
+            match client
+                .call_with_options(
+                    &p,
+                    &req,
+                    "fixture",
+                    Duration::from_secs(2),
+                    &defaults,
+                    strict,
+                )
+                .await
+            {
+                Err(e) => assert_conflict(e),
+                Ok(_) => panic!("normal transport accepted conflict"),
+            }
+            match client
+                .call_stream_with_options(
+                    &p,
+                    &req,
+                    "fixture",
+                    Duration::from_secs(2),
+                    &defaults,
+                    strict,
+                )
+                .await
+            {
+                Err(e) => assert_conflict(e),
+                Ok(_) => panic!("stream transport accepted conflict"),
+            }
+            assert_eq!(capture.lock().unwrap().len(), index * 2);
+            p.runtime_id = None;
+            client
+                .call(&p, &req, "fixture", Duration::from_secs(2), &defaults)
+                .await
+                .unwrap();
+            let events: Vec<_> = client
+                .call_stream(&p, &req, "fixture", Duration::from_secs(2), &defaults)
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            assert!(events.iter().all(|v| v.is_ok()));
+            assert_eq!(capture.lock().unwrap().len(), (index + 1) * 2);
+            for body in &capture.lock().unwrap()[index * 2..] {
+                assert_eq!(body["instructions"], value);
+            }
+        }
+    }
+    #[test]
+    fn responses_instructions_r3_health_exemption_is_exact_and_private() {
+        let strict = RequestWireOptions {
+            preserve_instruction: true,
+            ..Default::default()
+        };
+        let local = instruction_override_conflict();
+        assert!(is_instruction_override_conflict(&local, strict));
+        assert!(!is_instruction_override_conflict(
+            &local,
+            RequestWireOptions::default()
+        ));
+        for error in [
+            GatewayError::CapabilityUnavailable {
+                kind: "other local capability rejection".into(),
+            },
+            GatewayError::CapabilityUnavailable {
+                kind: format!("prefix {INSTRUCTION_OVERRIDE_CONFLICT}"),
+            },
+            GatewayError::Protocol(INSTRUCTION_OVERRIDE_CONFLICT.into()),
+            GatewayError::Upstream {
+                provider: "owned".into(),
+                model: "fixture".into(),
+                status: 500,
+                body: INSTRUCTION_OVERRIDE_CONFLICT.into(),
+            },
+        ] {
+            assert!(!is_instruction_override_conflict(&error, strict));
+        }
+    }
+
+    #[test]
+    fn responses_instructions_r3_effective_override_lookup_and_dialect_scope() {
+        let mut p = provider("http://127.0.0.1:1".into());
+        let strict = RequestWireOptions {
+            preserve_instruction: true,
+            ..Default::default()
+        };
+        assert!(validate_instruction_override(&p, "fixture", strict).is_err());
+        assert!(validate_instruction_override(&p, "missing-model", strict).is_ok());
+        for dialect in [
+            Dialect::OpenAI,
+            Dialect::Anthropic,
+            Dialect::Gemini,
+            Dialect::Ollama,
+        ] {
+            p.dialect = dialect;
+            assert!(validate_instruction_override(&p, "fixture", strict).is_ok());
+        }
+        p.dialect = Dialect::Responses;
+        let conflict = p.models[0].clone();
+        p.models[0].overrides = None;
+        p.models.push(conflict);
+        assert!(
+            validate_instruction_override(&p, "fixture", strict).is_ok(),
+            "same first matching upstream override as serializer/application"
+        );
+        p.models.swap(0, 1);
+        assert!(validate_instruction_override(&p, "fixture", strict).is_err());
+        for extra in [
+            json!({"Instructions":"configured-B"}),
+            json!({"other":{"instructions":"configured-B"}}),
+        ] {
+            p.models[0].overrides.as_mut().unwrap().extra_body = Some(extra);
+            assert!(validate_instruction_override(&p, "fixture", strict).is_ok());
+        }
+    }
+}
+
+#[cfg(test)]
+mod desktop_usage_observation_tests {
+    use super::*;
+    #[test]
+    fn numeric_allowlist_retains_zero_partial_and_drops_secret_or_invalid_values() {
+        use serde_json::json;
+        for raw in [
+            serde_json::Value::Null,
+            json!(42),
+            json!("PRIVATE_SYNTHETIC"),
+        ] {
+            assert!(desktop_openai_usage(&raw).is_null());
+        }
+        let raw = json!({"completion_tokens":0,"prompt_tokens":-1,"total_tokens":"PRIVATE_SYNTHETIC","credit":0.0,"debug_authorization":"PRIVATE_SYNTHETIC","prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":"PRIVATE_SYNTHETIC","unsafe":"PRIVATE_SYNTHETIC"}});
+        let value = desktop_openai_usage(&raw);
+        assert_eq!(
+            value,
+            json!({"completion_tokens":0,"credit":0.0,"prompt_tokens_details":{"cached_tokens":0}})
+        );
+        assert!(!value.to_string().contains("PRIVATE_SYNTHETIC"));
+        assert_eq!(
+            desktop_openai_usage(&json!({"completion_tokens":2,"credit":0.5})),
+            json!({"completion_tokens":2,"credit":0.5})
+        );
     }
 }

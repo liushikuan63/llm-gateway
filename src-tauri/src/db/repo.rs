@@ -1,4 +1,12 @@
 //! 数据访问。所有 SQL 集中在此，便于后续替换存储后端。
+pub mod catalog;
+pub mod conversation_feedback;
+pub(crate) mod native_usage;
+pub mod price_observation;
+pub mod request_feedback;
+pub(crate) mod request_timing;
+pub mod session_list;
+pub(crate) mod trae_registration;
 
 use chrono::Utc;
 use serde::Serialize;
@@ -208,7 +216,7 @@ pub async fn list_providers(pool: &SqlitePool) -> Result<Vec<Provider>> {
     Ok(out)
 }
 
-fn read_provider(r: &sqlx::sqlite::SqliteRow, models: Vec<ModelRef>) -> Provider {
+pub(crate) fn read_provider(r: &sqlx::sqlite::SqliteRow, models: Vec<ModelRef>) -> Provider {
     Provider {
         id: r.get("id"),
         name: r.get("name"),
@@ -230,6 +238,7 @@ fn read_provider(r: &sqlx::sqlite::SqliteRow, models: Vec<ModelRef>) -> Provider
 
 fn parse_dialect(s: &str) -> Dialect {
     match s {
+        "responses" => Dialect::Responses,
         "anthropic" => Dialect::Anthropic,
         "gemini" => Dialect::Gemini,
         "ollama" => Dialect::Ollama,
@@ -252,7 +261,7 @@ pub async fn list_models_of(pool: &SqlitePool, provider_id: &str) -> Result<Vec<
     list_models_on(&mut connection, provider_id).await
 }
 
-async fn list_models_on(
+pub(crate) async fn list_models_on(
     connection: &mut SqliteConnection,
     provider_id: &str,
 ) -> Result<Vec<ModelRef>> {
@@ -324,9 +333,26 @@ pub async fn upsert_provider(pool: &SqlitePool, p: &Provider) -> Result<()> {
     save_provider(pool, p, false).await
 }
 
+pub async fn upsert_provider_config_with_declarations(
+    pool: &SqlitePool,
+    p: &Provider,
+    patches: &crate::capability_declarations::Patches,
+) -> Result<()> {
+    save_provider_with_declarations(pool, p, true, patches).await
+}
+
 async fn save_provider(pool: &SqlitePool, p: &Provider, preserve_runtime: bool) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    save_provider_on(&mut tx, p, preserve_runtime).await?;
+    save_provider_with_declarations(pool, p, preserve_runtime, &Default::default()).await
+}
+
+async fn save_provider_with_declarations(
+    pool: &SqlitePool,
+    p: &Provider,
+    preserve_runtime: bool,
+    patches: &crate::capability_declarations::Patches,
+) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    save_provider_on(&mut tx, p, preserve_runtime, patches).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -335,7 +361,13 @@ async fn save_provider_on(
     connection: &mut SqliteConnection,
     p: &Provider,
     preserve_runtime: bool,
+    declarations: &crate::capability_declarations::Patches,
 ) -> Result<()> {
+    trae_registration::guard_native_provider_on(connection, p, preserve_runtime).await?;
+    let declaration_plan =
+        crate::capability_declarations::prepare_on(connection, p, preserve_runtime, declarations)
+            .await?;
+    let price_before = price_observation::before_save_on(connection, &p.id).await?;
     let now = Utc::now();
     sqlx::query(
         r#"INSERT INTO providers
@@ -381,6 +413,8 @@ async fn save_provider_on(
     .await?;
 
     // 模型列表整体替换，简单且不会留下孤儿
+    let previous_models = list_models_on(connection, &p.id).await?;
+    catalog::reconcile_model_policies_on(connection, p, &previous_models).await?;
     sqlx::query("DELETE FROM models WHERE provider_id = ?")
         .bind(&p.id)
         .execute(&mut *connection)
@@ -446,6 +480,9 @@ async fn save_provider_on(
                 .await?;
         }
     }
+    crate::capability_declarations::finish_on(connection, p, declaration_plan, declarations)
+        .await?;
+    price_observation::after_save_on(connection, p, &previous_models, price_before).await?;
     Ok(())
 }
 
@@ -521,12 +558,15 @@ pub async fn register_workbuddy_provider(
     proposed: &Provider,
     runtime: &AgentRuntime,
 ) -> Result<Provider> {
+    let (region, _, _) =
+        crate::agent_upstream::runtime::workbuddy_region_options(runtime.options.as_ref())
+            .map_err(crate::error::GatewayError::Protocol)?;
     register_direct_account_provider(
         pool,
         proposed,
         runtime,
         "workbuddy-model",
-        crate::workbuddy_auth::WorkBuddyAuth::issuer(),
+        crate::workbuddy_auth::WorkBuddyAuth::issuer_for_region(region),
     )
     .await
 }
@@ -562,8 +602,14 @@ pub async fn register_qoder_provider(
 
 fn direct_account_identity(kind: &str, options: Option<&serde_json::Value>) -> Result<String> {
     match kind {
-        "workbuddy-model" => crate::agent_upstream::runtime::workbuddy_options(options)
-            .map(|(account, _)| account)
+        "workbuddy-model" => crate::agent_upstream::runtime::workbuddy_region_options(options)
+            .map(|(region, account, _)| {
+                if region == crate::workbuddy_auth::WorkBuddyRegion::Global {
+                    account
+                } else {
+                    format!("cn\0{account}")
+                }
+            })
             .map_err(crate::error::GatewayError::Protocol),
         "qoder-model" => crate::agent_upstream::runtime::qoder_options(options)
             .map(|(region, account, _)| format!("{region:?}\0{account}"))
@@ -663,10 +709,39 @@ async fn register_direct_account_provider(
             .execute(&mut *tx)
             .await?;
     }
+    if kind == "qoder-model" {
+        if let Some(row) = &existing_runtime {
+            let incoming =
+                crate::agent_upstream::runtime::model_display_names(runtime.options.as_ref());
+            if !incoming.is_empty() {
+                let mut options: serde_json::Value = row
+                    .get::<Option<String>, _>("options_json")
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|_| invalid("Qoder显示名配置无效".into()))?
+                    .unwrap_or(serde_json::json!({}));
+                let mut names = crate::agent_upstream::runtime::model_display_names(Some(&options));
+                names.extend(
+                    incoming
+                        .into_iter()
+                        .filter(|(id, _)| proposed.models.iter().any(|m| &m.upstream == id)),
+                );
+                options["model_display_names"] = serde_json::to_value(names)
+                    .map_err(|_| invalid("Qoder显示名编码失败".into()))?;
+                sqlx::query("UPDATE agent_runtimes SET options_json=?,updated_at=? WHERE id=?")
+                    .bind(options.to_string())
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(&runtime.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+    }
     if existing_provider.is_none() {
         let mut empty = proposed.clone();
         empty.models.clear();
-        save_provider_on(&mut tx, &empty, false).await?;
+        save_provider_on(&mut tx, &empty, false, &Default::default()).await?;
     }
     let mut upstreams: std::collections::HashSet<_> =
         models.iter().map(|model| model.upstream.clone()).collect();
@@ -755,6 +830,33 @@ pub async fn write_model_capabilities(
     Ok(result.rows_affected() > 0)
 }
 
+/// Export the known providers' ledgers in one SQLite read statement. Separate
+/// model-by-model reads can straddle an atomic import and export a mixed file.
+/// Keep the existing malformed/null-ledger omission and sorted JSON contract.
+pub async fn read_capability_ledgers_snapshot(
+    pool: &SqlitePool,
+) -> Result<std::collections::BTreeMap<String, crate::capability::CapabilitySet>> {
+    let rows = sqlx::query("SELECT m.provider_id,m.alias,m.capability_sources_json FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.capability_sources_json IS NOT NULL ORDER BY p.priority ASC,p.name ASC,m.alias ASC")
+        .fetch_all(pool).await?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        if let Some(ledger) = row
+            .get::<Option<String>, _>("capability_sources_json")
+            .and_then(|raw| serde_json::from_str::<crate::capability::CapabilitySet>(&raw).ok())
+        {
+            out.insert(
+                format!(
+                    "{}/{}",
+                    row.get::<String, _>("provider_id"),
+                    row.get::<String, _>("alias")
+                ),
+                ledger,
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// 读某个模型的多来源账本。没有或坏 JSON 时返回 `None`（同 `read_capabilities`）。
 pub async fn read_capability_ledger(
     pool: &SqlitePool,
@@ -789,6 +891,32 @@ pub async fn write_capability_ledger(
     alias: &str,
     ledger: &crate::capability::CapabilitySet,
 ) -> Result<bool> {
+    let mut connection = pool.acquire().await?;
+    write_capability_ledger_on(&mut connection, provider_id, alias, ledger).await
+}
+
+/// A file import replaces all known-model ledgers in one transaction. Reuse
+/// the single-model encoder/resolver so trust order, unknowns and rounding do
+/// not diverge. Parsing is completed by the command before any write begins.
+pub async fn write_capability_ledgers_atomic(
+    pool: &SqlitePool,
+    plan: &[(String, String, crate::capability::CapabilitySet)],
+) -> Result<Vec<bool>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut hits = Vec::with_capacity(plan.len());
+    for (provider_id, alias, ledger) in plan {
+        hits.push(write_capability_ledger_on(&mut tx, provider_id, alias, ledger).await?);
+    }
+    tx.commit().await?;
+    Ok(hits)
+}
+
+async fn write_capability_ledger_on(
+    connection: &mut sqlx::SqliteConnection,
+    provider_id: &str,
+    alias: &str,
+    ledger: &crate::capability::CapabilitySet,
+) -> Result<bool> {
     let encoded =
         serde_json::to_string(ledger).map_err(|e| crate::error::GatewayError::Other(e.into()))?;
     // 从账本推出定值：每维取信任度最高的那个来源。
@@ -805,7 +933,7 @@ pub async fn write_capability_ledger(
     .bind(resolved_json)
     .bind(provider_id)
     .bind(alias)
-    .execute(pool)
+    .execute(connection)
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -839,38 +967,104 @@ pub fn resolved_from_ledger(
         .unwrap_or_default(),
         // D2 第 3 条：每次写入更新 updated_at。
         // 由**推定函数**盖时间戳而不是让每个调用方各盖一次 ——
-        // 漏盖的表现是「界面上这份数据永远显示成很久以前更新的」，
-        // 而用户据此判断「是不是该刷新了」。
+        // 只表示本机定值写入时间，不代表来源观察时间或证据新鲜度；
+        // 逐来源观察时间／样本数保留在账本，未知时不能借此补造。
         updated_at: Some(chrono::Utc::now()),
         // 其余维度（上下文窗口 / 吞吐 / 单价…）由各自的通道维护，不由账本推
         ..Default::default()
     }
 }
 
-/// 仅更新一个模型的价格 JSON，供「自动获取最新定价」使用。返回是否命中了记录。
+/// Apply a pricing plan only while its supplier, model identity and old price
+/// still match. This is an estimate update, never automatic free evidence.
 pub async fn update_model_price(
     pool: &SqlitePool,
-    provider_id: &str,
-    alias: &str,
+    expected_provider: &Provider,
+    expected_model: &ModelRef,
     price: &ModelPrice,
 ) -> Result<bool> {
+    update_model_price_observed(pool, expected_provider, expected_model, price, None).await
+}
+
+pub(crate) async fn update_model_price_observed(
+    pool: &SqlitePool,
+    expected_provider: &Provider,
+    expected_model: &ModelRef,
+    price: &ModelPrice,
+    observation: Option<&price_observation::CatalogInput>,
+) -> Result<bool> {
+    if price.source != PriceSource::Catalog || !price.is_valid() {
+        return Ok(false);
+    }
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    if catalog::current_target(&mut tx, &expected_provider.id)
+        .await?
+        .as_deref()
+        != Some(catalog::target_fingerprint(expected_provider).as_str())
+    {
+        return Ok(false);
+    }
+    let current: Option<(String, String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT upstream,model_type,upstream_path,price_json FROM models WHERE provider_id=? AND alias=?")
+            .bind(&expected_provider.id)
+            .bind(&expected_model.alias)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((upstream, model_type, upstream_path, raw)) = current else {
+        return Ok(false);
+    };
+    if upstream != expected_model.upstream
+        || observation.is_some()
+            && (model_type != expected_model.model_type.code()
+                || upstream_path != expected_model.upstream_path)
+    {
+        return Ok(false);
+    }
+    let current_price = match raw {
+        Some(raw) => match serde_json::from_str::<ModelPrice>(&raw) {
+            Ok(price) => Some(price),
+            Err(_) => return Ok(false),
+        },
+        None => None,
+    };
+    if current_price != expected_model.price
+        || current_price
+            .as_ref()
+            .is_some_and(|p| p.source == PriceSource::Manual)
+    {
+        return Ok(false);
+    }
     let encoded =
         serde_json::to_string(price).map_err(|e| crate::error::GatewayError::Other(e.into()))?;
     let result =
         sqlx::query("UPDATE models SET price_json = ? WHERE provider_id = ? AND alias = ?")
-            .bind(encoded)
-            .bind(provider_id)
-            .bind(alias)
-            .execute(pool)
+            .bind(&encoded)
+            .bind(&expected_provider.id)
+            .bind(&expected_model.alias)
+            .execute(&mut *tx)
             .await?;
+    if result.rows_affected() > 0 {
+        price_observation::after_catalog_on(
+            &mut tx,
+            expected_provider,
+            expected_model,
+            &encoded,
+            observation,
+        )
+        .await?;
+    }
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
 pub async fn delete_provider(pool: &SqlitePool, id: &str) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    price_observation::clear_provider_on(&mut tx, id).await?;
     sqlx::query("DELETE FROM providers WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -908,6 +1102,8 @@ pub async fn list_remote_access_keys(pool: &SqlitePool) -> Result<Vec<RemoteAcce
 }
 
 pub async fn create_remote_access_key(pool: &SqlitePool, key: &RemoteAccessKey) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    crate::budget::archive::contract(&mut tx).await?;
     sqlx::query(
         "INSERT INTO remote_access_keys
            (id, label, key_hash, enabled, rpm_limit,
@@ -925,8 +1121,13 @@ pub async fn create_remote_access_key(pool: &SqlitePool, key: &RemoteAccessKey) 
     .bind(crate::budget::serialize_allowed_models(&key.allowed_models))
     .bind(key.created_at)
     .bind(key.updated_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    // Only normal creation establishes a new key origin; never overwrite an
+    // existing watermark if an id is reused. Old migration keys remain fenced.
+    sqlx::query("INSERT INTO budget_key_history(key_id,complete_from_month) VALUES(?,?) ON CONFLICT(key_id) DO NOTHING")
+        .bind(&key.id).bind(crate::budget::month_start_secs(key.created_at.timestamp())).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -967,7 +1168,12 @@ pub async fn update_remote_access_key(
 /// 组装一行审计记录。抽出来是因为 `query_requests` 与导出共用同一套映射，
 /// 分两份写迟早会漂移（加一列只改一处，另一处静默少一个字段）。
 fn audit_row_from(r: &sqlx::sqlite::SqliteRow) -> crate::audit::AuditRow {
+    let usage = native_usage::RowUsage::from_row(r);
     crate::audit::AuditRow {
+        route_decision: crate::audit::route_decision::project(
+            r.get::<Option<String>, _>("route_decision_json").as_deref(),
+        ),
+        native_usage: usage.native,
         id: r.get::<i64, _>("id"),
         ts: r.get::<i64, _>("ts"),
         session_id: r.get::<Option<String>, _>("session_id"),
@@ -977,19 +1183,24 @@ fn audit_row_from(r: &sqlx::sqlite::SqliteRow) -> crate::audit::AuditRow {
         routed_model: r.get::<Option<String>, _>("routed_model"),
         status: r.get::<Option<i64>, _>("status"),
         latency_ms: r.get::<Option<i64>, _>("latency_ms"),
-        prompt_tokens: r.get::<i64, _>("prompt_tokens"),
-        completion_tokens: r.get::<i64, _>("completion_tokens"),
+        prompt_tokens: usage.prompt,
+        completion_tokens: usage.completion,
         fallback_attempts: r.get::<i64, _>("fallback_attempts"),
         error: r.get::<Option<String>, _>("error"),
-        cost: r.get::<Option<f64>, _>("cost"),
-        currency: r.get::<Option<String>, _>("currency"),
-        rate_label: r.get::<Option<String>, _>("rate_label"),
+        cost: usage.cost,
+        currency: usage.currency,
+        rate_label: usage.rate_label,
         estimated_prompt_tokens: r.get::<Option<i64>, _>("estimated_prompt_tokens"),
         // 解析成数组而不是留字符串 —— 导出的目的是给人看和给脚本读。
-        // 坏 JSON 退化成空数组而不是整行失败：一行坏数据不该让整个查询失败。
+        // Usage was projected from raw text first; this legacy attempts display
+        // fallback cannot turn malformed authoritative usage into legacy scalars.
         attempts: r
             .get::<Option<String>, _>("attempts_json")
             .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+            .map(|mut attempts| {
+                request_timing::normalize_generation_reports(&mut attempts);
+                attempts
+            })
             .unwrap_or_default(),
         route_intent: r.get::<Option<String>, _>("route_intent"),
         route_classifier: r.get::<Option<String>, _>("route_classifier"),
@@ -1009,7 +1220,7 @@ const AUDIT_COLUMNS: &str = "id, ts, session_id, client, requested_model, routed
      routed_model, status, latency_ms, prompt_tokens, completion_tokens, fallback_attempts, \
      error, cost, currency, rate_label, estimated_prompt_tokens, attempts_json, \
      route_intent, route_classifier, route_search, route_search_hits, route_refined, \
-     route_refine_note, access_key_id, refined_prompt, trace_id";
+     route_refine_note, access_key_id, refined_prompt, trace_id, route_decision_json";
 
 /// 把一串绑定值贴到查询上。
 ///
@@ -1230,6 +1441,11 @@ fn row_to_session(r: &sqlx::sqlite::SqliteRow) -> Session {
     }
 }
 
+const SESSION_READ_SQL: &str =
+    "SELECT id, snapshot_id, title, sticky_provider_id, sticky_model, sticky_expires_at,
+                total_tokens, compact_count, token_ratio, summary, created_at, updated_at
+         FROM sessions WHERE id = ?";
+
 pub async fn get_or_create_session(pool: &SqlitePool, id: &str) -> Result<Session> {
     // 使用 INSERT OR IGNORE 避免同一无显式 ID 的会话并发首请求时出现唯一键竞态。
     let now = Utc::now();
@@ -1242,14 +1458,10 @@ pub async fn get_or_create_session(pool: &SqlitePool, id: &str) -> Result<Sessio
     .execute(pool)
     .await?;
 
-    let row = sqlx::query(
-        "SELECT id, snapshot_id, title, sticky_provider_id, sticky_model, sticky_expires_at,
-                total_tokens, compact_count, token_ratio, summary, created_at, updated_at
-         FROM sessions WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_one(pool)
-    .await?;
+    let row = sqlx::query(SESSION_READ_SQL)
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
     Ok(row_to_session(&row))
 }
 
@@ -1366,27 +1578,76 @@ pub async fn recent_all_messages_with_content(
     recent_messages_with_content_by_compaction(pool, session_id, limit, false).await
 }
 
-async fn recent_messages_with_content_by_compaction(
-    pool: &SqlitePool,
-    session_id: &str,
-    limit: i64,
-    only_uncompacted: bool,
-) -> Result<Vec<RehydratedSessionMessage>> {
-    let rows = sqlx::query(
-        r#"SELECT * FROM (
+const CONTEXT_MESSAGE_READ_SQL: &str = r#"SELECT * FROM (
                 SELECT id, session_id, role, content, content_json, tool_calls, tool_call_id, name,
                        routed_provider, routed_model,
                        compacted, prompt_tokens, completion_tokens, created_at
                 FROM session_messages
                 WHERE session_id = ? AND (? = 0 OR compacted = 0)
                 ORDER BY id DESC LIMIT ?
-             ) ORDER BY id ASC"#,
-    )
-    .bind(session_id)
-    .bind(only_uncompacted as i64)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+             ) ORDER BY id ASC"#;
+
+pub(crate) struct ContextReadSnapshot {
+    pub session: Session,
+    pub history: Vec<RehydratedSessionMessage>,
+    pub persisted: Vec<RehydratedSessionMessage>,
+    pub capped: bool,
+}
+
+/// SELECT-only snapshot, sharing the production row/content decoders. Never
+/// creates/touches a session or falls back to another namespace.
+pub(crate) async fn context_read_snapshot(
+    pool: &SqlitePool,
+    id: &str,
+    limit: i64,
+) -> Result<Option<ContextReadSnapshot>> {
+    let limit = limit.clamp(1, i64::MAX - 1);
+    let mut tx = pool.begin().await?;
+    let Some(row) = sqlx::query(SESSION_READ_SQL)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let mut history = sqlx::query(CONTEXT_MESSAGE_READ_SQL)
+        .bind(id)
+        .bind(1_i64)
+        .bind(limit + 1)
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut persisted = sqlx::query(CONTEXT_MESSAGE_READ_SQL)
+        .bind(id)
+        .bind(0_i64)
+        .bind(limit + 1)
+        .fetch_all(&mut *tx)
+        .await?;
+    let capped = history.len() > limit as usize || persisted.len() > limit as usize;
+    history.drain(..history.len().saturating_sub(limit as usize));
+    persisted.drain(..persisted.len().saturating_sub(limit as usize));
+    let snapshot = ContextReadSnapshot {
+        session: row_to_session(&row),
+        history: history.iter().map(row_to_rehydrated_msg).collect(),
+        persisted: persisted.iter().map(row_to_rehydrated_msg).collect(),
+        capped,
+    };
+    tx.commit().await?;
+    Ok(Some(snapshot))
+}
+
+async fn recent_messages_with_content_by_compaction(
+    pool: &SqlitePool,
+    session_id: &str,
+    limit: i64,
+    only_uncompacted: bool,
+) -> Result<Vec<RehydratedSessionMessage>> {
+    let rows = sqlx::query(CONTEXT_MESSAGE_READ_SQL)
+        .bind(session_id)
+        .bind(only_uncompacted as i64)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.iter().map(row_to_rehydrated_msg).collect())
 }
 
@@ -1876,6 +2137,12 @@ pub struct RequestLog<'a> {
 /// 每处多四行既难读也容易漏。默认全空代表「这两项功能没开」。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteTrace {
+    /// Backend request identity for budget association, never exported or read
+    /// from client trace ids. Owned by the same request/audit lifecycle.
+    #[doc(hidden)]
+    pub budget_admission: Option<(String, i64, String)>,
+    /// Internal bounded plan observation; never accepted from ingress headers/JSON.
+    pub decision: Option<crate::audit::route_decision::Snapshot>,
     /// simple / vision / reasoning
     pub intent: Option<String>,
     /// rule / jev / heuristic
@@ -1940,6 +2207,10 @@ async fn log_request_internal(
     log: RequestLog<'_>,
     usage: Option<&[UsageEntry]>,
 ) -> Result<()> {
+    let mut log = log;
+    if log.route.budget_admission.is_none() {
+        log.route.budget_admission = crate::budget::holds::audit_context();
+    }
     let mut tx = pool.begin().await?;
     // D4 ③：这次请求有没有**点名**具体模型（`auto` / `smart` 这类虚拟名不算）。
     //
@@ -1947,14 +2218,14 @@ async fn log_request_internal(
     // `requested_model` 决定，而它本来就在 `log` 里 ——
     // 让每处各判一遍等于把一个纯函数复制九份，还没有任何好处。
     let user_pinned_model = crate::config::is_explicit_model_name(log.requested_model);
-    sqlx::query(
+    let inserted_request = sqlx::query(
         r#"INSERT INTO requests
              (ts, session_id, client, requested_model, routed_provider, routed_model, status,
               latency_ms, prompt_tokens, completion_tokens, fallback_attempts, error,
               cost, currency, rate_label, estimated_prompt_tokens, attempts_json,
               route_intent, route_classifier, route_search, route_search_hits,
               route_refined, route_refine_note, access_key_id, refined_prompt, trace_id,
-              user_pinned_model, session_model_switches, cascade_attempts, cascade_stop)
+              user_pinned_model, session_model_switches, cascade_attempts, cascade_stop, route_decision_json)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
              COALESCE((SELECT CASE WHEN routed_model IS ?
                                    THEN session_model_switches
@@ -1963,7 +2234,7 @@ async fn log_request_internal(
                         WHERE session_id = ?
                         ORDER BY ts DESC, rowid DESC
                         LIMIT 1), 0),
-             ?, ?)"#,
+             ?, ?, ?)"#,
     )
     .bind(ts)
     .bind(log.session_id)
@@ -2016,8 +2287,20 @@ async fn log_request_internal(
     // 级联信息只有 `normal_dispatch` 知道，算不出来。
     .bind(log.route.cascade_attempts)
     .bind(log.route.cascade_stop.as_deref())
+    .bind(log.route.decision.as_ref().and_then(|v| v.to_storage()))
     .execute(&mut *tx)
     .await?;
+
+    if let Some((uuid, month, currency)) = &log.route.budget_admission {
+        // No final-wire permit means no budget-controlled dispatch occurred.
+        // Keep an explicit zero-dispatch marker so a cache hit/local rejection
+        // is not later mistaken for unknown legacy consumption. Same txn.
+        sqlx::query("INSERT INTO budget_holds (hold_id,gateway_request_uuid,call_ordinal,key_id,admission_month,currency,state,reserved_micros,reported_reference_micros,target_price_json,created_at,updated_at) SELECT ?,?,0,?,?,?,'settled',0,0,'{\"kind\":\"no_budget_dispatch\"}',?,? WHERE NOT EXISTS (SELECT 1 FROM budget_holds WHERE gateway_request_uuid=?)")
+            .bind(uuid::Uuid::new_v4().to_string()).bind(uuid).bind(log.access_key_id).bind(month).bind(currency).bind(ts).bind(ts).bind(uuid)
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE budget_holds SET audit_request_id=? WHERE gateway_request_uuid=? AND key_id=? AND audit_request_id IS NULL")
+            .bind(inserted_request.last_insert_rowid()).bind(uuid).bind(log.access_key_id).execute(&mut *tx).await?;
+    }
 
     // 日粒度聚合，供用量看板直接查，不用每次扫全表。
     // `day` 从**同一个 ts** 推，不另取一次 now()：补写历史数据时
@@ -2071,8 +2354,6 @@ pub async fn stats_overview(pool: &SqlitePool) -> Result<serde_json::Value> {
         r#"SELECT COUNT(*) AS total,
                   SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END) AS ok,
                   AVG(latency_ms) AS avg_latency,
-                  SUM(prompt_tokens) AS pt,
-                  SUM(completion_tokens) AS ct,
                   SUM(fallback_attempts) AS fb
            FROM requests WHERE ts >= ?"#,
     )
@@ -2080,15 +2361,25 @@ pub async fn stats_overview(pool: &SqlitePool) -> Result<serde_json::Value> {
     .fetch_one(pool)
     .await?;
 
-    Ok(serde_json::json!({
+    let usage = native_usage::rolling_usage(pool, since).await?;
+    let mut value = serde_json::json!({
         "window": "24h",
         "total": r.get::<i64, _>("total"),
         "success": r.get::<Option<i64>, _>("ok").unwrap_or(0),
         "avg_latency_ms": r.get::<Option<f64>, _>("avg_latency").unwrap_or(0.0).round() as i64,
-        "prompt_tokens": r.get::<Option<i64>, _>("pt").unwrap_or(0),
-        "completion_tokens": r.get::<Option<i64>, _>("ct").unwrap_or(0),
+        "prompt_tokens": usage.totals.prompt,
+        "completion_tokens": usage.totals.completion,
         "fallback_attempts": r.get::<Option<i64>, _>("fb").unwrap_or(0),
-    }))
+    });
+    let timing = request_timing::rolling(pool, since).await?;
+    if timing.has_timing_metadata() {
+        value["request_timings"] = serde_json::json!(timing);
+    }
+    if let Some(native) = usage.totals.native_json() {
+        value["native_usage"] = native;
+        value["native_usage_by_model"] = usage.models_json().unwrap_or_default();
+    }
+    Ok(value)
 }
 
 pub async fn recent_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<serde_json::Value>> {
@@ -2106,7 +2397,8 @@ pub async fn recent_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<serde_
     Ok(rows
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let usage = native_usage::RowUsage::from_row(r);
+            let mut value = serde_json::json!({
                 "ts": r.get::<i64, _>("ts"),
                 "client": r.get::<Option<String>, _>("client"),
                 "requested_model": r.get::<String, _>("requested_model"),
@@ -2114,24 +2406,34 @@ pub async fn recent_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<serde_
                 "routed_model": r.get::<Option<String>, _>("routed_model"),
                 "status": r.get::<Option<i64>, _>("status"),
                 "latency_ms": r.get::<Option<i64>, _>("latency_ms"),
-                "prompt_tokens": r.get::<i64, _>("prompt_tokens"),
-                "completion_tokens": r.get::<i64, _>("completion_tokens"),
+                "prompt_tokens": usage.prompt,
+                "completion_tokens": usage.completion,
                 "fallback_attempts": r.get::<i64, _>("fallback_attempts"),
                 "error": r.get::<Option<String>, _>("error"),
-                "cost": r.get::<Option<f64>, _>("cost"),
-                "currency": r.get::<Option<String>, _>("currency"),
-                "rate_label": r.get::<Option<String>, _>("rate_label"),
+                "cost": usage.cost,
+                "currency": usage.currency,
+                "rate_label": usage.rate_label,
                 "estimated_prompt_tokens": r.get::<Option<i64>, _>("estimated_prompt_tokens"),
                 "attempts": r
                     .get::<Option<String>, _>("attempts_json")
-                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()),
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .map(|mut value| {
+                        if let Some(attempts) = value.as_array_mut() {
+                            request_timing::normalize_generation_reports(attempts);
+                        }
+                        value
+                    }),
                 "route_intent": r.get::<Option<String>, _>("route_intent"),
                 "route_classifier": r.get::<Option<String>, _>("route_classifier"),
                 "route_search": r.get::<Option<String>, _>("route_search"),
                 "route_search_hits": r.get::<Option<i64>, _>("route_search_hits"),
                 "route_refined": r.get::<Option<i64>, _>("route_refined").map(|v| v != 0),
                 "route_refine_note": r.get::<Option<String>, _>("route_refine_note"),
-            })
+            });
+            if let Some(native) = usage.native {
+                value["native_usage"] = native;
+            }
+            value
         })
         .collect())
 }
@@ -2242,15 +2544,20 @@ pub struct SpendBucket {
 }
 
 pub async fn purge_old_requests(pool: &SqlitePool, retention_days: i64) -> Result<()> {
-    let cutoff = Utc::now().timestamp() - retention_days * 86400;
-    sqlx::query("DELETE FROM requests WHERE ts < ?")
-        .bind(cutoff)
-        .execute(pool)
-        .await?;
-    Ok(())
+    purge_old_requests_at(pool, retention_days, Utc::now().timestamp()).await
+}
+
+// B: archive only financial facts and delete expired content in one transaction.
+async fn purge_old_requests_at(pool: &SqlitePool, retention_days: i64, now: i64) -> Result<()> {
+    let cutoff = now - retention_days * 86400;
+    crate::budget::archive::purge(pool, cutoff).await
 }
 
 /* -------------------------------- Snapshots ------------------------------- */
+
+#[cfg(test)]
+#[path = "repo/request_retention_tests.rs"]
+mod request_retention_tests;
 
 pub async fn list_snapshots(pool: &SqlitePool) -> Result<Vec<Snapshot>> {
     let rows =
@@ -2473,29 +2780,41 @@ pub async fn delete_secret(pool: &SqlitePool, name: &str) -> Result<bool> {
 /// 需求相反，所以拆成两个入口—— SQL 层过滤会把「已禁用」这个状态对前端
 /// 藏起来，用户就没法在界面上把它改回来了。
 pub async fn list_routable_providers(pool: &SqlitePool) -> Result<Vec<Provider>> {
-    Ok(list_providers(pool)
-        .await?
-        .into_iter()
-        .filter_map(|mut p| {
-            let had_models = !p.models.is_empty();
-            p.models.retain(|m| m.enabled);
-            // Preserve the legacy truly-empty provider default, but never revive
-            // an explicitly configured provider whose models were all disabled.
-            (!had_models || !p.models.is_empty()).then_some(p)
-        })
-        .collect())
+    let mut out = Vec::new();
+    let now = Utc::now().timestamp_millis();
+    for mut p in list_providers(pool).await? {
+        let had_models = !p.models.is_empty();
+        let target = catalog::target_fingerprint(&p);
+        p.models = catalog::filter_routable_models(
+            pool,
+            &p.id,
+            Some(&target),
+            std::mem::take(&mut p.models),
+            now,
+        )
+        .await?;
+        // A truly empty legacy provider keeps its old default. Filtering every
+        // configured model must never revive that provider as a default route.
+        if !had_models || !p.models.is_empty() {
+            out.push(p);
+        }
+    }
+    Ok(out)
 }
 
-/// 某供应商下**只有已启用模型**的列表，供精确点名模型时查。
+/// Enabled models plus current automatic-management facts for exact selection.
 pub async fn list_routable_models_of(
     pool: &SqlitePool,
     provider_id: &str,
 ) -> Result<Vec<ModelRef>> {
-    Ok(list_models_of(pool, provider_id)
-        .await?
-        .into_iter()
-        .filter(|m| m.enabled)
-        .collect())
+    Ok(catalog::filter_routable_models(
+        pool,
+        provider_id,
+        None,
+        list_models_of(pool, provider_id).await?,
+        Utc::now().timestamp_millis(),
+    )
+    .await?)
 }
 
 /* ------------------- 任务卡二 A5：账号型上游运行时 ------------------- */
@@ -2529,33 +2848,32 @@ pub async fn get_agent_runtime(pool: &SqlitePool, id: &str) -> Result<Option<Age
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    match row {
-        Some(row) => {
-            let options = match row.get::<Option<String>, _>("options_json") {
-                Some(raw) => {
-                    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
-                        crate::error::GatewayError::Other(anyhow::anyhow!(
-                            "账号运行时 options_json 无效，请重新保存运行时配置"
-                        ))
-                    })?;
-                    if !parsed.is_object() {
-                        return Err(crate::error::GatewayError::Other(anyhow::anyhow!(
-                            "账号运行时 options_json 必须是对象"
-                        )));
-                    }
-                    Some(parsed)
-                }
-                None => None,
-            };
-            let mut runtime = read_agent_runtime(&row)?;
-            runtime.options = options;
-            runtime
-                .validate()
-                .map_err(|error| crate::error::GatewayError::Other(anyhow::anyhow!(error)))?;
-            Ok(Some(runtime))
+    row.as_ref().map(read_agent_runtime_strict).transpose()
+}
+
+fn read_agent_runtime_strict(row: &sqlx::sqlite::SqliteRow) -> Result<AgentRuntime> {
+    let options = match row.get::<Option<String>, _>("options_json") {
+        Some(raw) => {
+            let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+                crate::error::GatewayError::Other(anyhow::anyhow!(
+                    "账号运行时 options_json 无效，请重新保存运行时配置"
+                ))
+            })?;
+            if !parsed.is_object() {
+                return Err(crate::error::GatewayError::Other(anyhow::anyhow!(
+                    "账号运行时 options_json 必须是对象"
+                )));
+            }
+            Some(parsed)
         }
-        None => Ok(None),
-    }
+        None => None,
+    };
+    let mut runtime = read_agent_runtime(row)?;
+    runtime.options = options;
+    runtime
+        .validate()
+        .map_err(|error| crate::error::GatewayError::Other(anyhow::anyhow!(error)))?;
+    Ok(runtime)
 }
 
 /// 从一行解出运行时。
@@ -2598,9 +2916,24 @@ pub async fn upsert_agent_runtime(pool: &SqlitePool, runtime: &AgentRuntime) -> 
         .as_ref()
         .and_then(|v| serde_json::to_string(v).ok());
     let now = Utc::now();
-    let created = get_agent_runtime(pool, &runtime.id)
-        .await?
-        .map(|existing| existing.created_at)
+    // Cache publication is asynchronous. Protect the actual persisted kind
+    // under SQLite's writer reservation, including the commit-to-reload gap.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let existing=sqlx::query("SELECT id,kind,label,options_json,enabled,created_at,updated_at FROM agent_runtimes WHERE id=?")
+        .bind(&runtime.id).fetch_optional(&mut *tx).await?;
+    if existing
+        .as_ref()
+        .is_some_and(|row| row.get::<String, _>("kind") == "trae-model")
+    {
+        return Err(crate::error::GatewayError::Protocol(
+            "native_runtime_identity_edit_denied".into(),
+        ));
+    }
+    let created = existing
+        .as_ref()
+        .map(read_agent_runtime_strict)
+        .transpose()?
+        .map(|r| r.created_at)
         .unwrap_or(runtime.created_at);
     sqlx::query(
         r#"INSERT OR REPLACE INTO agent_runtimes
@@ -2614,21 +2947,31 @@ pub async fn upsert_agent_runtime(pool: &SqlitePool, runtime: &AgentRuntime) -> 
     .bind(runtime.enabled as i64)
     .bind(created.to_rfc3339())
     .bind(now.to_rfc3339())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
-/// 删除。返回是否命中了记录。
-///
-/// **调用方要先检查有没有 Provider 引用它** —— 本函数不做级联：
-/// 删掉一个还被引用的运行时会留下一个指向空气的 `provider.runtime_id`，
-/// 而那会在请求时才报「未知账号运行时」，离操作已经很远了。
+/// Delete only an unreferenced runtime. The final reference check and delete
+/// share one writer transaction; a command's friendly precheck is only a hint.
 pub async fn delete_agent_runtime(pool: &SqlitePool, id: &str) -> Result<bool> {
-    let result = sqlx::query("DELETE FROM agent_runtimes WHERE id = ?")
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let referenced: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM providers WHERE runtime_id=?)")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if referenced {
+        return Err(crate::error::GatewayError::Protocol(
+            "运行时仍被供应商引用，请刷新后重试".into(),
+        ));
+    }
+    let result = sqlx::query("DELETE FROM agent_runtimes WHERE id=?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -2647,6 +2990,23 @@ pub async fn set_provider_runtime(
     provider_id: &str,
     runtime_id: Option<&str>,
 ) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let native: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM providers p JOIN agent_runtimes r ON r.id=p.runtime_id WHERE p.id=? AND r.kind='trae-model') OR EXISTS(SELECT 1 FROM agent_runtimes WHERE id=? AND kind='trae-model')")
+        .bind(provider_id).bind(runtime_id).fetch_one(&mut *tx).await?;
+    if native {
+        let existing: Option<Option<String>> =
+            sqlx::query_scalar("SELECT runtime_id FROM providers WHERE id=?")
+                .bind(provider_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if existing.as_ref().map(|v| v.as_deref()) == Some(runtime_id) {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        return Err(crate::error::GatewayError::Protocol(
+            "native_binding_requires_explicit_registration".into(),
+        ));
+    }
     let result = sqlx::query(
         "UPDATE providers SET runtime_id=?,updated_at=? WHERE id=? AND (? IS NULL OR EXISTS (SELECT 1 FROM agent_runtimes WHERE id=? AND enabled=1))",
     )
@@ -2655,8 +3015,9 @@ pub async fn set_provider_runtime(
     .bind(provider_id)
     .bind(runtime_id)
     .bind(runtime_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -2664,6 +3025,14 @@ pub async fn set_provider_runtime(
 
 pub async fn insert_benefit_run(
     pool: &SqlitePool,
+    run: &crate::benefits::BenefitRunRecord,
+) -> Result<i64> {
+    let mut conn = pool.acquire().await?;
+    insert_benefit_run_on(&mut conn, run).await
+}
+
+pub(crate) async fn insert_benefit_run_on(
+    conn: &mut sqlx::SqliteConnection,
     run: &crate::benefits::BenefitRunRecord,
 ) -> Result<i64> {
     let result = sqlx::query(
@@ -2678,7 +3047,7 @@ pub async fn insert_benefit_run(
     .bind(&run.message)
     .bind(run.manual)
     .bind(&run.created_at)
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(result.last_insert_rowid())
 }

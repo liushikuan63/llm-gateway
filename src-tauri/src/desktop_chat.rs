@@ -1,27 +1,302 @@
 //! Desktop chat uses the authenticated gateway listener, including routing, budgets and audit.
+//! Design and replay invariant: [request flow](../../docs/wiki/request-flows.md).
 use crate::config::AppConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::oneshot;
+
+pub const CANCELLED: &str = "desktop_chat_cancelled";
+#[derive(Debug, Serialize)]
+pub struct PersonalFailure {
+    pub message: String,
+    pub outcome: String,
+}
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum CommandError {
+    Ordinary(String),
+    Personal(PersonalFailure),
+}
+impl From<String> for CommandError {
+    fn from(value: String) -> Self {
+        Self::Ordinary(value)
+    }
+}
+impl From<PersonalFailure> for CommandError {
+    fn from(value: PersonalFailure) -> Self {
+        Self::Personal(value)
+    }
+}
+impl CommandError {
+    pub fn before_dispatch(personal: bool, message: String) -> Self {
+        if personal {
+            Self::Personal(PersonalFailure {
+                message,
+                outcome: "not_dispatched".into(),
+            })
+        } else {
+            Self::Ordinary(message)
+        }
+    }
+}
+const MAX_CONTROLLED_REQUESTS: usize = 32;
+
+struct ControlledJob {
+    owner: String,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+/// Process-local UI request ownership only. No sessions, credentials or model
+/// requests live here; dropping a request never guesses a usage refund.
+#[derive(Default)]
+pub struct RequestControls {
+    jobs: parking_lot::Mutex<HashMap<uuid::Uuid, ControlledJob>>,
+}
+
+pub struct ControlledRequest {
+    id: uuid::Uuid,
+    controls: Arc<RequestControls>,
+    cancelled: oneshot::Receiver<()>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct RequestReady {
+    pub request_id: String,
+    pub trace_id: String,
+}
+
+impl RequestControls {
+    pub fn register(
+        self: &Arc<Self>,
+        owner: &str,
+        request_id: &str,
+    ) -> Result<ControlledRequest, String> {
+        let id = parse_request_id(request_id)?;
+        if owner.is_empty() || owner.len() > 128 {
+            return Err("聊天窗口标识无效".into());
+        }
+        let mut jobs = self.jobs.lock();
+        if jobs.contains_key(&id) {
+            return Err("该聊天请求仍在处理中".into());
+        }
+        if jobs.len() >= MAX_CONTROLLED_REQUESTS {
+            return Err("并行聊天请求过多，请等待已有请求结束".into());
+        }
+        let (cancel, cancelled) = oneshot::channel();
+        jobs.insert(
+            id,
+            ControlledJob {
+                owner: owner.into(),
+                cancel: Some(cancel),
+            },
+        );
+        Ok(ControlledRequest {
+            id,
+            controls: self.clone(),
+            cancelled,
+        })
+    }
+
+    pub fn cancel(&self, owner: &str, request_id: &str) -> Result<bool, String> {
+        let id = parse_request_id(request_id)?;
+        let sender = {
+            let mut jobs = self.jobs.lock();
+            jobs.get_mut(&id)
+                .filter(|job| job.owner == owner)
+                .and_then(|job| job.cancel.take())
+        };
+        // Keep the entry until its guard drops: an accepted cancellation cannot
+        // allow an old guard to remove a newer request reusing the same id.
+        Ok(sender.is_some_and(|sender| sender.send(()).is_ok()))
+    }
+}
+
+fn parse_request_id(value: &str) -> Result<uuid::Uuid, String> {
+    if value.len() > 64 {
+        return Err("聊天请求标识无效".into());
+    }
+    uuid::Uuid::parse_str(value).map_err(|_| "聊天请求标识无效".into())
+}
+
+impl ControlledRequest {
+    pub fn id(&self) -> uuid::Uuid {
+        self.id
+    }
+    pub fn ready(&self) -> RequestReady {
+        RequestReady {
+            request_id: self.id.to_string(),
+            trace_id: self.id.simple().to_string(),
+        }
+    }
+    pub async fn run<T>(
+        mut self,
+        operation: impl Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        match self.cancelled.try_recv() {
+            Ok(()) | Err(oneshot::error::TryRecvError::Closed) => return Err(CANCELLED.into()),
+            Err(oneshot::error::TryRecvError::Empty) => (),
+        }
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            // A response already ready in this poll retains its known outcome.
+            result = &mut operation => result,
+            _ = &mut self.cancelled => Err(CANCELLED.into()),
+        }
+    }
+}
+
+impl Drop for ControlledRequest {
+    fn drop(&mut self) {
+        self.controls.jobs.lock().remove(&self.id);
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Preserve a completed assistant's separate reasoning channel on follow-up.
+    /// This is conversational history, not usage or entitlement evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatInput {
+    #[serde(default)]
+    pub personal_test: bool,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub session_id: String,
     pub max_tokens: u32,
 }
 
+/// Observed field shape only; reported does not certify supplier settlement.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyFieldState {
+    Reported,
+    Unavailable,
+    Invalid,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyUsageEvidence {
+    Unobserved,
+    Unknown,
+    Complete,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ReplyMetadata {
+    pub finish_reason: ReplyFieldState,
+    pub usage: ReplyFieldState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_evidence: Option<ReplyUsageEvidence>,
+}
+#[derive(Deserialize)]
+struct GatewayReplyObservation {
+    version: u8,
+    finish_reason: Option<Value>,
+    usage_present: bool,
+    usage_evidence: ReplyUsageEvidence,
+}
+
+/// Opt-in desktop metadata is captured before OpenAI's compatibility defaults.
+/// Ordinary clients and stored cache JSON retain their existing wire contracts.
+pub(crate) fn attach_gateway_observation(
+    body: &mut Value,
+    response: &crate::domain::ChatResponse,
+    requested: bool,
+    personal: bool,
+) {
+    if !requested {
+        return;
+    }
+    let evidence = if personal {
+        "unknown"
+    } else {
+        match response.reported_usage_evidence {
+            crate::domain::ReportedUsageEvidence::Unobserved => "unobserved",
+            crate::domain::ReportedUsageEvidence::Unknown => "unknown",
+            crate::domain::ReportedUsageEvidence::Complete(_) => "complete",
+        }
+    };
+    body["llmgw_reply_observation"] = serde_json::json!({
+        "version": 1, "finish_reason": response.finish_reason,
+        "usage_present": !personal && response.usage.is_some(), "usage_evidence": evidence,
+    });
+}
+
+fn reply_observations(body: &Value) -> (Option<String>, Option<Value>, ReplyMetadata) {
+    let mut finish = body.pointer("/choices/0/finish_reason").cloned();
+    let mut usage = body.get("usage").filter(|v| !v.is_null()).cloned();
+    let evidence = match body.get("llmgw_reply_observation") {
+        None => None, // Older gateways expose declarations, not pre-normalization evidence.
+        Some(value) => match serde_json::from_value::<GatewayReplyObservation>(value.clone()) {
+            Ok(observed) if observed.version == 1 => {
+                finish = observed.finish_reason;
+                if !observed.usage_present {
+                    usage = None;
+                }
+                Some(observed.usage_evidence)
+            }
+            _ => {
+                return (
+                    None,
+                    None,
+                    ReplyMetadata {
+                        finish_reason: ReplyFieldState::Invalid,
+                        usage: ReplyFieldState::Invalid,
+                        usage_evidence: None,
+                    },
+                )
+            }
+        },
+    };
+    let finish_state = match finish.as_ref() {
+        None | Some(Value::Null) => ReplyFieldState::Unavailable,
+        Some(Value::String(value)) if value.trim().is_empty() => ReplyFieldState::Unavailable,
+        Some(Value::String(_)) => ReplyFieldState::Reported,
+        Some(_) => ReplyFieldState::Invalid,
+    };
+    let finish = match finish {
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    };
+    let usage_state = match usage.as_ref() {
+        None => ReplyFieldState::Unavailable,
+        Some(Value::Object(_)) => ReplyFieldState::Reported,
+        Some(_) => ReplyFieldState::Invalid,
+    };
+    // Preserve the original non-null JSON, including partial/extension fields.
+    // State is about shape only; never fill unknown counts, prices or currency.
+    (
+        finish,
+        usage,
+        ReplyMetadata {
+            finish_reason: finish_state,
+            usage: usage_state,
+            usage_evidence: evidence,
+        },
+    )
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personal_test_outcome: Option<String>,
     pub content: String,
     pub reasoning: Option<String>,
+    /// Keep refusal separate from content so replay matches persisted history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     pub model: String,
     pub routed_via: Option<String>,
     pub session_id: String,
@@ -29,6 +304,10 @@ pub struct ChatResult {
     pub fallback_attempts: u32,
     pub latency_ms: u64,
     pub usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_metadata: Option<ReplyMetadata>,
     pub cached: bool,
 }
 
@@ -47,17 +326,21 @@ pub fn validate(input: &ChatInput) -> Result<(), String> {
         || input
             .messages
             .iter()
-            .map(|m| m.content.len())
+            .map(|m| {
+                m.content
+                    .len()
+                    .saturating_add(m.reasoning_content.as_deref().map_or(0, str::len))
+            })
             .sum::<usize>()
             > 262_144
         || input
             .messages
             .last()
             .map_or(true, |m| m.role != "user" || m.content.trim().is_empty())
-        || input
-            .messages
-            .iter()
-            .any(|m| !matches!(m.role.as_str(), "system" | "user" | "assistant"))
+        || input.messages.iter().any(|m| {
+            !matches!(m.role.as_str(), "system" | "user" | "assistant")
+                || m.reasoning_content.is_some() && m.role != "assistant"
+        })
     {
         return Err("聊天需以非空用户消息结束，最多 128 条、256 KiB 文本".into());
     }
@@ -153,6 +436,72 @@ pub async fn send(
     listener: std::net::SocketAddr,
     input: ChatInput,
 ) -> Result<ChatResult, String> {
+    send_with_trace(cfg, listener, input, None).await
+}
+
+pub async fn send_with_trace(
+    cfg: &AppConfig,
+    listener: std::net::SocketAddr,
+    input: ChatInput,
+    trace: Option<uuid::Uuid>,
+) -> Result<ChatResult, String> {
+    if input.personal_test {
+        return Err("个人测试默认关闭；必须通过已归属的桌面会话及可信来源发送".into());
+    }
+    send_inner(cfg, listener, input, trace, None).await
+}
+
+pub(crate) async fn send_personal(
+    cfg: &AppConfig,
+    listener: std::net::SocketAddr,
+    input: ChatInput,
+    trace: uuid::Uuid,
+    ticket: crate::personal_test::Ticket,
+) -> Result<ChatResult, PersonalFailure> {
+    let mut result = send_inner(cfg, listener, input, Some(trace), Some(&ticket.token))
+        .await
+        .map_err(|message| PersonalFailure {
+            message,
+            outcome: ticket.ctx.outcome().into(),
+        })?;
+    result.personal_test_outcome = Some(ticket.ctx.outcome().into());
+    Ok(result)
+}
+
+pub async fn send_controlled_personal(
+    gateway: &crate::proxy::server::GatewayState,
+    owner: &str,
+    request: ControlledRequest,
+    input: ChatInput,
+) -> Result<ChatResult, PersonalFailure> {
+    let trace = request.id();
+    let progress = Arc::new(crate::personal_test::Progress::default());
+    request
+        .run(async {
+            let cfg = gateway.cfg_snapshot();
+            let listener = gateway.listener_snapshot().ok_or("LLM 网关服务未开启")?;
+            let ticket = gateway
+                .personal_tests
+                .issue(owner, &input, trace, gateway, progress.clone())
+                .await?;
+            send_personal(&cfg, listener.bound_addr, input, trace, ticket)
+                .await
+                .map_err(|e| e.message)
+        })
+        .await
+        .map_err(|message| PersonalFailure {
+            message,
+            outcome: progress.outcome().into(),
+        })
+}
+
+async fn send_inner(
+    cfg: &AppConfig,
+    listener: std::net::SocketAddr,
+    input: ChatInput,
+    trace: Option<uuid::Uuid>,
+    personal_ticket: Option<&str>,
+) -> Result<ChatResult, String> {
     validate(&input)?;
     // Never send the unified key through a system/VPN proxy or to a caller-supplied URL.
     let host = if listener.is_ipv6() {
@@ -168,27 +517,36 @@ pub async fn send(
         .build()
         .map_err(|_| "无法初始化聊天连接".to_string())?;
     let started = Instant::now();
-    let mut response = client
+    let request = client
         .post(format!(
             "http://{host}:{}/v1/chat/completions",
             listener.port()
         ))
         .bearer_auth(&cfg.unified_key)
         .header("x-session-id", &input.session_id)
+        .header("x-llmgw-desktop-observation", "1")
         .header("x-client-name", "desktop-chat")
         .json(
             &serde_json::json!({ "model": input.model, "messages": input.messages,
             "max_tokens": input.max_tokens, "stream": false }),
-        )
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                "聊天请求超时；请核对用量与审计，确认上游是否已生成回复后再重试".to_string()
-            } else {
-                "无法连接本机网关，请检查诊断页与监听状态".to_string()
-            }
-        })?;
+        );
+    let request = if let Some(trace) = trace {
+        request.header("x-trace-id", trace.simple().to_string())
+    } else {
+        request
+    };
+    let request = if let Some(token) = personal_ticket {
+        request.header(crate::personal_test::HEADER, token)
+    } else {
+        request
+    };
+    let mut response = request.send().await.map_err(|e| {
+        if e.is_timeout() {
+            "聊天请求超时；请核对用量与审计，确认上游是否已生成回复后再重试".to_string()
+        } else {
+            "无法连接本机网关，请检查诊断页与监听状态".to_string()
+        }
+    })?;
     let status = response.status();
     let header = |name: &str| {
         response
@@ -241,12 +599,43 @@ pub async fn send(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    if content.is_empty() && reasoning.is_none() {
+    let refusal = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned);
+    if content.is_empty() && reasoning.is_none() && refusal.is_none() {
         return Err("模型未返回文本回复，请查看审计与供应商设置".into());
     }
+    // Existing RUST_LOG debug level only. These are provider declarations and
+    // channel-presence facts, never a verified terminal/settlement or a reason
+    // to retry. Do not log response values, identities, model IDs or token counts.
+    if tracing::enabled!(target: "llm_gateway::desktop_chat_reply", tracing::Level::DEBUG) {
+        let declared_finish = match body.pointer("/choices/0/finish_reason") {
+            None | Some(Value::Null) => "missing",
+            Some(Value::String(value)) => match value.as_str() {
+                "stop" => "stop",
+                "length" => "length",
+                "tool_calls" => "tool_calls",
+                "function_call" => "function_call",
+                "content_filter" => "content_filter",
+                _ => "other",
+            },
+            Some(_) => "invalid",
+        };
+        tracing::debug!(target: "llm_gateway::desktop_chat_reply", parent: None,
+            declared_finish,
+            has_main_text = !content.is_empty(),
+            has_reasoning = reasoning.is_some(),
+            has_refusal = refusal.is_some(),
+            "desktop_chat_reply_metadata_v1");
+    }
+    let (finish_reason, usage, response_metadata) = reply_observations(&body);
     Ok(ChatResult {
+        personal_test_outcome: None,
         content,
         reasoning,
+        refusal,
         model: body
             .get("model")
             .and_then(Value::as_str)
@@ -257,7 +646,9 @@ pub async fn send(
         trace_id,
         fallback_attempts,
         latency_ms: started.elapsed().as_millis() as u64,
-        usage: body.get("usage").filter(|v| !v.is_null()).cloned(),
+        usage,
+        finish_reason,
+        response_metadata: Some(response_metadata),
         cached,
     })
 }
@@ -266,6 +657,277 @@ pub async fn send(
 mod tests {
     use super::*;
     use crate::config::RoutingStrategy;
+
+    #[test]
+    fn actual_desktop_http_reply_metadata_is_closed_and_debug_level_controlled() {
+        use axum::{routing::post, Json, Router};
+        use std::{
+            io::Write,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Clone)]
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (enabled, finish, class, main, reasoning, refusal) in [
+            (
+                true,
+                Some(serde_json::json!("length")),
+                "length",
+                "PRIVATE_MAIN_CANARY",
+                Some("PRIVATE_REASON_CANARY"),
+                None,
+            ),
+            (
+                true,
+                Some(serde_json::json!("stop")),
+                "stop",
+                "PRIVATE_MAIN_CANARY",
+                None,
+                None,
+            ),
+            (
+                true,
+                Some(serde_json::json!("PRIVATE_FINISH_CANARY")),
+                "other",
+                "PRIVATE_MAIN_CANARY",
+                None,
+                None,
+            ),
+            (
+                true,
+                Some(serde_json::json!({"PRIVATE_FIELD_CANARY":"PRIVATE_VALUE_CANARY"})),
+                "invalid",
+                "PRIVATE_MAIN_CANARY",
+                None,
+                None,
+            ),
+            (true, None, "missing", "PRIVATE_MAIN_CANARY", None, None),
+            (
+                true,
+                Some(serde_json::Value::Null),
+                "missing",
+                "PRIVATE_MAIN_CANARY",
+                None,
+                None,
+            ),
+            (
+                true,
+                Some(serde_json::json!("content_filter")),
+                "content_filter",
+                "",
+                None,
+                Some("PRIVATE_REFUSAL_CANARY"),
+            ),
+            (
+                true,
+                Some(serde_json::json!("stop")),
+                "stop",
+                "",
+                Some("PRIVATE_REASON_CANARY"),
+                None,
+            ),
+            (
+                false,
+                Some(serde_json::json!("length")),
+                "length",
+                "PRIVATE_MAIN_CANARY",
+                None,
+                None,
+            ),
+        ] {
+            let bytes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let writer = Sink(bytes.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_env_filter(format!(
+                    "off,llm_gateway::desktop_chat_reply={}",
+                    if enabled { "debug" } else { "info" }
+                ))
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let parent = tracing::debug_span!(
+                    target: "llm_gateway::desktop_chat_reply",
+                    "owned_parent_context",
+                    private = "PRIVATE_PARENT_CANARY"
+                );
+                let _entered = parent.enter();
+                rt.block_on(async {
+                let mut packet=serde_json::json!({"model":"PRIVATE_MODEL_CANARY","choices":[{"message":{"role":"assistant","content":main,"reasoning_content":reasoning,"refusal":refusal}}]});
+                if let Some(finish)=finish {packet["choices"][0]["finish_reason"]=finish;}
+                let hits=Arc::new(AtomicUsize::new(0));let seen=hits.clone();
+                let app=Router::new().route("/v1/chat/completions",post(move || {let packet=packet.clone();let seen=seen.clone();async move {seen.fetch_add(1,Ordering::SeqCst);Json(packet)}}));
+                let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
+                let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
+                let result=send(&AppConfig::default(),addr,ChatInput {personal_test:false,model:"owned-model".into(),session_id:uuid::Uuid::new_v4().to_string(),max_tokens:128,messages:vec![ChatMessage{role:"user".into(),content:"owned diagnostic request".into(),reasoning_content:None}]}).await;
+                server.abort();let _=server.await;
+                let result=result.expect("positive HTTP decoder must succeed before log assertions");
+                assert_eq!(hits.load(Ordering::SeqCst),1,"one explicit owned HTTP request, no replay");
+                assert_eq!(result.content,main);assert_eq!(result.reasoning.as_deref(),reasoning);assert_eq!(result.refusal.as_deref(),refusal);
+                assert!(result.usage.is_none(),"unknown usage must stay unknown");
+                assert!(serde_json::to_value(result).unwrap().get("declared_finish").is_none(),"no new IPC/export contract");
+            })
+            });
+            let log = String::from_utf8(bytes.lock().clone()).unwrap();
+            for canary in [
+                "PRIVATE_MAIN_CANARY",
+                "PRIVATE_REASON_CANARY",
+                "PRIVATE_REFUSAL_CANARY",
+                "PRIVATE_MODEL_CANARY",
+                "PRIVATE_FINISH_CANARY",
+                "PRIVATE_FIELD_CANARY",
+                "PRIVATE_VALUE_CANARY",
+                "PRIVATE_PARENT_CANARY",
+            ] {
+                assert!(
+                    !log.contains(canary),
+                    "closed metadata must not expose values"
+                );
+            }
+            assert_eq!(
+                log.matches("desktop_chat_reply_metadata_v1").count(),
+                usize::from(enabled)
+            );
+            if enabled {
+                assert!(
+                    log.contains(&format!("declared_finish=\"{class}\""))
+                        || log.contains(&format!("declared_finish={class}")),
+                    "fixed stop classification required"
+                );
+                assert!(log.contains(&format!("has_main_text={}", !main.is_empty())));
+                assert!(log.contains(&format!("has_reasoning={}", reasoning.is_some())));
+                assert!(log.contains(&format!("has_refusal={}", refusal.is_some())));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_cancel_before_first_poll_never_dispatches() {
+        let controls = Arc::new(RequestControls::default());
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = controls.register("main", &id).unwrap();
+        assert!(!controls.cancel("another-window", &id).unwrap());
+        assert!(controls.cancel("main", &id).unwrap());
+        assert!(!controls.cancel("main", &id).unwrap());
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let result = request
+            .run(async {
+                polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert_eq!(result.unwrap_err(), CANCELLED);
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!controls.cancel("main", &id).unwrap());
+        assert!(controls.jobs.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn controlled_inflight_cancel_drops_only_target_and_keeps_other_request() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let controls = Arc::new(RequestControls::default());
+        let id = uuid::Uuid::new_v4().to_string();
+        let other_id = uuid::Uuid::new_v4().to_string();
+        let request = controls.register("main", &id).unwrap();
+        let other = controls.register("main", &other_id).unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job = tokio::spawn({
+            let entered = entered.clone();
+            let dropped = dropped.clone();
+            async move {
+                request
+                    .run(async move {
+                        let _guard = Dropped(dropped);
+                        entered.notify_one();
+                        std::future::pending::<Result<(), String>>().await
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        assert!(controls.cancel("main", &id).unwrap());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), job)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err(),
+            CANCELLED
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            other
+                .run(async { Ok::<_, String>("other success") })
+                .await
+                .unwrap(),
+            "other success"
+        );
+        assert!(controls.jobs.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn controlled_known_completion_can_win_accepted_cancel_without_false_cancel() {
+        let controls = Arc::new(RequestControls::default());
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = controls.register("main", &id).unwrap();
+        assert_eq!(request.ready().trace_id, request.id().simple().to_string());
+        let result = request
+            .run(async {
+                assert!(controls.cancel("main", &id).unwrap());
+                Ok::<_, String>("known success")
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, "known success");
+        assert!(!controls.cancel("main", &id).unwrap());
+    }
+
+    #[test]
+    fn controlled_registration_rejects_duplicate_invalid_and_overflow_and_cleans_on_drop() {
+        let controls = Arc::new(RequestControls::default());
+        assert!(controls.register("main", "not-a-uuid").is_err());
+        assert!(controls
+            .register("", &uuid::Uuid::new_v4().to_string())
+            .is_err());
+        let id = uuid::Uuid::new_v4().to_string();
+        let first = controls.register("main", &id).unwrap();
+        assert!(controls.register("another-window", &id).is_err());
+        let mut held = vec![first];
+        for _ in 1..MAX_CONTROLLED_REQUESTS {
+            held.push(
+                controls
+                    .register("main", &uuid::Uuid::new_v4().to_string())
+                    .unwrap(),
+            );
+        }
+        assert!(controls
+            .register("main", &uuid::Uuid::new_v4().to_string())
+            .is_err());
+        drop(held);
+        assert!(controls.jobs.lock().is_empty());
+        assert!(controls.register("main", &id).is_ok());
+    }
 
     #[test]
     fn timeout_covers_serial_fallback_and_two_compactions() {
@@ -347,3 +1009,6 @@ mod tests {
         assert!(request_timeout(&cfg, "auto").is_err());
     }
 }
+
+/// Optional true incremental delivery; buffered desktop consumers stay unchanged.
+pub mod stream;

@@ -5,6 +5,8 @@ use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
+pub(crate) const DEVICE_CONTEXT_REQUIRED: &str = "Trae 会话缺少可直连设备上下文，领取已暂停；请到客户端接入页关联本网关 Trae 独立登录，或在账号权益中显式重新复用客户端登录；已有旧预约时仍需等新活动窗口；未启动客户端";
+
 fn validate_status(value: &Value) -> Result<(), String> {
     if value.get("code").and_then(Value::as_i64) != Some(0)
         || !value.get("enable").is_some_and(Value::is_boolean)
@@ -53,14 +55,19 @@ async fn post(
     route: &str,
     token: &str,
     source: u8,
+    guard: Option<&crate::benefits::ClaimDispatchGuard>,
 ) -> Result<Value, String> {
-    let response = client
+    let request = client
         .post(format!("{base}/trae/api/v2/ug/checkin_credits/{route}"))
         .headers(crate::client_session::request_headers(
             token,
             ClaimPlatform::TraeCn,
         )?)
-        .json(&json!({"req_source":source}))
+        .json(&json!({"req_source":source}));
+    if let Some(guard) = guard {
+        guard.check_for(token).await?;
+    }
+    let response = request
         .send()
         .await
         .map_err(|_| "Trae 签到连接失败或超时；未自动重发领取".to_owned())?;
@@ -95,6 +102,58 @@ pub async fn request(
     request_at(token, proxy, campaign_id, "https://api.trae.cn").await
 }
 
+/// Every saved source carries an epoch guard, not only verified native sources.
+/// The old client executor cannot recheck this application's source after its
+/// internal status await. Missing device context therefore needs explicit
+/// migration; it must never silently enter that unguarded mutation path.
+pub(crate) async fn request_checked(
+    token: &str,
+    proxy: Option<&str>,
+    campaign_id: &str,
+    guard: &crate::benefits::ClaimDispatchGuard,
+) -> Result<Value, String> {
+    request_with_native_guarded(
+        token,
+        proxy,
+        Some(campaign_id),
+        "https://api.trae.cn",
+        Some(guard),
+        |_, _| async { Err(DEVICE_CONTEXT_REQUIRED.into()) },
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn request_at_for_test(
+    token: &str,
+    campaign_id: Option<&str>,
+    base: &str,
+) -> Result<Value, String> {
+    request_at(token, None, campaign_id, base).await
+}
+
+#[cfg(test)]
+pub(crate) async fn request_checked_at_for_test(
+    token: &str,
+    campaign_id: &str,
+    base: &str,
+    guard: &crate::benefits::ClaimDispatchGuard,
+) -> Result<Value, String> {
+    request_with_native_guarded(
+        token,
+        None,
+        Some(campaign_id),
+        base,
+        Some(guard),
+        |_, _| async {
+            panic!("owned guarded native HTTP test must not start a client");
+            #[allow(unreachable_code)]
+            Ok(Value::Null)
+        },
+    )
+    .await
+}
+
 async fn request_at(
     token: &str,
     proxy: Option<&str>,
@@ -118,7 +177,28 @@ where
     F: FnOnce(SessionCredential, String) -> Fut,
     Fut: std::future::Future<Output = Result<Value, String>>,
 {
+    request_with_native_guarded(token, proxy, campaign_id, base, None, native).await
+}
+
+async fn request_with_native_guarded<F, Fut>(
+    token: &str,
+    proxy: Option<&str>,
+    campaign_id: Option<&str>,
+    base: &str,
+    guard: Option<&crate::benefits::ClaimDispatchGuard>,
+    native: F,
+) -> Result<Value, String>
+where
+    F: FnOnce(SessionCredential, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
     let session = SessionCredential::parse(token, ClaimPlatform::TraeCn)?;
+    if let Some(guard) = guard {
+        guard.check_for(token).await?;
+        if !session.has_trae_device_context() {
+            return Err(DEVICE_CONTEXT_REQUIRED.into());
+        }
+    }
     let source = session.request_source.ok_or("Trae 客户端来源无效")?;
     let client = crate::outbound::apply_proxy(
         reqwest::Client::builder()
@@ -131,7 +211,10 @@ where
     .map_err(|_| "权益代理配置无效")?
     .build()
     .map_err(|_| "无法初始化权益请求")?;
-    let before = post(&client, base, "status", token, source).await?;
+    let before = post(&client, base, "status", token, source, guard).await?;
+    if let Some(guard) = guard {
+        guard.check_for(token).await?;
+    }
     validate_status(&before)?;
     let now = Utc::now();
     let Some(id) = campaign_id else {
@@ -147,12 +230,12 @@ where
         if !session.has_trae_device_context() {
             return native(session, expected_id).await;
         }
-        let claim = post(&client, base, "claim", token, source).await?;
+        let claim = post(&client, base, "claim", token, source, guard).await?;
         if !claim.is_object() || (claim.get("code").is_some() && claim["code"].as_i64() != Some(0))
         {
             return Err("Trae 直连领取被平台拒绝；未自动重发".into());
         }
-        let after = post(&client, base, "status", token, source).await?;
+        let after = post(&client, base, "status", token, source, guard).await?;
         validate_status(&after)?;
         if after["checked_in"] != true || daily_window(Utc::now()).0 != expected_id {
             return Err("Trae 直连领取未获同日状态确认；未自动重发".into());

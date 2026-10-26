@@ -1,0 +1,66 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
+async function verifyRequestPreview(browser,baseUrl,output,errors,fixture){
+ const context=await browser.newContext({viewport:{width:1280,height:1000}});await context.addInitScript(fixture);const page=await context.newPage();
+ const proof={scope:'source browser IPC fixture only; no model call or installed acceptance',checks:[],passed:false};
+ page.on('pageerror',e=>errors.push(e.message));page.on('console',m=>{if(m.type()==='error')errors.push(m.text());});
+ const shot=async(name,element)=>{const file=path.join(output,name+'.png');await element.screenshot({path:file});return{path:file,sha256:crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')};};
+ try{await page.goto(baseUrl);await page.locator('#boot-splash').waitFor({state:'hidden'});
+ await page.evaluate(()=>{const original=window.__TAURI_INTERNALS__.invoke;window.__previewCalls=[];window.__previewSends=0;window.__previewSettingsWrites=0;
+ window.__TAURI_INTERNALS__.invoke=async(c,a)=>{
+  if(c==='desktop_chat')window.__previewSends++;
+  if(c==='update_config'||c==='set_personal_test')window.__previewSettingsWrites++;
+  if(c!=='preview_routing_request')return original(c,a);
+  const input=structuredClone(a.input);window.__previewCalls.push(input);if(window.__previewFailure)throw 'owned preview read failure';
+  const media=JSON.stringify(input.request).includes('image_url')||!!input.request.tools,free=input.request.model==='free';
+  const row=(id,eligible,ordinal)=>({provider_id:id,provider_name:'owned '+id,model:'owned-model',configured_upstream:id+'-physical',eligible,exclusion_reason:eligible?null:'model_capability_missing',ordinal,score:eligible?0:null,breakdown:eligible?{factors:[],exact_match_bonus:1,total:0}:null});
+  const result={schema_version:window.__previewVersion||1,mode:'offline_supplied_messages',estimated_prompt_tokens:12,fixed_reserve_tokens:1100,trimmed_messages:0,configured_strategy:input.strategy||'priority',cost_policy:free?'free_only':'unrestricted',order_semantics:free?'free_weight_only_no_turn_prediction':'current_rank_no_session_stickiness',intent:null,gate_issue:free?'free_policy_rejected':null,rows:free?[row('text',false,null),row('vision',false,null)]:[row('text',!media,media?null:1),row('vision',true,media?1:2)],limitations:['仅本次消息，不重建会话。','不会运行Jev、搜索、模型或真实账号探测。']};
+  if(window.__previewRuntimeBlocked){result.gate_issue=null;result.rows=result.rows.map(r=>({...r,eligible:false,ordinal:null,score:null,breakdown:null,exclusion_reason:'runtime_unavailable'}));}
+  if(window.__previewHold)await new Promise(resolve=>{window.__previewRelease=resolve;});return result;
+ };});
+ await page.getByRole('navigation',{name:'主导航'}).getByRole('button',{name:'聊天测试',exact:true}).click();
+ const entry=page.getByText('请求形状离线预演',{exact:true});assert.equal(await entry.count(),1,'Chat must expose the request-shape offline preview entry');await entry.click();
+ const panel=page.getByTestId('request-preview-panel'),button=panel.getByRole('button',{name:'离线预演请求',exact:true}),status=()=>panel.getByRole('status');
+ await page.locator('#chat-prompt').fill('owned unsent draft');assert.equal(await page.evaluate(()=>window.__previewCalls.length),0);
+ await button.focus();await page.keyboard.press('Enter');await status().filter({hasText:'离线预演完成'}).waitFor();
+ const first=await page.evaluate(()=>window.__previewCalls[0]);assert.equal(first.request.model,'auto');assert.equal(first.request.messages.at(-1).content,'owned unsent draft');assert.equal(first.request.max_tokens,1024);assert.equal(first.request.stream,false);assert.equal(first.access_key_id,null);
+ assert.match(await panel.innerText(),/0\.000/);assert.equal(await page.locator('#chat-prompt').inputValue(),'owned unsent draft');assert.equal(await page.evaluate(()=>window.__previewSends),0);
+ proof.checks.push('explicit keyboard preview uses current unsent Chat body, known zero score remains numeric, draft and send state unchanged');
+ await panel.getByText('高级：统一请求 JSON',{exact:true}).click();const jsonInput=panel.getByLabel('预演请求 JSON',{exact:true});
+ const contrast=async()=>jsonInput.evaluate(el=>{const s=getComputedStyle(el),rgb=x=>x.match(/[\d.]+/g).slice(0,3).map(Number),lum=a=>a.map(v=>v/255).map(v=>v<=0.04045?v/12.92:((v+0.055)/1.055)**2.4).reduce((sum,v,i)=>sum+v*[0.2126,0.7152,0.0722][i],0),a=lum(rgb(s.color)),b=lum(rgb(s.backgroundColor));return{foreground:s.color,background:s.backgroundColor,ratio:(Math.max(a,b)+0.05)/(Math.min(a,b)+0.05)};});
+ const stableContrast=async()=>{try{await page.waitForFunction(()=>{const s=getComputedStyle(document.querySelector('#preview-json')),rgb=x=>x.match(/[\d.]+/g).slice(0,3).map(Number),lum=a=>a.map(v=>v/255).map(v=>v<=0.04045?v/12.92:((v+0.055)/1.055)**2.4).reduce((n,v,i)=>n+v*[0.2126,0.7152,0.0722][i],0),a=lum(rgb(s.color)),b=lum(rgb(s.backgroundColor));return(Math.max(a,b)+0.05)/(Math.min(a,b)+0.05)>=4.5;},undefined,{timeout:2000});}catch{throw Error('JSON editor contrast did not reach 4.5: '+JSON.stringify(await contrast()));}return contrast();};
+ if(await page.evaluate(()=>document.documentElement.dataset.theme==='dark'))await page.getByRole('button',{name:'切换到浅色主题',exact:true}).click();
+ const light=await stableContrast();proof.editor_contrast=[{theme:'light',...light}];assert(light.ratio>=4.5,'JSON editor must remain readable in the light theme');
+ await page.getByRole('button',{name:'切换到深色主题',exact:true}).click();await page.waitForFunction(()=>document.documentElement.dataset.theme==='dark');
+ const dark=await stableContrast();proof.editor_contrast.push({theme:'dark',...dark});assert(dark.ratio>=4.5,'JSON editor must remain readable in the dark theme');
+ await page.getByRole('button',{name:'切换到浅色主题',exact:true}).click();await page.waitForFunction(()=>document.documentElement.dataset.theme!=='dark');
+ const shaped={model:'auto',messages:[{role:'user',content:[{type:'image_url',image_url:{url:'data:image/png;base64,AAAA'}}]}],tools:[{type:'function',function:{name:'owned',parameters:{type:'object'}}}],stream:true};
+ await jsonInput.fill(JSON.stringify(shaped));await panel.getByLabel('访问 Key ID（可选，不输入密钥）',{exact:true}).fill('owned-key-id');await panel.getByLabel('模拟策略',{exact:true}).selectOption('smart');
+ await button.click();await status().filter({hasText:'离线预演完成'}).waitFor();const second=await page.evaluate(()=>window.__previewCalls[1]);assert.deepEqual(second.request,shaped);assert.equal(second.access_key_id,'owned-key-id');assert.equal(second.strategy,'smart');
+ const textRow=panel.locator('tbody tr').filter({hasText:'owned text'});assert.match(await textRow.innerText(),/已排除/);assert.match(await textRow.innerText(),/未知/);assert.doesNotMatch(await textRow.innerText(),/0\.000/);
+ proof.shaped_screenshot=await shot('request-preview-shape',panel);proof.checks.push('advanced media/tool/stream body, key identifier and temporary strategy forward exactly; excluded score stays unknown');
+ const callsBeforeRefresh=await page.evaluate(()=>window.__previewCalls.length);
+ await page.getByRole('button',{name:'刷新模型与评分',exact:true}).click();
+ await page.waitForFunction(()=>Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='刷新模型与评分')?.disabled===false);
+ assert.equal(await panel.getByRole('region',{name:'请求预演结果',exact:true}).count(),0,'configuration refresh must invalidate an older preview without rerunning it');
+ assert.equal(await page.evaluate(()=>window.__previewCalls.length),callsBeforeRefresh);
+ await page.evaluate(()=>{window.__previewHold=true;});await button.click();await page.waitForFunction(()=>typeof window.__previewRelease==='function');assert(await button.isDisabled());
+ const before=await page.evaluate(()=>window.__previewCalls.length);await page.keyboard.press('Enter');await jsonInput.fill(JSON.stringify({...shaped,model:'owned-new-model'}));
+ proof.pending_screenshot=await shot('request-preview-pending',panel);await page.evaluate(()=>{window.__previewHold=false;window.__previewRelease();});
+ await status().filter({hasText:'预演期间输入已变化'}).waitFor();assert.equal(await panel.getByRole('region',{name:'请求预演结果',exact:true}).count(),0);assert.equal(await page.evaluate(()=>window.__previewCalls.length),before);
+ proof.checks.push('one in-flight preview, stale completion discarded after input changes, no automatic replay');
+ await jsonInput.fill('{bad');await button.click();await panel.getByRole('alert').filter({hasText:'请求JSON无效'}).waitFor();assert.equal(await page.evaluate(()=>window.__previewCalls.length),before);assert.equal(await jsonInput.inputValue(),'{bad');
+ await jsonInput.fill(JSON.stringify(shaped));await button.click();await status().filter({hasText:'离线预演完成'}).waitFor();
+ await page.evaluate(()=>{window.__previewFailure=true;});await button.click();await panel.getByRole('alert').filter({hasText:'owned preview read failure'}).waitFor();assert.equal(await jsonInput.inputValue(),JSON.stringify(shaped));
+ assert.doesNotMatch(await status().innerText(),/离线预演完成/,'a failed refresh must not retain a current success notice');
+ await page.evaluate(()=>{window.__previewFailure=false;window.__previewVersion=99;});await button.click();await panel.getByRole('alert').filter({hasText:'预演返回格式或版本不可用'}).waitFor();
+ proof.checks.push('bad JSON sends no IPC; backend error and unknown version keep inputs and never become a successful preview');
+ await page.evaluate(()=>{window.__previewVersion=1;});await jsonInput.fill(JSON.stringify({...shaped,model:'free'}));await button.click();await status().filter({hasText:'离线预演完成'}).waitFor();
+ assert.match(await panel.innerText(),/严格免费模式/);assert.match(await panel.innerText(),/不预测或消耗轮转次序/);assert.equal(await page.evaluate(()=>window.__previewSends),0);assert.equal(await page.evaluate(()=>window.__previewSettingsWrites),0);
+ proof.free_screenshot=await shot('request-preview-free-closed',panel);proof.checks.push('strict-free eligibility refusal remains visible with no draw prediction, model request or configuration write');
+ await page.evaluate(()=>{window.__previewRuntimeBlocked=true;});await jsonInput.fill(JSON.stringify({...shaped,model:'auto',stream:false}));await button.click();await status().filter({hasText:'离线预演完成'}).waitFor();
+ assert.match(await panel.innerText(),/账号运行时配置不存在、已停用或无效（未探测登录）/);assert.doesNotMatch(await panel.innerText(),/runtime_unavailable/);assert.equal(await page.evaluate(()=>window.__previewSends),0);
+ proof.runtime_screenshot=await shot('request-preview-runtime-refused',panel);proof.checks.push('local runtime configuration refusal is an exclusion, not a low score or fabricated login observation');
+ proof.passed=true;
+ }catch(e){proof.error=String(e?.stack||e);try{proof.failure_screenshot=await shot('request-preview-failure',page.getByTestId('request-preview-panel'));}catch(x){proof.screenshot_error=String(x);}throw e;}finally{fs.writeFileSync(path.join(output,'request-preview-proof.json'),JSON.stringify(proof,null,2));await context.close();}
+}
+module.exports={verifyRequestPreview};

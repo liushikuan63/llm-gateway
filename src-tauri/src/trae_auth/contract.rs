@@ -4,6 +4,26 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub(super) const ISSUER: &str = "https://api.trae.cn";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CnOrigin {
+    TraeCn,
+    TraeComCn,
+}
+impl CnOrigin {
+    pub(super) fn from_issuer(raw: &str) -> Result<Self, String> {
+        match raw {
+            ISSUER => Ok(Self::TraeCn),
+            "https://api.trae.com.cn" => Ok(Self::TraeComCn),
+            _ => Err("Trae认证来源无效".into()),
+        }
+    }
+    pub(super) fn issuer(self) -> &'static str {
+        match self {
+            Self::TraeCn => ISSUER,
+            Self::TraeComCn => "https://api.trae.com.cn",
+        }
+    }
+}
 pub(super) const CLIENT_ID: &str = "ono9krqynydwx5";
 pub(super) const VERSION: &str = "3.4.2";
 pub(super) const EXCHANGE: &str = "/trae/api/v3/oauth/ExchangeToken";

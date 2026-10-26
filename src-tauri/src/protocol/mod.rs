@@ -4,4 +4,6 @@ pub mod gemini;
 pub mod gemini_inbound;
 pub mod ollama;
 pub mod openai;
+pub(crate) mod reasoning;
 pub mod responses;
+pub(crate) mod strict_account;

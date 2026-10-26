@@ -29,12 +29,16 @@ use tokio::net::TcpListener;
 
 use crate::config::{AppConfig, AuthFailureMode, RoutingStrategy};
 
+#[path = "server_request_preview.rs"]
+mod request_preview;
+pub use request_preview::{RequestPreview, RequestPreviewInput};
+
 use crate::context::{
     estimate_message_tokens, scoped_session_id, trim_to_budget, ContextStore, ExchangeWrite,
 };
 use crate::db::{self, repo};
 use crate::domain::{
-    ChatRequest, Content, FunctionCall, ImageUrl, Message, ModelType, Part, Provider,
+    ChatRequest, Content, Dialect, FunctionCall, ImageUrl, Message, ModelType, Part, Provider,
     RemoteAccessKey, Role, ToolCall, Usage,
 };
 use crate::error::{GatewayError, Result};
@@ -104,8 +108,22 @@ async fn auto_disable_provider(state: &Arc<GatewayState>, provider_id: &str, pro
         );
     }
 }
+use crate::cost_policy::{CostGate, RequestCostPolicy};
 use crate::router::ratelimit::{Quota, RateLimiter};
 use crate::router::Router as GatewayRouter;
+
+#[path = "trae/gateway.rs"]
+mod native_exact;
+
+#[path = "server_audit_tasks.rs"]
+mod audit_tasks;
+#[path = "server_stream_audit.rs"]
+mod stream_audit;
+
+struct AccountWire {
+    options: super::upstream::RequestWireOptions,
+    permit: Option<Arc<crate::entitlement::dispatch::Permit>>,
+}
 
 /* ------------------------------ 共享状态 ------------------------------ */
 
@@ -121,8 +139,16 @@ pub struct ListenerSnapshot {
 }
 
 pub struct GatewayState {
+    pub(crate) trae: std::result::Result<Arc<crate::proxy::trae::TraeModelClient>, String>,
+    native_runtime_ids: parking_lot::RwLock<std::collections::HashSet<String>>,
     pub db: db::Db,
+    audit_tasks: Arc<audit_tasks::AuditTasks>,
     pub cfg: Arc<parking_lot::RwLock<AppConfig>>,
+    pub catalog: Arc<crate::model_catalog::maintenance::Manager>,
+    pub cost_gate: Arc<CostGate>,
+    pub personal_tests: Arc<crate::personal_test::Controller>,
+    pub search_resources: Arc<crate::search::resources::SearchResources>,
+    free_selector: crate::cost_policy::FreeSelector,
     pub health: Arc<HealthRegistry>,
     pub limiter: Arc<RateLimiter>,
     /// 远程访问 Key 的独立本地限流器，不与上游 Provider 配额混用。
@@ -159,9 +185,12 @@ pub struct GatewayState {
     /// 手动和自动奖励领取共享同一服务与持久幂等账本。
     pub benefits: Arc<crate::benefits::BenefitsCenter>,
     pub(crate) workbuddy_auth: std::result::Result<crate::workbuddy_auth::WorkBuddyAuth, String>,
+    pub(crate) workbuddy_cn_auth: std::result::Result<crate::workbuddy_auth::WorkBuddyAuth, String>,
     pub(crate) qoder_auth: std::result::Result<crate::qoder_auth::QoderAuth, String>,
     pub(crate) trae_auth: std::result::Result<crate::trae_auth::TraeAuth, String>,
     pub(crate) workbuddy:
+        std::result::Result<Arc<crate::proxy::workbuddy::WorkBuddyModelClient>, String>,
+    pub(crate) workbuddy_cn:
         std::result::Result<Arc<crate::proxy::workbuddy::WorkBuddyModelClient>, String>,
     pub(crate) qoder: std::result::Result<Arc<crate::proxy::qoder::QoderModelClient>, String>,
     /// 任务卡二 B5 判据 5：**网关侧**的配额账本。
@@ -179,18 +208,29 @@ pub struct GatewayState {
     pub agent_concurrency: Arc<parking_lot::Mutex<crate::agent_upstream::ConcurrencyGate>>,
 }
 
+fn validate_retained_account_reasoning(req: &ChatRequest, platform: &str) -> Result<()> {
+    if !req.extra.contains_key("reasoning") {
+        return Ok(());
+    }
+    match platform {
+        "WorkBuddy" => super::workbuddy::validate_request_controls(req),
+        "Qoder" => crate::qoder_auth::request::validate_retained_reasoning(req),
+        _ => crate::protocol::reasoning::validate_message_only(req),
+    }
+}
+
 fn account_effective_request(
     provider: &Provider,
     req: &ChatRequest,
     model: &str,
     platform: &str,
 ) -> Result<ChatRequest> {
+    // Validate the caller before configuration can erase an unsupported field.
+    // Validate the effective request again before account auth/catalog work.
+    validate_retained_account_reasoning(req, platform)?;
     let mut effective = req.clone();
-    if let Some(overrides) = provider
-        .models
-        .iter()
-        .find(|m| m.upstream == model)
-        .and_then(|m| m.overrides.as_ref())
+    if let Some(overrides) =
+        super::upstream::selected_model(model, provider).and_then(|m| m.overrides.clone())
     {
         overrides.validate().map_err(GatewayError::Protocol)?;
         if overrides
@@ -213,13 +253,286 @@ fn account_effective_request(
             .as_ref()
             .and_then(serde_json::Value::as_object)
         {
+            if let (Some(caller), Some(configured)) =
+                (req.extra.get("reasoning"), body.get("reasoning"))
+            {
+                if caller != configured {
+                    return Err(GatewayError::RequestControlUnavailable {
+                        reason: "账号直连 reasoning 与模型配置冲突，未覆盖调用方对象",
+                    });
+                }
+            }
+            if (req.extra.contains_key("reasoning") || body.contains_key("reasoning"))
+                && body.contains_key("thinking")
+            {
+                return Err(GatewayError::RequestControlUnavailable {
+                    reason: "账号模型的 thinking 配置不能与 Responses reasoning 对象混用",
+                });
+            }
+            if let (Some(caller), Some(configured)) = (
+                req.extra.get("reasoning_effort"),
+                body.get("reasoning_effort"),
+            ) {
+                if caller != configured {
+                    if req.extra.contains_key("reasoning") || body.contains_key("reasoning") {
+                        return Err(GatewayError::RequestControlUnavailable {
+                            reason: "账号直连 reasoning effort 与模型配置冲突",
+                        });
+                    }
+                    return Err(GatewayError::Protocol(
+                        "账号直连 reasoning_effort 与模型配置冲突".into(),
+                    ));
+                }
+            }
             effective.extra.extend(body.clone());
         }
     }
+    validate_retained_account_reasoning(&effective, platform)?;
     Ok(effective)
 }
 
+#[cfg(test)]
+mod account_effort_override_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn provider(body: Value) -> Provider {
+        let now = chrono::Utc::now();
+        serde_json::from_value(json!({
+            "id":"synthetic-account", "name":"synthetic-account", "dialect":"openai",
+            "base_url":"http://127.0.0.1:1", "api_key_enc":"", "enabled":true,
+            "priority":1,"rpm_limit":0,"intelligence":50,"created_at":now,"updated_at":now,
+            "models":[{"alias":"synthetic-alias","upstream":"synthetic-upstream",
+                "context_window":16384,"supports_tools":true,"supports_vision":false,
+                "supports_thinking":true,"supports_stream":true,
+                "overrides":{"temperature":0.25,"max_tokens":32,"extra_body":body}}]
+        }))
+        .unwrap()
+    }
+
+    fn request() -> ChatRequest {
+        serde_json::from_value(
+            json!({"model":"synthetic-alias","messages":[],"stream":false,
+            "temperature":0.75,"max_tokens":64,"extra_opaque":"caller"}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn account_effort_override_conflicts_cannot_erase_explicit_caller_values() {
+        for platform in ["WorkBuddy", "Qoder"] {
+            for (caller, configured) in [
+                (json!("low"), json!("high")),
+                (Value::Null, json!("low")),
+                (json!("low"), Value::Null),
+                (json!("low"), json!("LOW")),
+                (json!("low"), json!("low ")),
+                (json!({"synthetic-secret":true}), json!("low")),
+            ] {
+                let p = provider(json!({"reasoning_effort":configured}));
+                let mut req = request();
+                req.extra.insert("reasoning_effort".into(), caller);
+                let before = serde_json::to_value(&req).unwrap();
+                let result = account_effective_request(&p, &req, "synthetic-upstream", platform);
+                assert!(
+                    result.is_err(),
+                    "conflicting explicit effort was overwritten for {platform}"
+                );
+                let error = result.unwrap_err();
+                assert!(matches!(error, GatewayError::Protocol(_)));
+                let text = error.to_string();
+                assert!(!text.contains("synthetic-secret"));
+                assert!(!text.contains("synthetic-upstream"));
+                assert_eq!(serde_json::to_value(&req).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn account_effort_override_same_value_default_and_opaque_priority_are_preserved() {
+        for platform in ["WorkBuddy", "Qoder"] {
+            for caller in [None, Some(json!("low"))] {
+                let p = provider(json!({"reasoning_effort":"low","extra_opaque":"configured"}));
+                let mut req = request();
+                if let Some(value) = caller {
+                    req.extra.insert("reasoning_effort".into(), value);
+                }
+                let effective =
+                    account_effective_request(&p, &req, "synthetic-upstream", platform).unwrap();
+                assert_eq!(effective.extra["reasoning_effort"], "low");
+                assert_eq!(effective.extra["extra_opaque"], "configured");
+                assert_eq!(effective.temperature, Some(0.25));
+                assert_eq!(effective.max_tokens, Some(32));
+            }
+            let p = provider(json!({"extra_opaque":"configured"}));
+            let mut req = request();
+            req.extra.insert("reasoning_effort".into(), json!("high"));
+            let effective =
+                account_effective_request(&p, &req, "synthetic-upstream", platform).unwrap();
+            assert_eq!(effective.extra["reasoning_effort"], "high");
+            let unchanged =
+                account_effective_request(&p, &req, "different-upstream", platform).unwrap();
+            assert_eq!(
+                serde_json::to_value(unchanged).unwrap(),
+                serde_json::to_value(req).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_account_review_override_cannot_erase_caller_contract() {
+        for platform in ["WorkBuddy", "Qoder"] {
+            for (caller, configured) in [
+                (
+                    json!({"effort":"high","summary":"auto"}),
+                    json!({"reasoning":{"effort":"low"}}),
+                ),
+                (
+                    json!({"effort":"high"}),
+                    json!({"reasoning":{"effort":"low"}}),
+                ),
+                (json!({"effort":"high"}), json!({"reasoning_effort":"low"})),
+                (
+                    json!({"effort":"high"}),
+                    json!({"thinking":{"effort":"low"}}),
+                ),
+            ] {
+                let mut req = request();
+                req.extra.insert("reasoning".into(), caller);
+                let before = serde_json::to_value(&req).unwrap();
+                let error = account_effective_request(
+                    &provider(configured),
+                    &req,
+                    "synthetic-upstream",
+                    platform,
+                )
+                .map(|_| ())
+                .expect_err("caller controls cannot be erased");
+                assert!(matches!(
+                    error,
+                    GatewayError::RequestControlUnavailable { .. }
+                ));
+                assert_eq!(error.http_status(), StatusCode::BAD_REQUEST);
+                assert!(!error.retryable());
+                assert!(crate::proxy::upstream::is_local_request_policy_rejection(
+                    &error,
+                    Default::default()
+                ));
+                assert_eq!(serde_json::to_value(&req).unwrap(), before);
+            }
+            let mut req = request();
+            req.extra
+                .insert("reasoning".into(), json!({"effort":"high"}));
+            let effective = account_effective_request(
+                &provider(json!({"reasoning":{"effort":"high"}})),
+                &req,
+                "synthetic-upstream",
+                platform,
+            )
+            .unwrap();
+            assert_eq!(effective.extra["reasoning"], req.extra["reasoning"]);
+            for carrier in ["reasoning_effort", "thinking"] {
+                let mut req = request();
+                if carrier == "thinking" {
+                    req.thinking = Some(json!({"effort":"low"}));
+                } else {
+                    req.extra.insert(carrier.into(), json!("low"));
+                }
+                let error = account_effective_request(
+                    &provider(json!({"reasoning":{"effort":"high"}})),
+                    &req,
+                    "synthetic-upstream",
+                    platform,
+                )
+                .unwrap_err();
+                assert!(matches!(
+                    error,
+                    GatewayError::RequestControlUnavailable { .. }
+                ));
+                assert!(!error.retryable());
+                assert!(crate::proxy::upstream::is_local_request_policy_rejection(
+                    &error,
+                    Default::default()
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_account_review_exact_alias_empty_override_is_authoritative() {
+        for platform in ["WorkBuddy", "Qoder"] {
+            for configured in [false, true] {
+                let mut p =
+                    provider(json!({"reasoning_effort":"low","extra_opaque":"wrong-sibling"}));
+                let mut selected = p.models[0].clone();
+                selected.alias = "owned-selected-alias".into();
+                selected.overrides = if configured {
+                    Some(
+                        serde_json::from_value(json!({"temperature":0.5,"max_tokens":48,
+                        "extra_body":{"reasoning_effort":"high","extra_opaque":"selected"}}))
+                        .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                p.models.push(selected.clone());
+                let mut req = request();
+                req.extra
+                    .insert("reasoning".into(), json!({"effort":"high"}));
+                crate::proxy::dispatch_target::scope(p.id.clone(), selected, || async {
+                    tokio::task::yield_now().await;
+                    let effective =
+                        account_effective_request(&p, &req, "synthetic-upstream", platform)
+                            .unwrap();
+                    assert_eq!(effective.extra["reasoning"], req.extra["reasoning"]);
+                    assert_eq!(
+                        effective.extra["extra_opaque"],
+                        if configured { "selected" } else { "caller" }
+                    );
+                    assert_eq!(
+                        effective.temperature,
+                        Some(if configured { 0.5 } else { 0.75 })
+                    );
+                    assert_eq!(effective.max_tokens, Some(if configured { 48 } else { 64 }));
+                    if configured {
+                        assert_eq!(effective.extra["reasoning_effort"], "high");
+                    } else {
+                        assert!(!effective.extra.contains_key("reasoning_effort"));
+                    }
+                })
+                .await;
+            }
+        }
+    }
+}
+
 impl GatewayState {
+    pub(crate) fn workbuddy_client(
+        &self,
+        region: crate::workbuddy_auth::WorkBuddyRegion,
+    ) -> std::result::Result<&Arc<crate::proxy::workbuddy::WorkBuddyModelClient>, String> {
+        match region {
+            crate::workbuddy_auth::WorkBuddyRegion::Global => self.workbuddy.as_ref(),
+            crate::workbuddy_auth::WorkBuddyRegion::Cn => self.workbuddy_cn.as_ref(),
+        }
+        .map_err(Clone::clone)
+    }
+
+    fn bound_workbuddy_client(
+        &self,
+        region: crate::workbuddy_auth::WorkBuddyRegion,
+        provider: &Provider,
+    ) -> Result<&Arc<crate::proxy::workbuddy::WorkBuddyModelClient>> {
+        if provider.base_url != crate::workbuddy_auth::WorkBuddyAuth::issuer_for_region(region)
+            || !provider.api_key_enc.is_empty()
+        {
+            return Err(GatewayError::Protocol(
+                "WorkBuddy运行时与供应商区域或凭据类型不一致".into(),
+            ));
+        }
+        self.workbuddy_client(region)
+            .map_err(GatewayError::Protocol)
+    }
     pub(crate) async fn call_chat_upstream(
         &self,
         provider: &Provider,
@@ -228,28 +541,149 @@ impl GatewayState {
         timeout: Duration,
         defaults: &crate::config::OllamaOptionsConfig,
     ) -> Result<crate::domain::ChatResponse> {
+        self.call_chat_upstream_with_options(
+            provider,
+            req,
+            model,
+            timeout,
+            defaults,
+            Default::default(),
+        )
+        .await
+    }
+
+    async fn account_permit(
+        &self,
+        provider: &Provider,
+        model: &str,
+        options: super::upstream::RequestWireOptions,
+    ) -> Result<Option<Arc<crate::entitlement::dispatch::Permit>>> {
+        if provider.runtime_id.is_none() || !self.cost_gate.effective(options.cost_policy).is_free()
+        {
+            return Ok(None);
+        }
+        let purpose = if options.entitlement_purpose.is_empty() {
+            "chat"
+        } else {
+            options.entitlement_purpose
+        };
+        self.cost_gate
+            .accounts
+            .reserve(provider, model, purpose)
+            .await
+            .map(Some)
+    }
+    async fn call_chat_upstream_with_options(
+        &self,
+        provider: &Provider,
+        req: &ChatRequest,
+        model: &str,
+        timeout: Duration,
+        defaults: &crate::config::OllamaOptionsConfig,
+        options: super::upstream::RequestWireOptions,
+    ) -> Result<crate::domain::ChatResponse> {
+        if crate::budget::holds::active() && provider.runtime_id.is_some() {
+            return Err(crate::budget::holds::rejected(
+                "account_budget_contract_unverified",
+            ));
+        }
+        let personal = crate::personal_test::current();
+        if let Some(ctx) = &personal {
+            ctx.before_agent(self, provider, provider.runtime_id.as_deref().unwrap_or(""))
+                .await
+                .map_err(|e| GatewayError::Protocol(e).no_replay())?;
+        }
+        let permit = self.account_permit(provider, model, options).await?;
+        let result = self
+            .call_chat_upstream_inner(
+                provider,
+                req,
+                model,
+                timeout,
+                defaults,
+                AccountWire {
+                    options,
+                    permit: permit.clone(),
+                },
+            )
+            .await;
+        let result = match (result, permit) {
+            (Err(error), Some(permit)) => Err(permit.failed(error).await),
+            (result, _) => result,
+        };
+        if personal.is_some() {
+            result.map_err(GatewayError::no_replay)
+        } else {
+            result
+        }
+    }
+    async fn call_chat_upstream_inner(
+        &self,
+        provider: &Provider,
+        req: &ChatRequest,
+        model: &str,
+        timeout: Duration,
+        defaults: &crate::config::OllamaOptionsConfig,
+        wire: AccountWire,
+    ) -> Result<crate::domain::ChatResponse> {
+        let AccountWire { options, permit } = wire;
+        if provider.runtime_id.is_some()
+            && self.cost_gate.effective(options.cost_policy).is_free()
+            && permit.is_none()
+        {
+            return Err(crate::cost_policy::rejected(
+                "account_hard_stop_and_reservation_unverified",
+            ));
+        }
+        let tps_source = self.health.tps_lease(provider, model);
         let started = Instant::now();
         let result = if let Some(runtime_id) = provider.runtime_id.as_deref() {
-            match crate::agent_upstream::runtime::resolve_chat_runtime(
+            let runtime = crate::agent_upstream::runtime::resolve_chat_runtime(
                 self.db.pool(),
                 &self.adapters,
                 runtime_id,
             )
             .await
-            .map_err(|kind| GatewayError::CapabilityUnavailable { kind })?
+            .map_err(|kind| GatewayError::CapabilityUnavailable { kind })?;
+            if permit.is_some()
+                && !matches!(
+                    &runtime,
+                    crate::agent_upstream::runtime::ChatRuntime::Qoder { .. }
+                        | crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { .. }
+                )
             {
+                return Err(crate::cost_policy::rejected(
+                    "account_entitlement_transport_unverified",
+                ));
+            }
+            if self.cost_gate.effective(options.cost_policy).is_free() && permit.is_none() {
+                return Err(crate::cost_policy::rejected(
+                    "account_hard_stop_and_reservation_unverified",
+                ));
+            }
+            match runtime {
                 crate::agent_upstream::runtime::ChatRuntime::WorkBuddy {
+                    region,
                     account_id,
                     aliases,
                     ..
                 } => {
-                    let client = self
-                        .workbuddy
-                        .as_ref()
-                        .map_err(|e| GatewayError::Protocol(e.clone()))?;
+                    let client = self.bound_workbuddy_client(region, provider)?;
                     let effective = account_effective_request(provider, req, model, "WorkBuddy")?;
                     let model = aliases.get(model).map(String::as_str).unwrap_or(model);
-                    client.call(&account_id, &effective, model, timeout).await
+                    if permit.is_some() {
+                        client
+                            .call_with_entitlement(
+                                &account_id,
+                                &effective,
+                                model,
+                                timeout,
+                                permit.clone(),
+                            )
+                            .await
+                    } else {
+                        client.call(&account_id, &effective, model, timeout).await
+                    }
                 }
                 crate::agent_upstream::runtime::ChatRuntime::Qoder {
                     region,
@@ -263,11 +697,25 @@ impl GatewayState {
                         .map_err(|e| GatewayError::Protocol(e.clone()))?;
                     let effective = account_effective_request(provider, req, model, "Qoder")?;
                     let model = aliases.get(model).map(String::as_str).unwrap_or(model);
-                    client
-                        .call(region, &account_id, &effective, model, timeout)
-                        .await
+                    if permit.is_some() {
+                        client
+                            .call_with_entitlement(
+                                region,
+                                &account_id,
+                                &effective,
+                                model,
+                                timeout,
+                                permit.clone(),
+                            )
+                            .await
+                    } else {
+                        client
+                            .call(region, &account_id, &effective, model, timeout)
+                            .await
+                    }
                 }
                 crate::agent_upstream::runtime::ChatRuntime::Agent(_) => {
+                    crate::protocol::reasoning::validate_message_only(req)?;
                     crate::agent_upstream::call_agent_with_runtime(
                         self.db.pool(),
                         &self.adapters,
@@ -278,10 +726,15 @@ impl GatewayState {
                     )
                     .await
                 }
+                crate::agent_upstream::runtime::ChatRuntime::Trae { .. } => {
+                    return Err(GatewayError::CapabilityUnavailable {
+                        kind: "native_exact_requires_openai_raw_ingress".into(),
+                    });
+                }
             }
         } else {
             self.upstream
-                .call(provider, req, model, timeout, defaults)
+                .call_with_options(provider, req, model, timeout, defaults, options)
                 .await
         };
         if let Ok(response) = &result {
@@ -289,7 +742,7 @@ impl GatewayState {
             self.health.record_success(&provider.id, model, elapsed);
             if let Some(usage) = &response.usage {
                 self.health
-                    .record_tps(&provider.id, model, usage.completion_tokens, elapsed);
+                    .record_bound_tps(tps_source.as_ref(), usage.completion_tokens, elapsed);
                 self.limiter
                     .record_tokens(&format!("{}::{model}", provider.id), usage.total_tokens);
             }
@@ -304,31 +757,101 @@ impl GatewayState {
         model: &str,
         timeout: Duration,
         defaults: &crate::config::OllamaOptionsConfig,
+        options: super::upstream::RequestWireOptions,
     ) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<UpstreamEvent>> + Send>>>
     {
+        if crate::budget::holds::active() && provider.runtime_id.is_some() {
+            return Err(crate::budget::holds::rejected(
+                "account_budget_contract_unverified",
+            ));
+        }
+        let permit = self.account_permit(provider, model, options).await?;
+        let result = self
+            .call_chat_upstream_stream_inner(
+                provider,
+                req,
+                model,
+                timeout,
+                defaults,
+                AccountWire {
+                    options,
+                    permit: permit.clone(),
+                },
+            )
+            .await;
+        match (result, permit) {
+            (Err(error), Some(permit)) => Err(permit.failed(error).await),
+            (result, _) => result,
+        }
+    }
+    async fn call_chat_upstream_stream_inner(
+        &self,
+        provider: &Provider,
+        req: &ChatRequest,
+        model: &str,
+        timeout: Duration,
+        defaults: &crate::config::OllamaOptionsConfig,
+        wire: AccountWire,
+    ) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<UpstreamEvent>> + Send>>>
+    {
+        let AccountWire { options, permit } = wire;
+        if provider.runtime_id.is_some()
+            && self.cost_gate.effective(options.cost_policy).is_free()
+            && permit.is_none()
+        {
+            return Err(crate::cost_policy::rejected(
+                "account_hard_stop_and_reservation_unverified",
+            ));
+        }
         if let Some(id) = provider.runtime_id.as_deref() {
-            match crate::agent_upstream::runtime::resolve_chat_runtime(
+            let runtime = crate::agent_upstream::runtime::resolve_chat_runtime(
                 self.db.pool(),
                 &self.adapters,
                 id,
             )
             .await
-            .map_err(|kind| GatewayError::CapabilityUnavailable { kind })?
+            .map_err(|kind| GatewayError::CapabilityUnavailable { kind })?;
+            if permit.is_some()
+                && !matches!(
+                    &runtime,
+                    crate::agent_upstream::runtime::ChatRuntime::Qoder { .. }
+                        | crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { .. }
+                )
             {
+                return Err(crate::cost_policy::rejected(
+                    "account_entitlement_transport_unverified",
+                ));
+            }
+            if self.cost_gate.effective(options.cost_policy).is_free() && permit.is_none() {
+                return Err(crate::cost_policy::rejected(
+                    "account_hard_stop_and_reservation_unverified",
+                ));
+            }
+            match runtime {
                 crate::agent_upstream::runtime::ChatRuntime::WorkBuddy {
+                    region,
                     account_id,
                     aliases,
                     ..
                 } => {
-                    let client = self
-                        .workbuddy
-                        .as_ref()
-                        .map_err(|e| GatewayError::Protocol(e.clone()))?;
+                    let client = self.bound_workbuddy_client(region, provider)?;
                     let effective = account_effective_request(provider, req, model, "WorkBuddy")?;
                     let model = aliases.get(model).map(String::as_str).unwrap_or(model);
-                    return client
-                        .call_stream(&account_id, &effective, model, timeout)
-                        .await;
+                    return if permit.is_some() {
+                        client
+                            .call_stream_with_entitlement(
+                                &account_id,
+                                &effective,
+                                model,
+                                timeout,
+                                permit.clone(),
+                            )
+                            .await
+                    } else {
+                        client
+                            .call_stream(&account_id, &effective, model, timeout)
+                            .await
+                    };
                 }
                 crate::agent_upstream::runtime::ChatRuntime::Qoder {
                     region,
@@ -342,9 +865,22 @@ impl GatewayState {
                         .map_err(|e| GatewayError::Protocol(e.clone()))?;
                     let effective = account_effective_request(provider, req, model, "Qoder")?;
                     let model = aliases.get(model).map(String::as_str).unwrap_or(model);
-                    return client
-                        .call_stream(region, &account_id, &effective, model, timeout)
-                        .await;
+                    return if permit.is_some() {
+                        client
+                            .call_stream_with_entitlement(
+                                region,
+                                &account_id,
+                                &effective,
+                                model,
+                                timeout,
+                                permit.clone(),
+                            )
+                            .await
+                    } else {
+                        client
+                            .call_stream(region, &account_id, &effective, model, timeout)
+                            .await
+                    };
                 }
                 _ => {
                     return Err(GatewayError::CapabilityUnavailable {
@@ -354,8 +890,21 @@ impl GatewayState {
             }
         }
         self.upstream
-            .call_stream(provider, req, model, timeout, defaults)
+            .call_stream_with_options(provider, req, model, timeout, defaults, options)
             .await
+    }
+    pub(crate) fn audit_tasks(&self) -> Arc<audit_tasks::AuditTasks> {
+        self.audit_tasks.clone()
+    }
+    pub(crate) fn audit_failure(&self) -> Option<String> {
+        self.audit_tasks.failure()
+    }
+    pub(crate) async fn drain_audits(&self, deadline: Duration) -> std::result::Result<(), String> {
+        let (audits, sources) = tokio::join!(
+            self.audit_tasks.drain(deadline),
+            self.search_resources.drain_source_writes(deadline)
+        );
+        audits.and(sources)
     }
     pub fn new(db: db::Db, cfg: AppConfig) -> Self {
         let health = Arc::new(HealthRegistry::new());
@@ -373,13 +922,27 @@ impl GatewayState {
         upstream.set_proxy(cfg.http_proxy.as_deref());
         let benefits = Arc::new(crate::benefits::BenefitsCenter::new(db.pool().clone()));
         let workbuddy_auth = crate::workbuddy_auth::WorkBuddyAuth::new(db.pool().clone(), None);
+        let workbuddy_cn_auth = crate::workbuddy_auth::WorkBuddyAuth::new_for_region(
+            db.pool().clone(),
+            None,
+            crate::workbuddy_auth::WorkBuddyRegion::Cn,
+        );
         let qoder_auth = crate::qoder_auth::QoderAuth::new(db.pool().clone(), None);
         let trae_auth =
             crate::trae_auth::TraeAuth::new(db.pool().clone(), cfg.http_proxy.as_deref());
+        let trae = trae_auth
+            .clone()
+            .map(|auth| Arc::new(crate::proxy::trae::TraeModelClient::new(auth)));
         let workbuddy = workbuddy_auth
             .clone()
             .map(|auth| Arc::new(crate::proxy::workbuddy::WorkBuddyModelClient::new(auth)));
+        let workbuddy_cn = workbuddy_cn_auth
+            .clone()
+            .map(|auth| Arc::new(crate::proxy::workbuddy::WorkBuddyModelClient::new(auth)));
         if let Ok(client) = &workbuddy {
+            client.set_proxy(cfg.http_proxy.as_deref());
+        }
+        if let Ok(client) = &workbuddy_cn {
             client.set_proxy(cfg.http_proxy.as_deref());
         }
         let qoder = qoder_auth
@@ -389,9 +952,28 @@ impl GatewayState {
             client.set_proxy(cfg.http_proxy.as_deref());
         }
 
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let catalog = Arc::new(crate::model_catalog::maintenance::Manager::new(
+            db.clone(),
+            cfg.clone(),
+        ));
+        let cost_gate = Arc::new(CostGate::new(db.clone(), cfg.clone()));
+        upstream.set_cost_gate(cost_gate.clone());
+        let search_resources = Arc::new(crate::search::resources::SearchResources::with_database(
+            cfg.read().search.clone(),
+            db.clone(),
+        ));
         Self {
+            trae,
+            native_runtime_ids: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            audit_tasks: Arc::new(audit_tasks::AuditTasks::default()),
             db,
-            cfg: Arc::new(parking_lot::RwLock::new(cfg)),
+            cfg,
+            catalog,
+            cost_gate,
+            personal_tests: Arc::new(crate::personal_test::Controller::default()),
+            search_resources,
+            free_selector: Default::default(),
             health,
             limiter,
             client_limiter: Arc::new(RateLimiter::new()),
@@ -399,9 +981,11 @@ impl GatewayState {
             upstream,
             benefits,
             workbuddy_auth,
+            workbuddy_cn_auth,
             qoder_auth,
             trae_auth,
             workbuddy,
+            workbuddy_cn,
             qoder,
             ctx,
             cache,
@@ -429,6 +1013,83 @@ impl GatewayState {
         self.listener_snapshot.read().clone()
     }
 
+    /// Read-only preview shares current fee facts, sample threshold and local
+    /// quota weight with dispatch. It never advances turns or acquires a permit.
+    pub async fn explain_routing(
+        &self,
+        requested: &str,
+    ) -> Result<Vec<crate::router::CandidateExplanation>> {
+        let cfg = self.cfg_snapshot();
+        let providers = repo::list_providers(self.db.pool()).await?;
+        let policy = RequestCostPolicy::resolve(&cfg, requested);
+        let mut rows = match self.router.explain_candidates(&providers, &cfg, requested) {
+            Ok(rows) => rows,
+            Err(GatewayError::ModelNotFound(_)) if policy.is_free() => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        if !policy.is_free() {
+            return Ok(rows);
+        }
+        for row in &mut rows {
+            let target = providers
+                .iter()
+                .find(|p| p.id == row.provider_id)
+                .and_then(|p| {
+                    p.models
+                        .iter()
+                        .find(|m| m.alias == row.model && m.upstream == row.upstream)
+                        .map(|m| (p, m))
+                });
+            let (fee, weight) = if let Some((p, m)) = target {
+                (
+                    repo::catalog::free_eligibility_checked(self.db.pool(), p, m, || {
+                        chrono::Utc::now().timestamp_millis()
+                    })
+                    .await?,
+                    crate::cost_policy::FreeSelector::weight(
+                        &self.health.get(&p.id, &m.upstream),
+                        self.router.quota_headroom(p, m),
+                    ),
+                )
+            } else {
+                (
+                    repo::catalog::FreeEligibility {
+                        eligible: false,
+                        reason: "empty_provider_fee_unknown".into(),
+                        observed_at: None,
+                        expires_at: None,
+                    },
+                    crate::cost_policy::FreeSelector::weight(
+                        &self.health.get(&row.provider_id, &row.upstream),
+                        0.0,
+                    ),
+                )
+            };
+            if !fee.eligible {
+                row.eligible = false;
+                row.ineligible_reason = Some(crate::cost_policy::reason_label(&fee.reason).into());
+            }
+            if self.cost_gate.is_inflight(&row.provider_id, &row.upstream) {
+                row.eligible = false;
+                row.ineligible_reason =
+                    Some(crate::cost_policy::reason_label("free_qualified_models_busy").into());
+            }
+            row.score = if row.eligible {
+                weight.value as f32
+            } else {
+                0.0
+            };
+            row.free_weight = Some(weight);
+            row.free_eligibility = Some(fee);
+        }
+        rows.sort_by(|a, b| {
+            b.eligible
+                .cmp(&a.eligible)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
+        Ok(rows)
+    }
+
     pub async fn reload_providers(&self) -> Result<()> {
         // 走 routable 变体：路由表里只放**已启用**的模型。
         //
@@ -439,9 +1100,17 @@ impl GatewayState {
         // 撑不过一次保存。
         let list = repo::list_routable_providers(self.db.pool()).await?;
         let remote_keys = repo::list_remote_access_keys(self.db.pool()).await?;
+        let native_ids = repo::list_agent_runtimes(self.db.pool())
+            .await?
+            .into_iter()
+            .filter(|r| r.kind == "trae-model")
+            .map(|r| r.id)
+            .collect();
         // 发布路由与缓存失效时阻止配置/代次快照交叉读取。
         let _cfg_guard = self.cfg.write();
+        self.health.sync_tps_sources(&list);
         *self.providers.write() = list;
+        *self.native_runtime_ids.write() = native_ids;
         *self.remote_access_keys.write() = remote_keys;
 
         // 缓存失效挂在这里，而不是散在各个命令里。
@@ -485,17 +1154,43 @@ impl GatewayState {
     pub fn cfg_snapshot(&self) -> AppConfig {
         self.cfg.read().clone()
     }
+    fn legacy_providers(&self) -> Vec<Provider> {
+        let native = self.native_runtime_ids.read();
+        self.providers
+            .read()
+            .iter()
+            .filter(|p| !p.runtime_id.as_ref().is_some_and(|id| native.contains(id)))
+            .cloned()
+            .collect()
+    }
+    pub(crate) fn is_native_runtime(&self, id: &str) -> bool {
+        self.native_runtime_ids.read().contains(id)
+    }
 
     /// 配置热更新的共同入口；同步路由规则并清除旧响应缓存。
     pub fn update_cfg(&self, cfg: AppConfig) {
         let mut current = self.cfg.write();
+        if current.search != cfg.search {
+            self.search_resources.reconfigure(&cfg.search);
+        }
+        if current.catalog_maintenance != cfg.catalog_maintenance
+            || current.http_proxy != cfg.http_proxy
+        {
+            self.catalog.configuration_changed();
+        }
         self.router.set_custom_rules(cfg.custom_rules.clone());
         self.upstream.set_proxy(cfg.http_proxy.as_deref());
         if let Ok(client) = &self.workbuddy {
             client.set_proxy(cfg.http_proxy.as_deref());
         }
+        if let Ok(client) = &self.workbuddy_cn {
+            client.set_proxy(cfg.http_proxy.as_deref());
+        }
         if let Ok(client) = &self.qoder {
             client.set_proxy(cfg.http_proxy.as_deref());
+        }
+        if let Ok(auth) = &self.trae_auth {
+            auth.set_proxy(cfg.http_proxy.as_deref());
         }
         self.cache.reconfigure(&cfg.cache);
         // 去重配置热更新：条目里存的是「上一次的执行结果」，
@@ -520,6 +1215,7 @@ impl GatewayState {
         self: &Arc<Self>,
         session_id: &str,
         force: bool,
+        policy: RequestCostPolicy,
     ) -> Result<bool> {
         let _guard = self.compaction_lock.lock().await;
         let cfg = self.cfg_snapshot();
@@ -535,7 +1231,11 @@ impl GatewayState {
             .compact(&session, &cfg, move |messages| {
                 let summary_state = summary_state.clone();
                 let previous_summary = previous_summary.clone();
-                async move { summary_state.summarize(messages, &previous_summary).await }
+                async move {
+                    summary_state
+                        .summarize_with_policy(messages, &previous_summary, policy)
+                        .await
+                }
             })
             .await?;
         Ok(compacted.is_some())
@@ -617,6 +1317,33 @@ mod tests {
 /* ------------------------------ 服务启动 ------------------------------ */
 
 pub async fn serve(state: Arc<GatewayState>) -> Result<()> {
+    serve_inner(state, &mut None, None).await
+}
+
+/// Reports readiness only after this task owns a successfully bound listener.
+/// Startup errors are delivered directly; another process's healthz is irrelevant.
+pub(crate) async fn serve_ready(
+    state: Arc<GatewayState>,
+    ready: tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    let mut ready = Some(ready);
+    let result = serve_inner(state, &mut ready, Some(shutdown)).await;
+    if let Some(ready) = ready {
+        let error = match &result {
+            Err(error) => error.to_string(),
+            Ok(()) => "网关服务在确认监听前已结束".to_owned(),
+        };
+        let _ = ready.send(Err(error));
+    }
+    result
+}
+
+async fn serve_inner(
+    state: Arc<GatewayState>,
+    ready: &mut Option<tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>>,
+    shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<()> {
     let cfg = state.cfg_snapshot();
     cfg.validate_remote_mode().map_err(GatewayError::Other)?;
     if cfg.remote_mode.enabled
@@ -692,27 +1419,46 @@ pub async fn serve(state: Arc<GatewayState>) -> Result<()> {
         remote_mode_enabled: cfg.remote_mode.enabled,
         remote_public_url: cfg.remote_mode.public_url.clone(),
     });
-    let _lifetime = ListenerLifetime(state.clone());
+    let _lifetime = ListenerLifetime(state.clone(), bound_addr);
     state
         .listener_is_loopback
         .store(is_loopback, Ordering::Release);
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(bound_addr));
+    }
     tracing::info!("LLM Gateway 已启动: http://{addr}");
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(|e| GatewayError::Other(e.into()))?;
+    );
+    let result = if let Some(shutdown) = shutdown {
+        server
+            .with_graceful_shutdown(async move {
+                // Sender loss also shuts down an owned service. Axum signals
+                // accepted connections to disable keepalive before draining.
+                let _ = shutdown.await;
+            })
+            .await
+    } else {
+        server.await
+    };
+    result.map_err(|e| GatewayError::Other(e.into()))?;
     Ok(())
 }
 
 /// Cancellation and listener shutdown both invalidate the diagnostic snapshot.
-struct ListenerLifetime(Arc<GatewayState>);
+struct ListenerLifetime(Arc<GatewayState>, SocketAddr);
 
 impl Drop for ListenerLifetime {
     fn drop(&mut self) {
-        *self.0.listener_snapshot.write() = None;
-        self.0.listener_is_loopback.store(false, Ordering::Release);
+        let mut snapshot = self.0.listener_snapshot.write();
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.bound_addr == self.1)
+        {
+            *snapshot = None;
+            self.0.listener_is_loopback.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -735,6 +1481,7 @@ async fn auth(
     }
 
     let cfg = state.cfg_snapshot();
+    let mut budget_request = None;
     // 只信任来自回环地址的转发头。即使用户刚关闭远程模式，仍要识别旧
     // 反代送来的 `X-Forwarded-For`，否则它会在重启前被误判成“本机请求”。
     let proxied_client = peer.ip().is_loopback() && forwarded_client_ip(req.headers()).is_some();
@@ -833,29 +1580,21 @@ async fn auth(
         // 消费，把拒绝也写进去会让「本月花了多少」被自己的拒绝记录污染。
         if cfg.budget.enabled && key.monthly_budget_micros > 0 {
             let since = crate::budget::month_start_secs(chrono::Utc::now().timestamp());
-            // 已知边界（卡片要求在注释里写明，不引数据库锁）：判定与记账之间
-            // 有窗口，并发请求可能同时观察到同一份「未超」的累计值，
-            // 于是极小概率超支一次。真要严格就用 requests 自增 id 做乐观扣减，
-            // 那要事务；本卡按卡片口径接受这个窗口。
-            let spent_rows =
-                match repo::sum_cost_by_currency_for_key(state.db.pool(), &key.id, since).await {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        tracing::error!("预算账本读取失败，暂停受预算约束的请求: {error}");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            Json(serde_json::json!({
-                                "error": {
-                                    "message": "暂时无法读取预算账本，请稍后重试或检查本机诊断",
-                                    "type": "server_error",
-                                    "code": "budget_unavailable",
-                                }
-                            })),
-                        )
-                            .into_response();
-                    }
-                };
-            let used = crate::budget::spent_in_currency(&spent_rows, &key.budget_currency);
+            // Cheap early rejection only. Final HTTP send performs its own
+            // serialized durable reservation; this read never grants money.
+            let used = match crate::budget::holds::used_for_auth(
+                state.db.pool(),
+                &key.id,
+                since,
+                &key.budget_currency,
+            )
+            .await
+            {
+                Ok(used) => used,
+                Err(error) => {
+                    return error_response(&error);
+                }
+            };
             if let crate::budget::GateDecision::BudgetExceeded {
                 used,
                 limit,
@@ -886,6 +1625,9 @@ async fn auth(
             }
         }
 
+        if cfg.budget.enabled && key.monthly_budget_micros > 0 {
+            budget_request = Some(crate::budget::holds::request(&state, key.clone()));
+        }
         AuthContext {
             client: Some(format!("remote-key:{}", key.id)),
         }
@@ -899,7 +1641,18 @@ async fn auth(
     };
 
     req.extensions_mut().insert(context);
-    next.run(req).await
+    if let Some(budget) = budget_request {
+        let response = crate::budget::holds::scope(budget.clone(), next.run(req)).await;
+        let (parts, body) = response.into_parts();
+        let mut body = body.into_data_stream();
+        let stream = async_stream::stream! {
+            use futures_util::StreamExt;
+            while let Some(chunk) = crate::budget::holds::scope(budget.clone(), body.next()).await { yield chunk; }
+        };
+        Response::from_parts(parts, axum::body::Body::from_stream(stream))
+    } else {
+        next.run(req).await
+    }
 }
 
 fn remote_proxy_unavailable_response(message: &str) -> Response {
@@ -1111,7 +1864,29 @@ async fn gw_agent_run(
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<AgentRunRequest>,
 ) -> Response {
+    // CLI/account execution has no verified hard stop or atomic balance
+    // reservation. Reject before runtime resolution, quota consumption or spawn.
+    let policy = RequestCostPolicy::resolve(&state.cfg_snapshot(), &req.model);
+    if state.cost_gate.effective(policy).is_free() {
+        return error_response(&crate::cost_policy::rejected(
+            "account_hard_stop_and_reservation_unverified",
+        ));
+    }
+    match repo::get_agent_runtime(state.db.pool(), &req.runtime).await {
+        Ok(Some(runtime)) if runtime.kind == "trae-model" => {
+            return native_exact::caller_error(
+                "native_exact_does_not_allow_agent_or_probe_execution",
+            )
+        }
+        Err(_) => return native_exact::caller_error("native_runtime_read_failed"),
+        _ => (),
+    }
     let cfg = state.cfg_snapshot();
+    if state.cost_gate.effective(policy).is_free() {
+        return error_response(&crate::cost_policy::rejected(
+            "account_hard_stop_and_reservation_unverified",
+        ));
+    }
     let started = Instant::now();
 
     // ===== B5 判据 5：**网关自己的**配额，判定 + 记账同一个临界区 =====
@@ -1162,13 +1937,20 @@ async fn gw_agent_run(
             .into_response();
     }
 
-    let outcome = crate::agent_upstream::run_agent_request_with_runtime(
+    let outcome = crate::agent_upstream::run_agent_request_with_runtime_checked(
         state.db.pool(),
         &cfg.agent,
         &state.adapters,
         &req.runtime,
         &req.model,
         &req.prompt,
+        || {
+            if state.cost_gate.effective(policy).is_free() {
+                Err("account_hard_stop_and_reservation_unverified".into())
+            } else {
+                Ok(())
+            }
+        },
     )
     .await;
     // **必须与上面的 `try_enter` 配对。** 漏掉这一句的后果是
@@ -1176,6 +1958,11 @@ async fn gw_agent_run(
     // 它紧跟 `.await` 之后、在任何 `return` 之前，就是为了让「配对」
     // 这件事在代码里是**看得见的**。
     state.agent_concurrency.lock().leave();
+    if outcome.is_err() && state.cost_gate.effective(policy).is_free() {
+        return error_response(&crate::cost_policy::rejected(
+            "account_hard_stop_and_reservation_unverified",
+        ));
+    }
     let latency_ms = started.elapsed().as_millis() as u64;
 
     // ===== 审计：`route_intent = "agent"` + 产物清单（卡片 A8 要求）=====
@@ -1239,6 +2026,7 @@ async fn gw_agent_run(
     )
     .await
     {
+        state.audit_tasks().record_failure();
         tracing::warn!("Agent 执行的审计写入失败：{e}");
     }
 
@@ -1266,9 +2054,31 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    match native_exact::resolve(
+        &state,
+        body.get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto"),
+    )
+    .await
+    {
+        Ok(Some(selected)) => {
+            return native_exact::dispatch_native_exact(
+                state,
+                selected,
+                body,
+                &headers,
+                auth.client,
+            )
+            .await
+        }
+        Err(error) => return native_exact::caller_error(&error),
+        Ok(None) => (),
+    }
+    let caller = super::control_modes::CallerControls::capture(&body, Dialect::OpenAI);
     match serde_json::from_value::<crate::protocol::openai::OaChatRequest>(body) {
         Ok(r) => match r.to_internal() {
-            Ok(req) => dispatch(state, req, &headers, auth.client, Exit::OpenAI).await,
+            Ok(req) => dispatch(state, req, &headers, auth.client, Exit::OpenAI, caller).await,
             Err(e) => error_response(&e),
         },
         Err(e) => error_response(&GatewayError::Protocol(format!("请求体解析失败: {e}"))),
@@ -1282,9 +2092,20 @@ async fn anthropic_messages(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    if let Some(response) = native_exact::reject_other_ingress(
+        &state,
+        body.get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto"),
+    )
+    .await
+    {
+        return response;
+    }
+    let caller = super::control_modes::CallerControls::capture(&body, Dialect::Anthropic);
     match serde_json::from_value::<crate::protocol::anthropic::AnthropicRequest>(body) {
         Ok(r) => match r.to_internal() {
-            Ok(req) => dispatch(state, req, &headers, auth.client, Exit::Anthropic).await,
+            Ok(req) => dispatch(state, req, &headers, auth.client, Exit::Anthropic, caller).await,
             Err(e) => error_response(&e),
         },
         Err(e) => error_response(&GatewayError::Protocol(format!("请求体解析失败: {e}"))),
@@ -1322,6 +2143,9 @@ async fn gemini_generate(
             "路径 {model_action:?} 不是 <模型名>:<动作> 的形态"
         )));
     };
+    if let Some(response) = native_exact::reject_other_ingress(&state, &model).await {
+        return response;
+    }
     let stream = match action.as_str() {
         "generateContent" => false,
         "streamGenerateContent" => true,
@@ -1340,6 +2164,7 @@ async fn gemini_generate(
     // 动作是权威，query 只是提示。
     let _ = query;
 
+    let caller = super::control_modes::CallerControls::capture(&body, Dialect::Gemini);
     let inbound: crate::protocol::gemini_inbound::GeminiInboundRequest =
         match serde_json::from_value(body) {
             Ok(v) => v,
@@ -1354,7 +2179,66 @@ async fn gemini_generate(
         Ok(req) => req,
         Err(error) => return error_response(&error),
     };
-    dispatch(state, req, &headers, auth.client, Exit::Gemini).await
+    dispatch(state, req, &headers, auth.client, Exit::Gemini, caller).await
+}
+
+/// A per-request provenance boundary: original input alone reaches persistence;
+/// this instruction is assembled only into effective model input.
+#[derive(Default)]
+struct ResponseRequestContext {
+    personal_test: bool,
+    instruction: Option<String>,
+    cost_policy: RequestCostPolicy,
+    normalized_ingress: Option<super::control_modes::ControlSet>,
+    caller: Option<super::control_modes::CallerControls>,
+}
+
+impl ResponseRequestContext {
+    fn parse(body: &serde_json::Value) -> std::result::Result<Self, Box<Response>> {
+        let instruction = match body.get("instructions") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) if value.is_empty() => None,
+            Some(serde_json::Value::String(value)) => Some(value.clone()),
+            Some(_) => return Err(Box::new((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {"type":"invalid_request_error", "code":"invalid_instructions",
+                        "param":"instructions", "message":"instructions must be a string or null"}
+                })),
+            )
+                .into_response())),
+        };
+        Ok(Self {
+            instruction,
+            personal_test: false,
+            cost_policy: Default::default(),
+            normalized_ingress: None,
+            caller: Some(super::control_modes::CallerControls::capture(
+                body,
+                Dialect::Responses,
+            )),
+        })
+    }
+
+    fn strict(&self) -> bool {
+        self.instruction.is_some() || self.personal_test
+    }
+
+    fn prepend(&self, messages: &mut Vec<Message>) {
+        if let Some(instruction) = &self.instruction {
+            messages.insert(0, Message::system(instruction.clone()));
+        }
+    }
+
+    fn wire_options(&self) -> super::upstream::RequestWireOptions {
+        super::upstream::RequestWireOptions {
+            entitlement_purpose: "chat",
+            preserve_instruction: self.strict(),
+            cost_policy: self.cost_policy,
+            normalized_ingress: self.normalized_ingress,
+            caller: self.caller,
+        }
+    }
 }
 
 /// Codex CLI 需要的 /v1/responses。
@@ -1366,6 +2250,20 @@ async fn responses(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    if let Some(response) = native_exact::reject_other_ingress(
+        &state,
+        body.get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto"),
+    )
+    .await
+    {
+        return response;
+    }
+    let mut request_context = match ResponseRequestContext::parse(&body) {
+        Ok(context) => context,
+        Err(response) => return *response,
+    };
     let model = body
         .get("model")
         .and_then(|m| m.as_str())
@@ -1404,8 +2302,19 @@ async fn responses(
         tools: normalize_responses_tools(body.get("tools")),
         tool_choice: normalize_responses_tool_choice(body.get("tool_choice")),
         thinking: None,
-        extra: Default::default(),
+        // Native Responses controls must survive compaction, clones and request
+        // identity. Keep their public field instead of inventing thinking budgets.
+        extra: body
+            .get("reasoning")
+            .map(|reasoning| {
+                [("reasoning".into(), reasoning.clone())]
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
+
+    request_context.normalized_ingress = Some(super::control_modes::ControlSet::from_request(&req));
 
     if compaction {
         // Codex Remote Compaction V2 把普通 /responses 请求末尾追加
@@ -1416,10 +2325,27 @@ async fn responses(
         req.tool_choice = None;
         req.messages
             .insert(0, Message::system(crate::context::summarization_prompt("")));
-        return dispatch_remote_compaction(state, req, &headers, auth.client, stream).await;
+        request_context.prepend(&mut req.messages);
+        return dispatch_remote_compaction(
+            state,
+            req,
+            &headers,
+            auth.client,
+            stream,
+            request_context.wire_options(),
+        )
+        .await;
     }
 
-    dispatch(state, req, &headers, auth.client, Exit::Responses).await
+    dispatch_with_context(
+        state,
+        req,
+        &headers,
+        auth.client,
+        Exit::Responses,
+        request_context,
+    )
+    .await
 }
 
 async fn embeddings(
@@ -1546,19 +2472,31 @@ async fn passthrough_dispatch(
         Some(model) if !model.trim().is_empty() => model.to_string(),
         _ => return error_response(&GatewayError::Protocol("非聊天请求缺少 model".into())),
     };
+    if let Some(response) = native_exact::reject_other_ingress(&state, &requested_model).await {
+        return response;
+    }
     let cfg = state.cfg_snapshot();
     if let Some(response) = model_allowlist_gate(&state, &cfg, client.as_deref(), &requested_model)
     {
         return response;
     }
-    let providers = state.providers.read().clone();
-    let candidates = match state
+    let providers = state.legacy_providers();
+    let policy = RequestCostPolicy::resolve(&cfg, &requested_model);
+    let mut candidates = match state
         .router
         .resolve_typed(&requested_model, &providers, model_type)
     {
         Ok(candidates) => candidates,
-        Err(error) => return error_response(&error),
+        Err(error) => {
+            return error_response(&crate::cost_policy::route_error(
+                error,
+                state.cost_gate.effective(policy),
+            ))
+        }
     };
+    if let Err(error) = state.cost_gate.filter(&mut candidates, policy).await {
+        return error_response(&error);
+    }
     if candidates.is_empty() {
         return error_response(&GatewayError::ModelNotFound(format!(
             "{requested_model}（类型 {}）",
@@ -1566,14 +2504,23 @@ async fn passthrough_dispatch(
         )));
     }
 
-    let mut ranked = state
-        .router
-        .rank(candidates, &cfg, Default::default(), None);
+    let ranking = state.router.rank_observed(
+        candidates,
+        &cfg,
+        Default::default(),
+        None,
+        None,
+        0,
+        crate::intellect::TaskDomain::General,
+    );
+    let mut ranked = ranking.candidates;
+    let mut active_promoted = false;
     if let Some(active_id) = state.active.read().clone() {
         if let Some(position) = ranked
             .iter()
             .position(|candidate| candidate.provider.id == active_id)
         {
+            active_promoted = position != 0;
             let active = ranked.remove(position);
             ranked.insert(0, active);
         }
@@ -1584,11 +2531,43 @@ async fn passthrough_dispatch(
         });
     }
 
+    let free_selector_applied = state.cost_gate.effective(policy).is_free();
+    if free_selector_applied {
+        if let Err(error) =
+            state
+                .free_selector
+                .select(&mut ranked, &state.health, &state.router, None)
+        {
+            return error_response(&error);
+        }
+    }
+    // Capture only this actual typed chain before dispatch. Keep the existing
+    // success/error audit owner and transaction; selection Drop owns cancellation.
+    let mut decision = crate::audit::route_decision::Snapshot::typed(
+        cfg.routing_strategy,
+        &ranked,
+        model_type,
+        active_promoted,
+        free_selector_applied,
+    );
+    if let (Some(decision), Some(observed)) = (decision.as_mut(), ranking.observation.as_ref()) {
+        decision.with_scores(observed);
+    }
     let max_attempts = if cfg.failover_enabled {
         cfg.max_fallback_attempts
     } else {
         1
     };
+    let tps_sources: Vec<_> = ranked
+        .iter()
+        .map(|c| {
+            (
+                c.provider.id.clone(),
+                c.model.upstream.clone(),
+                state.health.tps_lease(&c.provider, &c.model.upstream),
+            )
+        })
+        .collect();
     let flag = AtomicFlag::new();
     let chain =
         FailoverChain::new(&ranked, max_attempts, &flag).with_admission(state.router.clone());
@@ -1597,22 +2576,47 @@ async fn passthrough_dispatch(
     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
     let body = Arc::new(body);
     let started = Instant::now();
+    let cancellation_records = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let chain = chain.with_cancellation_records(cancellation_records.clone());
+    let (selection_audit, _) = stream_audit::StreamAudit::new(stream_audit::AuditContext {
+        state: state.clone(),
+        session_id: String::new(),
+        requested_model: requested_model.clone(),
+        client: client.clone(),
+        provider_id: None,
+        model: None,
+        records: Vec::new(),
+        trace_id: crate::trace::new_trace_id(),
+        route: repo::RouteTrace {
+            decision: decision.clone(),
+            ..Default::default()
+        },
+        started,
+        estimated_prompt: 0,
+    });
+    // The selected typed transport owns no chat fields. On cancellation, drop
+    // its coroutine first so the existing observation guard settles the journal.
+    // Ready disarms this owner; the original success/error writer remains sole.
+    let selection_audit = selection_audit.without_chat_context();
     let mut attempt_records = Vec::new();
-    let outcome = chain
-        .run_with_auth_policy(
+    let outcome = stream_audit::select(
+        chain.run_with_auth_policy(
             &mut attempt_records,
             |provider, model| {
                 let upstream = upstream_state.clone();
                 let body = body.clone();
                 async move {
                     upstream
-                        .call_passthrough(
+                        .call_passthrough_with_policy(
                             &provider,
                             &model,
                             path_segments,
                             &body,
                             timeout,
-                            expect_json,
+                            super::upstream::PassthroughWireOptions {
+                                expect_json,
+                                cost_policy: policy,
+                            },
                         )
                         .await
                 }
@@ -1630,8 +2634,11 @@ async fn passthrough_dispatch(
                 state.health.record_failure(&provider.id, model, error);
             },
             auth_confirm_handler(state.clone(), cfg.clone()),
-        )
-        .await;
+        ),
+        selection_audit,
+        cancellation_records,
+    )
+    .await;
 
     match outcome {
         Ok(outcome) => {
@@ -1681,12 +2688,15 @@ async fn passthrough_dispatch(
             // 没有 `completion_tokens` 就算不出 tok/s，
             // 而在这里编一个 0 会把 EWMA 拉向 0，
             // 与「0 = 无样本」的约定撞车（`record_tps` 自己也会拒绝 0）。
-            state.health.record_tps(
-                &outcome.provider_id,
-                &outcome.model,
-                completion_tokens,
-                latency as u32,
-            );
+            let source = tps_sources
+                .iter()
+                .find(|(provider, model, _)| {
+                    provider == &outcome.provider_id && model == &outcome.model
+                })
+                .and_then(|(_, _, source)| source.as_ref());
+            state
+                .health
+                .record_bound_tps(source, completion_tokens, latency as u32);
             if let Some(provider) = ranked
                 .iter()
                 .find(|candidate| candidate.provider.id == outcome.provider_id)
@@ -1710,8 +2720,9 @@ async fn passthrough_dispatch(
             let audit_model = outcome.model.clone();
             let attempts = outcome.attempts;
             let attempts_json = attempts_json(&attempt_records);
-            tokio::spawn(async move {
-                let _ = repo::log_request(
+            let audit_tasks = audit_state.audit_tasks();
+            audit_tasks.spawn(async move {
+                repo::log_request(
                     audit_state.db.pool(),
                     repo::RequestLog {
                         session_id: None,
@@ -1739,10 +2750,13 @@ async fn passthrough_dispatch(
                         rate_label: audit_rate_label.as_deref(),
                         estimated_prompt_tokens: None,
                         attempts_json: attempts_json.as_deref(),
-                        route: Default::default(),
+                        route: repo::RouteTrace {
+                            decision,
+                            ..Default::default()
+                        },
                     },
                 )
-                .await;
+                .await
             });
 
             let mut response = match outcome.value {
@@ -1781,8 +2795,9 @@ async fn passthrough_dispatch(
             let audit_requested_model = requested_model.clone();
             let attempts_json = attempts_json(&attempt_records);
             let latency = started.elapsed().as_millis() as i64;
-            tokio::spawn(async move {
-                let _ = repo::log_request(
+            let audit_tasks = audit_state.audit_tasks();
+            audit_tasks.spawn(async move {
+                repo::log_request(
                     audit_state.db.pool(),
                     repo::RequestLog {
                         session_id: None,
@@ -1810,10 +2825,13 @@ async fn passthrough_dispatch(
                         rate_label: None,
                         estimated_prompt_tokens: None,
                         attempts_json: attempts_json.as_deref(),
-                        route: Default::default(),
+                        route: repo::RouteTrace {
+                            decision,
+                            ..Default::default()
+                        },
                     },
                 )
-                .await;
+                .await
             });
             error_response(&error)
         }
@@ -1828,8 +2846,10 @@ async fn dispatch_remote_compaction(
     headers: &HeaderMap,
     client: Option<String>,
     client_stream: bool,
+    mut wire_options: super::upstream::RequestWireOptions,
 ) -> Response {
     let cfg = state.cfg_snapshot();
+    wire_options.cost_policy = RequestCostPolicy::resolve(&cfg, &req.model).strengthen(&cfg);
     if let Some(response) = model_allowlist_gate(&state, &cfg, client.as_deref(), &req.model) {
         return response;
     }
@@ -1839,17 +2859,46 @@ async fn dispatch_remote_compaction(
         .map(str::to_owned);
     let response_session_id = crate::context::derive_session_id(&req, header_sid.as_deref());
 
-    let providers = state.providers.read().clone();
+    let providers = state.legacy_providers();
     let candidates = match state.router.resolve(&req.model, &providers) {
         Ok(candidates) => candidates,
-        Err(error) => return error_response(&error),
+        Err(error) => {
+            return error_response(&crate::cost_policy::route_error(
+                error,
+                state.cost_gate.effective(wire_options.cost_policy),
+            ))
+        }
     };
 
     let required = required_capabilities(&req);
     let media = crate::media::Media::of(&req);
     let mut candidates = candidates;
+    if let Err(error) = state
+        .cost_gate
+        .filter(&mut candidates, wire_options.cost_policy)
+        .await
+    {
+        return error_response(&error);
+    }
     // Unsendable candidates must not affect eligible models' normalization.
     let media_rejections = filter_by_media_carry(&mut candidates, &media);
+    if wire_options.preserve_instruction {
+        let reserve = fixed_context_reserve(&req, &candidates);
+        let calibration = state.calibration_snapshot().await;
+        let tokens = estimate_message_tokens(&req.messages);
+        let available = candidates
+            .iter()
+            .map(|c| c.model.context_window.max(0) as u32)
+            .max()
+            .unwrap_or(0);
+        candidates.retain(|c| candidate_supports_context(c, tokens, reserve, &calibration));
+        if candidates.is_empty() {
+            return error_response(&GatewayError::ContextLengthExceeded {
+                required: tokens.saturating_add(reserve),
+                available,
+            });
+        }
+    }
     let mut ranked = state.router.rank(candidates, &cfg, required, None);
     if ranked.is_empty() {
         return error_response(&missing_capability_error(
@@ -1866,6 +2915,28 @@ async fn dispatch_remote_compaction(
             let active = ranked.remove(position);
             ranked.insert(0, active);
         }
+    }
+
+    if let Err(error) = validate_first_http_instruction_override(&ranked, wire_options) {
+        return error_response(&error);
+    }
+
+    if state
+        .cost_gate
+        .effective(wire_options.cost_policy)
+        .is_free()
+    {
+        if let Err(error) =
+            state
+                .free_selector
+                .select(&mut ranked, &state.health, &state.router, None)
+        {
+            return error_response(&error);
+        }
+    }
+
+    if let Err(error) = validate_first_http_reasoning(&ranked, &req) {
+        return error_response(&error);
     }
 
     let max_attempts = if cfg.failover_enabled {
@@ -1893,7 +2964,14 @@ async fn dispatch_remote_compaction(
                 let defaults = cfg.ollama_options.clone();
                 async move {
                     state
-                        .call_chat_upstream(&provider, &request, &model, timeout, &defaults)
+                        .call_chat_upstream_with_options(
+                            &provider,
+                            &request,
+                            &model,
+                            timeout,
+                            &defaults,
+                            wire_options,
+                        )
                         .await
                 }
             },
@@ -1907,7 +2985,9 @@ async fn dispatch_remote_compaction(
                         state.router.mark_rate_limited(provider, model_ref);
                     }
                 }
-                state.health.record_failure(&provider.id, model, error);
+                if !super::upstream::is_local_request_policy_rejection(error, wire_options) {
+                    state.health.record_failure(&provider.id, model, error);
+                }
             },
             auth_confirm_handler(state.clone(), cfg.clone()),
         )
@@ -1964,8 +3044,9 @@ async fn dispatch_remote_compaction(
             let prompt_tokens = usage.prompt_tokens as i64;
             let completion_tokens = usage.completion_tokens as i64;
             let attempts_json = attempts_json(&attempt_records);
-            tokio::spawn(async move {
-                let _ = repo::log_request(
+            let audit_tasks = audit_state.audit_tasks();
+            audit_tasks.spawn(async move {
+                repo::log_request(
                     audit_state.db.pool(),
                     repo::RequestLog {
                         session_id: Some(&audit_session_id),
@@ -1996,7 +3077,7 @@ async fn dispatch_remote_compaction(
                         route: Default::default(),
                     },
                 )
-                .await;
+                .await
             });
 
             let payload = serde_json::json!({
@@ -2079,8 +3160,9 @@ async fn dispatch_remote_compaction(
             let requested_model = req.model.clone();
             let attempts_json = attempts_json(&attempt_records);
             let latency = started.elapsed().as_millis() as i64;
-            tokio::spawn(async move {
-                let _ = repo::log_request(
+            let audit_tasks = audit_state.audit_tasks();
+            audit_tasks.spawn(async move {
+                repo::log_request(
                     audit_state.db.pool(),
                     repo::RequestLog {
                         session_id: Some(&audit_session_id),
@@ -2111,7 +3193,7 @@ async fn dispatch_remote_compaction(
                         route: Default::default(),
                     },
                 )
-                .await;
+                .await
             });
             error_response(&error)
         }
@@ -2445,8 +3527,19 @@ async fn ollama_chat(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    if let Some(response) = native_exact::reject_other_ingress(
+        &state,
+        body.get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto"),
+    )
+    .await
+    {
+        return response;
+    }
+    let caller = super::control_modes::CallerControls::capture(&body, Dialect::Ollama);
     match crate::protocol::ollama::ollama_request_to_internal(&body) {
-        Ok(req) => dispatch(state, req, &headers, auth.client, Exit::Ollama).await,
+        Ok(req) => dispatch(state, req, &headers, auth.client, Exit::Ollama, caller).await,
         Err(error) => error_response(&error),
     }
 }
@@ -2469,7 +3562,20 @@ async fn ollama_tags(State(state): State<Arc<GatewayState>>) -> impl IntoRespons
     Json(serde_json::json!({ "models": data }))
 }
 
-async fn count_tokens(Json(body): Json<serde_json::Value>) -> Response {
+async fn count_tokens(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(response) = native_exact::reject_other_ingress(
+        &state,
+        body.get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto"),
+    )
+    .await
+    {
+        return response;
+    }
     // Claude Code 用此端点预估上下文。沿用内部统一消息的粗略 token 估算，
     // 保证估值与压缩触发条件一致，而不是固定返回一个误导性的常量。
     match serde_json::from_value::<crate::protocol::anthropic::AnthropicRequest>(body) {
@@ -2497,9 +3603,89 @@ enum Exit {
     Gemini,
 }
 
+/// Match the existing call_chat_upstream account/HTTP branch: every runtime_id
+/// is resolved by an account/agent adapter, never this HTTP serializer. Only the
+/// actual first route is checked; an unused conflicting fallback is not rejected.
+fn validate_first_http_instruction_override(
+    ranked: &[crate::router::score::Candidate],
+    options: super::upstream::RequestWireOptions,
+) -> Result<()> {
+    if let Some(candidate) = ranked.first().filter(|c| c.provider.runtime_id.is_none()) {
+        super::upstream::validate_model_instruction_override(
+            candidate.provider.dialect,
+            candidate.model.overrides.as_ref(),
+            options,
+        )?;
+    }
+    Ok(())
+}
+
+/// Check the selected HTTP candidate before cache lookup or stream headers.
+/// Account/agent adapters keep their own contract; this is not a capability claim
+/// about those transports. Actual fallback sends repeat the same pure validation.
+fn validate_first_http_reasoning(
+    ranked: &[crate::router::score::Candidate],
+    req: &ChatRequest,
+) -> Result<()> {
+    if let Some(candidate) = ranked.first().filter(|c| c.provider.runtime_id.is_none()) {
+        crate::protocol::reasoning::validate(
+            req,
+            candidate.provider.dialect,
+            candidate.model.supports_thinking,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod instruction_override_tests {
+    use super::*;
+    #[test]
+    fn responses_instructions_r3_precheck_follows_account_http_branch() {
+        let now = chrono::Utc::now();
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "id":"owned", "name":"owned", "dialect":"responses", "base_url":"http://127.0.0.1:1", "api_key_enc":"",
+            "enabled":true,"priority":1,"rpm_limit":0,"intelligence":50,"created_at":now,"updated_at":now,
+            "models":[{"alias":"fixture","upstream":"fixture","context_window":16384,
+                "supports_tools":true,"supports_vision":false,"supports_thinking":false,"supports_stream":true,
+                "overrides":{"extra_body":{"instructions":"configured-B"}}}]
+        })).unwrap();
+        let mut candidate = crate::router::score::Candidate {
+            model: provider.models[0].clone(),
+            provider,
+            requested_model: "fixture".into(),
+            exact_match: true,
+            virtual_strategy: None,
+        };
+        let options = super::super::upstream::RequestWireOptions {
+            preserve_instruction: true,
+            ..Default::default()
+        };
+        assert!(validate_first_http_instruction_override(&[candidate.clone()], options).is_err());
+        for runtime in ["workbuddy-model", "qoder-model", "agent-runtime"] {
+            candidate.provider.runtime_id = Some(runtime.into());
+            assert!(
+                validate_first_http_instruction_override(&[candidate.clone()], options).is_ok()
+            );
+        }
+        // Calling the HTTP function itself must still defend its wire even if
+        // metadata carries a runtime id; server account dispatch skips it above.
+        assert!(super::super::upstream::validate_instruction_override(
+            &candidate.provider,
+            "fixture",
+            options,
+        )
+        .is_err());
+    }
+}
+
 /// 已完成会话定位、上下文重建和路由排序的一次内部派发。
 /// 非流式与流式路径共享这组不可拆分的输入，避免两处函数签名继续膨胀。
 struct DispatchInput {
+    decision: Option<crate::audit::route_decision::Snapshot>,
+    // Request-scoped opt-in, never forwarded to an upstream or persisted.
+    desktop_observation: bool,
+    wire_options: super::upstream::RequestWireOptions,
     req: ChatRequest,
     new_messages: Vec<Message>,
     /// 客户端可见的逻辑会话 ID。远程模式下不能回显内部隔离后的存储键。
@@ -2561,6 +3747,8 @@ async fn run_routing_preflight(
     state: &Arc<GatewayState>,
     cfg: &AppConfig,
     req: &mut ChatRequest,
+    policy: RequestCostPolicy,
+    journal: crate::audit::auxiliary::Journal,
 ) -> RoutingPreflight {
     let mut preflight = RoutingPreflight {
         intent: None,
@@ -2579,6 +3767,11 @@ async fn run_routing_preflight(
             has_tools: req.tools.is_some(),
             requested_model: &req.model,
         };
+        if state.cost_gate.effective(policy).is_free() {
+            preflight.intent =
+                Some(crate::intellect::classify(&input, &cfg.smart_routing, None).await);
+            return preflight;
+        }
         // 决策端点不可达时按需拉起一次（默认关闭，开关与路径全由用户填）。
         //
         // **只在配置了端点时尝试**，且失败不阻断——拉不起来就是走启发式，
@@ -2602,13 +3795,22 @@ async fn run_routing_preflight(
         }
 
         // Jev 客户端按需构造：配置无效时只是拿不到决策信号，不是错误。
-        let jev = crate::intellect::JevClient::new(
-            &cfg.smart_routing.jev.base_url,
-            &cfg.smart_routing.jev.model,
-            cfg.smart_routing.jev.timeout_ms,
-            cfg.smart_routing.jev.max_state_chars,
-        )
-        .ok();
+        let jev = if state.cost_gate.effective(policy).is_free() {
+            None
+        } else {
+            crate::intellect::JevClient::new(
+                &cfg.smart_routing.jev.base_url,
+                &cfg.smart_routing.jev.model,
+                cfg.smart_routing.jev.timeout_ms,
+                cfg.smart_routing.jev.max_state_chars,
+            )
+            .ok()
+            .map(|client| {
+                client
+                    .with_cost_policy(state.cost_gate.clone(), policy)
+                    .with_observation(journal.clone())
+            })
+        };
         let intent = crate::intellect::classify(&input, &cfg.smart_routing, jev.as_ref()).await;
         tracing::info!(
             intent = intent.class.code(),
@@ -2629,14 +3831,16 @@ async fn run_routing_preflight(
     //
     // 失败一律用原文，不阻断。
     let mut effective_text = user_text.clone();
-    if cfg.smart_routing.prompt_refine.enabled {
+    if cfg.smart_routing.prompt_refine.enabled && !state.cost_gate.effective(policy).is_free() {
         let wants_refine = preflight
             .intent
             .as_ref()
             .map(|intent| intent.needs_refine)
             .unwrap_or(false);
         if wants_refine {
-            if let Some(outcome) = run_prompt_refine(state, cfg, &user_text).await {
+            if let Some(outcome) =
+                run_prompt_refine(state, cfg, &user_text, policy, Some(journal.clone())).await
+            {
                 if outcome.applied {
                     effective_text = outcome.prompt.clone();
                     apply_refined_prompt(&mut req.messages, &outcome.prompt);
@@ -2647,27 +3851,48 @@ async fn run_routing_preflight(
     }
 
     // 联网搜索预取。失败不阻断请求——只把状态记下来回给客户端。
-    if cfg.search.enabled {
+    if cfg.search.enabled && !state.cost_gate.effective(policy).is_free() {
         let needs_web = preflight
             .intent
             .as_ref()
             .map(|intent| intent.needs_web)
             .unwrap_or(false);
         if needs_web {
-            let key = load_search_key(state).await;
-            let outcome = match crate::outbound::search_client(cfg.http_proxy.as_deref()) {
-                Ok(client) => {
-                    crate::search::executor::prefetch(
-                        &client,
-                        &cfg.search,
-                        key.as_deref(),
-                        &mut req.messages,
-                        &effective_text,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    crate::search::executor::SearchOutcome::failed(cfg.search.backend, error)
+            let mdn = cfg.search.backend == crate::config::SearchBackendKind::MdnMcp;
+            let key = if mdn {
+                None
+            } else {
+                load_search_key(state).await
+            };
+            if state.cost_gate.effective(policy).is_free() {
+                return preflight;
+            }
+            let outcome = if mdn {
+                crate::search::executor::prefetch_with_resources(
+                    crate::search::executor::shared_client(),
+                    &cfg.search,
+                    None,
+                    &mut req.messages,
+                    &effective_text,
+                    &state.search_resources,
+                )
+                .await
+            } else {
+                match crate::outbound::search_client(cfg.http_proxy.as_deref()) {
+                    Ok(client) => {
+                        crate::search::executor::prefetch_with_resources(
+                            &client,
+                            &cfg.search,
+                            key.as_deref(),
+                            &mut req.messages,
+                            &effective_text,
+                            &state.search_resources,
+                        )
+                        .await
+                    }
+                    Err(error) => {
+                        crate::search::executor::SearchOutcome::failed(cfg.search.backend, error)
+                    }
                 }
             };
             if let Some(error) = outcome.error.as_deref() {
@@ -2689,11 +3914,16 @@ async fn run_prompt_refine(
     state: &Arc<GatewayState>,
     cfg: &AppConfig,
     user_text: &str,
+    policy: RequestCostPolicy,
+    journal: Option<crate::audit::auxiliary::Journal>,
 ) -> Option<crate::intellect::RefineOutcome> {
+    if state.cost_gate.effective(policy).is_free() {
+        return None;
+    }
     if user_text.trim().chars().count() < cfg.smart_routing.prompt_refine.min_chars {
         return None;
     }
-    let providers = state.providers.read().clone();
+    let providers = state.legacy_providers();
     let required = crate::router::score::RequiredCapabilities::default();
     let mut ranked = state.router.rank(
         state.router.resolve("auto", &providers).ok()?,
@@ -2729,12 +3959,17 @@ async fn run_prompt_refine(
         return None;
     }
     let started = Instant::now();
-    let outcome = crate::intellect::refine::refine(
+    if state.cost_gate.effective(policy).is_free() {
+        return None;
+    }
+    let tps_source = state.health.tps_lease(&candidate.provider, &target.model);
+    let outcome = crate::intellect::refine::refine_observed(
         &client,
         &target,
         target.api_key.clone(),
         user_text,
         &cfg.smart_routing.prompt_refine,
+        journal,
     )
     .await;
     if outcome.applied || outcome.usage.is_some() {
@@ -2743,12 +3978,9 @@ async fn run_prompt_refine(
             .health
             .record_success(&candidate.provider.id, &target.model, elapsed);
         if let Some(usage) = &outcome.usage {
-            state.health.record_tps(
-                &candidate.provider.id,
-                &target.model,
-                usage.completion_tokens,
-                elapsed,
-            );
+            state
+                .health
+                .record_bound_tps(tps_source.as_ref(), usage.completion_tokens, elapsed);
             state
                 .router
                 .record_tokens(&candidate.provider, &reserved.model, usage.total_tokens);
@@ -2790,11 +4022,13 @@ impl DispatchInput {
     /// 智能模式 + 联网搜索的审计视图。关掉任一功能时对应字段为 `None`，
     /// 这与「判定为 false / 空结果」是两件事，界面上要分开显示。
     fn route_trace(&self) -> repo::RouteTrace {
-        route_trace_of(
+        let mut route = route_trace_of(
             self.intent.as_ref(),
             self.search.as_ref(),
             self.refine.as_ref(),
-        )
+        );
+        route.decision = self.decision.clone();
+        route
     }
 }
 
@@ -2804,13 +4038,18 @@ fn route_trace_of(
     refine: Option<&crate::intellect::RefineOutcome>,
 ) -> repo::RouteTrace {
     repo::RouteTrace {
+        budget_admission: crate::budget::holds::audit_context(),
         intent: intent.map(|i| i.class.code().to_owned()),
         classifier: intent.map(|i| i.classifier.code().to_owned()),
         search: search.map(|outcome| match outcome.error {
             Some(_) => "failed".to_owned(),
             None => crate::search::backend_code(outcome.backend),
         }),
-        search_hits: search.map(|outcome| outcome.hits as i64),
+        // Opaque MDN text has no authoritative document count.
+        search_hits: search.and_then(|outcome| {
+            (outcome.backend != crate::config::SearchBackendKind::MdnMcp)
+                .then_some(outcome.hits as i64)
+        }),
         refined: refine.map(|outcome| outcome.applied),
         refine_note: refine.map(|outcome| {
             outcome
@@ -2823,6 +4062,7 @@ fn route_trace_of(
         // `audit_route`（审计用的是 clone 出来那份，响应头那份不动）。
         cascade_attempts: 0,
         cascade_stop: None,
+        decision: None,
     }
 }
 
@@ -2837,10 +4077,9 @@ fn apply_route_headers(trace: &repo::RouteTrace, headers: &mut HeaderMap) {
     }
     if let Some(search) = trace.search.as_deref() {
         headers.insert("x-route-search", parse_header(search));
-        headers.insert(
-            "x-route-search-hits",
-            parse_header(&trace.search_hits.unwrap_or(0).to_string()),
-        );
+        if let Some(hits) = trace.search_hits {
+            headers.insert("x-route-search-hits", parse_header(&hits.to_string()));
+        }
     }
     // 只在真的触发了改写链路时才发。没触发时一个头都不多，
     // 这样「客户端看到 refined 头」就等于「提示词确实被动过」。
@@ -3600,12 +4839,96 @@ fn model_allowlist_gate(
 
 async fn dispatch(
     state: Arc<GatewayState>,
+    req: ChatRequest,
+    headers: &HeaderMap,
+    client: Option<String>,
+    exit: Exit,
+    caller: super::control_modes::CallerControls,
+) -> Response {
+    dispatch_with_context(
+        state,
+        req,
+        headers,
+        client,
+        exit,
+        ResponseRequestContext {
+            caller: Some(caller),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn dispatch_with_context(
+    state: Arc<GatewayState>,
+    req: ChatRequest,
+    headers: &HeaderMap,
+    client: Option<String>,
+    exit: Exit,
+    request_context: ResponseRequestContext,
+) -> Response {
+    if let Some(token) = headers.get(crate::personal_test::HEADER) {
+        let value = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+        };
+        let ctx = state.personal_tests.take(
+            token.to_str().unwrap_or(""),
+            &req,
+            value("x-trace-id"),
+            value("x-session-id"),
+            client.as_deref(),
+        );
+        return match ctx {
+            Ok(ctx) => {
+                crate::personal_test::scope(
+                    ctx,
+                    dispatch_context_inner(state, req, headers, client, exit, request_context),
+                )
+                .await
+            }
+            Err(error) => error_response(&GatewayError::Unauthorized(error)),
+        };
+    }
+    dispatch_context_inner(state, req, headers, client, exit, request_context).await
+}
+
+async fn dispatch_context_inner(
+    state: Arc<GatewayState>,
     mut req: ChatRequest,
     headers: &HeaderMap,
     client: Option<String>,
     exit: Exit,
+    request_context: ResponseRequestContext,
 ) -> Response {
-    let (cfg, cache_generation) = state.cfg_snapshot_with_cache_generation();
+    if let Some(response) = native_exact::reject_other_ingress(&state, &req.model).await {
+        return response;
+    }
+    let (mut cfg, cache_generation) = state.cfg_snapshot_with_cache_generation();
+    let configured_strategy = cfg.routing_strategy;
+    let mut request_context = request_context;
+    if crate::personal_test::current().is_some() {
+        // Backend-owned request scope only. Preserve FreeOnly and use strict
+        // provenance to skip preflight/background remote compaction/refinement.
+        request_context.personal_test = true;
+        cfg.failover_enabled = false;
+        cfg.max_fallback_attempts = 1;
+        cfg.auth_failure.confirm_retries = 0;
+        cfg.auth_failure.mode = crate::config::AuthFailureMode::Strict;
+        cfg.routing_strategy = RoutingStrategy::Priority;
+        cfg.cache.enabled = false;
+        cfg.dedup.mode = crate::proxy::dedup::DedupMode::Off;
+    }
+    // Capture before session reconstruction, search, classification or tools enrichment.
+    // Protocol adapters have already normalized the caller's control fields.
+    if request_context.normalized_ingress.is_none() {
+        request_context.normalized_ingress =
+            Some(super::control_modes::ControlSet::from_request(&req));
+    }
+    request_context.cost_policy = RequestCostPolicy::resolve(&cfg, &req.model);
+    let policy = request_context.cost_policy;
 
     // B4 traceId 在**入口处定一次**。之后所有落库、响应头、span 都用它。
     //
@@ -3637,289 +4960,539 @@ async fn dispatch(
     // 对外继续回显逻辑 ID，避免泄露命名空间并保持客户端续接方式不变。
     let session_id = scoped_session_id(&response_session_id, client.as_deref());
 
-    let first_user_text = req
-        .messages
-        .iter()
-        .find(|m| m.role == Role::User)
-        .map(|m| m.content_text())
-        .unwrap_or_default();
+    // Only accepted requests gain this owner: auth/model rejection remains
+    // outside it. No main upstream invocation exists during this preflight.
+    let preflight_records = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (preflight_audit, preflight_progress) =
+        stream_audit::StreamAudit::new(stream_audit::AuditContext {
+            state: state.clone(),
+            session_id: session_id.clone(),
+            requested_model: req.model.clone(),
+            client: client.clone(),
+            provider_id: None,
+            model: None,
+            records: Vec::new(),
+            trace_id: trace_id.clone(),
+            route: Default::default(),
+            started: Instant::now(),
+            estimated_prompt: estimate_message_tokens(&req.messages) as i64,
+        });
+    preflight_progress.decision(crate::audit::route_decision::Snapshot::not_reached(
+        configured_strategy,
+        request_context.personal_test,
+    ));
+    let preflight_journal = preflight_progress.journal();
+    let preparing = async {
+        let first_user_text = req
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.content_text())
+            .unwrap_or_default();
 
-    let mut session = match state.ctx.touch(&session_id, &first_user_text).await {
-        Ok(s) => s,
-        Err(e) => return error_response(&e),
-    };
+        let mut session = match state.ctx.touch(&session_id, &first_user_text).await {
+            Ok(s) => s,
+            Err(e) => return error_response(&e),
+        };
 
-    // 先处理已经超出常规阈值的会话。这样下一轮请求不会与刚刚完成的异步压缩
-    // 竞争；拿到单飞锁后会重新读取会话，确保摘要不会被陈旧任务覆盖。
-    if state.ctx.needs_compaction(&session, &cfg).await {
-        match state.compact_session_if_needed(&session_id, false).await {
-            Ok(true) => match repo::get_or_create_session(state.db.pool(), &session_id).await {
-                Ok(refreshed) => session = refreshed,
-                Err(error) => return error_response(&error),
-            },
-            Ok(false) => {}
-            Err(error) => tracing::warn!("请求前自动压缩失败，将继续执行容量保护: {error}"),
-        }
-    }
-
-    // 2) 上下文重建：把落库的历史拼回请求里，同时保留本轮真正新增的
-    // 输入尾部，供响应成功后原子写回。不能从“最后一条 user”猜测：工具
-    // 续轮可能只有 assistant tool_calls + tool result。
-    let incoming_messages = req.messages.clone();
-    let mut new_messages = match state
-        .ctx
-        .prepare_context(&session, &req.messages, CONTEXT_HISTORY_LIMIT)
-        .await
-    {
-        Ok(prepared) => {
-            req.messages = prepared.messages;
-            prepared.new_messages
-        }
-        Err(e) => {
-            tracing::warn!("上下文重建失败，使用原始请求: {e}");
-            incoming_messages.clone()
-        }
-    };
-
-    // 3) 粘性判定
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let sticky = match (
-        session.sticky_provider_id.as_deref(),
-        session.sticky_model.as_deref(),
-        session.sticky_expires_at,
-    ) {
-        (Some(p), Some(m), Some(exp)) if exp > now => Some((p.to_string(), m.to_string())),
-        _ => None,
-    };
-
-    // 4) 智能模式分类与联网搜索预取。必须夹在上下文重建之后、`resolve()` 之前：
-    //    注入的检索消息会改变 token 估算，而分类器需要看到完整历史。
-    let preflight = run_routing_preflight(&state, &cfg, &mut req).await;
-
-    // 5) 候选链
-    let providers = state.providers.read().clone();
-    // 总开关关着时，虚拟模型名 `smart` 不产生任何效果——否则会出现
-    // 「不分类、不搜索，但排序已经换成 Smart 权重」的半吊子状态。
-    let smart_enabled = smart_mode_enabled(&cfg);
-    let mut candidates = match state.router.resolve_typed_with(
-        &req.model,
-        &providers,
-        ModelType::Chat,
-        smart_enabled,
-    ) {
-        Ok(c) => c,
-        Err(e) => return error_response(&e),
-    };
-
-    if req.stream {
-        // Account adapters currently return a complete response; never send their
-        // placeholder HTTP address through the streaming transport.
-        let mut supported = Vec::new();
-        for candidate in candidates {
-            if !candidate.model.supports_stream {
-                continue;
+        // 先处理已经超出常规阈值的会话。这样下一轮请求不会与刚刚完成的异步压缩
+        // 竞争；拿到单飞锁后会重新读取会话，确保摘要不会被陈旧任务覆盖。
+        if !request_context.strict() && state.ctx.needs_compaction(&session, &cfg).await {
+            match state
+                .compact_session_if_needed(&session_id, false, policy)
+                .await
+            {
+                Ok(true) => match repo::get_or_create_session(state.db.pool(), &session_id).await {
+                    Ok(refreshed) => session = refreshed,
+                    Err(error) => return error_response(&error),
+                },
+                Ok(false) => {}
+                Err(error) => tracing::warn!("请求前自动压缩失败，将继续执行容量保护: {error}"),
             }
-            let direct = match candidate.provider.runtime_id.as_deref() {
-                None => true,
-                Some(id) => matches!(
-                    crate::agent_upstream::runtime::resolve_chat_runtime(
-                        state.db.pool(),
-                        &state.adapters,
-                        id
+        }
+
+        // 2) 上下文重建：把落库的历史拼回请求里，同时保留本轮真正新增的
+        // 输入尾部，供响应成功后原子写回。不能从“最后一条 user”猜测：工具
+        // 续轮可能只有 assistant tool_calls + tool result。
+        let incoming_messages = req.messages.clone();
+        // Read all retained history in strict mode; the legacy 1000-message cap must
+        // not silently truncate a request that asks for complete context.
+        let history_limit = if request_context.strict() {
+            usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+        } else {
+            CONTEXT_HISTORY_LIMIT
+        };
+        let mut new_messages = match state
+            .ctx
+            .prepare_context(&session, &req.messages, history_limit)
+            .await
+        {
+            Ok(mut prepared) => {
+                if request_context.strict() {
+                    // The persistence delta can exclude replayed compacted messages.
+                    // Assemble model input independently so every caller item survives.
+                    prepared
+                        .messages
+                        .truncate(prepared.messages.len() - prepared.new_messages.len());
+                    req.messages =
+                        crate::context::dedup_tail(prepared.messages, &incoming_messages);
+                } else {
+                    req.messages = prepared.messages;
+                }
+                prepared.new_messages
+            }
+            Err(e) => {
+                if request_context.strict() {
+                    return error_response(&e);
+                }
+                tracing::warn!("上下文重建失败，使用原始请求: {e}");
+                incoming_messages.clone()
+            }
+        };
+
+        request_context.prepend(&mut req.messages);
+
+        // 3) 粘性判定
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let sticky = match (
+            session.sticky_provider_id.as_deref(),
+            session.sticky_model.as_deref(),
+            session.sticky_expires_at,
+        ) {
+            (Some(p), Some(m), Some(exp)) if exp > now => Some((p.to_string(), m.to_string())),
+            _ => None,
+        };
+
+        // 4) 智能模式分类与联网搜索预取。必须夹在上下文重建之后、`resolve()` 之前：
+        //    注入的检索消息会改变 token 估算，而分类器需要看到完整历史。
+        let preflight = if request_context.strict() {
+            // Classify the full effective input locally: no hidden Jev/autostart,
+            // prompt rewriting or search calls, including before a capacity refusal.
+            let intent = if smart_mode_active(&cfg, &req.model) {
+                Some(
+                    crate::intellect::classify(
+                        &crate::intellect::ClassifyInput {
+                            messages: &req.messages,
+                            media: crate::media::Media::of(&req),
+                            has_tools: req.tools.is_some(),
+                            requested_model: &req.model,
+                        },
+                        &cfg.smart_routing,
+                        None,
                     )
                     .await,
-                    Ok(
-                        crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { .. }
-                            | crate::agent_upstream::runtime::ChatRuntime::Qoder { .. }
-                    )
-                ),
+                )
+            } else {
+                None
             };
-            if direct {
-                supported.push(candidate);
+            RoutingPreflight {
+                intent,
+                search: None,
+                refine: None,
             }
-        }
-        candidates = supported;
-        if candidates.is_empty() {
-            return error_response(&GatewayError::CapabilityUnavailable {
-                kind: "流式输出；账号适配器请使用非流式聊天".into(),
-            });
-        }
-    }
+        } else {
+            run_routing_preflight(&state, &cfg, &mut req, policy, preflight_journal.clone()).await
+        };
 
-    // 路由前按候选窗口扣除输出、工具 schema 和协议余量。先强制压缩可压缩的
-    // 持久化历史，再在必要时按完整工具交换裁剪；仍放不下时明确报错，绝不把
-    // 超窗 payload 交给小窗口备选 Provider。
-    //
-    // 估算校准：本地按字符估算，与上游真实 token 之间存在系统性偏差。用日志里
-    // 「实际 / 估算」的 EWMA 比值保守换算，避免把超窗 payload 送进窗口。
-    let calibration = state.calibration_snapshot().await;
-    let fixed_reserve = fixed_context_reserve(&req, &candidates);
-    if let Some(max_message_budget) = max_message_budget(&candidates, fixed_reserve) {
-        let conservative_ratio = conservative_ratio(&candidates, &calibration);
-        let scaled_budget = (max_message_budget as f64 / conservative_ratio).floor() as u32;
-        if scaled(estimate_message_tokens(&req.messages), conservative_ratio) > max_message_budget {
-            match state.compact_session_if_needed(&session_id, true).await {
-                Ok(true) => {
-                    session = match repo::get_or_create_session(state.db.pool(), &session_id).await
-                    {
-                        Ok(refreshed) => refreshed,
-                        Err(error) => return error_response(&error),
-                    };
-                    match state
-                        .ctx
-                        .prepare_context(&session, &incoming_messages, CONTEXT_HISTORY_LIMIT)
-                        .await
-                    {
-                        Ok(prepared) => {
-                            req.messages = prepared.messages;
-                            new_messages = prepared.new_messages;
-                        }
-                        Err(error) => {
-                            tracing::warn!("压缩后上下文重建失败，保留压缩前上下文: {error}");
-                        }
-                    }
+        // 5) 候选链
+        let providers = state.legacy_providers();
+        // 总开关关着时，虚拟模型名 `smart` 不产生任何效果——否则会出现
+        // 「不分类、不搜索，但排序已经换成 Smart 权重」的半吊子状态。
+        let smart_enabled = smart_mode_enabled(&cfg);
+        let mut candidates = match state.router.resolve_typed_with(
+            &req.model,
+            &providers,
+            ModelType::Chat,
+            smart_enabled,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                return error_response(&crate::cost_policy::route_error(
+                    e,
+                    state.cost_gate.effective(policy),
+                ))
+            }
+        };
+        if let Err(error) = state.cost_gate.filter(&mut candidates, policy).await {
+            return error_response(&error);
+        }
+
+        if req.stream {
+            // Account adapters currently return a complete response; never send their
+            // placeholder HTTP address through the streaming transport.
+            let mut supported = Vec::new();
+            for candidate in candidates {
+                if !candidate.model.supports_stream {
+                    continue;
                 }
-                Ok(false) => {}
-                Err(error) => return error_response(&error),
+                let direct = match candidate.provider.runtime_id.as_deref() {
+                    None => true,
+                    Some(id) => matches!(
+                        crate::agent_upstream::runtime::resolve_chat_runtime(
+                            state.db.pool(),
+                            &state.adapters,
+                            id
+                        )
+                        .await,
+                        Ok(
+                            crate::agent_upstream::runtime::ChatRuntime::WorkBuddy { .. }
+                                | crate::agent_upstream::runtime::ChatRuntime::Qoder { .. }
+                        )
+                    ),
+                };
+                if direct {
+                    supported.push(candidate);
+                }
             }
-        }
-
-        let before_trim = estimate_message_tokens(&req.messages);
-        if scaled(before_trim, conservative_ratio) > max_message_budget {
-            req.messages = trim_to_budget(req.messages, scaled_budget);
-            let after_trim = estimate_message_tokens(&req.messages);
-            if scaled(after_trim, conservative_ratio) > max_message_budget {
-                return error_response(&GatewayError::ContextLengthExceeded {
-                    required: scaled(before_trim, conservative_ratio).saturating_add(fixed_reserve),
-                    available: max_message_budget.saturating_add(fixed_reserve),
+            candidates = supported;
+            if candidates.is_empty() {
+                return error_response(&GatewayError::CapabilityUnavailable {
+                    kind: "流式输出；账号适配器请使用非流式聊天".into(),
                 });
             }
-            tracing::warn!(
-                "会话 {} 在所有候选窗口内无法完整容纳，已从 {} tokens 裁剪至 {} tokens",
-                session_id,
-                before_trim,
-                after_trim
-            );
         }
-    }
 
-    // 多模态需求：带图片/音频/视频的请求只能交给确实接受该模态、且协议链路能真正
-    // 承载该媒体的模型，否则不是「慢一点」，而是内容被上游静默丢弃。
-    let required = required_capabilities(&req);
-    let media = crate::media::Media::of(&req);
+        // 路由前按候选窗口扣除输出、工具 schema 和协议余量。先强制压缩可压缩的
+        // 持久化历史，再在必要时按完整工具交换裁剪；仍放不下时明确报错，绝不把
+        // 超窗 payload 交给小窗口备选 Provider。
+        //
+        // 估算校准：本地按字符估算，与上游真实 token 之间存在系统性偏差。用日志里
+        // 「实际 / 估算」的 EWMA 比值保守换算，避免把超窗 payload 送进窗口。
+        let calibration = state.calibration_snapshot().await;
+        let fixed_reserve = fixed_context_reserve(&req, &candidates);
+        if let Some(max_message_budget) = max_message_budget(&candidates, fixed_reserve) {
+            let conservative_ratio = conservative_ratio(&candidates, &calibration);
+            let scaled_budget = (max_message_budget as f64 / conservative_ratio).floor() as u32;
+            if scaled(estimate_message_tokens(&req.messages), conservative_ratio)
+                > max_message_budget
+            {
+                if request_context.strict() {
+                    return error_response(&GatewayError::ContextLengthExceeded {
+                        required: scaled(
+                            estimate_message_tokens(&req.messages),
+                            conservative_ratio,
+                        )
+                        .saturating_add(fixed_reserve),
+                        available: max_message_budget.saturating_add(fixed_reserve),
+                    });
+                }
+                match state
+                    .compact_session_if_needed(&session_id, true, policy)
+                    .await
+                {
+                    Ok(true) => {
+                        session =
+                            match repo::get_or_create_session(state.db.pool(), &session_id).await {
+                                Ok(refreshed) => refreshed,
+                                Err(error) => return error_response(&error),
+                            };
+                        match state
+                            .ctx
+                            .prepare_context(&session, &incoming_messages, CONTEXT_HISTORY_LIMIT)
+                            .await
+                        {
+                            Ok(prepared) => {
+                                req.messages = prepared.messages;
+                                new_messages = prepared.new_messages;
+                            }
+                            Err(error) => {
+                                tracing::warn!("压缩后上下文重建失败，保留压缩前上下文: {error}");
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => return error_response(&error),
+                }
+            }
 
-    // D3：长 prompt 型代价需要这个数，而它原本在**下面**才算出来，
-    // 所以上提到 rank 之前。重复计算一次没有意义，直接用同一个值。
-    let request_message_tokens = estimate_message_tokens(&req.messages);
-    // Normalize cost/throughput only among candidates that can serve this request.
-    // A later-excluded small-window or incompatible-dialect model must not change
-    // the ordering of the remaining models (including cross-currency comparability).
-    let media_rejections = filter_by_media_carry(&mut candidates, &media);
-    candidates.retain(|candidate| {
-        candidate_supports_context(
-            candidate,
+            let before_trim = estimate_message_tokens(&req.messages);
+            if scaled(before_trim, conservative_ratio) > max_message_budget {
+                req.messages = trim_to_budget(req.messages, scaled_budget);
+                let after_trim = estimate_message_tokens(&req.messages);
+                if scaled(after_trim, conservative_ratio) > max_message_budget {
+                    return error_response(&GatewayError::ContextLengthExceeded {
+                        required: scaled(before_trim, conservative_ratio)
+                            .saturating_add(fixed_reserve),
+                        available: max_message_budget.saturating_add(fixed_reserve),
+                    });
+                }
+                tracing::warn!(
+                    "会话 {} 在所有候选窗口内无法完整容纳，已从 {} tokens 裁剪至 {} tokens",
+                    session_id,
+                    before_trim,
+                    after_trim
+                );
+            }
+        }
+
+        // 多模态需求：带图片/音频/视频的请求只能交给确实接受该模态、且协议链路能真正
+        // 承载该媒体的模型，否则不是「慢一点」，而是内容被上游静默丢弃。
+        let required = required_capabilities(&req);
+        let media = crate::media::Media::of(&req);
+
+        // D3：长 prompt 型代价需要这个数，而它原本在**下面**才算出来，
+        // 所以上提到 rank 之前。重复计算一次没有意义，直接用同一个值。
+        let request_message_tokens = estimate_message_tokens(&req.messages);
+        // Normalize cost/throughput only among candidates that can serve this request.
+        // A later-excluded small-window or incompatible-dialect model must not change
+        // the ordering of the remaining models (including cross-currency comparability).
+        let media_rejections = filter_by_media_carry(&mut candidates, &media);
+        candidates.retain(|candidate| {
+            candidate_supports_context(
+                candidate,
+                request_message_tokens,
+                fixed_reserve,
+                &calibration,
+            )
+        });
+        let ranking = state.router.rank_observed(
+            candidates,
+            &cfg,
+            required,
+            sticky.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
+            preflight.intent.as_ref().map(|intent| intent.class),
             request_message_tokens,
-            fixed_reserve,
-            &calibration,
-        )
-    });
-    let mut ranked = state.router.rank_with_intent(
-        candidates,
-        &cfg,
-        required,
-        sticky.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
-        preflight.intent.as_ref().map(|intent| intent.class),
-        request_message_tokens,
-        // D4：领域从请求内容判定。**与 `intent` 同源**（都在这一层），
-        // 因为两者都是分类的产物；分开算会让「难度说 reasoning、
-        // 领域说 vision」这种不一致有机会出现。
-        crate::intellect::detect_domain(&crate::intellect::ClassifyInput {
-            messages: &req.messages,
-            media,
-            // 与 L1913 那处**同款判定**。两处口径不同会让
-            // 「分类说有工具、领域判定说没有」这种不一致有机会出现。
-            has_tools: req.tools.is_some(),
-            requested_model: &req.model,
-        }),
-    );
-    if ranked.is_empty() {
-        return error_response(&missing_capability_error(
-            &required,
-            &media,
-            &media_rejections,
-        ));
-    }
-
-    // UI 的“热切换”不应只是写一份状态。把用户指定的 provider 提到候选链首位，
-    // 仍保留其余健康候选作为故障转移后备。
-    if let Some(active_id) = state.active.read().clone() {
-        if let Some(pos) = ranked.iter().position(|c| c.provider.id == active_id) {
-            let active = ranked.remove(pos);
-            ranked.insert(0, active);
+            // D4：领域从请求内容判定。**与 `intent` 同源**（都在这一层），
+            // 因为两者都是分类的产物；分开算会让「难度说 reasoning、
+            // 领域说 vision」这种不一致有机会出现。
+            crate::intellect::detect_domain(&crate::intellect::ClassifyInput {
+                messages: &req.messages,
+                media,
+                // 与 L1913 那处**同款判定**。两处口径不同会让
+                // 「分类说有工具、领域判定说没有」这种不一致有机会出现。
+                has_tools: req.tools.is_some(),
+                requested_model: &req.model,
+            }),
+        );
+        let mut ranked = ranking.candidates;
+        if ranked.is_empty() {
+            return error_response(&missing_capability_error(
+                &required,
+                &media,
+                &media_rejections,
+            ));
         }
-    }
 
-    // 6) 重复请求抑制。**判据在入口处定，执行与登记在这里**：
-    //
-    // - 放在路由与上下文重建**之后**：那样一次重复请求照样会触碰会话、跑分类器，
-    //   而它本来就是应当被抑制掉的那一次。
-    // - 放在执行**之前**：这正是「让第二次不再发上游」的位置。
-    //
-    // 指纹由「请求内容 + 会话 + 客户端」派生，不依赖调用方回传任何 id ——
-    // 主流 SDK 客户端不保证回传幂等键，而网关侧派生键对它们一律有效。
-    let fingerprint = dedup_fingerprint(&state, client.as_deref(), &req);
-    let permit = match state.dedup.begin(fingerprint.as_deref()).await {
-        DedupDecision::Off => None,
-        DedupDecision::Take(permit) => Some(permit),
-        DedupDecision::Share { verdict, .. } => {
-            return duplicate_conflict_response(verdict, fingerprint.as_deref().unwrap_or(""));
+        let mut active_promoted = false;
+        // UI 的“热切换”不应只是写一份状态。把用户指定的 provider 提到候选链首位，
+        // 仍保留其余健康候选作为故障转移后备。
+        if let Some(active_id) = state.active.read().clone() {
+            if let Some(pos) = ranked.iter().position(|c| c.provider.id == active_id) {
+                active_promoted = pos != 0;
+                let active = ranked.remove(pos);
+                ranked.insert(0, active);
+            }
         }
-    };
 
-    // 6) 执行（区分流式/非流式）
-    let dispatch_input = DispatchInput {
-        req,
-        new_messages,
-        response_session_id,
-        session_id: session_id.clone(),
-        client,
-        ranked,
-        cfg,
-        exit,
-        intent: preflight.intent,
-        search: preflight.search,
-        refine: preflight.refine,
-        cache_session: header_sid.clone().unwrap_or_default(),
-        cache_generation,
-        // traceId 在**入口处定一次**：客户端给了合法值就透传（便于跨服务串联），
-        // 否则生成新的。清洗在 `resolve_trace_id` 里做 —— 这个值会被写进
-        // 响应头，不清洗就是 HTTP 头注入面。
-        trace_id: trace_id.clone(),
-    };
-    let streaming = dispatch_input.req.stream;
-    let response = if streaming {
-        stream_dispatch(state.clone(), dispatch_input).await
-    } else {
-        normal_dispatch(state.clone(), dispatch_input).await
-    };
+        let free_selector_applied = state.cost_gate.effective(policy).is_free();
+        if free_selector_applied {
+            if let Err(error) = state.free_selector.select(
+                &mut ranked,
+                &state.health,
+                &state.router,
+                sticky.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
+            ) {
+                return error_response(&error);
+            }
+        }
 
-    // 7) 登记结果，供下一次重复请求判定。
-    //
-    // **只记「有没有成功交付过」**，不缓冲响应体：流式响应边生成边发，
-    // 缓冲它等于把流式变成「等完再一次给出」；而非流式请求在本项目的
-    // 调用方上不是重复投递的来源。登记这一个 bit 就够判定「该拒绝还是该放行」。
-    if let Some(permit) = &permit {
-        let outcome = if response.status().as_u16() < 400 {
-            DedupOutcome::Delivered
-        } else {
-            DedupOutcome::Failed
+        // Observe the already formed plan before dedup or another awaited boundary.
+        // No ranking, health mutation, model calls or second audit owner here.
+        let mut decision = crate::audit::route_decision::Snapshot::capture(
+            configured_strategy,
+            request_context.personal_test,
+            &ranked,
+            sticky.as_ref(),
+            active_promoted,
+            free_selector_applied,
+            &route_trace_of(
+                preflight.intent.as_ref(),
+                preflight.search.as_ref(),
+                preflight.refine.as_ref(),
+            ),
+        );
+        let (calls, omitted) = preflight_journal.snapshot();
+        if !calls.is_empty() || omitted > 0 {
+            decision.with_auxiliary(calls, omitted);
+        }
+        if let Some(observed) = ranking.observation.as_ref() {
+            decision.with_scores(observed);
+        }
+        preflight_progress.decision(decision.clone());
+
+        // 6) 重复请求抑制。**判据在入口处定，执行与登记在这里**：
+        //
+        // - 放在路由与上下文重建**之后**：那样一次重复请求照样会触碰会话、跑分类器，
+        //   而它本来就是应当被抑制掉的那一次。
+        // - 放在执行**之前**：这正是「让第二次不再发上游」的位置。
+        //
+        // 指纹由「请求内容 + 会话 + 客户端」派生，不依赖调用方回传任何 id ——
+        // 主流 SDK 客户端不保证回传幂等键，而网关侧派生键对它们一律有效。
+        let fingerprint = dedup_fingerprint(
+            &state,
+            client.as_deref(),
+            &req,
+            request_context.wire_options(),
+        );
+        let permit = match state.dedup.begin(fingerprint.as_deref()).await {
+            DedupDecision::Off => None,
+            DedupDecision::Take(permit) => Some(permit),
+            DedupDecision::Share { verdict, .. } => {
+                preflight_progress.suppress_ready_observation();
+                return duplicate_conflict_response(verdict, fingerprint.as_deref().unwrap_or(""));
+            }
         };
-        state.dedup.finish(permit, outcome);
+
+        // 6) 执行（区分流式/非流式）
+        let dispatch_input = DispatchInput {
+            decision: Some(decision),
+            desktop_observation: headers
+                .get("x-llmgw-desktop-observation")
+                .is_some_and(|v| v == "1"),
+            wire_options: request_context.wire_options(),
+            req,
+            new_messages,
+            response_session_id,
+            session_id: session_id.clone(),
+            client,
+            ranked,
+            cfg,
+            exit,
+            intent: preflight.intent,
+            search: preflight.search,
+            refine: preflight.refine,
+            cache_session: header_sid.clone().unwrap_or_default(),
+            cache_generation,
+            // traceId 在**入口处定一次**：客户端给了合法值就透传（便于跨服务串联），
+            // 否则生成新的。清洗在 `resolve_trace_id` 里做 —— 这个值会被写进
+            // 响应头，不清洗就是 HTTP 头注入面。
+            trace_id: trace_id.clone(),
+        };
+        // The normal/stream path immediately establishes its own owner. Keeping
+        // preflight armed while it awaits would duplicate cancellation audits.
+        preflight_progress.handoff();
+        let streaming = dispatch_input.req.stream;
+        let response = if streaming {
+            stream_dispatch(state.clone(), dispatch_input).await
+        } else {
+            normal_dispatch(state.clone(), dispatch_input).await
+        };
+
+        // 7) 登记结果，供下一次重复请求判定。
+        //
+        // **只记「有没有成功交付过」**，不缓冲响应体：流式响应边生成边发，
+        // 缓冲它等于把流式变成「等完再一次给出」；而非流式请求在本项目的
+        // 调用方上不是重复投递的来源。登记这一个 bit 就够判定「该拒绝还是该放行」。
+        if let Some(permit) = &permit {
+            let outcome = if response.status().as_u16() < 400 {
+                DedupOutcome::Delivered
+            } else {
+                DedupOutcome::Failed
+            };
+            state.dedup.finish(permit, outcome);
+        }
+        response
+    };
+    let observed_preparing = async {
+        let response = preparing.await;
+        preflight_progress.preflight_response(response.status().as_u16());
+        response
+    };
+    stream_audit::select(observed_preparing, preflight_audit, preflight_records).await
+}
+
+/// A private identity projection, never a model request or persisted input.
+/// Default identities keep the legacy shape. Strict identities use an envelope
+/// without the mandatory ChatRequest model/messages/stream root keys, so caller
+/// flattened extras cannot forge the policy merely by guessing a reserved name.
+/// Only tools is copied to the root for existing cache bypass checks.
+fn request_identity_value(
+    req: &ChatRequest,
+    options: super::upstream::RequestWireOptions,
+) -> std::result::Result<serde_json::Value, serde_json::Error> {
+    let request = serde_json::to_value(req)?;
+    if !options.preserve_instruction {
+        return Ok(request);
     }
-    response
+    let tools = request.get("tools").cloned();
+    let mut identity = serde_json::json!({
+        "__llm_gateway_response_request_policy_v1": {
+            "request": request,
+            "wire_options": {"preserve_instruction": true},
+        },
+    });
+    if let Some(tools) = tools {
+        identity["tools"] = tools;
+    }
+    Ok(identity)
+}
+
+fn request_identity_json(
+    req: &ChatRequest,
+    options: super::upstream::RequestWireOptions,
+) -> std::result::Result<String, serde_json::Error> {
+    if options.preserve_instruction {
+        request_identity_value(req, options).and_then(|value| serde_json::to_string(&value))
+    } else {
+        // Dedup hashes the legacy struct serialization, including its field
+        // order. Do not round-trip this default path through a JSON Value.
+        serde_json::to_string(req)
+    }
+}
+
+#[cfg(test)]
+mod request_identity_tests {
+    use super::*;
+
+    #[test]
+    fn responses_instructions_r1_default_identity_bytes_and_unforgeable_envelope() {
+        let mut req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model":"fixture", "messages":[{"role":"system","content":" \t "},{"role":"user","content":"U"}],
+            "stream":false, "temperature":0.5, "max_tokens":42,
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+            "z_extra":{"nested":[2,1]}, "a_extra":"original",
+        })).unwrap();
+        let original = serde_json::to_value(&req).unwrap();
+        let legacy_bytes = serde_json::to_string(&req).unwrap();
+        let default = super::super::upstream::RequestWireOptions::default();
+        let strict = super::super::upstream::RequestWireOptions {
+            preserve_instruction: true,
+            ..Default::default()
+        };
+        assert_eq!(request_identity_value(&req, default).unwrap(), original);
+        assert_eq!(
+            request_identity_json(&req, default).unwrap().as_bytes(),
+            legacy_bytes.as_bytes()
+        );
+        let identity = request_identity_value(&req, strict).unwrap();
+        assert_eq!(identity["tools"], original["tools"]);
+        for field in ["model", "messages", "stream"] {
+            assert!(original.get(field).is_some());
+            assert!(identity.get(field).is_none());
+        }
+        assert_eq!(
+            identity["__llm_gateway_response_request_policy_v1"]["request"],
+            original
+        );
+        assert_ne!(request_identity_json(&req, strict).unwrap(), legacy_bytes);
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            original,
+            "input must not acquire private metadata"
+        );
+        req.extra.insert(
+            "__llm_gateway_response_request_policy_v1".into(),
+            identity["__llm_gateway_response_request_policy_v1"].clone(),
+        );
+        assert_ne!(request_identity_value(&req, default).unwrap(), identity);
+        assert_eq!(
+            request_identity_json(&req, default).unwrap(),
+            serde_json::to_string(&req).unwrap()
+        );
+    }
 }
 
 /// 该不该给这次请求算指纹。返回 `None` 表示这次请求不参与去重。
@@ -3936,9 +5509,13 @@ fn dedup_fingerprint(
     state: &GatewayState,
     client: Option<&str>,
     req: &ChatRequest,
+    options: super::upstream::RequestWireOptions,
 ) -> Option<String> {
     let cfg = state.cfg_snapshot();
     if !crate::proxy::dedup::should_compute_fingerprint(&cfg.dedup) {
+        return None;
+    }
+    if options.cost_policy.strengthen(&cfg).is_free() {
         return None;
     }
     if req.tools.is_some() {
@@ -3947,7 +5524,7 @@ fn dedup_fingerprint(
     if request_has_media(req) {
         return None;
     }
-    let request_json = match serde_json::to_string(req) {
+    let request_json = match request_identity_json(req, options) {
         Ok(json) => json,
         Err(error) => {
             tracing::warn!("去重：请求体无法序列化，本次跳过判定：{error}");
@@ -4170,9 +5747,16 @@ fn candidate_supports_context(
         <= candidate.model.context_window as u32
 }
 
-fn schedule_compaction(state: Arc<GatewayState>, session_id: String) {
+fn schedule_compaction(state: Arc<GatewayState>, session_id: String, policy: RequestCostPolicy) {
+    // A detached job cannot inherit this request's durable budget owner.
+    if crate::budget::holds::active() {
+        return;
+    }
     tokio::spawn(async move {
-        if let Err(error) = state.compact_session_if_needed(&session_id, false).await {
+        if let Err(error) = state
+            .compact_session_if_needed(&session_id, false, policy)
+            .await
+        {
             tracing::warn!("响应后自动压缩失败: {error}");
         }
     });
@@ -4276,14 +5860,24 @@ type CascadeAskFuture =
 ///
 /// 把两者合并成 `0.0` 会让「Jev 没起来」变成「每次都升级到最贵那档」，
 /// 那与实测量到的「edgeJev 会高置信度判错」叠加起来是双倍损失。
-async fn cascade_confidence(cfg: &AppConfig, question: &str, answer: &str) -> Option<f32> {
+async fn cascade_confidence(
+    state: &GatewayState,
+    cfg: &AppConfig,
+    question: &str,
+    answer: &str,
+    policy: RequestCostPolicy,
+) -> Option<f32> {
+    if state.cost_gate.effective(policy).is_free() {
+        return None;
+    }
     let jev = crate::intellect::JevClient::new(
         &cfg.smart_routing.jev.base_url,
         &cfg.smart_routing.jev.model,
         cfg.smart_routing.jev.timeout_ms,
         cfg.smart_routing.jev.max_state_chars,
     )
-    .ok()?;
+    .ok()?
+    .with_cost_policy(state.cost_gate.clone(), policy);
     // state 是「问题 + 候选回答」。截断由 `truncate_state` 负责（保留尾部），
     // 与分类那条通道同一个函数 —— 两处各写一套截断迟早不一致。
     let state = format!("【用户的问题】\n{question}\n\n【候选回答】\n{answer}");
@@ -4355,12 +5949,48 @@ async fn persist_completed_exchange(
 
 /// 非流式请求执行与缓存。
 async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Response {
-    let route = input.route_trace();
+    let started = Instant::now();
+    let records: AttemptRecordSink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (audit, progress) = stream_audit::StreamAudit::new(stream_audit::AuditContext {
+        state: state.clone(),
+        session_id: input.session_id.clone(),
+        requested_model: input.req.model.clone(),
+        client: input.client.clone(),
+        provider_id: None,
+        model: None,
+        records: Vec::new(),
+        trace_id: input.trace_id.clone(),
+        route: input.route_trace(),
+        started,
+        estimated_prompt: estimate_message_tokens(&input.req.messages) as i64,
+    });
+    // Keep one owner through cache/context/calibration awaits, not only the
+    // upstream selection. A completed HTTP hop remains completed if the client
+    // leaves before the whole buffered response is ready.
+    stream_audit::select(
+        normal_dispatch_inner(state, input, started, records.clone(), progress),
+        audit,
+        records,
+    )
+    .await
+}
+
+async fn normal_dispatch_inner(
+    state: Arc<GatewayState>,
+    input: DispatchInput,
+    started: Instant,
+    records_sink: AttemptRecordSink,
+    audit_progress: stream_audit::ProgressHandle,
+) -> Response {
+    let mut route = input.route_trace();
     // `tokio::spawn(async move { … })` 是**按值**捕获用到的变量，
     // 所以下面的后台任务要用的是一份克隆，原变量留给响应头。
     // `mut` 是因为 D4 级联的两个字段要等请求跑完才回填（见下面）。
     let mut audit_route = route.clone();
     let DispatchInput {
+        decision: _,
+        desktop_observation,
+        wire_options,
         cache_session,
         cache_generation,
         trace_id,
@@ -4378,7 +6008,6 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         // 原来是 `_refine`（明确丢弃），现在真的要读它。
         refine,
     } = input;
-    let started = Instant::now();
     let max_attempts = if cfg.failover_enabled {
         cfg.max_fallback_attempts
     } else {
@@ -4413,6 +6042,21 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     } else {
         false
     };
+    if cascade_on {
+        if let Some(decision) = route.decision.as_mut() {
+            decision.cascade_order(&ranked, cascade_ordered);
+            audit_progress.decision(decision.clone());
+        }
+        audit_route.decision = route.decision.clone();
+    }
+
+    if let Err(error) = validate_first_http_reasoning(&ranked, &req) {
+        return error_response(&error);
+    }
+
+    if let Err(error) = validate_first_http_instruction_override(&ranked, wire_options) {
+        return error_response(&error);
+    }
 
     // 缓存键的 provider/model 用**本轮路由的首选**（ranked[0]）。
     //
@@ -4423,10 +6067,18 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let intended_route = ranked
         .first()
         .map(|c| (c.provider.id.clone(), c.model.upstream.clone()));
-    let cache_cfg = cfg.cache.clone();
+    let mut cache_cfg = cfg.cache.clone();
+    if state
+        .cost_gate
+        .effective(wire_options.cost_policy)
+        .is_free()
+    {
+        cache_cfg.enabled = false;
+    }
     let cache_miss_key = match (&intended_route, cache_cfg.enabled) {
         (Some((pid, mid)), true) => {
-            let request_value = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let request_value =
+                request_identity_value(&req, wire_options).unwrap_or(serde_json::Value::Null);
             let key_input = crate::cache::CacheKeyInput {
                 provider_id: pid,
                 routed_model: mid,
@@ -4453,6 +6105,14 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     // 若直接存编码后的 body，同一个逻辑请求来自不同客户端就会串格式。
                     let cached: crate::domain::ChatResponse =
                         serde_json::from_value(value).unwrap_or_default();
+                    audit_progress.cached_replay(
+                        pid,
+                        mid,
+                        ranked
+                            .first()
+                            .and_then(|candidate| candidate.model.price.as_ref())
+                            .map(|price| price.currency.code()),
+                    );
                     let assistant = Message {
                         role: Role::Assistant,
                         content: Content::Text(cached.content.clone()),
@@ -4475,9 +6135,16 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     .await
                     {
                         tracing::error!("缓存响应上下文持久化失败: {error}");
+                        audit_progress.failed_before_response(&error);
                         return error_response(&error);
                     }
-                    schedule_compaction(state.clone(), session_id.clone());
+                    if !wire_options.preserve_instruction {
+                        schedule_compaction(
+                            state.clone(),
+                            session_id.clone(),
+                            wire_options.cost_policy,
+                        );
+                    }
 
                     // 缓存重放是独立请求，审计关联本次 trace；未调用上游，
                     // 不能将缓存响应里的旧 usage 再计入花费或吞吐统计。
@@ -4498,8 +6165,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         refine.as_ref().map(|result| result.prompt.as_str()),
                     );
                     let latency_ms = started.elapsed().as_millis() as i64;
-                    tokio::spawn(async move {
-                        let _ = repo::log_request(
+                    let audit_tasks = audit_state.audit_tasks();
+                    audit_tasks.spawn(async move {
+                        repo::log_request(
                             audit_state.db.pool(),
                             repo::RequestLog {
                                 session_id: Some(&audit_session_id),
@@ -4526,9 +6194,17 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                                 trace_id: &audit_trace_id,
                             },
                         )
-                        .await;
+                        .await
                     });
-                    let body = encode_response(&cached, mid, exit);
+                    let mut body = encode_response(&cached, mid, exit);
+                    if exit == Exit::OpenAI {
+                        crate::desktop_chat::attach_gateway_observation(
+                            &mut body,
+                            &cached,
+                            desktop_observation,
+                            false,
+                        );
+                    }
                     let mut resp = Json(body).into_response();
                     apply_route_headers(&route, resp.headers_mut());
                     let h = resp.headers_mut();
@@ -4561,7 +6237,8 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let cache_bypass = if cache_cfg.enabled && cache_miss_key.is_none() {
         match &intended_route {
             Some((pid, mid)) => {
-                let request_value = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+                let request_value =
+                    request_identity_value(&req, wire_options).unwrap_or(serde_json::Value::Null);
                 let probe = crate::cache::CacheKeyInput {
                     provider_id: pid,
                     routed_model: mid,
@@ -4590,7 +6267,6 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let router = state.router.clone();
     // 级联各跳的逐跳明细共用这一个收集器：不共享的话，
     // 「第一跳发给了便宜的模型、被升级掉了」这件事在审计里会消失。
-    let records_sink: AttemptRecordSink = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let charges_sink = Arc::new(parking_lot::Mutex::new(Vec::<CallCharge>::new()));
     // 同一请求的级联升级仍须遵守前一跳确认的鉴权拒绝与免 Key 隔离。
     let auth_isolation = Arc::new(parking_lot::Mutex::new(
@@ -4604,12 +6280,13 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     // 不会出现「生产路径与用例跑的不是同一段代码」那种假验证。
     let cascade_run = {
         let question = last_user_text(&req);
-        crate::router::cascade::run_cascade_with_cursor(
-            &if cascade_on {
-                cfg.cascade
-            } else {
-                Default::default()
-            },
+        let cascade_config = if cascade_on {
+            cfg.cascade
+        } else {
+            Default::default()
+        };
+        let selecting = crate::router::cascade::run_cascade_with_cursor(
+            &cascade_config,
             CascadeRunRequest {
                 candidates: ranked.len(),
                 streaming: false,
@@ -4626,13 +6303,15 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 let sink = Arc::clone(&records_sink);
                 let charges = Arc::clone(&charges_sink);
                 let auth_isolation = Arc::clone(&auth_isolation);
+                let audit_progress = audit_progress.clone();
                 Box::pin(async move {
                     // `AtomicFlag` 只被流式路径 `set`，而这里是**非流式**入口；
                     // 每次尝试各起一个，等价于原来共享一个（它永远是 0）。
                     let flag = AtomicFlag::new();
                     let chain = FailoverChain::new(&ranked[start..], max_attempts, &flag)
                         .with_admission(router.clone())
-                        .with_auth_isolation(auth_isolation);
+                        .with_auth_isolation(auth_isolation)
+                        .with_cancellation_records(sink.clone());
                     let chain = chain
                         .with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
                     let timeout = Duration::from_secs(cfg.upstream_timeout_secs);
@@ -4647,8 +6326,13 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                                 async move {
                                     // Shared account/HTTP dispatch and per-call sampling.
                                     state
-                                        .call_chat_upstream(
-                                            &provider, &r, &model, timeout, &defaults,
+                                        .call_chat_upstream_with_options(
+                                            &provider,
+                                            &r,
+                                            &model,
+                                            timeout,
+                                            &defaults,
+                                            wire_options,
                                         )
                                         .await
                                 }
@@ -4662,15 +6346,20 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                                         router.mark_rate_limited(provider, m);
                                     }
                                 }
-                                health.record_failure(&provider.id, model, err);
+                                if !super::upstream::is_local_request_policy_rejection(
+                                    err,
+                                    wire_options,
+                                ) {
+                                    health.record_failure(&provider.id, model, err);
+                                }
                             },
                             auth_confirm_handler(state.clone(), cfg.clone()),
                         )
                         .await;
-                    // 链要 `&mut Vec`，所以明细先落在本地，链跑完再并进共享 sink
-                    // ——共享锁不能跨 await 持有。
+                    // The chain journals each settled hop, including cancellation.
+                    // Do not append its local copy again on normal completion.
                     if let Ok(o) = &outcome {
-                        if let Some(record) = records.last_mut() {
+                        if let Some(record) = sink.lock().last_mut() {
                             record.transport = o.value.transport.clone();
                         }
                         let price = ranked
@@ -4679,8 +6368,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                             .and_then(|c| c.model.price.as_ref());
                         let (cost, currency, label) = o
                             .value
-                            .usage
-                            .as_ref()
+                            .reference_cost_usage()
                             .map(|u| {
                                 price_charge(
                                     price,
@@ -4713,12 +6401,20 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         charges
                             .lock()
                             .push((o.value.usage.clone(), cost, currency, label, entry));
+                        // Retain only consumption already observed on completed calls.
+                        // Do not mark the still-pending client request as successful.
+                        audit_progress.observed_charges(&charges.lock());
                     }
-                    sink.lock().append(&mut records);
                     Ok::<_, GatewayError>(outcome)
                 })
             },
             |payload: &CascadeAttemptPayload| -> CascadeAskFuture {
+                // Preserve Cascade's cost order and ordinary failover, but never
+                // consult an auxiliary model for a strict full-input request.
+                // Unavailable is distinct from both disabled and high confidence.
+                if wire_options.preserve_instruction {
+                    return Box::pin(async { ConfidenceReading::unavailable() });
+                }
                 // 失败的那一跳不问 Jev：没有回答可评估。
                 // 返回「通道不可用」而不是 `Some(0.0)` —— 后者会触发升级，
                 // 而这里根本没有可升级的东西（错误由外层如实报出）。
@@ -4728,8 +6424,17 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 let cfg = cfg.clone();
                 let question = question.clone();
                 let content = outcome.value.content.clone();
+                let state = state.clone();
                 Box::pin(async move {
-                    match cascade_confidence(&cfg, &question, &content).await {
+                    match cascade_confidence(
+                        &state,
+                        &cfg,
+                        &question,
+                        &content,
+                        wire_options.cost_policy,
+                    )
+                    .await
+                    {
                         Some(value) => ConfidenceReading::available(value),
                         None => ConfidenceReading::unavailable(),
                     }
@@ -4746,12 +6451,13 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     })
                     .unwrap_or(start)
             },
-        )
-        .await
+        );
+        selecting.await
     };
 
     // 各次尝试的逐跳明细都在这个 sink 里（级联升级过的前几跳也在）。
-    let attempt_records: Vec<AttemptRecord> = std::mem::take(&mut *records_sink.lock());
+    // The outer cancellation owner still needs this journal during DB awaits.
+    let attempt_records: Vec<AttemptRecord> = records_sink.lock().clone();
     let charges = call_totals(&charges_sink.lock());
     let mut call_usage: Vec<repo::UsageEntry> =
         charges_sink.lock().iter().map(|c| c.4.clone()).collect();
@@ -4829,6 +6535,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             .await
             {
                 tracing::error!("响应成功但上下文持久化失败: {error}");
+                audit_progress.failed_before_response(&error);
                 return error_response(&error);
             }
 
@@ -4838,26 +6545,30 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             // 校准写入必须在触发压缩之前完成：压缩阈值要按同一份「实际/估算」口径
             // 判断，否则刚观测到的偏差要等到下一轮才生效。
             let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
-            if let Ok(calibration) = repo::record_token_calibration(
-                state.db.pool(),
-                &pid,
-                &mid,
-                estimated_prompt,
-                pt as i64,
-            )
-            .await
-            {
-                if let Err(error) = repo::update_session_token_ratio(
+            if crate::personal_test::current().is_none() {
+                if let Ok(calibration) = repo::record_token_calibration(
                     state.db.pool(),
-                    &session_id,
-                    calibration.ratio,
+                    &pid,
+                    &mid,
+                    estimated_prompt,
+                    pt as i64,
                 )
                 .await
                 {
-                    tracing::warn!("更新会话校准比值失败: {error}");
+                    if let Err(error) = repo::update_session_token_ratio(
+                        state.db.pool(),
+                        &session_id,
+                        calibration.ratio,
+                    )
+                    .await
+                    {
+                        tracing::warn!("更新会话校准比值失败: {error}");
+                    }
                 }
             }
-            schedule_compaction(state.clone(), session_id.clone());
+            if !wire_options.preserve_instruction {
+                schedule_compaction(state.clone(), session_id.clone(), wire_options.cost_policy);
+            }
 
             let audit_state = state.clone();
             let audit_session_id = session_id.clone();
@@ -4872,7 +6583,8 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             // traceId 要被三个地方用：响应头（借用）、审计落库（移进 spawn）、
             // 以及每一条降级明细。先克隆一份，后面都用它。
             let audit_trace_id = trace_id.clone();
-            let audit_attempts = attempts_json_traced(&attempt_records, Some(&audit_trace_id));
+            let audit_attempts =
+                attempts_json_traced(&attempt_records, Some(&audit_trace_id), Some(&session_id));
             // 必须在 `tokio::spawn` **之前**算好：spawn 的闭包按值捕获，
             // 而 `cfg` 与 `refine` 在里面拿不到。走 `refined_prompt_to_store`
             // 而不是手写 `if`，是为了让「开关」与「脱敏」永远同进同退。
@@ -4889,8 +6601,9 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             // traceId 要被两个地方用：响应头（借用）与审计落库（移进 spawn）。
             // 先克隆一份给 spawn，原值留给响应头。
             let audit_trace_id = trace_id.clone();
-            tokio::spawn(async move {
-                let _ = repo::log_request_with_usage(
+            let audit_tasks = audit_state.audit_tasks();
+            audit_tasks.spawn(async move {
+                repo::log_request_with_usage(
                     audit_state.db.pool(),
                     repo::RequestLog {
                         session_id: Some(&audit_session_id),
@@ -4919,10 +6632,23 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     },
                     &call_usage,
                 )
-                .await;
+                .await
             });
 
-            let body = encode_response(&o.value, &o.model, exit);
+            let mut body = encode_response(&o.value, &o.model, exit);
+            // Only this backend-owned path lacks a trusted usage contract.
+            // Keep ordinary OpenAI's historical default usage serialization.
+            if crate::personal_test::current().is_some() {
+                body["usage"] = serde_json::Value::Null;
+            }
+            if exit == Exit::OpenAI {
+                crate::desktop_chat::attach_gateway_observation(
+                    &mut body,
+                    &o.value,
+                    desktop_observation,
+                    crate::personal_test::current().is_some(),
+                );
+            }
             let mut resp = Json(body).into_response();
             apply_route_headers(&route, resp.headers_mut());
             let h = resp.headers_mut();
@@ -5015,9 +6741,11 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             // 失败路径也要带上 traceId：本地永远要有，不能因为路径不同就留空。
             // 克隆一份给 spawn，原值留给响应头。
             let audit_trace_id = trace_id.clone();
-            let audit_attempts = attempts_json_traced(&attempt_records, Some(&audit_trace_id));
-            tokio::spawn(async move {
-                let _ = repo::log_request_with_usage(
+            let audit_attempts =
+                attempts_json_traced(&attempt_records, Some(&audit_trace_id), Some(&session_id));
+            let audit_tasks = st.audit_tasks();
+            audit_tasks.spawn(async move {
+                repo::log_request_with_usage(
                     st.db.pool(),
                     repo::RequestLog {
                         session_id: Some(&sid),
@@ -5047,7 +6775,7 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     },
                     &call_usage,
                 )
-                .await;
+                .await
             });
             error_response(&e)
         }
@@ -5056,9 +6784,11 @@ async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
 struct PreparedUpstreamStream {
     started: Instant,
+    tps_source: Option<crate::proxy::health::TpsLease>,
     stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<UpstreamEvent>> + Send>>,
     first_event: UpstreamEvent,
     initial_usage: Option<Usage>,
+    initial_usage_observation: Option<serde_json::Value>,
     initial_finish_reason: Option<String>,
 }
 
@@ -5070,6 +6800,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
     let route = input.route_trace();
     let DispatchInput {
+        decision: _,
+        desktop_observation,
+        wire_options,
         // 流式一律 BYPASS，用不到缓存键里的会话 id。
         cache_session: _cache_session,
         cache_generation: _cache_generation,
@@ -5087,14 +6820,21 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         refine: _refine,
     } = input;
 
-    // `async_stream::stream!` 生成的是协程，它**会拿走**在里面用到的变量。
-    // `trace_id` 既要在协程里落库、又要在协程外的响应头上用，
-    // 所以先克隆一份给协程，原值留给响应头。
-    let stream_trace_id = trace_id.clone();
+    if let Err(error) = validate_first_http_reasoning(&ranked, &req) {
+        return error_response(&error);
+    }
+
+    if let Err(error) = validate_first_http_instruction_override(&ranked, wire_options) {
+        return error_response(&error);
+    }
 
     let req_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let started = Instant::now();
-    let max_attempts = if cfg.failover_enabled {
+    // The new desktop stream is a single generation dispatch, including
+    // failures before the first chunk. Ordinary clients retain their policy.
+    let max_attempts = if desktop_observation && exit == Exit::OpenAI {
+        1
+    } else if cfg.failover_enabled {
         cfg.max_fallback_attempts
     } else {
         1
@@ -5102,9 +6842,24 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
     // 响应头一经发送就无法改写。先完成连接与首个有效事件的选择，才能让
     // X-Routed-Via / X-Fallback-Attempts 反映实际结果，同时仍能在未输出前降级。
+    let cancellation_records = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (selection_audit, _) = stream_audit::StreamAudit::new(stream_audit::AuditContext {
+        state: state.clone(),
+        session_id: session_id.clone(),
+        requested_model: req.model.clone(),
+        client: client.clone(),
+        provider_id: None,
+        model: None,
+        records: Vec::new(),
+        trace_id: trace_id.clone(),
+        route: route.clone(),
+        started,
+        estimated_prompt: estimate_message_tokens(&req.messages) as i64,
+    });
     let flag = AtomicFlag::new();
     let chain = FailoverChain::new(&ranked, max_attempts, &flag)
         .with_admission(state.router.clone())
+        .with_cancellation_records(cancellation_records.clone())
         .with_auth_policy(cfg.auth_failure.mode, cfg.auth_failure.confirm_retries);
     let upstream = state.clone();
     let request = Arc::new(req.clone());
@@ -5113,71 +6868,86 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let mut attempt_records = Vec::new();
     // 一次尝试止于首个可输出事件。整条流不能放进降级闭包，否则首字节后
     // 的故障也会重放请求。鉴权复测、免 Key 否决和停用均复用同一条链。
-    let selected = chain
-        .run_with_auth_policy(
-            &mut attempt_records,
-            move |provider, model| {
-                let upstream = upstream.clone();
-                let request = request.clone();
-                let defaults = defaults.clone();
-                async move {
-                    let started = Instant::now();
-                    let mut stream = upstream
-                        .call_chat_upstream_stream(&provider, &request, &model, timeout, &defaults)
-                        .await?;
-                    let mut initial_usage = None;
-                    let mut initial_finish_reason = None;
-                    loop {
-                        match stream.next().await {
-                            Some(Ok(UpstreamEvent::Ping)) => {}
-                            Some(Ok(UpstreamEvent::Usage(value))) => {
-                                merge_usage(&mut initial_usage, value)
+    let selecting = chain.run_with_auth_policy(
+        &mut attempt_records,
+        move |provider, model| {
+            let upstream = upstream.clone();
+            let request = request.clone();
+            let defaults = defaults.clone();
+            async move {
+                let started = Instant::now();
+                let tps_source = upstream.health.tps_lease(&provider, &model);
+                let mut stream = upstream
+                    .call_chat_upstream_stream(
+                        &provider,
+                        &request,
+                        &model,
+                        timeout,
+                        &defaults,
+                        wire_options,
+                    )
+                    .await?;
+                let mut initial_usage = None;
+                let mut initial_usage_observation = None;
+                let mut initial_finish_reason = None;
+                loop {
+                    match stream.next().await {
+                        Some(Ok(UpstreamEvent::Ping)) => {}
+                        Some(Ok(UpstreamEvent::Usage(value))) => {
+                            merge_usage(&mut initial_usage, value)
+                        }
+                        Some(Ok(UpstreamEvent::UsageObservation(value))) => {
+                            merge_desktop_usage_observation(&mut initial_usage_observation, value);
+                        }
+                        Some(Ok(UpstreamEvent::Finish { finish_reason })) => {
+                            if finish_reason.is_some() {
+                                initial_finish_reason = finish_reason;
                             }
-                            Some(Ok(UpstreamEvent::Finish { finish_reason })) => {
-                                if finish_reason.is_some() {
-                                    initial_finish_reason = finish_reason;
-                                }
-                            }
-                            Some(Ok(first_event)) => {
-                                return Ok(PreparedUpstreamStream {
-                                    started,
-                                    stream,
-                                    first_event,
-                                    initial_usage,
-                                    initial_finish_reason,
-                                })
-                            }
-                            Some(Err(error)) => return Err(error),
-                            None => {
-                                return Err(GatewayError::Upstream {
-                                    provider: provider.name.clone(),
-                                    model,
-                                    status: 502,
-                                    body: "上游在输出首个有效事件前结束".into(),
-                                })
-                            }
+                        }
+                        Some(Ok(first_event)) => {
+                            return Ok(PreparedUpstreamStream {
+                                started,
+                                tps_source,
+                                stream,
+                                first_event,
+                                initial_usage,
+                                initial_usage_observation,
+                                initial_finish_reason,
+                            })
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => {
+                            return Err(GatewayError::Upstream {
+                                provider: provider.name.clone(),
+                                model,
+                                status: 502,
+                                body: "上游在输出首个有效事件前结束".into(),
+                            })
                         }
                     }
                 }
-            },
-            |provider, model, error| {
-                if let Some(candidate) = ranked.iter().find(|candidate| {
-                    candidate.provider.id == provider.id && candidate.model.upstream == model
-                }) {
-                    record_candidate_failure(&state, candidate, error);
-                }
-            },
-            auth_confirm_handler(state.clone(), cfg.clone()),
-        )
-        .await;
+            }
+        },
+        |provider, model, error| {
+            if let Some(candidate) = ranked.iter().find(|candidate| {
+                candidate.provider.id == provider.id && candidate.model.upstream == model
+            }) {
+                record_candidate_failure(&state, candidate, error, wire_options);
+            }
+        },
+        auth_confirm_handler(state.clone(), cfg.clone()),
+    );
+    let selected = stream_audit::select(selecting, selection_audit, cancellation_records).await;
     let attempts = attempt_records.len();
     let (
         candidate,
         mut upstream_stream,
         first_event,
         initial_usage,
+        initial_usage_observation,
         initial_finish_reason,
         winning_started,
+        winning_tps_source,
     ) = match selected {
         Ok(outcome) => {
             let candidate = ranked
@@ -5194,8 +6964,10 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 prepared.stream,
                 prepared.first_event,
                 prepared.initial_usage,
+                prepared.initial_usage_observation,
                 prepared.initial_finish_reason,
                 prepared.started,
+                prepared.tps_source,
             )
         }
         Err(error) => {
@@ -5221,17 +6993,26 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
     let requested_model = req.model.clone();
     let stream_state = state.clone();
     let stream_session_id = session_id.clone();
-    let stream_attempts = attempts;
-    let stream_client = client.clone();
-    // 同上：`stream!` 展开成 `async move`，会按值捕获。审计里那份另存，
-    // 响应头那一份留在外层函数里。
-    let stream_route = route.clone();
-
+    let (stream_audit, audit_progress) =
+        stream_audit::StreamAudit::new(stream_audit::AuditContext {
+            state: state.clone(),
+            session_id: session_id.clone(),
+            requested_model,
+            client,
+            provider_id: Some(provider_id.clone()),
+            model: Some(model.clone()),
+            records: attempt_records,
+            trace_id: trace_id.clone(),
+            route: route.clone(),
+            started,
+            estimated_prompt: estimate_message_tokens(&req.messages) as i64,
+        });
     let s = stream! {
         let mut full = String::new();
         let mut refusal_seen = false;
         let mut streamed_tool_call_deltas = Vec::new();
         let mut usage = initial_usage;
+        let mut usage_observation = initial_usage_observation;
         let mut final_finish_reason = initial_finish_reason;
         let mut openai_role_sent = false;
         let mut anthropic_stream = None;
@@ -5374,6 +7155,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                 Some(Ok(UpstreamEvent::Usage(value))) => {
                     merge_usage(&mut usage, value);
                 }
+                Some(Ok(UpstreamEvent::UsageObservation(value))) => {
+                    merge_desktop_usage_observation(&mut usage_observation,value);
+                }
                 Some(Ok(UpstreamEvent::Ping)) => {
                     if matches!(exit, Exit::OpenAI | Exit::Anthropic) {
                         yield Ok::<String, std::convert::Infallible>(sse_event(Some("ping"), "{}"));
@@ -5389,7 +7173,8 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                     break true;
                 }
                 Some(Err(error)) => {
-                    record_candidate_failure(&stream_state, &candidate, &error);
+                    audit_progress.failed(&error);
+                    record_candidate_failure(&stream_state, &candidate, &error, wire_options);
                     persist_incomplete_stream_exchange(
                         &stream_state,
                         IncompleteStreamExchange {
@@ -5403,19 +7188,8 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         },
                     )
                     .await;
-                    schedule_compaction(stream_state.clone(), stream_session_id.clone());
-                    spawn_failed_stream_audit(
-                        stream_state.clone(),
-                        FailedStreamAudit {
-                            session_id: &stream_session_id,
-                            requested_model: &requested_model,
-                            client: stream_client.as_deref(),
-                            attempts: stream_attempts,
-                            started,
-                            error: &error,
-                            records: &attempt_records,
-                        },
-                    );
+                    if !wire_options.preserve_instruction { schedule_compaction(stream_state.clone(), stream_session_id.clone(),wire_options.cost_policy); }
+
                     yield Ok::<String, std::convert::Infallible>(encode_error_chunk(&req_id, &error, exit));
                     return;
                 }
@@ -5426,7 +7200,8 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         status: StatusCode::BAD_GATEWAY.as_u16(),
                         body: "流式响应在完成事件前意外结束".into(),
                     };
-                    record_candidate_failure(&stream_state, &candidate, &error);
+                    audit_progress.failed(&error);
+                    record_candidate_failure(&stream_state, &candidate, &error, wire_options);
                     persist_incomplete_stream_exchange(
                         &stream_state,
                         IncompleteStreamExchange {
@@ -5440,19 +7215,8 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
                         },
                     )
                     .await;
-                    schedule_compaction(stream_state.clone(), stream_session_id.clone());
-                    spawn_failed_stream_audit(
-                        stream_state.clone(),
-                        FailedStreamAudit {
-                            session_id: &stream_session_id,
-                            requested_model: &requested_model,
-                            client: stream_client.as_deref(),
-                            attempts: stream_attempts,
-                            started,
-                            error: &error,
-                            records: &attempt_records,
-                        },
-                    );
+                    if !wire_options.preserve_instruction { schedule_compaction(stream_state.clone(), stream_session_id.clone(),wire_options.cost_policy); }
+
                     yield Ok::<String, std::convert::Infallible>(encode_error_chunk(&req_id, &error, exit));
                     return;
                 }
@@ -5463,6 +7227,17 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         // 已收到明确 Done 后才更新成功率、粘性路由并发送完成帧。首事件后的异常
         // 不会换家，也不会伪装成成功；已经输出的部分会作为 incomplete exchange
         // 落库，下一轮仍能保持与客户端所见一致的上下文。
+        // Capture presence before compatibility defaults; the stream adapter's
+        // normalized usage does not certify original token completeness or fees.
+        let observed_usage = usage_observation.unwrap_or_else(|| usage.as_ref().map(crate::protocol::openai::usage_json).unwrap_or(serde_json::Value::Null));
+        let observed_usage_present = !observed_usage.is_null();
+        let desktop_observation_frame = (desktop_observation && exit == Exit::OpenAI).then(||
+            sse_event(Some("llmgw_reply_observation"), serde_json::json!({
+                "version":1, "finish_reason":final_finish_reason,
+                "usage_present":observed_usage_present,
+                "usage":observed_usage,
+                "usage_evidence":if observed_usage_present {"unknown"} else {"unobserved"},
+            }).to_string()));
         let final_usage = usage.unwrap_or_default();
         let prompt_tokens = final_usage.prompt_tokens;
         let completion_tokens = final_usage.completion_tokens;
@@ -5471,12 +7246,13 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         // 记账收敛到共享函数。**删掉下面这几行现在会红**：
         // `server_stream.rs` 的 `流式完成后健康统计记下吞吐` 就是为它写的
         // （在此之前这里的注释说的是「单独删时没有用例会红」—— 那句话已经过期）。
-        crate::proxy::health::record_success_with_throughput(
+        crate::proxy::health::record_success_with_source_throughput(
             stream_state.health.as_ref(),
             &provider_id,
             &model,
             winning_started.elapsed().as_millis().min(u32::MAX as u128) as u32,
             completion_tokens,
+            winning_tps_source.as_ref(),
         );
         stream_state
             .router
@@ -5504,6 +7280,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             )
             .await
         {
+            audit_progress.failed(&error);
             tracing::error!("流式响应成功但上下文持久化失败: {error}");
             yield Ok::<String, std::convert::Infallible>(encode_error_chunk(&req_id, &error, exit));
             return;
@@ -5519,7 +7296,11 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         {
             tracing::warn!("更新流式会话粘性路由失败: {error}");
         }
-        schedule_compaction(stream_state.clone(), stream_session_id.clone());
+        if !wire_options.preserve_instruction { schedule_compaction(stream_state.clone(), stream_session_id.clone(),wire_options.cost_policy); }
+
+        // Mark completion before yielding terminal frames. A reader stopping at
+        // [DONE] must not bypass audit or become a fabricated cancellation.
+        audit_progress.completed(&final_usage, candidate.model.price.as_ref(), latency);
 
         if let Some(stream) = anthropic_stream.as_mut() {
             for encoded in stream.finish() {
@@ -5535,6 +7316,9 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             }
         }
 
+        if let Some(frame) = desktop_observation_frame {
+            yield Ok::<String, std::convert::Infallible>(frame);
+        }
         if let Some(stream) = responses_stream.as_mut() {
             yield Ok::<String, std::convert::Infallible>(stream.completed_event(&model, &final_usage));
         } else {
@@ -5547,57 +7331,8 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
             yield Ok::<String, std::convert::Infallible>(end);
         }
 
-        let audit_state = stream_state.clone();
-        let audit_session_id = stream_session_id.clone();
-        let audit_provider_id = provider_id.clone();
-        let audit_model = model.clone();
-        let audit_client = stream_client.clone();
-        let audit_requested_model = requested_model.clone();
-        let (audit_cost, audit_currency, audit_rate_label) = price_charge(
-            candidate.model.price.as_ref(),
-            prompt_tokens as i64,
-            completion_tokens as i64,
-            final_usage.cache_read_tokens as i64,
-            final_usage.cache_creation_tokens as i64,
-        );
-        let estimated_prompt = estimate_message_tokens(&req.messages) as i64;
-        // 用协程外面备好的那份（见 `stream_trace_id` 的说明）。
-        let audit_trace_id = stream_trace_id;
-        let audit_attempts =
-            attempts_json_traced(&attempt_records, Some(&audit_trace_id));
-        tokio::spawn(async move {
-            let _ = repo::log_request(
-                audit_state.db.pool(),
-                repo::RequestLog {
-                    session_id: Some(&audit_session_id),
-                    client: audit_client.as_deref(),
-                    // 这次消费归属的远程 Key。本机统一 Key 的请求是 None。
-                    // 与 client 同源派生，不另写一套前缀解析。
-                    access_key_id: crate::budget::access_key_id_of(audit_client.as_deref()),
-                    // 改写后的提示词默认不落库；只有开了 audit.store_refined_prompt
-                    // 才会由 refined_prompt_to_store 返回脱敏后的文本。失败路径一律 None。
-                    refined_prompt: None,
-                    trace_id: &audit_trace_id,
-                    requested_model: &audit_requested_model,
-                    routed_provider: Some(&audit_provider_id),
-                    routed_model: Some(&audit_model),
-                    status: Some(200),
-                    latency_ms: latency as i64,
-                    prompt_tokens: prompt_tokens as i64,
-                    completion_tokens: completion_tokens as i64,
-                    fallback_attempts: fallback_count(stream_attempts),
-                    error: None,
-                    cost: audit_cost,
-                    currency: audit_currency,
-                    rate_label: audit_rate_label.as_deref(),
-                    estimated_prompt_tokens: Some(estimated_prompt),
-                    attempts_json: audit_attempts.as_deref(),
-                    route: stream_route,
-                },
-            )
-            .await;
-        });
     };
+    let s = stream_audit::wrap(s, stream_audit);
 
     let body = Body::from_stream(s.map(|chunk| {
         let data = match chunk {
@@ -5646,6 +7381,39 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 /// 各方言会分段或在结尾重复报告用量；按维度取较完整的值，并保证 total
 /// 不会小于输入与输出之和。这样 Anthropic 的 input/output 分离事件和 OpenAI
 /// 的 usage-only chunk 都能落到同一条审计记录。
+/// A null usage frame is no new report and cannot erase prior known fields.
+/// Merge partial numeric declarations without manufacturing absent counters.
+fn merge_desktop_usage_observation(
+    current: &mut Option<serde_json::Value>,
+    next: serde_json::Value,
+) {
+    use serde_json::Value;
+    if next.is_null() {
+        if current.is_none() {
+            *current = Some(Value::Null);
+        }
+        return;
+    }
+    match (
+        current.as_mut().and_then(Value::as_object_mut),
+        next.as_object(),
+    ) {
+        (Some(current), Some(next)) => {
+            for (key, value) in next {
+                if let (Some(old), Some(new)) = (
+                    current.get_mut(key).and_then(Value::as_object_mut),
+                    value.as_object(),
+                ) {
+                    old.extend(new.iter().map(|(key, value)| (key.clone(), value.clone())));
+                } else {
+                    current.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        _ => *current = Some(next),
+    }
+}
+
 fn merge_usage(current: &mut Option<Usage>, next: Usage) {
     let usage = current.get_or_insert_with(Usage::default);
     usage.prompt_tokens = usage.prompt_tokens.max(next.prompt_tokens);
@@ -5719,7 +7487,11 @@ fn record_candidate_failure(
     state: &GatewayState,
     candidate: &crate::router::score::Candidate,
     error: &GatewayError,
+    options: super::upstream::RequestWireOptions,
 ) {
+    if super::upstream::is_local_request_policy_rejection(error, options) {
+        return;
+    }
     if let GatewayError::Upstream { status: 429, .. } = error {
         state
             .router
@@ -5826,12 +7598,13 @@ fn price_charge(
 /// `attempt` 由**数组下标**决定，不是从记录里读的：记录本身没有这个字段，
 /// 而按遍历顺序编号正是调用方看到的顺序，不会与排序后的下标不一致。
 fn attempts_json(records: &[crate::router::failover::AttemptRecord]) -> Option<String> {
-    attempts_json_traced(records, None)
+    attempts_json_traced(records, None, None)
 }
 
 fn attempts_json_traced(
     records: &[crate::router::failover::AttemptRecord],
     trace_id: Option<&str>,
+    session_id: Option<&str>,
 ) -> Option<String> {
     if records.is_empty() {
         return None;
@@ -5848,6 +7621,12 @@ fn attempts_json_traced(
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("trace_id".into(), serde_json::json!(trace_id));
                 obj.insert("attempt".into(), serde_json::json!(index));
+                if let (Some(subject), Some(session)) = (&record.subject, session_id) {
+                    if let Some(receipt) = subject.project(session, trace_id, &record.provider_id, &record.model, index) {
+                        if let Ok(receipt) = serde_json::to_value(receipt) { obj.insert("subject_receipt".into(), receipt); }
+                    }
+                }
+                if index==0 {if let Some(ctx)=crate::personal_test::current(){obj.insert("personal_test".into(),serde_json::json!({"version":1,"usage":"unverified","outcome":ctx.outcome()}));}}
             }
             value
         })
@@ -5882,8 +7661,9 @@ fn spawn_failed_stream_audit(state: Arc<GatewayState>, audit: FailedStreamAudit<
     let status = error.http_status().as_u16() as i64;
     let kind = classify(error);
     let attempts_json = attempts_json(records);
-    tokio::spawn(async move {
-        let _ = repo::log_request(
+    let audit_tasks = state.audit_tasks();
+    audit_tasks.spawn(async move {
+        repo::log_request(
             state.db.pool(),
             repo::RequestLog {
                 session_id: Some(&session_id),
@@ -5914,7 +7694,7 @@ fn spawn_failed_stream_audit(state: Arc<GatewayState>, audit: FailedStreamAudit<
                 route: Default::default(),
             },
         )
-        .await;
+        .await
     });
 }
 
@@ -6788,7 +8568,14 @@ fn map_stop_reason(finish: Option<&str>) -> &'static str {
 fn error_response(e: &GatewayError) -> Response {
     let status = e.http_status();
     let body = e.to_openai_error();
-    (status, Json(body)).into_response()
+    let mut response = (status, Json(body)).into_response();
+    if crate::cost_policy::is_busy_error(e) {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    response
 }
 
 fn parse_header(s: &str) -> axum::http::HeaderValue {
@@ -6851,6 +8638,20 @@ impl GatewayState {
 
     /// 用最便宜的可用模型生成摘要（压缩上下文时调用）
     pub async fn summarize(&self, msgs: Vec<Message>, prev: &str) -> Result<String> {
+        self.summarize_with_policy(
+            msgs,
+            prev,
+            RequestCostPolicy::resolve(&self.cfg_snapshot(), "auto"),
+        )
+        .await
+    }
+
+    async fn summarize_with_policy(
+        &self,
+        msgs: Vec<Message>,
+        prev: &str,
+        policy: RequestCostPolicy,
+    ) -> Result<String> {
         use crate::context::summarization_prompt;
 
         let mut all: Vec<Message> = vec![Message::system(summarization_prompt(prev))];
@@ -6870,13 +8671,22 @@ impl GatewayState {
             extra: Default::default(),
         };
 
-        let providers = self.providers.read().clone();
-        let candidates = self.router.resolve("auto", &providers)?;
+        let providers = self.legacy_providers();
+        let mut candidates = self.router.resolve("auto", &providers).map_err(|error| {
+            crate::cost_policy::route_error(error, self.cost_gate.effective(policy))
+        })?;
+        self.cost_gate
+            .filter_for(&mut candidates, policy, "summary")
+            .await?;
         let mut cfg = self.cfg_snapshot();
         // 摘要任务挑便宜快的：用 Fastest 策略，且只需要 2 次尝试
         cfg.routing_strategy = RoutingStrategy::Fastest;
         // 摘要调用是纯文本任务，不需要任何模态能力。
-        let ranked = self.router.rank(candidates, &cfg, Default::default(), None);
+        let mut ranked = self.router.rank(candidates, &cfg, Default::default(), None);
+        if self.cost_gate.effective(policy).is_free() {
+            self.free_selector
+                .select(&mut ranked, &self.health, &self.router, None)?;
+        }
 
         let flag = AtomicFlag::new();
         let chain = FailoverChain::new(&ranked, 2, &flag).with_admission(self.router.clone());
@@ -6893,8 +8703,19 @@ impl GatewayState {
                     let r = r.clone();
                     let defaults = defaults.clone();
                     async move {
-                        self.call_chat_upstream(&p, &r, &m, timeout, &defaults)
-                            .await
+                        self.call_chat_upstream_with_options(
+                            &p,
+                            &r,
+                            &m,
+                            timeout,
+                            &defaults,
+                            super::upstream::RequestWireOptions {
+                                cost_policy: policy,
+                                entitlement_purpose: "summary",
+                                ..Default::default()
+                            },
+                        )
+                        .await
                     }
                 },
                 |p, m, e| self.health.record_failure(&p.id, m, e),
@@ -6902,5 +8723,245 @@ impl GatewayState {
             .await?;
 
         Ok(o.value.content)
+    }
+}
+
+#[cfg(test)]
+mod account_prerequisite_final_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn account_prerequisite_final_send_rejects_free_before_runtime_resolution() {
+        let db = db::Db::connect_in_memory().await.unwrap();
+        let state = GatewayState::new(db.clone(), AppConfig::default());
+        let now = chrono::Utc::now();
+        let provider = Provider {
+            id: "owned-account-final".into(),
+            name: "Owned missing account runtime".into(),
+            dialect: Dialect::OpenAI,
+            base_url: "http://127.0.0.1:1/must-not-send".into(),
+            api_key_enc: String::new(),
+            enabled: true,
+            priority: 1,
+            rpm_limit: 0,
+            intelligence: 50,
+            models: vec![],
+            runtime_id: Some("owned-missing-runtime".into()),
+            note: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model":"owned-model","messages":[{"role":"user","content":"owned final guard"}],"stream":false
+        })).unwrap();
+        let defaults = crate::config::OllamaOptionsConfig::default();
+        // Control: without the free policy, the exact same missing runtime reaches
+        // ordinary runtime resolution and has a different local error contract.
+        let ordinary = state
+            .call_chat_upstream_with_options(
+                &provider,
+                &request,
+                "owned-model",
+                Duration::from_secs(1),
+                &defaults,
+                Default::default(),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("owned runtime is intentionally absent");
+        assert!(matches!(
+            ordinary,
+            GatewayError::CapabilityUnavailable { .. }
+        ));
+        for global in [false, true] {
+            let mut cfg = state.cfg_snapshot();
+            cfg.free_routing.enabled = global;
+            state.update_cfg(cfg);
+            let options = super::super::upstream::RequestWireOptions {
+                cost_policy: if global {
+                    RequestCostPolicy::Unrestricted
+                } else {
+                    RequestCostPolicy::FreeOnly
+                },
+                ..Default::default()
+            };
+            for streaming in [false, true] {
+                request.stream = streaming;
+                let error = if streaming {
+                    state
+                        .call_chat_upstream_stream(
+                            &provider,
+                            &request,
+                            "owned-model",
+                            Duration::from_secs(1),
+                            &defaults,
+                            options,
+                        )
+                        .await
+                        .map(|_| ())
+                        .expect_err("final account stream must fail closed")
+                } else {
+                    state
+                        .call_chat_upstream_with_options(
+                            &provider,
+                            &request,
+                            "owned-model",
+                            Duration::from_secs(1),
+                            &defaults,
+                            options,
+                        )
+                        .await
+                        .map(|_| ())
+                        .expect_err("final account call must fail closed")
+                };
+                assert!(matches!(&error, GatewayError::FreePolicyRejected { reason }
+                    if reason == "account_hard_stop_and_reservation_unverified"));
+                assert_eq!(error.http_status(), StatusCode::CONFLICT);
+                assert!(!error.retryable());
+            }
+        }
+        let reservations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM free_entitlement_reservations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(reservations, 0);
+        assert_eq!(state.health.total_failovers(), 0);
+    }
+}
+
+#[cfg(test)]
+mod refine_usage_observation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn actual_refine_consumer_keeps_unknown_usage_and_preserves_known_positive() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reply = Arc::new(parking_lot::Mutex::new(serde_json::json!({})));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let response = reply.clone();
+        let count = hits.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let response = response.clone();
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let value = response.lock().clone();
+                    Json(value)
+                }
+            }),
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let db = db::Db::connect_in_memory().await.unwrap();
+        let provider:Provider=serde_json::from_value(serde_json::json!({"id":"owned-refine","name":"owned","dialect":"openai","base_url":format!("http://{address}/v1"),"api_key_enc":"","enabled":true,"priority":1,"rpm_limit":0,"intelligence":50,"runtime_id":null,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"models":[{"alias":"refine-model","upstream":"refine-model","enabled":true,"context_window":16384,"supports_tools":false,"supports_vision":false,"supports_audio":false,"supports_video":false,"supports_thinking":false,"supports_stream":true,"model_type":"chat"}]})).unwrap();
+        repo::upsert_provider(db.pool(), &provider).await.unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.smart_routing.prompt_refine.enabled = true;
+        cfg.smart_routing.prompt_refine.provider_id = Some("owned-refine".into());
+        cfg.smart_routing.prompt_refine.min_chars = 1;
+        let state = Arc::new(GatewayState::new(db, cfg.clone()));
+        state.reload_providers().await.unwrap();
+        for (index, usage) in [
+            serde_json::json!({}),
+            serde_json::json!({"prompt_tokens":4,"completion_tokens":3,"total_tokens":7}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            *reply.lock() = serde_json::json!({"choices":[{"message":{"content":"请逐步分析偶发空值的实际触发条件，并提供可复现的排查与验证步骤"}}],"usage":usage});
+            let outcome = run_prompt_refine(
+                &state,
+                &cfg,
+                "请分析这个函数偶发空返回的原因与复现方法",
+                RequestCostPolicy::Unrestricted,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(outcome.applied);
+            assert_eq!(outcome.model.as_deref(), Some("refine-model"));
+            if index == 0 {
+                assert!(
+                    outcome.usage.is_none(),
+                    "actual GatewayState consumer cannot observe missing primary counts as zero"
+                );
+            } else {
+                let usage = outcome.usage.unwrap();
+                assert_eq!(
+                    (
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.total_tokens
+                    ),
+                    (4, 3, 7)
+                );
+            }
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                index + 1,
+                "selection/reservation/consumption performs no extra model call"
+            );
+        }
+        task.abort();
+    }
+}
+
+#[cfg(test)]
+mod desktop_usage_observation_merge_tests {
+    use super::*;
+    #[test]
+    fn null_frames_do_not_erase_known_partial_fields_or_manufacture_counters() {
+        use serde_json::json;
+        let mut current = None;
+        merge_desktop_usage_observation(&mut current, serde_json::Value::Null);
+        assert_eq!(current, Some(serde_json::Value::Null));
+        merge_desktop_usage_observation(&mut current, json!({"completion_tokens":2}));
+        merge_desktop_usage_observation(&mut current, serde_json::Value::Null);
+        assert_eq!(current, Some(json!({"completion_tokens":2})));
+        merge_desktop_usage_observation(
+            &mut current,
+            json!({"prompt_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}),
+        );
+        merge_desktop_usage_observation(
+            &mut current,
+            json!({"prompt_tokens_details":{"cache_write_tokens":1}}),
+        );
+        assert_eq!(
+            current,
+            Some(
+                json!({"completion_tokens":2,"prompt_tokens":0,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":1}})
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod mdn_trace_tests {
+    use super::*;
+    #[test]
+    fn opaque_counts_remain_unknown_in_audit_and_headers_but_legacy_zero_is_kept() {
+        let mut outcome = crate::search::executor::SearchOutcome::failed(
+            crate::config::SearchBackendKind::MdnMcp,
+            "synthetic",
+        );
+        outcome.error = None;
+        let trace = route_trace_of(None, Some(&outcome), None);
+        assert_eq!(trace.search.as_deref(), Some("mdn_mcp"));
+        assert_eq!(trace.search_hits, None);
+        let mut headers = HeaderMap::new();
+        apply_route_headers(&trace, &mut headers);
+        assert!(!headers.contains_key("x-route-search-hits"));
+        assert_eq!(headers["x-route-search"], "mdn_mcp");
+        outcome.backend = crate::config::SearchBackendKind::DuckDuckGo;
+        let trace = route_trace_of(None, Some(&outcome), None);
+        assert_eq!(trace.search_hits, Some(0));
+        let mut headers = HeaderMap::new();
+        apply_route_headers(&trace, &mut headers);
+        assert_eq!(headers["x-route-search-hits"], "0");
     }
 }

@@ -4,6 +4,13 @@ pub type Result<T> = std::result::Result<T, GatewayError>;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
+    #[error("本机参考价预算拒绝：{reason}")]
+    BudgetRejected {
+        code: &'static str,
+        reason: &'static str,
+    },
+    #[error("严格免费政策拒绝：{reason}")]
+    FreePolicyRejected { reason: String },
     /// Account requests with an explicit single-attempt contract must not enter
     /// auth confirmation, failover or cascade replay after dispatch.
     #[error("{source}")]
@@ -37,6 +44,9 @@ pub enum GatewayError {
     #[error("没有可处理该请求的模型：需要 {kind}，请为相应模型勾选对应能力后重试")]
     CapabilityUnavailable { kind: String },
 
+    #[error("请求控制参数无法在所选上游表达：{reason}")]
+    RequestControlUnavailable { reason: &'static str },
+
     #[error("协议转换失败: {0}")]
     Protocol(String),
 
@@ -51,6 +61,13 @@ pub enum GatewayError {
 }
 
 impl GatewayError {
+    pub(crate) fn is_budget_rejection(&self) -> bool {
+        match self {
+            Self::BudgetRejected { .. } => true,
+            Self::NoReplay { source } => source.is_budget_rejection(),
+            _ => false,
+        }
+    }
     pub fn no_replay(self) -> Self {
         match self {
             value @ Self::NoReplay { .. } => value,
@@ -66,9 +83,46 @@ impl GatewayError {
             _ => None,
         }
     }
+    // Only a fixed code emitted by the WorkBuddy adapter may become a public hint.
+    // Never expose arbitrary upstream messages, request ids, or response bodies.
+    fn workbuddy_rejection_code(&self) -> Option<&'static str> {
+        match self {
+            Self::NoReplay { source } => source.workbuddy_rejection_code(),
+            Self::Upstream {
+                provider,
+                status: 400,
+                body,
+                ..
+            } if provider == "WorkBuddy"
+                && body.starts_with("WorkBuddy 拒绝请求或返回无效响应; ")
+                && body.split("; ").any(|part| part == "code=11128") =>
+            {
+                Some("workbuddy_11128")
+            }
+            _ => None,
+        }
+    }
+
+    fn workbuddy_rejection_diagnostic(&self) -> Option<&'static str> {
+        match self {
+            Self::NoReplay { source } => source.workbuddy_rejection_diagnostic(),
+            Self::Upstream { body, .. }
+                if self.workbuddy_rejection_code().is_some()
+                    && body
+                        .split("; ")
+                        .any(|part| part == "rejection=policy_denied") =>
+            {
+                Some("policy_denied")
+            }
+            _ => None,
+        }
+    }
+
     /// 判定该错误是否值得触发降级（换下一个 provider 重试）
     pub fn retryable(&self) -> bool {
         match self {
+            Self::BudgetRejected { .. } => false,
+            Self::FreePolicyRejected { .. } => false,
             GatewayError::NoReplay { .. } => false,
             GatewayError::Upstream { status, .. } => {
                 // 这个列表筛的是「换一家**还有没有戏**」，不是「错误严不严重」。
@@ -105,20 +159,33 @@ impl GatewayError {
             GatewayError::ContextLengthExceeded { .. } => true,
             // 候选链已按模态过滤过，换家不会有别的结果。
             GatewayError::CapabilityUnavailable { .. } => false,
+            GatewayError::RequestControlUnavailable { .. } => false,
             _ => true,
         }
     }
 
     /// 映射为对外 HTTP 状态码（统一成 OpenAI 风格的错误体）
     pub fn http_status(&self) -> axum::http::StatusCode {
+        if let Self::BudgetRejected { code, .. } = self {
+            return match *code {
+                "budget_exceeded" => axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "budget_unavailable" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                _ => axum::http::StatusCode::CONFLICT,
+            };
+        }
         use axum::http::StatusCode;
+        if crate::cost_policy::is_busy_error(self) {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
         match self {
+            Self::FreePolicyRejected { .. } => StatusCode::CONFLICT,
             GatewayError::NoReplay { source } => source.http_status(),
             GatewayError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             GatewayError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             GatewayError::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
             // 请求本身无法被任何已配置模型处理，属于调用方需要调整的请求/配置问题。
             GatewayError::CapabilityUnavailable { .. } => StatusCode::BAD_REQUEST,
+            GatewayError::RequestControlUnavailable { .. } => StatusCode::BAD_REQUEST,
             GatewayError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             GatewayError::AllProvidersFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::Upstream { status, .. } => {
@@ -138,7 +205,16 @@ impl GatewayError {
                 model,
                 status,
                 ..
-            } => format!("上游服务 {provider}/{model} 返回 HTTP {status}"),
+            } => {
+                let message = format!("上游服务 {provider}/{model} 返回 HTTP {status}");
+                if self.workbuddy_rejection_diagnostic() == Some("policy_denied") {
+                    format!("{message}（WorkBuddy 平台业务码 11128：上游明确返回策略拒绝，请核验当前账号允许的调用通道及接入协议；本请求不会自动重试）")
+                } else if self.workbuddy_rejection_code().is_some() {
+                    format!("{message}（WorkBuddy 平台业务码 11128：当前请求被平台拒绝，需要核对消息格式或调用通道；请查看客户端接入指引）")
+                } else {
+                    message
+                }
+            }
             GatewayError::Timeout(_) => "上游服务请求超时".into(),
             _ => self.to_string(),
         }
@@ -146,22 +222,33 @@ impl GatewayError {
 
     /// 转成 OpenAI 兼容错误体
     pub fn to_openai_error(&self) -> serde_json::Value {
+        if let Self::BudgetRejected { code, reason } = self {
+            return serde_json::json!({"error":{"message":self.public_message(),"type":code,"code":code,"reason":reason}});
+        }
         if let Self::NoReplay { source } = self {
             return source.to_openai_error();
         }
-        serde_json::json!({
+        if let Self::FreePolicyRejected { reason } = self {
+            return serde_json::json!({"error":{"message":self.public_message(),"type":"free_policy_rejected","code":"free_policy_rejected","reason":reason}});
+        }
+        let mut response = serde_json::json!({
             "error": {
                 "message": self.public_message(),
                 "type": match self {
                     GatewayError::Unauthorized(_) => "invalid_api_key",
                     GatewayError::ContextLengthExceeded { .. } => "context_length_exceeded",
                     GatewayError::CapabilityUnavailable { .. } => "model_capability_unavailable",
+                    GatewayError::RequestControlUnavailable { .. } => "invalid_request_error",
                     GatewayError::Timeout(_) | GatewayError::AllProvidersFailed{..} => "server_error",
                     _ => "upstream_error",
                 },
-                "code": null
+                "code": self.workbuddy_rejection_code()
             }
-        })
+        });
+        if let Some(diagnostic) = self.workbuddy_rejection_diagnostic() {
+            response["error"]["diagnostic"] = serde_json::json!(diagnostic);
+        }
+        response
     }
 }
 
@@ -214,5 +301,41 @@ mod no_replay_tests {
         assert_eq!(error.to_openai_error()["error"]["type"], "server_error");
         assert_eq!(crate::router::failover::classify(&error), "timeout");
         assert!(error.upstream_status().is_none());
+    }
+    #[test]
+    fn workbuddy_11128_is_actionable_but_never_exposes_upstream_body_or_request_id() {
+        let error=GatewayError::Upstream {provider:"WorkBuddy".into(),model:"fixture".into(),status:400,
+            body:"WorkBuddy 拒绝请求或返回无效响应; code=11128; request_id=fixture-private-request; unused=fixture-private-canary".into()}.no_replay();
+        let public = error.to_openai_error();
+        assert_eq!(public["error"]["code"], "workbuddy_11128");
+        assert!(public["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("11128"));
+        assert!(!public.to_string().contains("fixture-private"));
+        assert_eq!(error.http_status().as_u16(), 400);
+        assert!(!error.retryable());
+        for (provider, status, body) in [
+            ("Other", 400, "WorkBuddy 拒绝请求或返回无效响应; code=11128"),
+            (
+                "WorkBuddy",
+                401,
+                "WorkBuddy 拒绝请求或返回无效响应; code=11128",
+            ),
+            (
+                "WorkBuddy",
+                400,
+                "WorkBuddy 拒绝请求或返回无效响应; code=111280",
+            ),
+            ("WorkBuddy", 400, "arbitrary upstream text; code=11128"),
+        ] {
+            let error = GatewayError::Upstream {
+                provider: provider.into(),
+                model: "fixture".into(),
+                status,
+                body: body.into(),
+            };
+            assert!(error.to_openai_error()["error"]["code"].is_null());
+        }
     }
 }

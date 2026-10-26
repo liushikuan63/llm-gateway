@@ -214,3 +214,13 @@
   .onboarding-review-actions { display: grid; grid-template-columns: 1fr; }
   .onboarding-review-actions .onboarding-page-link { width: 100%; }
 }
+
+/* Keep the footer reachable when readonly readiness adds content on short views. */
+.onboarding-dialog { display: flex; flex-direction: column; }
+.onboarding-header, .onboarding-progress, .onboarding-footer { flex-shrink: 0; }
+.onboarding-content { min-height: 0; }
+.onboarding-check { margin-top: 14px; padding: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); font-size: 12px; overflow-wrap: anywhere; }
+.onboarding-check p { margin: 7px 0; }
+.onboarding-check ul { margin: 8px 0; padding-left: 18px; line-height: 1.6; }
+.onboarding-check-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.onboarding-check-actions button { font-size: 12px; }

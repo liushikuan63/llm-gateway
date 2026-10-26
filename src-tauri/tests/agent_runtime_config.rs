@@ -11,6 +11,58 @@ use llm_gateway_lib::domain::{AgentRuntime, Message};
 use serde_json::{json, Value};
 
 #[tokio::test]
+async fn workbuddy_regions_resolve_separately_and_legacy_missing_region_stays_global() {
+    use llm_gateway_lib::agent_upstream::runtime::{
+        resolve_chat_runtime, workbuddy_region_options, ChatRuntime,
+    };
+    use llm_gateway_lib::workbuddy_auth::WorkBuddyRegion;
+    let db = Db::connect_in_memory().await.unwrap();
+    let registry = AdapterRegistry::with_builtins();
+    for (id, region) in [
+        ("wb-legacy", None),
+        ("wb-global", Some("global")),
+        ("wb-cn", Some("cn")),
+    ] {
+        let mut runtime = AgentRuntime::new(id, "workbuddy-model", id);
+        let mut options = json!({"account_id":"same-account"});
+        if let Some(region) = region {
+            options["region"] = json!(region);
+        }
+        runtime.options = Some(options);
+        repo::upsert_agent_runtime(db.pool(), &runtime)
+            .await
+            .unwrap();
+        match resolve_chat_runtime(db.pool(), &registry, id)
+            .await
+            .unwrap()
+        {
+            ChatRuntime::WorkBuddy {
+                region: actual,
+                account_id,
+                ..
+            } => {
+                assert_eq!(
+                    actual,
+                    if region == Some("cn") {
+                        WorkBuddyRegion::Cn
+                    } else {
+                        WorkBuddyRegion::Global
+                    }
+                );
+                assert_eq!(account_id, "same-account");
+            }
+            _ => panic!("direct account unexpectedly became a CLI"),
+        }
+    }
+    for region in [json!("unknown"), json!(""), json!(null), json!(42)] {
+        assert!(workbuddy_region_options(Some(
+            &json!({"account_id":"same-account", "region":region})
+        ))
+        .is_err());
+    }
+}
+
+#[tokio::test]
 async fn workbuddy_direct_runtime_resolves_account_and_preserves_cli_paths() {
     use llm_gateway_lib::agent_upstream::runtime::{resolve_chat_runtime, ChatRuntime};
     let db = Db::connect_in_memory().await.unwrap();

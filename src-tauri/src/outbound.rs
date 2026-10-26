@@ -48,6 +48,12 @@ pub fn is_local_target(url: &Url) -> bool {
     match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
         Ok(IpAddr::V6(ip)) => {
+            // URL/connector normalization may retain an IPv4-mapped literal.
+            // Preserve the same local bypass as its embedded IPv4 destination;
+            // inability to connect locally never authorizes proxy delegation.
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return ip.is_loopback() || ip.is_private() || ip.is_link_local();
+            }
             // Bit masks preserve the crate's Rust 1.77 minimum version.
             let first = ip.segments()[0];
             ip.is_loopback() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
@@ -86,6 +92,14 @@ pub fn search_client(proxy: Option<&str>) -> Result<Client, String> {
     *cache = Some((key, client.clone()));
     Ok(client)
 }
+
+#[cfg(test)]
+#[path = "outbound/socks_tests.rs"]
+pub(crate) mod socks_tests;
+
+#[cfg(test)]
+#[path = "outbound/network_tests.rs"]
+mod network_tests;
 
 #[cfg(test)]
 mod tests {

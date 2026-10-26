@@ -1,10 +1,13 @@
 //! A single headless daily owner. No model requests, gateway listener or webview.
 use crate::{benefit_config::BenefitsConfig, benefits::BenefitsCenter, config::AppConfig};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
+
+#[path = "benefit_task/settings_commit.rs"]
+mod settings_commit;
+pub(crate) use settings_commit::{coordinate, task_change};
 
 pub async fn register(cfg: &BenefitsConfig, data: &Path, resources: &Path) -> Result<(), String> {
     cfg.validate().map_err(|_| "权益设置无效")?;
@@ -98,11 +101,11 @@ pub async fn execute_once(
     std::fs::create_dir_all(&directory).map_err(|_| "无法创建领取收据目录")?;
     let mut claims = Vec::new();
     let mut failed = false;
-    for account in settings
-        .accounts
-        .iter()
-        .filter(|a| a.enabled && settings.account_is_due(&a.id, now))
-    {
+    for account in settings.accounts.iter().filter(|a| {
+        a.enabled
+            && settings.account_auto_claim_allowed(&a.id)
+            && settings.account_is_due(&a.id, now)
+    }) {
         let path = directory.join(format!("{day}-{}.json", account.id));
         let mut file = match std::fs::OpenOptions::new()
             .write(true)
@@ -135,11 +138,16 @@ pub async fn execute_once(
                 continue;
             }
         };
-        file.write_all(b"{\"status\":\"reserved_no_automatic_retry\"}")
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "无法持久化领取收据，未发起请求")?;
+        let origin = crate::benefits::ReceiptOrigin::persist(&mut file, data, &path)?;
         let result = center
-            .claim_at(settings, cfg.http_proxy.as_deref(), &account.id, false, now)
+            .claim_with_origin(
+                settings,
+                cfg.http_proxy.as_deref(),
+                &account.id,
+                false,
+                now,
+                Some(origin),
+            )
             .await;
         let entry = match result {
             Ok(value) => {
@@ -189,6 +197,7 @@ pub async fn headless(
         | "--qoder-job-status"
         | "--qoder-job-prepare"
         | "--qoder-job-refresh"
+        | "--qoder-job-reissue"
         | "--qoder-signing-prepare"
         | "--qoder-model-catalog"
         | "--qoder-job-cancel" => {
@@ -212,6 +221,7 @@ pub async fn headless(
                 "--qoder-job-status" => serde_json::to_value(auth.job_status(region, id).await?),
                 "--qoder-job-prepare" => serde_json::to_value(auth.job_prepare(region, id).await?),
                 "--qoder-job-refresh" => serde_json::to_value(auth.job_refresh(region, id).await?),
+                "--qoder-job-reissue" => serde_json::to_value(auth.job_reissue(region, id).await?),
                 "--qoder-signing-prepare" => {
                     serde_json::to_value(auth.model_signing_prepare(region, id).await?)
                 }
@@ -233,19 +243,18 @@ pub async fn headless(
         | "--workbuddy-login-poll"
         | "--workbuddy-login-status"
         | "--workbuddy-login-cancel"
-        | "--workbuddy-login-refresh" => {
-            let auth = crate::workbuddy_auth::WorkBuddyAuth::new(
-                db.pool().clone(),
-                cfg.http_proxy.as_deref(),
-            )?;
-            let id = platform
-                .filter(|id| !id.starts_with("--"))
-                .ok_or("缺少账号或登录会话 ID")?;
+        | "--workbuddy-login-refresh"
+        | "--workbuddy-checkin-status" => {
+            let (auth, id) =
+                headless_workbuddy_auth(db.pool(), cfg.http_proxy.as_deref(), platform)?;
             let value = match action {
                 "--workbuddy-login-start" => serde_json::to_value(auth.start(id).await?),
                 "--workbuddy-login-poll" => serde_json::to_value(auth.poll(id).await?),
                 "--workbuddy-login-status" => serde_json::to_value(auth.session_status(id).await?),
                 "--workbuddy-login-refresh" => serde_json::to_value(auth.refresh(id).await?),
+                "--workbuddy-checkin-status" => {
+                    serde_json::to_value(auth.checkin_status(id).await?)
+                }
                 _ => {
                     auth.cancel(id).await?;
                     Ok(serde_json::json!({"status":"cancelled"}))
@@ -359,11 +368,21 @@ pub async fn headless(
         "--install-benefits-task" => {
             let previous = cfg.benefits.clone();
             cfg.benefits.scheduler_mode = "windows_task".into();
-            register(&cfg.benefits, data, &crate::benefit_login::resource_root()?).await?;
-            if cfg.save().is_err() {
-                let _ = register(&previous, data, &crate::benefit_login::resource_root()?).await;
-                return Err("权益设置保存失败，已请求恢复原任务状态".into());
-            }
+            let resources = crate::benefit_login::resource_root()?;
+            // Explicit install also repairs an unchanged task. It shares error
+            // recovery with APP saves without changing CLI setup/opt-in semantics.
+            coordinate(
+                &previous,
+                &cfg.benefits,
+                true,
+                |settings| {
+                    let resources = resources.clone();
+                    async move { register(&settings, data, &resources).await }
+                },
+                || cfg.save().map_err(|_| "权益设置保存失败".to_string()),
+                || previous.clone(),
+            )
+            .await?;
             Ok(
                 serde_json::json!({"status":"windows_task_installed","trigger_minutes":cfg.benefits.trigger_minutes(),"timezone":cfg.benefits.auto_claim_timezone}),
             )
@@ -395,6 +414,7 @@ pub fn try_headless() -> Option<i32> {
             | "--qoder-job-status"
             | "--qoder-job-prepare"
             | "--qoder-job-refresh"
+            | "--qoder-job-reissue"
             | "--qoder-signing-prepare"
             | "--qoder-model-catalog"
             | "--qoder-job-cancel"
@@ -403,6 +423,7 @@ pub fn try_headless() -> Option<i32> {
             | "--workbuddy-login-status"
             | "--workbuddy-login-cancel"
             | "--workbuddy-login-refresh"
+            | "--workbuddy-checkin-status"
             | "--benefits-verify-native"
             | "--setup-trae-benefits"
             | "--import-benefit-client"
@@ -436,6 +457,113 @@ pub fn try_headless() -> Option<i32> {
         Err(error) => {
             eprintln!("{error}");
             Some(1)
+        }
+    }
+}
+
+fn headless_workbuddy_auth<'a>(
+    pool: &sqlx::SqlitePool,
+    proxy: Option<&str>,
+    target: Option<&'a str>,
+) -> Result<(crate::workbuddy_auth::WorkBuddyAuth, &'a str), String> {
+    use crate::workbuddy_auth::{WorkBuddyAuth, WorkBuddyRegion};
+    let target = target
+        .filter(|id| !id.starts_with("--"))
+        .ok_or("缺少账号或登录会话 ID")?;
+    let (region, id) = match target.split_once(':') {
+        Some(("global", id)) => (WorkBuddyRegion::Global, id),
+        Some(("cn", id)) => (WorkBuddyRegion::Cn, id),
+        Some(_) => return Err("WorkBuddy 区域必须是 global 或 cn".into()),
+        None => (WorkBuddyRegion::Global, target),
+    };
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return Err("账号或登录会话 ID 无效".into());
+    }
+    Ok((
+        WorkBuddyAuth::new_for_region(pool.clone(), proxy, region)?,
+        id,
+    ))
+}
+
+#[cfg(test)]
+mod workbuddy_headless_tests {
+    use super::headless_workbuddy_auth;
+    use crate::{db::Db, workbuddy_auth::WorkBuddyRegion};
+
+    #[tokio::test]
+    async fn explicit_regions_and_legacy_target_select_the_correct_service() {
+        let db = Db::connect_in_memory().await.unwrap();
+        for (target, region, expected) in [
+            ("cn:same-account", WorkBuddyRegion::Cn, "same-account"),
+            (
+                "global:same-account",
+                WorkBuddyRegion::Global,
+                "same-account",
+            ),
+            ("same-account", WorkBuddyRegion::Global, "same-account"),
+        ] {
+            let (auth, id) = headless_workbuddy_auth(db.pool(), None, Some(target)).unwrap();
+            assert_eq!(auth.region(), region);
+            assert_eq!(id, expected);
+            let status = auth.session_status(id).await.unwrap();
+            assert_eq!(status.account_id, expected);
+            assert_eq!(status.status, "not_logged_in");
+        }
+    }
+
+    #[tokio::test]
+    async fn same_named_saved_accounts_use_separate_encrypted_region_sessions() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let (global, _) = headless_workbuddy_auth(db.pool(), None, Some("global:same")).unwrap();
+        let (cn, _) = headless_workbuddy_auth(db.pool(), None, Some("cn:same")).unwrap();
+        global
+            .test_seed_account(
+                "same",
+                "fixture-global-uid",
+                "fixture-global-access",
+                "fixture-global-refresh",
+            )
+            .await;
+        cn.test_seed_account(
+            "same",
+            "fixture-cn-uid",
+            "fixture-cn-access",
+            "fixture-cn-refresh",
+        )
+        .await;
+        let global_status = global.session_status("same").await.unwrap();
+        let cn_status = cn.session_status("same").await.unwrap();
+        assert_ne!(global_status.identity, cn_status.identity);
+        let (legacy, id) = headless_workbuddy_auth(db.pool(), None, Some("same")).unwrap();
+        assert_eq!(legacy.session_status(id).await.unwrap(), global_status);
+        let (selected, id) = headless_workbuddy_auth(db.pool(), None, Some("cn:same")).unwrap();
+        assert_eq!(selected.session_status(id).await.unwrap(), cn_status);
+    }
+
+    #[tokio::test]
+    async fn unknown_region_and_malformed_targets_are_rejected_locally() {
+        let db = Db::connect_in_memory().await.unwrap();
+        for target in [
+            None,
+            Some(""),
+            Some("--data-dir"),
+            Some("other:account"),
+            Some("CN:account"),
+            Some(":account"),
+            Some("cn:"),
+            Some("cn:a:b"),
+            Some("cn:account with space"),
+            Some("cn:line\nbreak"),
+        ] {
+            assert!(
+                headless_workbuddy_auth(db.pool(), None, target).is_err(),
+                "target must fail locally"
+            );
         }
     }
 }

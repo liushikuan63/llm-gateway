@@ -27,9 +27,10 @@ fn effort(value: &str) -> Result<&str> {
     }
 }
 fn reasoning(req: &ChatRequest) -> Result<Map<String, Value>> {
-    let explicit = req
-        .extra
-        .get("reasoning_effort")
+    // The existing Qoder encoder has an explicit effort mapping, but no summary
+    // field. Keep its established value/budget policy after shape validation.
+    crate::protocol::reasoning::validate(req, crate::domain::Dialect::OpenAI, true)?;
+    let explicit = crate::protocol::reasoning::chat_effort(req)
         .map(|v| {
             effort(
                 v.as_str()
@@ -112,6 +113,23 @@ fn reasoning(req: &ChatRequest) -> Result<Map<String, Value>> {
         result.insert("reasoning_effort".into(), json!(value));
     }
     Ok(result)
+}
+
+/// Only the newly retained canonical carrier gets the new local error class.
+/// Legacy flat/thinking-only callers keep their established mapping and errors.
+pub(crate) fn validate_retained_reasoning(req: &ChatRequest) -> Result<()> {
+    if !req.extra.contains_key("reasoning") {
+        return Ok(());
+    }
+    reasoning(req).map(|_| ()).map_err(|error| {
+        if matches!(&error, GatewayError::RequestControlUnavailable { .. }) {
+            error
+        } else {
+            GatewayError::RequestControlUnavailable {
+                reason: "Qoder reasoning effort 载体无效或相互冲突",
+            }
+        }
+    })
 }
 
 fn definitions(req: &ChatRequest) -> Result<(Value, HashSet<String>)> {
@@ -217,6 +235,7 @@ pub fn build(
     request: Uuid,
     started_ms: i64,
 ) -> Result<Value> {
+    validate_retained_reasoning(req)?;
     if model.enabled != Some(true) || model.format != "openai" {
         return Err(invalid("模型未启用或目录格式尚未验证"));
     }
@@ -229,7 +248,7 @@ pub fn build(
     if req
         .extra
         .keys()
-        .any(|k| !["user", "stream_options", "reasoning_effort"].contains(&k.as_str()))
+        .any(|k| !["user", "stream_options", "reasoning_effort", "reasoning"].contains(&k.as_str()))
     {
         return Err(invalid("请求包含尚未验证的扩展字段，请先补齐协议映射"));
     }
@@ -470,6 +489,35 @@ mod tests {
         );
         req.max_tokens = Some(0);
         assert!(body(&req, &metadata).is_err());
+    }
+
+    #[test]
+    fn responses_reasoning_effort_uses_existing_qoder_mapping() {
+        let mut req = request(json!([{"role":"user","content":"owned"}]));
+        req.extra
+            .insert("reasoning".into(), json!({"effort":"high"}));
+        assert_eq!(
+            body(&req, &model()).unwrap()["parameters"]["reasoning_effort"],
+            "high"
+        );
+        req.extra.insert("reasoning_effort".into(), json!("low"));
+        assert!(
+            body(&req, &model()).is_err(),
+            "conflicting explicit carriers must not silently win"
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_summary_is_not_silently_discarded() {
+        let mut req = request(json!([{"role":"user","content":"owned"}]));
+        req.extra.insert(
+            "reasoning".into(),
+            json!({"effort":"high","summary":"auto"}),
+        );
+        assert!(matches!(
+            body(&req, &model()),
+            Err(GatewayError::RequestControlUnavailable { .. })
+        ));
     }
     fn request(messages: Value) -> ChatRequest {
         serde_json::from_value(

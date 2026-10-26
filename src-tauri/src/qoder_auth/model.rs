@@ -5,6 +5,7 @@ pub(crate) struct ModelAuthorization {
     pub(crate) region: Region,
     pub(crate) account: String,
     pub(crate) fingerprint: String,
+    pub(crate) principal_fingerprint: String,
     context: Value,
     records: Vec<(String, String)>,
     device_expiry: Option<i64>,
@@ -130,10 +131,18 @@ impl QoderAuth {
                     .to_owned(),
             );
         }
+        let principal_fingerprint = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(region.key(), &device.uid, device.organization.as_deref()))
+                    .map_err(|_| "Qoder主体编码失败")?
+            )
+        );
         let authorization = ModelAuthorization {
             region,
             account: account.into(),
             fingerprint,
+            principal_fingerprint,
             context: json!({"region":region,"machine_id":context.machine_id,"uid":context.uid,"version":"1.0.51","organization_id":context.organization_id,
                 "organization_tags":context.organization_tags,"data_policy_agreed":context.data_policy_agreed,"runtime_fields":context.runtime_fields}),
             records,

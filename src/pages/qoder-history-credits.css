@@ -1,0 +1,10 @@
+.client-credit-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 12px; margin-top: 16px; }
+.client-credit-totals > .card { min-width: 0; overflow-wrap: anywhere; }
+.client-credit-totals h4 { margin: 0 0 12px; }
+.client-credit-details dl { margin: 10px 0; }
+.client-credit-details dl > div { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0; }
+.client-credit-details dt { color: var(--muted); font-size: 12px; }
+.client-credit-details dd { margin: 0; font-variant-numeric: tabular-nums; }
+.client-credit-details .sub { margin: 4px 0; }
+.client-credit-details.compact { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); min-width: 220px; font-size: 12px; }
+.client-credit-details.compact dl > div { display: block; }

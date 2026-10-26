@@ -6,6 +6,55 @@ use llm_gateway_lib::{
 use serde_json::json;
 use sqlx::{Row, SqlitePool};
 
+#[tokio::test]
+async fn same_named_accounts_in_two_regions_register_without_collision_and_wrong_issuer_rolls_back()
+{
+    let db = Db::connect_in_memory().await.unwrap();
+    let global = runtime("same-account");
+    let global_provider = provider(&global, vec![model("m", "upstream-global")]);
+    repo::register_workbuddy_provider(db.pool(), &global_provider, &global)
+        .await
+        .unwrap();
+    let mut cn = runtime("same-account");
+    cn.id = "workbuddy-cn-same-account".into();
+    cn.options = Some(json!({"account_id":"same-account", "region":"cn"}));
+    let mut cn_provider = provider(&cn, vec![model("m", "upstream-cn")]);
+    let before = snapshot(db.pool()).await;
+    assert!(
+        repo::register_workbuddy_provider(db.pool(), &cn_provider, &cn)
+            .await
+            .is_err()
+    );
+    assert_eq!(snapshot(db.pool()).await, before);
+    cn_provider.base_url = "https://copilot.tencent.com".into();
+    repo::register_workbuddy_provider(db.pool(), &cn_provider, &cn)
+        .await
+        .unwrap();
+    let rows = repo::list_providers(db.pool()).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .find(|p| p.id == global_provider.id)
+            .unwrap()
+            .models[0]
+            .upstream,
+        "upstream-global"
+    );
+    assert_eq!(
+        rows.iter().find(|p| p.id == cn_provider.id).unwrap().models[0].upstream,
+        "upstream-cn"
+    );
+    let stable = snapshot(db.pool()).await;
+    let mut wrong_binding = cn.clone();
+    wrong_binding.options = Some(json!({"account_id":"same-account", "region":"global"}));
+    assert!(
+        repo::register_workbuddy_provider(db.pool(), &cn_provider, &wrong_binding)
+            .await
+            .is_err()
+    );
+    assert_eq!(snapshot(db.pool()).await, stable);
+}
+
 fn runtime(account: &str) -> AgentRuntime {
     let mut runtime = AgentRuntime::new(
         format!("workbuddy-{account}"),

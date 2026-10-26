@@ -61,7 +61,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       // 再打开验 UI 能提交并回填。
       prompt_refine: { enabled: false, provider_id: null, model: null, timeout_ms: 2000, max_chars: 2000, clarity_noul: 0.72, min_chars: 24 },
     },
-    search: { enabled: true, backend: "tavily", searxng_url: null, max_results: 5, timeout_ms: 8000, inject_as: "system" },
+    search: { enabled: true, backend: "tavily", searxng_url: null, max_results: 5, timeout_ms: 8000, inject_as: "system", query_cache_ttl_secs:0,coalesce_queries:false,source_min_interval_ms:0,free_search_scope:"web",free_search_locale:"source_default",free_proxy_url:null,page_text_enabled:false },
     local_models: {
       enabled: true, probe_timeout_ms: 2000,
       endpoints: [
@@ -107,6 +107,10 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
   window.__fixtureBenefitRuns = [];
   window.__fixtureBenefitClaimed = {};
   window.__fixtureBenefitQueries = 0;
+  const benefitAuthSource = account => {
+    const key = `${account.platform}:${account.id}`, has = !!window.__fixtureBenefitTokens[key], session = window.__fixtureBenefitSessions[key];
+    return { account_id: account.id, platform: account.platform, source: has ? session ? "saved_session" : "saved_token" : "none", source_revision: `fixture-${key}-${has}`, identity: session?.identity ?? null, access_expires_at_ms: null, expiry_unknown: false, candidate_identity: null, candidate_eligible: false, candidate_access_expires_at_ms: null, candidate_expiry_unknown: false, can_restore: false, previous_present: false, error_code: null, message: null };
+  };
   const benefitOverview = () => {
     const config = window.__fixtureConfig.benefits;
     return { enabled: config.enabled, auto_claim: config.auto_claim, auto_claim_after_hour: config.auto_claim_after_hour, auto_claim_after_minute: config.auto_claim_after_minute, auto_claim_timezone: config.auto_claim_timezone,
@@ -117,7 +121,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         const error = query && window.__fixtureBenefitAccountError ? "平台凭据被拒，请更新 Token。" : null;
         const claimed = Boolean(window.__fixtureBenefitClaimed[`${account.platform}:${account.id}`]);
         return { account_id: account.id, platform: account.platform, label: account.label, enabled: account.enabled,
-          has_token: hasToken, token_masked: hasToken ? "********" : null, error,
+          auth_source: benefitAuthSource(account), has_token: hasToken, token_masked: hasToken ? "********" : null, error,
           session_account: query ? window.__fixtureBenefitSessions[`${account.platform}:${account.id}`]??null : null,
           capabilities: { query: true, manual_claim: true, auto_claim: true, scope: "活动赠送权益" },
           last_run: window.__fixtureBenefitRuns.find(run => run.account_id === account.id) ?? null,
@@ -254,7 +258,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     // 只有白名单写法不会漏 —— 实测踩过：夹具写成 `!== "duckduckgo"`，
     // 必应中国（免 Key）会被误报成需要 Key，断言跟着一起错。
     const needsKey = s.backend === "tavily" || s.backend === "brave";
-    return { enabled: s.enabled, backend: s.backend, searxng_url: s.searxng_url, max_results: s.max_results, timeout_ms: s.timeout_ms, inject_as: s.inject_as, api_key_masked: window.__fixtureSearchKey.masked, has_key: window.__fixtureSearchKey.configured, backend_needs_key: needsKey };
+    return { enabled: s.enabled, backend: s.backend, searxng_url: s.searxng_url, max_results: s.max_results, timeout_ms: s.timeout_ms, inject_as: s.inject_as, api_key_masked: window.__fixtureSearchKey.masked, has_key: window.__fixtureSearchKey.configured, backend_needs_key: needsKey,query_cache_ttl_secs:s.query_cache_ttl_secs??0,coalesce_queries:s.coalesce_queries??false,source_min_interval_ms:s.source_min_interval_ms??0,free_search_scope:s.free_search_scope??"web",free_search_scopes:["web","npm_packages","hacker_news"],free_search_locale:s.free_search_locale??"source_default",free_search_locales:["source_default","cn_zh","us_en","gb_en"],free_proxy_url:s.free_proxy_url??null,page_text_enabled:s.page_text_enabled??false,resources:{schema_version:1,entries:0,inflight:0,cache_hits:0,cache_misses:0,coalesced:0,queries_started:0,rejected:0} };
   };
   window.__fixtureSaved = [];
   if (empty) window.__fixtureProviders = [];
@@ -335,7 +339,8 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
   // 金额刻意不同币种，验证界面分币种展示而不是相加。
   window.__fixtureStats = {
     window: "24h", total_requests: 3, today_requests: 3, success_rate: 2 / 3,
-    avg_latency_ms: 320, total_fallbacks: 2, fallback_request_count: 2, fallback_rate: 2 / 3,
+    avg_latency_ms: 320, latency_sample_count: 3, latency_p50_ms: 220, latency_p95_ms: 410,
+    total_fallbacks: 2, fallback_request_count: 2, fallback_rate: 2 / 3,
     total_prompt_tokens: 1234, total_completion_tokens: 567,
     provider_distribution: [
       { provider_id: "openrouter", provider: "OpenRouter", requests: 2, successful_requests: 2, prompt_tokens: 1200, completion_tokens: 500, fallback_attempts: 1 },
@@ -451,17 +456,28 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     invoke: async (cmd, args) => {
     window.__fixtureCalls.push(cmd);
     switch (cmd) {
+      case "get_personal_test": return {enabled:false,target:null,trusted_source_ready:false};
       case "qoder_job_status":
       case "qoder_job_prepare":
-      case "qoder_job_refresh": {
+      case "qoder_job_refresh":
+      case "qoder_job_reissue": {
         const key = `${args.region}:${args.accountId}`;
-        if (cmd !== "qoder_job_status") {
+        if (cmd === "qoder_job_reissue") {
+          if (!window.__fixtureQdJobExpired?.[key] || window.__fixtureQdReissueAttempted?.[key]) throw Error("synthetic unavailable reissue");
+          (window.__fixtureQdReissueAttempted ??= {})[key] = true;
+          if (window.__fixtureQdReissueHold) await new Promise(resolve => { window.__fixtureQdReissueRelease = resolve; });
+          if (window.__fixtureQdReissueFailure) throw Error("synthetic reissue outcome unknown");
+          window.__fixtureQdJobExpired[key] = false;
+          (window.__fixtureQdJobs ??= {})[key] = true;
+        } else if (cmd !== "qoder_job_status") {
           if (window.__fixtureQdJobFailure) throw Error("synthetic model authentication failure");
           (window.__fixtureQdJobs ??= {})[key] = true;
         }
-        return { status: window.__fixtureQdJobs?.[key] ? "prepared" : window.__fixtureQdAccounts?.[key] ? "not_prepared" : "not_logged_in",
-          region: args.region, account_id: args.accountId, access_expires_at_ms: null, refresh_expires_at_ms: null,
-          can_refresh: !!window.__fixtureQdJobs?.[key], attempt_blocked: false, inference_verified: false };
+        const expired = !!window.__fixtureQdJobExpired?.[key];
+        return { status: expired ? "expired" : window.__fixtureQdJobs?.[key] ? "prepared" : window.__fixtureQdAccounts?.[key] ? "not_prepared" : "not_logged_in",
+          region: args.region, account_id: args.accountId, access_expires_at_ms: expired ? Date.now()-1000 : null, refresh_expires_at_ms: expired ? Date.now()-500 : null,
+          can_refresh: !expired && !!window.__fixtureQdJobs?.[key], can_reissue: expired && !window.__fixtureQdReissueAttempted?.[key],
+          reissue_attempted: expired && !!window.__fixtureQdReissueAttempted?.[key], attempt_blocked: false, inference_verified: false };
       }
       case "register_qoder_provider": {
         (window.__fixtureQdRegistrations ??= []).push({ region: args.region, account: args.accountId });
@@ -509,13 +525,24 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         if (window.__fixtureQdCancelFailure) throw Error("synthetic cancel failure");
         delete window.__fixtureQdPending?.[args.loginId]; return null;
       }
+      case "trae_model_catalog":
+        return { account_id: args.accountId, region: "cn", origin: "https://trae-api-cn.mchost.guru", fetched_at_ms: 1792022400000, groups: [], warnings: [] };
+      case "trae_native_model_catalog":
+        return { account_id: args.accountId, region: "cn", profile_id: "cn-ordinary-3.4.3-aicc20260212-v1", source_function: "solo_work_remote", fetched_at_ms: Date.now(), catalog_revision: "synthetic-native-empty", entries: [], excluded_count: 0, warnings: [] };
+      case "register_trae_provider":
+        throw Error("Native registration requires the focused synthetic fixture");
       case "trae_login_status":
         return { status: "not_logged_in", account_id: args.accountId, identity: null, can_refresh: false,
           access_expires_at_ms: null, refresh_expires_at_ms: null, refresh_attempted: false };
+      case "trae_login_recovery":
+        return { account_id: args.accountId, login_preparing: false, refresh_in_flight: false, refresh_interrupted: false, login: null };
+      case "trae_login_cancel_recovery":
+        return null;
       case "workbuddy_login_status":
       case "workbuddy_login_refresh": {
         const id = args.accountId;
-        const ready = cmd === "workbuddy_login_refresh" || !!window.__fixtureWbAccounts?.[id];
+        const accounts = args.region === "cn" ? (window.__fixtureWbCnAccounts ??= {}) : (window.__fixtureWbAccounts ??= {});
+        const ready = cmd === "workbuddy_login_refresh" || !!accounts[id];
         return { status: ready ? "authenticated" : "not_logged_in", account_id: id,
           identity: ready ? { display_name: `离线账号 ${id}`, masked_email: null, captured_at: null } : null,
           can_refresh: ready, access_expires_at_ms: null, refresh_expires_at_ms: null, refresh_attempted: false };
@@ -523,32 +550,35 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       case "workbuddy_login_start": {
         const account = args.accountId;
         const id = `offline-login-${account}-${(window.__fixtureWbStarts ??= []).length}`;
-        window.__fixtureWbStarts.push({ id, account });
+        window.__fixtureWbStarts.push({ id, account, region: args.region ?? "global" });
         (window.__fixtureWbPending ??= {})[id] = account;
+        (window.__fixtureWbPendingRegions ??= {})[id] = args.region ?? "global";
         if (window.__fixtureWbStartHold) await new Promise(resolve => { window.__fixtureWbStartRelease = resolve; });
-        return { login_id: id, authorization_url: window.__fixtureWbBadUrl ? "https://example.invalid/authorize" : "https://www.workbuddy.ai/authorize?state=offline-fixture",
+        return { login_id: id, authorization_url: window.__fixtureWbBadUrl ? "https://example.invalid/authorize" : args.region === "cn" ? "https://copilot.tencent.com/login?state=offline-fixture" : "https://www.workbuddy.ai/authorize?state=offline-fixture",
           deadline_ms: Date.now() + (window.__fixtureWbDeadlineMs ?? 300000), server_ttl_seconds: null };
       }
       case "workbuddy_login_poll": {
         const account = window.__fixtureWbPending?.[args.loginId];
         if (!account) throw Error("cancelled synthetic session");
+        if (window.__fixtureWbPendingRegions?.[args.loginId] !== (args.region ?? "global")) throw Error("synthetic region mismatch");
         if (window.__fixtureWbPollHold) await new Promise(resolve => { window.__fixtureWbPollRelease = resolve; });
         if (window.__fixtureWbPollFailure) throw Error("synthetic polling failure");
         const ready = !!window.__fixtureWbAuthorize;
-        if (ready) (window.__fixtureWbAccounts ??= {})[account] = true;
+        if (ready) (args.region === "cn" ? (window.__fixtureWbCnAccounts ??= {}) : (window.__fixtureWbAccounts ??= {}))[account] = true;
         return { status: ready ? "authenticated" : "awaiting_authorization", account_id: account,
           identity: ready ? { display_name: `离线账号 ${account}`, masked_email: null, captured_at: null } : null,
           can_refresh: ready, access_expires_at_ms: null, refresh_expires_at_ms: null, refresh_attempted: false };
       }
       case "workbuddy_login_cancel": {
+        if (window.__fixtureWbPendingRegions?.[args.loginId] && window.__fixtureWbPendingRegions[args.loginId] !== (args.region ?? "global")) throw Error("synthetic region mismatch");
         (window.__fixtureWbCancels ??= []).push(args.loginId);
         if (window.__fixtureWbCancelFailure) throw Error("synthetic cancel failure");
         delete window.__fixtureWbPending?.[args.loginId]; return null;
       }
       case "register_workbuddy_provider": {
-        if (!window.__fixtureWbAccounts?.[args.accountId]) throw Error("synthetic account is not logged in");
+        if (!(args.region === "cn" ? window.__fixtureWbCnAccounts : window.__fixtureWbAccounts)?.[args.accountId]) throw Error("synthetic account is not logged in");
         if (window.__fixtureWbRegisterHold) await new Promise(resolve => { window.__fixtureWbRegisterRelease = resolve; });
-        return { provider_id: "offline-wb-provider", runtime_id: "offline-wb-runtime", model_count: 27, warnings: [] };
+        return { provider_id: args.region === "cn" ? "offline-wb-cn-provider" : "offline-wb-provider", runtime_id: args.region === "cn" ? "offline-wb-cn-runtime" : "offline-wb-runtime", model_count: 27, warnings: [] };
       }
       case "desktop_chat": {
         (window.__fixtureChatInputs ??= []).push(structuredClone(args.input));
@@ -556,7 +586,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         if (window.__fixtureChatFailure) throw new Error("HTTP 503：模拟上游不可用");
         return { content: "收到，模型已接入。", reasoning: window.__fixtureChatReasoning ?? null, model: "fixture-model", routed_via: "workbuddy/fixture-model",
           session_id: args.input.session_id, trace_id: "fixture-trace", fallback_attempts: 0, latency_ms: 27,
-          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }, cached: false };
+          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }, cached: false, ...(window.__fixtureChatReplyMetadata ?? {}) };
       }
       case "export_desktop_chat": {
         if (window.__fixtureChatExportFailure) throw new Error("模拟本地对话文件不可写");
@@ -583,6 +613,30 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         if (window.__fixtureProviderHold) await new Promise(resolve => (window.__fixtureProviderPending ??= []).push(resolve));
         return structuredClone(window.__fixtureProviders);
       case "get_config": if (configFailure) throw new Error("模拟配置读取失败"); return structuredClone(window.__fixtureConfig);
+      case "get_proxy_control_status":
+      case "set_gateway_proxy_enabled":
+      case "set_system_proxy_enabled":
+      case "save_proxy_startup_options": {
+        window.__fixtureProxyControl ??= {
+          gateway: { running: false, bound_addr: null, last_error: null },
+          system: { supported: true, enabled: false, mode: "direct", manual_server: null, source: "external", error: null },
+          startup: { start_gateway_on_launch: false, start_system_proxy_on_launch: false, system_proxy_server: null },
+        };
+        const control = window.__fixtureProxyControl;
+        if (cmd === "set_gateway_proxy_enabled") {
+          control.gateway.running = args.enabled;
+          control.gateway.bound_addr = args.enabled ? "127.0.0.1:15721" : null;
+        } else if (cmd === "set_system_proxy_enabled") {
+          control.system.enabled = args.enabled;
+          control.system.mode = args.enabled ? "manual" : "direct";
+        } else if (cmd === "save_proxy_startup_options") control.startup = structuredClone(args.options);
+        return structuredClone(control);
+      }
+      case "benefit_auth_source": {
+        const account = window.__fixtureConfig.benefits.accounts.find(account => account.id === args.accountId);
+        if (!account) throw Error("Unknown fixture benefit account");
+        return benefitAuthSource(account);
+      }
       case "benefits_overview": {
         const plan = window.__fixtureBenefitPlans?.shift() ?? {};
         const result = plan.overview ?? benefitOverview();
@@ -974,6 +1028,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
             : null,
         };
       }
+      case "get_current_client_usage_job": return null;
       case "scan_client_usage": {
         window.__fixtureClientScanCalls=(window.__fixtureClientScanCalls??0)+1;
         if(window.__fixtureClientScanFailure)throw new Error("模拟客户端日志读取失败");
@@ -982,8 +1037,8 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         const row={source:"codex",profile:"default",model:"fixture-model",provider:null,granularity:"request",day:"2026-10-13",requests:2,input_tokens:200,output_tokens:40,cache_read_tokens:60,cache_write_tokens:0,partial_fields:[],known_usage_records:2,unknown_usage_records:0,cache_hit_requests:1,cache_miss_requests:1,cache_unknown_requests:0,estimated_cost:0.000226,estimated_currency:"USD",estimate_note:null,price_reference:"fixture reference"};
         const unknown={...row,source:"qoder",model:"auto",input_tokens:null,output_tokens:null,cache_read_tokens:null,cache_write_tokens:null,known_usage_records:0,unknown_usage_records:2,cache_hit_requests:0,cache_miss_requests:0,cache_unknown_requests:2,estimated_cost:null,estimated_currency:null,estimate_note:"price_missing",price_reference:null};
         const dsh={...row,source:"dsh",profile:"stable",provider:"fixture-provider",model:"range-model",granularity:"daily_aggregate",day:"2026-10-12",requests:2,input_tokens:30,output_tokens:4,cache_read_tokens:20,estimated_cost:0.000020};
-        const daily=window.__fixtureClientScanEmpty?[]:[row,unknown,dsh,{...dsh,day:"2026-10-13",requests:3,input_tokens:70,output_tokens:6,cache_read_tokens:40,estimated_cost:0.000046}].filter(r=>r.day>=args.fromDay&&r.day<=args.toDay);
-        const summary=[];for(const r of daily){const old=summary.find(x=>x.source===r.source&&x.model===r.model&&x.profile===r.profile&&x.provider===r.provider);if(old){for(const k of ['requests','input_tokens','output_tokens','cache_read_tokens','cache_write_tokens','estimated_cost'])old[k]=old[k]===null||r[k]===null?null:old[k]+r[k];}else summary.push({...r,day:null,granularity:'range_total'});}
+        const daily=window.__fixtureClientScanEmpty?[]:(window.__fixtureClientUsageRows??[row,unknown,dsh,{...dsh,day:"2026-10-13",requests:3,input_tokens:70,output_tokens:6,cache_read_tokens:40,estimated_cost:0.000046}]).filter(r=>r.day>=args.fromDay&&r.day<=args.toDay);
+        const summary=[];for(const r of daily){const old=summary.find(x=>x.source===r.source&&x.model===r.model&&x.profile===r.profile&&x.provider===r.provider&&x.estimated_currency===r.estimated_currency);if(old){for(const k of ['requests','input_tokens','output_tokens','cache_read_tokens','cache_write_tokens','estimated_cost','estimated_cost_min','estimated_cost_max'])old[k]=old[k]==null||r[k]==null?null:old[k]+r[k];}else summary.push({...r,day:null,granularity:'range_total'});}
         return {generated_at:new Date().toISOString(),from_day:args.fromDay,to_day:args.toDay,sources:[{source:"codex",profile:"default",status:"ok",files_scanned:1,records_scanned:5,skipped_records:0,bytes_read:200,notes:[]},{source:"qoder",profile:"default",status:"partial",files_scanned:1,records_scanned:2,skipped_records:0,bytes_read:100,notes:["qoder_input_contract_unknown"]}],rows:daily,summary_rows:summary,daily_rows:daily};
       }
       case "plugin:dialog|save":
@@ -999,7 +1054,14 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       }
       case "export_bundle": return null;
       case "plugin:dialog|open": return window.__fixtureDialogPath ?? "C:/fixture/bundle";
+      case "price_observations": return [];
       case "pricing_status": return window.__fixturePricingStatus;
+      case "catalog_maintenance_status": return { settings: structuredClone(window.__fixtureConfig.catalog_maintenance ?? {enabled:false,provider_ids:[]}), statuses: [] };
+      case "save_catalog_maintenance": window.__fixtureConfig.catalog_maintenance=structuredClone(args.settings); return {settings:structuredClone(args.settings),statuses:[]};
+      case "save_free_routing": window.__fixtureConfig.free_routing=structuredClone(args.settings); return structuredClone(args.settings);
+      case "catalog_inventory": return {entries:[],total:0,offset:args.offset??0,limit:100};
+      case "scan_catalog_maintenance": return {status:"incomplete",summary:null,failure_kind:null};
+      case "cancel_catalog_maintenance": return false;
       case "refresh_pricing":
         window.__fixturePricingStatus = { at: "2026-09-12T02:00:00Z", manual: true, feed_url: "https://openrouter.ai/api/v1/models", feed_models: 443, updated: 2, skipped_manual: 1, unmatched: 1 };
         window.__fixtureProviders = window.__fixtureProviders.map(p => p.id === "anthropic"
@@ -1060,6 +1122,12 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       case "petdex_install_pet": window.__fixturePetInstalled = args.slug; return "installed";
       case "run_gateway_self_check": if (window.__fixtureSelfCheckFails) return { healthy: false, base_url: "http://127.0.0.1:15721", routed_via: null, latency_ms: 12, error: "网关返回 HTTP 503：所有候选 Provider 均不可用（尝试 2 次）" };
         return { healthy: true, base_url: "http://127.0.0.1:15721", routed_via: "openrouter/vendor/chat:free", latency_ms: 321, error: null };
+      case "list_sessions_page": {
+        const input=args.input??{}, q=(input.query??"").trim(), size=Math.max(1,Math.min(200,input.limit??50));
+        const all=window.__fixtureSessions.filter(s=>[s.title,s.id,s.sticky_provider_id,s.sticky_model].some(v=>(v??"").toLowerCase().includes(q.toLowerCase()))).sort((a,b)=>b.updated_at.localeCompare(a.updated_at)||b.id.localeCompare(a.id));
+        const start=input.cursor?Number(input.cursor.split(":").at(-1)):0, rows=structuredClone(all.slice(start,start+size)), more=start+rows.length<all.length;
+        return {rows,total_count:all.length,has_more:more,next_cursor:more?`owned-fixture-list:${start+rows.length}`:null,selected:structuredClone(window.__fixtureSessions.find(s=>s.id===input.selected_id)??null),query:q};
+      }
       case "list_sessions": return structuredClone(window.__fixtureSessions);
       case "get_session_messages":
         if (window.__fixtureSessionMessageHold) await new Promise(resolve => { window.__fixtureSessionMessageRelease = resolve; });
@@ -1068,7 +1136,7 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       case "get_session_messages_page": {
         const id = args.id, after = args.afterId ?? 0;
         (window.__fixtureSessionPageRequests ??= []).push({ id, after });
-        const rows = structuredClone(window.__fixtureSessionPages?.[id] ?? (id === "session-empty" ? [] : id === "session-fast" ? [message(10, "assistant", "这是快速切换后的正确会话内容。")] : window.__fixtureMessages));
+        const rows = structuredClone(window.__fixtureSessionPages?.[id] ?? (id === "session-empty" ? [] : id === "session-fast" ? [{ ...message(10, "assistant", "这是快速切换后的正确会话内容。"), session_id: id }] : window.__fixtureMessages));
         if (window.__fixtureSessionPageHold?.id === id && window.__fixtureSessionPageHold.after === after) {
           await new Promise(resolve => { window.__fixtureSessionPageRelease = resolve; });
         }
@@ -1158,7 +1226,12 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       // 而不是只断言控件长得对。少了它，「保存成功但界面没回填」这类
       // 回归会一路滑到「保存没发生」才被看见。
       (window.__fixtureDiag = window.__fixtureDiag || []).push(next.backend);
-        window.__fixtureConfig.search = { ...window.__fixtureConfig.search, ...next };
+        const patch={...next};if(patch.query_cache_ttl_secs===undefined)delete patch.query_cache_ttl_secs;if(patch.coalesce_queries===undefined)delete patch.coalesce_queries;if(patch.source_min_interval_ms===undefined)delete patch.source_min_interval_ms;if(patch.free_search_scope===undefined)delete patch.free_search_scope;if(patch.free_proxy_url===undefined)delete patch.free_proxy_url;if(patch.free_search_locale===undefined)delete patch.free_search_locale;if(patch.page_text_enabled===undefined)delete patch.page_text_enabled;
+        if(patch.free_search_locale!==undefined&&!["source_default","cn_zh","us_en","gb_en"].includes(patch.free_search_locale))throw "invalid search locale";
+        if(patch.free_search_scope!==undefined&&!["web","npm_packages","hacker_news","stack_overflow"].includes(patch.free_search_scope))throw "invalid search scope";
+        if(patch.source_min_interval_ms!==undefined&&(!Number.isSafeInteger(patch.source_min_interval_ms)||patch.source_min_interval_ms<0||patch.source_min_interval_ms>3600000))throw '源发送预留间隔无效';
+        if(patch.query_cache_ttl_secs!==undefined&&(!Number.isSafeInteger(patch.query_cache_ttl_secs)||patch.query_cache_ttl_secs<0||patch.query_cache_ttl_secs>3600))throw '本机检索缓存有效期必须在0到3600秒之间';
+        window.__fixtureConfig.search = { ...window.__fixtureConfig.search, ...patch };
         if ("api_key" in next && next.api_key) window.__fixtureSearchKey = { masked: "tvly-****-zzzz", configured: true };
         // 返回**裸的** SearchSettingsView，不包一层 —— commands.rs 的
         // update_search_settings 结尾是直接 `get_search_settings(state)`。
@@ -1249,19 +1322,29 @@ async function verifyAsyncPages(browser, errors) {
   await nav.getByRole("button", { name: "设置", exact: true }).click();
   await page.getByText("统一接入地址", { exact: true }).waitFor();
   await page.waitForTimeout(450);
-  assert.equal(await page.locator("#gateway-port").inputValue(), "15888",
-    "StrictMode第一次加载的旧配置不能覆盖第二次加载结果");
+  if(process.env.LLMGW_UI_ASSETS==='dist'){
+    assert.equal(await page.locator("#gateway-port").inputValue(),"15721","production mounts once and returns its captured configuration");
+    await nav.getByRole("button",{name:"供应商",exact:true}).click();await nav.getByRole("button",{name:"设置",exact:true}).click();await page.getByText("统一接入地址",{exact:true}).waitFor();
+    assert.equal(await page.locator("#gateway-port").inputValue(),"15888","a fresh production mount reads the updated configuration");
+  }else{
+    assert.equal(await page.locator("#gateway-port").inputValue(), "15888",
+      "StrictMode第一次加载的旧配置不能覆盖第二次加载结果");
+  }
   assert.equal(await page.getByRole("alert").count(), 0);
   await page.locator("#gateway-port").scrollIntoViewIfNeeded();
-  await page.screenshot({ path: path.join(output, "settings-load-out-of-order.png"), fullPage: true });
+  await page.screenshot({ path: path.join(output, process.env.LLMGW_UI_ASSETS==='dist'?"settings-production-remount.png":"settings-load-out-of-order.png"), fullPage: true });
   await nav.getByRole("button", { name: "供应商", exact: true }).click();
   await page.evaluate(() => { window.__fixtureSettingsLoadPlans = [{ delayMs: 350, error: "过期设置请求失败" }, {}]; });
   await nav.getByRole("button", { name: "设置", exact: true }).click();
+  if(process.env.LLMGW_UI_ASSETS==='dist'){
+    await page.getByRole("alert").filter({hasText:"过期设置请求失败"}).waitFor();
+    await page.getByRole("button",{name:"重试加载设置",exact:true}).click();
+  }
   await page.getByText("统一接入地址", { exact: true }).waitFor();
   await page.waitForTimeout(450);
   assert.equal(await page.getByRole("alert").count(), 0,
     "过期设置请求失败不能把已加载成功的页面改成错误状态");
-  await page.screenshot({ path: path.join(output, "settings-stale-error-ignored.png"), fullPage: true });
+  await page.screenshot({ path: path.join(output, process.env.LLMGW_UI_ASSETS==='dist'?"settings-production-retry-recovery.png":"settings-stale-error-ignored.png"), fullPage: true });
   await page.evaluate(() => { window.__fixtureProviderHold = true; window.__fixtureProviderPending = []; });
   await page.getByRole("button", { name: "轮换 Key", exact: true }).click();
   await page.waitForFunction(() => window.__fixtureProviderPending.length === 1);
@@ -1435,7 +1518,7 @@ async function verifyChatPage(browser, errors) {
   await chat.getByText("收到，模型已接入。", { exact: true }).waitFor();
   assert.equal(await chat.locator("img").count(), 0, "model and user text is rendered safely as text");
   assert((await chat.innerText()).includes("降级 0 次"));
-  assert((await chat.innerText()).includes("输入 5 / 输出 2 tokens"));
+  assert((await chat.innerText()).includes("输入 5 / 输出 2 / 合计 7 tokens"));
   await chat.locator("#chat-model:not(:disabled)").waitFor();
   const explicit = await chat.locator("#chat-model option").nth(1).getAttribute("value");
   await chat.locator("#chat-model").selectOption(explicit);
@@ -1489,6 +1572,7 @@ async function verifyChatPage(browser, errors) {
 }
 
 async function verifyUsageEnhancements(browser, errors) {
+  await require("./client-fee-ui.cjs").verifyClientFees(browser, fixture, baseUrl, output, errors);
   const context=await browser.newContext({viewport:{width:1440,height:1000}});
   await context.addInitScript(fixture);
   await context.addInitScript(()=>{
@@ -1498,6 +1582,8 @@ async function verifyUsageEnhancements(browser, errors) {
   const page=await context.newPage();page.on('pageerror',e=>errors.push(String(e)));
   await page.goto(baseUrl);const nav=page.getByRole('navigation',{name:'主导航'});
   await nav.getByRole('button',{name:'用量与审计',exact:true}).click();
+  await page.getByText(/有效样本 3/).waitFor();
+  await page.getByText(/P50 220ms · P95 410ms/).waitFor();
   await page.getByText('当前 1–120 条 / 共 250 条',{exact:true}).waitFor();
   assert.equal(await page.evaluate(()=>window.__fixtureClientScanCalls??0),0,'page entry does not scan local client logs');
   await page.locator('#audit-next').click();await page.getByText('当前 121–240 条 / 共 250 条',{exact:true}).waitFor();
@@ -1567,20 +1653,27 @@ async function verifyChatEnhancements(browser, errors) {
   await nav.getByRole("button", { name: "聊天测试", exact: true }).click();
   const chat = page.getByTestId("chat-page"), prompt = chat.locator("#chat-prompt");
   await chat.locator("#chat-model:not(:disabled)").waitFor();
-  await page.evaluate(() => { window.__fixtureChatReasoning = "第一轮独立推理证据"; });
+  await page.evaluate(() => { window.__fixtureChatReasoning = "第一轮独立推理证据"; window.__fixtureChatReplyMetadata={finish_reason:"length",response_metadata:{finish_reason:"reported",usage:"reported"}}; });
   await prompt.fill("第一轮");
   await chat.getByRole("button", { name: "发送消息", exact: true }).click();
   await chat.locator(".chat-turn.assistant").waitFor();
   await chat.locator("#chat-model:not(:disabled)").waitFor();
-  await page.evaluate(() => { window.__fixtureChatReasoning = null; });
+  await page.evaluate(() => { window.__fixtureChatReasoning = null; window.__fixtureChatReplyMetadata={finish_reason:null,response_metadata:{finish_reason:"unavailable",usage:"reported"},usage:{prompt_tokens:0,completion_tokens:null,total_tokens:7,credit_units:"0.125"}}; });
   await prompt.fill("第二轮");
   await prompt.press("Control+Enter");
   await chat.locator(".chat-turn.assistant").nth(1).waitFor();
   assert.equal(await chat.locator(".chat-meta").count(), 2, "second response must preserve the first response metadata");
+  assert((await chat.locator(".chat-meta").nth(0).innerText()).includes("结束原因：length"));
+  assert((await chat.locator(".chat-meta").nth(1).innerText()).includes("结束原因：未知"));
+  assert((await chat.locator(".chat-meta").nth(1).innerText()).includes("输入 0 / 输出 未知"));
   await chat.locator(".chat-turn.assistant").first().getByText("推理内容", { exact: true }).click();
   await chat.getByText("第一轮独立推理证据", { exact: true }).waitFor();
   const inputs = await page.evaluate(() => window.__fixtureChatInputs);
-  assert(inputs[1].messages.every(m => Object.keys(m).sort().join(",") === "content,role"), "IPC must omit presentation metadata");
+  assert.deepEqual(inputs[1].messages, [
+    {role:"user",content:"第一轮"},
+    {role:"assistant",content:"收到，模型已接入。",reasoning_content:"第一轮独立推理证据"},
+    {role:"user",content:"第二轮"},
+  ], "IPC replays only bounded conversational history, never result/trace/usage/refusal presentation metadata");
   await page.screenshot({ path: path.join(output, "chat-metadata-preserved.png"), fullPage: true });
 
   await page.evaluate(() => { window.__fixtureSavePath = "C:/fixture/chat.json"; });
@@ -1713,7 +1806,7 @@ async function verifyQoderLogin(browser, errors) {
     const global = page.getByTestId("qoder-login-global"), cn = page.getByTestId("qoder-login-cn");
     const button = (section, name) => section.getByRole("button", { name, exact: true });
     await page.waitForFunction(() => window.__fixtureCalls.filter(c => c === "qoder_login_status").length === 2);
-    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => /^(qoder_login_(start|poll|refresh)|qoder_job_(prepare|refresh)|register_qoder_provider)$/.test(c)), [], "entry only reads local status");
+    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => /^(qoder_login_(start|poll|refresh)|qoder_job_(prepare|refresh|reissue)|register_qoder_provider)$/.test(c)), [], "entry only reads local status");
     await global.getByLabel("本机账号名称").fill("非法账号");
     assert(await button(global, "网页登录").isDisabled());
     assert.equal(await global.getByLabel("本机账号名称").getAttribute("aria-invalid"), "true");
@@ -1829,7 +1922,7 @@ async function verifyWorkBuddyLogin(browser, errors) {
     const account = login.getByLabel("本机账号名称");
     const button = name => login.getByRole("button", { name, exact: true });
     await page.waitForFunction(() => window.__fixtureCalls.includes("workbuddy_login_status"));
-    const forbidden = /^(workbuddy_login_start|workbuddy_login_poll|workbuddy_login_refresh|register_workbuddy_provider|qoder_job_prepare|qoder_job_refresh|register_qoder_provider|desktop_chat|test_provider|claim_benefit_now)$/;
+    const forbidden = /^(workbuddy_login_start|workbuddy_login_poll|workbuddy_login_refresh|register_workbuddy_provider|qoder_job_prepare|qoder_job_refresh|qoder_job_reissue|register_qoder_provider|desktop_chat|test_provider|claim_benefit_now)$/;
     assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => forbidden.test(c)), [], "page entry must read only local status");
     assert(await button("接入模型").isDisabled());
     await button("网页登录").click();
@@ -2326,7 +2419,7 @@ async function verifyBenefits(browser, errors) {
   assert.equal(await page.getByRole("checkbox", { name: "每日自动领取", exact: true }).isChecked(), false);
   assert.equal(await page.evaluate(() => window.__fixtureBenefitQueries), 0, "默认关闭时不向平台查询");
   assert.equal(await page.evaluate(() => window.__fixtureCalls.includes("claim_benefit_now")), false, "进入页面不自动领取");
-  assert((await page.getByTestId("benefit-capabilities").innerText()).includes("自动签到能力未知"));
+  assert((await page.getByTestId("benefit-capabilities").innerText()).includes("默认使用独立凭据"));
   await page.getByRole("button", { name: "Qoder 官方活动说明", exact: true }).click();
   await page.waitForFunction(() => Boolean(window.__fixtureOpenedOfficialUrl));
   assert.equal(await page.evaluate(() => window.__fixtureOpenedOfficialUrl), "https://docs.qoder.com/events/100credits");
@@ -2352,7 +2445,7 @@ async function verifyBenefits(browser, errors) {
   assert.equal(await page.getByLabel("权益 Token", { exact: true }).getAttribute("type"), "password");
   await page.getByRole("button", { name: "保存 Token", exact: true }).click();
   await settled();
-  assert((await international.innerText()).includes("Token 已保存"));
+  assert((await international.innerText()).includes("原签到 Token"));
   assert.equal(await page.evaluate(() => window.__fixtureBenefitQueries), 0, "保存Token不会绕过关闭态发平台请求");
   assert(!(await page.getByTestId("benefits-page").innerText()).includes("fixture-benefit-private-value"));
   assert(await page.evaluate(() => !JSON.stringify(window.__fixtureConfig).includes("fixture-benefit-private-value") && !JSON.stringify(localStorage).includes("fixture-benefit-private-value")), "Token不进config或storage");
@@ -2434,14 +2527,14 @@ async function verifyBenefits(browser, errors) {
   await page.getByLabel("平台", { exact: true }).selectOption("qoder_cn");
   await page.getByRole("button", { name: "保存账号", exact: true }).click();
   await settled();
-  assert((await international.innerText()).includes("缺少 Token"), "切换平台不能误复用国际版Token");
+  assert((await international.innerText()).includes("未设置签到凭据"), "切换平台不能误复用国际版Token");
   await international.getByRole("button", { name: "编辑账号", exact: true }).click();
   await page.getByLabel("平台", { exact: true }).selectOption("qoder");
   await page.getByRole("button", { name: "保存账号", exact: true }).click();
   await settled();
   await international.getByRole("button", { name: "清除 Token", exact: true }).click();
   await settled();
-  assert((await international.innerText()).includes("缺少 Token"));
+  assert((await international.innerText()).includes("未设置签到凭据"));
   assert((await page.getByTestId("benefit-history").innerText()).includes("实际发放"), "清除Token保留历史");
   await page.screenshot({ path: path.join(output, "benefits-token-cleared.png"), fullPage: true });
   await page.getByRole("checkbox", { name: "启用账号权益", exact: true }).uncheck();
@@ -2453,6 +2546,10 @@ async function verifyBenefits(browser, errors) {
   await nav.getByRole("button", { name: "供应商", exact: true }).click();
   await page.evaluate(() => { window.__fixtureBenefitPlans = [{ delayMs: 350, overview: { enabled: false, auto_claim: false, auto_claim_after_hour: 10, auto_claim_after_minute: 0, auto_claim_timezone: "local", checked_at: "2026-10-10T01:00:00Z", accounts: [] } }, {}]; });
   await nav.getByRole("button", { name: "账号权益", exact: true }).click();
+  if(process.env.LLMGW_UI_ASSETS==='dist'){
+    await page.waitForTimeout(450);assert.equal(await international.count(),0,"production uses the single initial overview");
+    await page.getByRole("button",{name:"刷新权益",exact:true}).click();
+  }
   await international.waitFor();
   await page.waitForTimeout(450);
   assert.equal(await international.count(), 1, "StrictMode晚到旧权益结果不覆盖新账号列表");
@@ -2605,11 +2702,19 @@ async function verifyDiagnostics(browser, errors) {
   await nav.getByRole("button", { name: "本地诊断", exact: true }).click();
   await page.getByTestId("diagnostics-summary").waitFor();
   await page.waitForTimeout(450);
+  if(process.env.LLMGW_UI_ASSETS==='dist'){
+    assert((await page.getByTestId("diagnostics-checks").innerText()).includes("过期诊断结果"),"production has one initial diagnostic snapshot");
+    await page.getByRole("button",{name:"刷新诊断",exact:true}).click();
+    await page.waitForFunction(()=>!document.querySelector('[data-testid="diagnostics-page"] .page-heading button').disabled);
+  }
   assert(!(await page.getByTestId("diagnostics-checks").innerText()).includes("过期诊断结果"), "StrictMode旧诊断结果不能覆盖新结果");
-  await page.screenshot({ path: path.join(output, "diagnostics-out-of-order.png"), fullPage: true });
+  await page.screenshot({ path: path.join(output, process.env.LLMGW_UI_ASSETS==='dist'?"diagnostics-production-refresh.png":"diagnostics-out-of-order.png"), fullPage: true });
   await nav.getByRole("button", { name: "供应商", exact: true }).click();
   await page.evaluate(() => { window.__fixtureDiagnosticsPlans = [{ delayMs: 350, error: "过期诊断失败" }, {}]; });
   await nav.getByRole("button", { name: "本地诊断", exact: true }).click();
+  if(process.env.LLMGW_UI_ASSETS==='dist'){
+    await page.getByRole("alert").waitFor();await page.getByRole("button",{name:"刷新诊断",exact:true}).click();
+  }
   await page.getByTestId("diagnostics-summary").waitFor();
   await page.waitForTimeout(450);
   assert.equal(await page.getByRole("alert").count(), 0, "过期诊断失败不能污染成功的状态");
@@ -2641,15 +2746,133 @@ async function verifyDiagnostics(browser, errors) {
   await context.close();
 }
 
-module.exports = { fixture };
+module.exports = { fixture, verifySessionPagination };
 if (require.main === module) (async () => {
+  if(process.env.LLMGW_UI_NATIVE){
+    if(process.env.LLMGW_UI_NATIVE==='proxy-controls') {
+      const proof=await require('./proxy-controls-native-ui.cjs').verifyNativeProxyControls(output);
+      console.log(`UI_NATIVE_FOCUS_OK: proxy-controls; actual gateway switches and persisted startup; no IPC fixtures; checks=${proof.checks.length}; screenshots=${output}`);return;
+    }
+    assert.equal(process.env.LLMGW_UI_NATIVE,'client-counters','unsupported native UI focus');
+    const proof=await require('./client-counter-native-ui.cjs').verifyNativeCounters(output);
+    console.log(`UI_NATIVE_FOCUS_OK: client-counters; actual backend scan, compiled UI and keyboard date filter; no IPC fixtures; checks=${proof.checks.length}; screenshots=${output}`);return;
+  }
   fs.mkdirSync(output, { recursive: true });
+  if(process.env.LLMGW_UI_ASSETS){
+    assert.equal(process.env.LLMGW_UI_ASSETS,'dist','unsupported asset mode');
+    assert.equal(new URL(baseUrl).origin,'https://llmgw-fixture.invalid','asset mode must use an isolated secure virtual origin');
+  }
   const browser = await chromium.launch({ headless: true, ...(process.env.LLMGW_BROWSER_CHANNEL ? { channel: process.env.LLMGW_BROWSER_CHANNEL } : {}) });
+  if(process.env.LLMGW_UI_ASSETS){
+    assert.equal(process.env.LLMGW_UI_ASSETS,'dist','unsupported asset mode');
+    assert.equal(new URL(baseUrl).origin,'https://llmgw-fixture.invalid','asset mode must use an isolated secure virtual origin');
+    const dist=fs.realpathSync(process.env.LLMGW_UI_DIST_ROOT || path.resolve(__dirname,'../dist')),create=browser.newContext.bind(browser);
+    assert(fs.statSync(path.join(dist,'index.html')).isFile()&&fs.statSync(path.join(dist,'assets')).isDirectory(),'asset root must be a built frontend output');
+    browser.newContext=async options=>{
+      const context=await create(options);
+      await context.route(`${baseUrl}/**`,async route=>{
+        const url=new URL(route.request().url());const relative=decodeURIComponent(url.pathname).replace(/^\/+/, '') || 'index.html';
+        const file=path.resolve(dist,relative);
+        assert(file.startsWith(dist+path.sep)&&fs.statSync(file).isFile(),'virtual browser can only read a built dist file');
+        const ext=path.extname(file),type={'.html':'text/html','.js':'text/javascript','.css':'text/css','.json':'application/json','.svg':'image/svg+xml','.png':'image/png','.woff2':'font/woff2'}[ext]??'application/octet-stream';
+        await route.fulfill({status:200,contentType:type,body:fs.readFileSync(file)});
+      });return context;
+    };
+  }
   try {
     if (process.env.LLMGW_UI_FOCUS) {
       const focus = process.env.LLMGW_UI_FOCUS, errors = [];
-      assert(["chat", "sessions", "usage", "qoder", "trae"].includes(focus), "unsupported UI focus");
-      if (focus === "chat") await verifyChatEnhancements(browser, errors);
+      if(focus==='model-declarations') {await require('./model-declarations-ui.cjs').verifyModelDeclarations(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: model-declarations');return;}
+      if(focus==='shell-endpoint-read') {await require('./shell-endpoint-read-ui.cjs').verifyShellEndpointRead(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: shell-endpoint-read');return;}
+      if(focus==='help-menu-keyboard') {const proof=await require('./help-menu-ui.cjs').verifyHelpMenu(browser,baseUrl,output);assert.equal(proof.passed,true);console.log('UI_FOCUS_OK: help-menu-keyboard');return;}
+      if(focus==='stack-overflow') {await require('./stack-overflow-ui.cjs').verifyStackOverflow(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: stack-overflow');return;}
+      if(focus==='search-settings-read-state') {await require('./search-settings-read-state-ui.cjs').verifySearchSettingsReadState(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: search-settings-read-state');return;}
+      if(focus==='manual-search-cancel') {await require('./manual-search-cancel-ui.cjs').verifyManualSearchCancel(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: manual-search-cancel');return;}
+      if(focus==='cli-readback') {await require('./cli-readback-ui.cjs').verifyCliReadback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: cli-readback');return;}
+      if(focus==='settings-mutation-recovery') {await require('./settings-mutation-recovery-ui.cjs').verifySettingsMutationRecovery(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: settings-mutation-recovery');return;}
+      if(focus==='settings-save-readback') {await require('./settings-save-readback-ui.cjs').verifySettingsSaveReadback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: settings-save-readback');return;}
+      if(focus==='workbuddy-account-name') {await require('./workbuddy-account-name-ui.cjs').verifyWorkbuddyAccountNames(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: workbuddy-account-name; screenshots=${output}`);return;}
+      if(focus==='feedback-coverage-partial') {await require('./feedback-coverage-partial-ui.cjs').verifyFeedbackCoveragePartial(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: feedback-coverage-partial');return;}
+      if(focus==='session-message-contract') {await require('./session-message-contract-ui.cjs').verifySessionMessageContract(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: session-message-contract');return;}
+      if(focus==='session-compact-recovery') {await require('./session-compact-recovery-ui.cjs').verifySessionCompactRecovery(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: session-compact-recovery');return;}
+      if(focus==='session-delete-recovery') {await require('./session-delete-recovery-ui.cjs').verifySessionDeleteRecovery(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: session-delete-recovery');return;}
+      if(focus==='session-list-pages') {await require('./session-list-pages-ui.cjs').verifySessionListPages(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: session-list-pages');return;}
+      if(focus==='price-observation') {await require('./price-observation-ui.cjs').verifyPriceObservation(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: price-observation');return;}
+      if(focus==='capability-evidence') {await require('./capability-evidence-ui.cjs').verifyCapabilityEvidence(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: capability-evidence');return;}
+      if(focus==='provider-health-result') {await require('./provider-health-result-ui.cjs').verifyProviderHealthResult(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: provider-health-result');return;}
+      if(focus==='providers-read-state') {await require('./providers-read-state-ui.cjs').verifyProvidersReadState(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: providers-read-state');return;}
+      if(focus==='chat-error-trace') {await require('./chat-error-trace-ui.cjs').verifyChatErrorTrace(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-error-trace; screenshots=${output}`);return;}
+      if(focus==='observation-context') {await require('./observation-context-ui.cjs').verifyObservationContext(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: observation-context');return;}
+      if(focus==='generation-readback') {await require('./request-generation-readback-ui.cjs').verifyGenerationReadback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: generation-readback');return;}
+      if(focus==='generation-summary') {await require('./request-generation-summary-ui.cjs').verifyGenerationSummary(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: generation-summary');return;}
+      if(focus==='request-generation') {await require('./request-generation-ui.cjs').verifyRequestGeneration(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: request-generation; screenshots=${output}`);return;}
+      if(focus==='capability-applicability') {await require('./capability-applicability-ui.cjs').verifyCapabilityApplicability(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: capability-applicability; screenshots=${output}`);return;}
+      if(focus==='remote-key-budget') {await require('./remote-key-budget-ui.cjs').verifyRemoteKeyBudget(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: remote-key-budget; screenshots=${output}`);return;}
+      if(focus==='hacker-news') {await require('./hacker-news-ui.cjs').verifyHackerNews(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: hacker-news; screenshots=${output}`);return;}
+      if(focus==='search-aggregate') {await require('./search-aggregate-ui.cjs').verifySearchAggregate(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: search-aggregate; screenshots=${output}`);return;}
+      if(focus==='trae-web-stale-read') {await require('./trae-web-stale-read-ui.cjs').verifyTraeWebStaleRead(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: trae-web-stale-read');return;}
+      if(focus==='trae-web-errors') {await require('./trae-web-error-ui.cjs').verifyTraeWebErrorRecovery(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: trae-web-errors');return;}
+      if(focus==='trae-web-login') {await require('./trae-web-login-ui.cjs').verifyTraeWebLogin(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: trae-web-login; screenshots=${output}`);return;}
+      if(focus==='search-locale') {await require('./search-locale-ui.cjs').verifySearchLocale(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: search-locale; screenshots=${output}`);return;}
+      if(focus==='mdn-backend') {await require('./mdn-backend-ui.cjs').verifyMdnBackend(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: mdn-backend');return;}
+      if(focus==='mdn-reference') {await require('./mdn-reference-ui.cjs').verifyMdnReference(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: mdn-reference');return;}
+      if(focus==='search-result-facts') {await require('./search-result-facts-ui.cjs').verifySearchResultFacts(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: search-result-facts; screenshots=${output}`);return;}
+      if(focus==='page-text') {await require('./search-page-text-ui.cjs').verifyPageText(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: page-text; screenshots=${output}`);return;}
+      if(focus==='search-egress') {await require('./search-egress-ui.cjs').verifySearchEgress(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: search-egress; screenshots=${output}`);return;}
+      if(focus==='npm-search') {await require('./npm-search-ui.cjs').verifyNpmSearch(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: npm-search; screenshots=${output}`);return;}
+      if(focus==='search-resources') {await require('./search-resources-ui.cjs').verifySearchResources(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: search-resources; screenshots=${output}`);return;}
+      if(focus==='session-preview') {await require('./session-preview-ui.cjs').verifySessionPreview(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: session-preview; screenshots=${output}`);return;}
+      if(focus==='request-preview') {await require('./request-preview-ui.cjs').verifyRequestPreview(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: request-preview; screenshots=${output}`);return;}
+      if(focus==='feedback-coverage') {await require('./feedback-coverage-ui.cjs').verifyFeedbackCoverage(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: feedback-coverage; screenshots=${output}`);return;}
+      if(focus==='capability-transfer') {await require('./capability-transfer-ui.cjs').verifyCapabilityTransfer(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: capability-transfer; screenshots=${output}`);return;}
+      if(focus==='onboarding-navigation') {await require('./onboarding-readiness-ui.cjs').verifyOnboardingNavigation(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-navigation');return;}
+      if(focus==='onboarding-unknown') {await require('./onboarding-readiness-ui.cjs').verifyOnboardingUnknown(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-unknown');return;}
+      if(focus==='onboarding-compat') {await require('./onboarding-readiness-ui.cjs').verifyOnboardingCompatibility(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-compat');return;}
+      if(focus==='chat-favorites') {await require('./chat-favorites-ui.cjs').verifyChatFavorites(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-favorites; screenshots=${output}`);return;}
+      if(focus==='chat-price-source') {await require('./chat-price-source-ui.cjs').verifyChatPriceSource(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-price-source; screenshots=${output}`);return;}
+      if(focus==='chat-price') {await require('./chat-price-view-ui.cjs').verifyChatPriceView(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-price; screenshots=${output}`);return;}
+      if(focus==='chat-model-filter') {await require('./chat-model-filter-ui.cjs').verifyChatModelFilter(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: chat-model-filter');return;}
+      if(focus==='onboarding-readiness') {await require('./onboarding-readiness-ui.cjs').verifyOnboardingReadiness(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-readiness');return;}
+      if(focus==='tps-idle-age') {await require('./tps-idle-age-ui.cjs').verifyTpsIdleAge(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: tps-idle-age; screenshots=${output}`);return;}
+      if(focus==='capability-explain-state') {await require('./capability-explain-state-ui.cjs').verifyCapabilityExplainState(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: capability-explain-state; screenshots=${output}`);return;}
+      if(focus==='conversation-feedback') {await require('./conversation-feedback-ui.cjs').verifyConversationFeedback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: conversation-feedback');return;}
+      if(focus==='s6-declaration-readback') {await require('./s6-declaration-readback-ui.cjs').verifyS6DeclarationReadback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: s6-declaration-readback');return;}
+      if(focus==='request-decision-scoring') {await require('./request-decision-scoring-ui.cjs').verifyRequestDecisionScoring(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: request-decision-scoring');return;}
+      if(focus==='request-decision'||focus==='request-decision-typed'||focus==='request-decision-native'||focus==='request-decision-auxiliary') {await require('./request-decision-ui.cjs').verifyRequestDecision(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: ${focus}; screenshots=${output}`);return;}
+      if(focus==='task-feedback') {await require('./request-feedback-ui.cjs').verifyTaskFeedback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: task-feedback; screenshots=${output}`);return;}
+      if(focus==='personal-test') {await require('./personal-test-ui.cjs').verifyPersonal(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: personal-test; screenshots=${output}`);return;}
+      if(focus==='six-region-chat-history') {await require('./six-region-chat-history-ui.cjs').verifySixRegionChatHistory(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: six-region-chat-history; screenshots=${output}`);return;}
+      if(focus==='chat-reply-observation') {await require('./chat-reply-observation-ui.cjs').verifyReplyObservation(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-reply-observation; screenshots=${output}`);return;}
+      if(focus==='chat-stream') {await require('./chat-stream-ui.cjs').verifyChatStream(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-stream; screenshots=${output}`);return;}
+      if(focus==='chat-cancel') {await require('./chat-cancel-ui.cjs').verifyChatCancellation(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-cancel; screenshots=${output}`);return;}
+      if(focus==='request-timing-stats') {await require('./request-timing-stats-ui.cjs').verifyRequestTimingStats(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: request-timing-stats; screenshots=${output}`);return;}
+      if(focus==='request-timing') {await require('./request-timing-ui.cjs').verifyRequestTiming(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: request-timing; screenshots=${output}`);return;}
+      if(focus==='benefit-auto-claim') {await require('./benefit-auto-claim-ui.cjs').verifyBenefitAutoClaim(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: benefit-auto-claim; screenshots=${output}`);return;}
+      if(focus==='free-routing') {await require('./free-routing-ui.cjs').verifyFreeRouting(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: free-routing; screenshots=${output}`);return;}
+      if(focus==='qoder-cancel-lifecycle') {await require('./qoder-cancel-lifecycle-ui.cjs').verifyQoderCancelLifecycle(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: qoder-cancel-lifecycle; screenshots=${output}`);return;}
+      assert(["chat", "sessions", "usage", "qoder", "trae", "trae-recovery", "trae-model-catalog", "trae-native-models", "trae-native-providers", "trae-native-usage", "account-runtime-options", "trae-benefits-binding", "benefits", "proxy", "workbuddy-regions", "client-history", "qoder-history", "qoder-reissue", "qoder-names", "workbuddy-benefits", "codex-archive", "dsh-prices", "catalog-maintenance"].includes(focus), "unsupported UI focus");
+      if (focus === "catalog-maintenance") await require("./catalog-maintenance-ui.cjs").verifyCatalogMaintenance(browser,baseUrl,output,errors,fixture);
+      if (focus === "dsh-prices") await require("./dsh-price-ui.cjs").verifyDshPrices(browser, baseUrl, output, errors, fixture);
+      if (focus === "workbuddy-benefits") await require("./workbuddy-benefits-ui.cjs").verifyWorkbuddyBenefits(browser, baseUrl, output, errors, fixture);
+      if (focus === "benefits") await verifyBenefits(browser, errors);
+      if (focus === "trae-benefits-binding") await require("./trae-benefits-binding-ui.cjs").verifyTraeBenefitsBinding(browser, baseUrl, output, errors, fixture);
+      if (focus === "trae-model-catalog") await require("./trae-model-catalog-ui.cjs").verifyTraeModelCatalog(browser, baseUrl, output, errors, fixture);
+      if (focus === "trae-native-providers") await require("./trae-native-provider-ui.cjs").verifyTraeNativeProviders(browser, baseUrl, output, errors, fixture);
+      if (focus === "trae-native-models") await require("./trae-native-models-ui.cjs").verifyTraeNativeModels(browser, baseUrl, output, errors, fixture);
+      if (focus === "trae-native-usage") await require("./trae-native-usage-ui.cjs").verifyTraeNativeUsage(browser, baseUrl, output, errors, fixture);
+      if (focus === "account-runtime-options") await require("./account-runtime-options-ui.cjs").verifyAccountRuntimeOptions(browser, baseUrl, output, errors, fixture);
+      if (focus === "trae-recovery") await require("./trae-recovery-ui.cjs").verifyTraeRecovery(browser, baseUrl, output, errors, fixture);
+      if (focus === "codex-archive") await require("./codex-archive-ui.cjs").verifyCodexArchive(browser, baseUrl, output, errors, fixture);
+      if (focus === "qoder-names") await require("./qoder-model-names-ui.cjs").verifyQoderModelNames(browser, baseUrl, output, errors, fixture);
+      if (focus === "qoder-reissue") await require("./qoder-reissue-ui.cjs").verifyQoderReissue(browser, baseUrl, output, errors, fixture);
+      if (focus === "qoder-history") await require("./qoder-history-ui.cjs").verifyQoderHistoryCredits(browser, baseUrl, output, errors, fixture);
+      if (focus === "client-history") await require("./client-history-ui.cjs").verifyClientHistory(browser, baseUrl, output, errors, fixture);
+      if (focus === "workbuddy-regions") await require("./workbuddy-regions-ui.cjs").verifyWorkbuddyRegions(browser, baseUrl, output, errors, fixture);
+      if (focus === "proxy") await require("./proxy-controls-ui.cjs").verifyProxyControls(browser, baseUrl, output, errors, fixture);
+      if (focus === "chat") {
+        await verifyChatEnhancements(browser, errors);
+        await require('./chat-refusal-ui.cjs').verifyChatRefusal(browser,baseUrl,output,errors,fixture);
+      }
       if (focus === "sessions") await verifySessionPagination(browser, errors);
       if (focus === "usage") await verifyUsageEnhancements(browser, errors);
       if (focus === "qoder") await verifyQoderLogin(browser, errors);
@@ -2659,6 +2882,21 @@ if (require.main === module) (async () => {
       return;
     }
     await require("./trae-login-ui.cjs").verifyTraeLogin(browser, baseUrl, output, []);
+    await require("./trae-recovery-ui.cjs").verifyTraeRecovery(browser, baseUrl, output, [], fixture);
+    await require("./trae-model-catalog-ui.cjs").verifyTraeModelCatalog(browser, baseUrl, output, [], fixture);
+    await require("./trae-native-models-ui.cjs").verifyTraeNativeModels(browser, baseUrl, output, [], fixture);
+    await require("./trae-native-provider-ui.cjs").verifyTraeNativeProviders(browser, baseUrl, output, [], fixture);
+    await require("./request-timing-ui.cjs").verifyRequestTiming(browser,baseUrl,output,[],fixture);
+    await require("./request-timing-stats-ui.cjs").verifyRequestTimingStats(browser,baseUrl,output,[],fixture);
+    await require("./trae-native-usage-ui.cjs").verifyTraeNativeUsage(browser, baseUrl, output, [], fixture);
+    await require("./account-runtime-options-ui.cjs").verifyAccountRuntimeOptions(browser, baseUrl, output, [], fixture);
+    await require("./trae-benefits-binding-ui.cjs").verifyTraeBenefitsBinding(browser, baseUrl, output, [], fixture);
+    await require("./proxy-controls-ui.cjs").verifyProxyControls(browser, baseUrl, output, [], fixture);
+    await require("./workbuddy-regions-ui.cjs").verifyWorkbuddyRegions(browser, baseUrl, output, [], fixture);
+    await require("./client-history-ui.cjs").verifyClientHistory(browser, baseUrl, output, [], fixture);
+    await require("./qoder-history-ui.cjs").verifyQoderHistoryCredits(browser, baseUrl, output, [], fixture);
+    await require("./codex-archive-ui.cjs").verifyCodexArchive(browser, baseUrl, output, [], fixture);
+    await require("./dsh-price-ui.cjs").verifyDshPrices(browser, baseUrl, output, [], fixture);
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: "reduce" });
     await context.addInitScript(fixture);
     const page = await context.newPage();
@@ -2689,13 +2927,27 @@ if (require.main === module) (async () => {
     await failedSettingsPage.screenshot({ path: path.join(output, "settings-load-recovered.png"), fullPage: true });
     await failedSettingsContext.close();
     await verifyAsyncPages(browser, errors);
+    await require('./settings-save-readback-ui.cjs').verifySettingsSaveReadback(browser,baseUrl,output,errors,fixture);
+    await require('./settings-mutation-recovery-ui.cjs').verifySettingsMutationRecovery(browser,baseUrl,output,errors,fixture);
+    await require('./cli-readback-ui.cjs').verifyCliReadback(browser,baseUrl,output,errors,fixture);
+    await require('./manual-search-cancel-ui.cjs').verifyManualSearchCancel(browser,baseUrl,output,errors,fixture);
+    await require('./search-settings-read-state-ui.cjs').verifySearchSettingsReadState(browser,baseUrl,output,errors,fixture);
     await verifyVpnPage(browser, errors);
     await verifyVpnKernel(browser, errors);
     await verifyWorkBuddyLogin(browser, errors);
     await verifyQoderLogin(browser, errors);
+    await require("./qoder-reissue-ui.cjs").verifyQoderReissue(browser, baseUrl, output, errors, fixture);
+    await require("./qoder-model-names-ui.cjs").verifyQoderModelNames(browser, baseUrl, output, errors, fixture);
+    await require("./workbuddy-benefits-ui.cjs").verifyWorkbuddyBenefits(browser, baseUrl, output, errors, fixture);
+    await require("./benefit-auto-claim-ui.cjs").verifyBenefitAutoClaim(browser, baseUrl, output, errors, fixture);
     await verifyIntegratedRuntimes(browser, errors);
     await verifyChatPage(browser, errors);
     await verifyChatEnhancements(browser, errors);
+    await require('./chat-refusal-ui.cjs').verifyChatRefusal(browser,baseUrl,output,errors,fixture);
+    await require('./chat-stream-ui.cjs').verifyChatStream(browser,baseUrl,output,errors,fixture);
+    await require('./search-aggregate-ui.cjs').verifySearchAggregate(browser,baseUrl,output,errors,fixture);
+    await require('./catalog-maintenance-ui.cjs').verifyCatalogMaintenance(browser,baseUrl,output,errors,fixture);
+    await require('./free-routing-ui.cjs').verifyFreeRouting(browser,baseUrl,output,errors,fixture);
     await verifySessionPagination(browser, errors);
     await verifyUsageEnhancements(browser, errors);
     await verifyDiagnostics(browser, errors);
@@ -3173,7 +3425,8 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await factsSearch.fill("vision-model");
     assert.equal(await factsTable.locator("tbody tr").count(), 1, "事实表须按模型筛选");
     assert((await factsTable.innerText()).includes("每 100 万"), "配置价格不依赖质量账本");
-    assert((await factsTable.innerText()).includes("未声明或不支持"), "旧布尔值不得伪称官方明确不支持");
+    const legacyFactsText = await factsTable.innerText();
+    assert(legacyFactsText.includes("未确认支持：") && legacyFactsText.includes("旧布尔 false 未区分缺失和否定来源") && legacyFactsText.includes("不等于已实测不支持"), "旧布尔值不得伪称官方明确不支持");
     await factsSearch.fill("");
     const capSummary = await page.locator(".capability-summary").innerText();
     assert(/2 个模型有能力数据/.test(capSummary), `汇总要给出模型总数：${capSummary}`);
@@ -3553,7 +3806,8 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     const spendText = await page.locator(".spend-cards").innerText();
     assert(spendText.includes("$0.0123"), `小额美元金额应保留 4 位有效精度：${spendText}`);
     assert(spendText.includes("¥1.50"), `人民币金额应独立展示：${spendText}`);
-    assert((await page.locator(".unpriced-hint").innerText()).includes("未配置价格"));
+    const unpricedHint = await page.locator(".unpriced-hint").innerText();
+    assert(unpricedHint.includes("未计入本地花费") && unpricedHint.includes("历史记录不会自动重算"));
     // 花表明细与未计价请求
     assert((await page.locator(".card").filter({ hasText: "近 30 天花费 · 按模型" }).innerText()).includes("vendor/chat:free"));
     assert((await page.locator(".requests-table").innerText()).includes("未计价"));
@@ -3658,8 +3912,12 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "会话上下文", exact: true }).click();
     await page.locator(".session-item").first().waitFor();
     await page.getByLabel("搜索会话").fill("空会话");
+    assert.equal(await page.locator(".session-item").count(), 3, "输入尚未应用，不自动重读");
+    await page.getByRole("button", {name:"搜索会话",exact:true}).click();
+    await page.waitForFunction(() => document.querySelectorAll(".session-item").length === 1);
     assert.equal(await page.locator(".session-item").count(), 1);
-    await page.getByLabel("搜索会话").fill("");
+    await page.getByRole("button", {name:"清空筛选",exact:true}).click();
+    await page.waitForFunction(() => document.querySelectorAll(".session-item").length === 3);
     await page.locator(".session-item").filter({ hasText: "通用网关长上下文" }).click();
     await page.locator(".session-item").filter({ hasText: "快速切换验证" }).click();
     await page.getByText("这是快速切换后的正确会话内容。", { exact: true }).waitFor();

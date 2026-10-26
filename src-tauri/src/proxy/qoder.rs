@@ -198,6 +198,20 @@ impl QoderModelClient {
         model: &str,
         timeout: Duration,
     ) -> Result<EventStream> {
+        self.call_stream_with_entitlement(region, account, request, model, timeout, None)
+            .await
+    }
+    pub(crate) async fn call_stream_with_entitlement(
+        &self,
+        region: Region,
+        account: &str,
+        request: &ChatRequest,
+        model: &str,
+        timeout: Duration,
+        permit: Option<Arc<crate::entitlement::dispatch::Permit>>,
+    ) -> Result<EventStream> {
+        // No auth/catalog/model request may precede a local shape rejection.
+        crate::qoder_auth::request::validate_retained_reasoning(request)?;
         let deadline = tokio::time::Instant::now() + timeout;
         let service = self.auth.read().clone();
         let http = self.http.read().clone().map_err(GatewayError::Protocol)?;
@@ -245,8 +259,28 @@ impl QoderModelClient {
                 .model_authorization_current(&auth)
                 .await
                 .map_err(account_auth)?;
+            if let Some(permit) = &permit {
+                permit
+                    .before_send(&auth.fingerprint, &auth.principal_fingerprint, model)
+                    .await?;
+                // Dispatch commit can wait for SQLite; fence the captured account again.
+                service
+                    .model_authorization_current(&auth)
+                    .await
+                    .map_err(account_auth)?;
+            }
             // The wire body is already encoded. JSON-quoting it again invalidates
             // both the request and its body-bound signature.
+            // Stable captured principal, not the credential-generation fingerprint.
+            super::subject_receipt::capture(
+                if region == Region::Cn {
+                    super::subject_receipt::Profile::QoderCn
+                } else {
+                    super::subject_receipt::Profile::QoderGlobal
+                },
+                account,
+                &auth.principal_fingerprint,
+            );
             let response = http
                 .post(url)
                 .headers(headers)
@@ -305,11 +339,26 @@ impl QoderModelClient {
                     service.model_authorization_current(&auth).await.map_err(account_auth)?;
                     Ok::<_,GatewayError>(next)
                 }).await.map_err(|_|GatewayError::Timeout("Qoder模型响应超时，未自动重试".into()))??;
-                match chunk {
-                    Some(chunk)=>for event in decoder.feed(&chunk,false,&secrets)? {yield event;},
-                    None=>{for event in decoder.feed(&[],true,&secrets)? {yield event;}break;}
+                let eof = chunk.is_none();
+                let decoded = match chunk {
+                    Some(chunk) => decoder.feed(&chunk, false, &secrets)?,
+                    None => decoder.feed(&[], true, &secrets)?,
+                };
+                for event in decoded {
+                    // One decoded frame can yield several events. Each resumed
+                    // publication must still own the captured account generation.
+                    tokio::time::timeout_at(deadline, service.model_authorization_current(&auth))
+                        .await.map_err(|_| GatewayError::Timeout("Qoder模型响应超时，未自动重试".into()))?
+                        .map_err(account_auth)?;
+                    if let (Some(permit), UpstreamEvent::Done { usage, .. }) = (&permit, &event) {
+                        tokio::time::timeout_at(deadline, async {
+                            permit.settle_usage(usage.as_ref()).await?;
+                            service.model_authorization_current(&auth).await.map_err(account_auth)
+                        }).await.map_err(|_| GatewayError::Timeout("Qoder模型结算等待超时，未自动重试".into()))??;
+                    }
+                    yield event;
                 }
-                if decoder.is_done(){break;}
+                if eof || decoder.is_done(){break;}
             }
         };
         Ok(Box::pin(events.map(|result: Result<UpstreamEvent>| {
@@ -324,8 +373,20 @@ impl QoderModelClient {
         model: &str,
         timeout: Duration,
     ) -> Result<ChatResponse> {
+        self.call_with_entitlement(region, account, request, model, timeout, None)
+            .await
+    }
+    pub(crate) async fn call_with_entitlement(
+        &self,
+        region: Region,
+        account: &str,
+        request: &ChatRequest,
+        model: &str,
+        timeout: Duration,
+        permit: Option<Arc<crate::entitlement::dispatch::Permit>>,
+    ) -> Result<ChatResponse> {
         collect(
-            self.call_stream(region, account, request, model, timeout)
+            self.call_stream_with_entitlement(region, account, request, model, timeout, permit)
                 .await?,
             model,
         )
@@ -334,6 +395,7 @@ impl QoderModelClient {
 }
 async fn collect(mut events: EventStream, model: &str) -> Result<ChatResponse> {
     let mut response = ChatResponse {
+        reported_usage_evidence: Default::default(),
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         model: model.into(),
         transport: Some("qoder-http".into()),
@@ -365,6 +427,8 @@ async fn collect(mut events: EventStream, model: &str) -> Result<ChatResponse> {
                 response.usage = usage;
                 done = true;
             }
+            // Display-only evidence never changes this legacy collector/accounting.
+            UpstreamEvent::UsageObservation(_) => {}
             UpstreamEvent::Ping => {}
         }
     }

@@ -5,6 +5,8 @@
 //! `/chat/completions`、`/messages` 等完整接口地址保存为基础地址后被重复拼接。
 
 use futures_util::{stream, StreamExt};
+pub mod maintenance;
+pub mod observation;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -334,7 +336,14 @@ async fn discover_openai(
         .and_then(Value::as_array)
         .ok_or_else(|| "上游模型目录响应格式无效".to_string())?;
 
-    Ok((data.iter().filter_map(openai_model).collect(), Vec::new()))
+    let models: Vec<_> = data.iter().filter_map(openai_model).collect();
+    let warnings = if models.len() == data.len() {
+        Vec::new()
+    } else {
+        // Automatic maintenance must not interpret discarded rows as absence.
+        vec!["模型目录含无法解析的记录，结果可能不完整".into()]
+    };
+    Ok((models, warnings))
 }
 
 async fn discover_anthropic(
@@ -675,26 +684,67 @@ fn ollama_context(response: &Value) -> Option<i32> {
 
 fn pricing_is_free(pricing: Option<&Value>) -> Option<bool> {
     let pricing = pricing?.as_object()?;
-    // OpenRouter 的免费与否至少需要完整的 prompt/completion 定价。只看到其中
-    // 一项为零无法证明另一个方向免费；任何已给出的其他计费项也必须是合法的
-    // 非负数，不能在解析时悄悄丢弃。
-    let mut values = vec![
-        nonnegative_price(pricing.get("prompt")?)?,
-        nonnegative_price(pricing.get("completion")?)?,
-    ];
-    for field in [
-        "request",
-        "image",
-        "web_search",
-        "internal_reasoning",
-        "input_cache_read",
-        "input_cache_write",
-    ] {
-        if let Some(value) = pricing.get(field) {
-            values.push(nonnegative_price(value)?);
+    let mut free = known_pricing_dimensions_are_zero(pricing, &["overrides"])?;
+    if let Some(overrides) = pricing.get("overrides") {
+        // Validate every tier, including thresholds and cache prices. A dropped
+        // tier or conflicting threshold cannot provide a free-model proof.
+        openrouter_tiers(Some(overrides))?;
+        for tier in overrides.as_array()? {
+            free &= known_pricing_dimensions_are_zero(tier.as_object()?, &["min_prompt_tokens"])?;
         }
     }
-    Some(values.into_iter().all(|value| value == 0.0))
+    Some(free)
+}
+
+const CATALOG_BILLING_DIMENSIONS: &[&str] = &[
+    "prompt",
+    "completion",
+    "request",
+    "image",
+    "web_search",
+    "internal_reasoning",
+    "input_cache_read",
+    "input_cache_write",
+];
+
+fn known_pricing_dimensions_are_zero(
+    pricing: &serde_json::Map<String, Value>,
+    structural_fields: &[&str],
+) -> Option<bool> {
+    if pricing.keys().any(|key| {
+        !CATALOG_BILLING_DIMENSIONS.contains(&key.as_str())
+            && !structural_fields.contains(&key.as_str())
+    }) {
+        return None;
+    }
+    let mut free = exact_zero_price(pricing.get("prompt")?)?;
+    free &= exact_zero_price(pricing.get("completion")?)?;
+    for field in CATALOG_BILLING_DIMENSIONS.iter().skip(2) {
+        if let Some(value) = pricing.get(*field) {
+            free &= exact_zero_price(value)?;
+        }
+    }
+    Some(free)
+}
+
+fn exact_zero_price(value: &Value) -> Option<bool> {
+    // This pricing contract uses decimal strings. A decoded JSON Number may
+    // already have lost a nonzero token to underflow; even numeric zero is not
+    // authoritative evidence. Estimates may still accept numeric amounts.
+    let Value::String(raw) = value else {
+        return None;
+    };
+    nonnegative_price(value)?;
+    if raw.starts_with('-') {
+        return None;
+    }
+    let mantissa = raw.split(['e', 'E']).next()?;
+    Some(
+        mantissa
+            .bytes()
+            .filter(u8::is_ascii_digit)
+            .all(|digit| digit == b'0'),
+    )
 }
 
 /// OpenRouter 的 `pricing` 以「每 token、美元」的字符串给出，这里统一换算成
@@ -716,41 +766,50 @@ fn openrouter_price(pricing: Option<&Value>) -> Option<ModelPrice> {
             .and_then(nonnegative_price)
             .map(|price| price * 1_000_000.0),
         currency: Currency::Usd,
-        tiers: openrouter_tiers(pricing.get("overrides")),
+        tiers: openrouter_tiers(pricing.get("overrides"))?,
         rules: Vec::new(),
         source: PriceSource::Catalog,
     };
     price.is_valid().then_some(price)
 }
 
-fn openrouter_tiers(value: Option<&Value>) -> Vec<PriceTier> {
-    let Some(entries) = value.and_then(Value::as_array) else {
-        return Vec::new();
+fn openrouter_tiers(value: Option<&Value>) -> Option<Vec<PriceTier>> {
+    let Some(value) = value else {
+        return Some(Vec::new());
     };
+    let entries = value.as_array()?;
     let mut tiers: Vec<PriceTier> = entries
         .iter()
-        .filter_map(|entry| {
+        .map(|entry| {
             let min = entry.get("min_prompt_tokens")?.as_i64()?;
+            if min < 0 {
+                return None;
+            }
             let prompt = nonnegative_price(entry.get("prompt")?)? * 1_000_000.0;
             let completion = nonnegative_price(entry.get("completion")?)? * 1_000_000.0;
             Some(PriceTier {
-                min_prompt_tokens: min.max(0),
+                min_prompt_tokens: min,
                 prompt,
                 completion,
-                cache_read: entry
-                    .get("input_cache_read")
-                    .and_then(nonnegative_price)
-                    .map(|price| price * 1_000_000.0),
-                cache_creation: entry
-                    .get("input_cache_write")
-                    .and_then(nonnegative_price)
-                    .map(|price| price * 1_000_000.0),
+                cache_read: match entry.get("input_cache_read") {
+                    Some(value) => Some(nonnegative_price(value)? * 1_000_000.0),
+                    None => None,
+                },
+                cache_creation: match entry.get("input_cache_write") {
+                    Some(value) => Some(nonnegative_price(value)? * 1_000_000.0),
+                    None => None,
+                },
             })
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     tiers.sort_by_key(|tier| tier.min_prompt_tokens);
-    tiers.dedup_by_key(|tier| tier.min_prompt_tokens);
-    tiers
+    if tiers
+        .windows(2)
+        .any(|pair| pair[0].min_prompt_tokens == pair[1].min_prompt_tokens)
+    {
+        return None;
+    }
+    Some(tiers)
 }
 
 fn nonnegative_price(value: &Value) -> Option<f64> {

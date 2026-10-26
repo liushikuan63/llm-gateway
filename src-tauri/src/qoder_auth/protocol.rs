@@ -3,6 +3,10 @@ use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
     time::Duration,
 };
 use tokio::{
@@ -17,6 +21,99 @@ const INPUT_LIMIT: usize = 9 * 1024 * 1024;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const ERROR_LIMIT: usize = 4096;
 
+// Diagnostics contain only closed vocabulary and counters, never pipe contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipePhase {
+    Encode,
+    Spawn,
+    Pipes,
+    Write,
+    Shutdown,
+    ReadStdout,
+    ReadStderr,
+    Wait,
+    Worker,
+    Decode,
+    Complete,
+    Timeout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipeErrorClass {
+    None,
+    InputLimit,
+    Io,
+    OutputLimit,
+    WorkerRejected,
+    UnclassifiedStderr,
+    NonzeroExit,
+    InvalidResponse,
+    Timeout,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PipeDiagnostic {
+    phase: PipePhase,
+    error_class: PipeErrorClass,
+    exit_code: Option<i32>,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+}
+
+impl PipeDiagnostic {
+    fn emit(&self) {
+        tracing::warn!(
+            target: "llm_gateway::private_pipe",
+            phase = ?self.phase,
+            error_class = ?self.error_class,
+            exit_code = ?self.exit_code,
+            stdout_bytes = self.stdout_bytes,
+            stderr_bytes = self.stderr_bytes,
+            "private pipe failed"
+        );
+    }
+}
+
+struct PipeObservation {
+    diagnostic: Mutex<PipeDiagnostic>,
+    stdout_bytes: AtomicUsize,
+    stderr_bytes: AtomicUsize,
+}
+
+impl PipeObservation {
+    fn new() -> Self {
+        Self {
+            diagnostic: Mutex::new(PipeDiagnostic {
+                phase: PipePhase::Encode,
+                error_class: PipeErrorClass::None,
+                exit_code: None,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            }),
+            stdout_bytes: AtomicUsize::new(0),
+            stderr_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn error(&self, phase: PipePhase, class: PipeErrorClass, message: &'static str) -> String {
+        let mut diagnostic = self.diagnostic.lock().unwrap_or_else(|e| e.into_inner());
+        diagnostic.phase = phase;
+        diagnostic.error_class = class;
+        message.into()
+    }
+
+    fn snapshot(&self) -> PipeDiagnostic {
+        let diagnostic = self.diagnostic.lock().unwrap_or_else(|e| e.into_inner());
+        PipeDiagnostic {
+            phase: diagnostic.phase,
+            error_class: diagnostic.error_class,
+            exit_code: diagnostic.exit_code,
+            stdout_bytes: self.stdout_bytes.load(Ordering::Relaxed),
+            stderr_bytes: self.stderr_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
 struct OwnedChild(Child);
 impl Drop for OwnedChild {
     fn drop(&mut self) {
@@ -29,7 +126,11 @@ impl Drop for OwnedChild {
     }
 }
 
-async fn bounded(mut reader: impl AsyncRead + Unpin, maximum: usize) -> Result<Vec<u8>, String> {
+async fn bounded(
+    mut reader: impl AsyncRead + Unpin,
+    maximum: usize,
+    bytes: &AtomicUsize,
+) -> Result<Vec<u8>, &'static str> {
     let mut result = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -40,8 +141,9 @@ async fn bounded(mut reader: impl AsyncRead + Unpin, maximum: usize) -> Result<V
         if size == 0 {
             return Ok(result);
         }
+        bytes.fetch_add(size, Ordering::Relaxed);
         if result.len().saturating_add(size) > maximum {
-            return Err("Qoder签名管道输出过大".into());
+            return Err("Qoder签名管道输出过大");
         }
         result.extend_from_slice(&chunk[..size]);
     }
@@ -109,9 +211,45 @@ async fn run_limited(
     input_limit: usize,
     output_limit: usize,
 ) -> Result<Value, String> {
-    let input = serde_json::to_vec(request).map_err(|_| "Qoder签名输入编码失败")?;
+    let observation = PipeObservation::new();
+    let result = run_limited_observed(
+        node,
+        worker,
+        request,
+        deadline,
+        input_limit,
+        output_limit,
+        &observation,
+    )
+    .await;
+    if result.is_err() {
+        observation.snapshot().emit();
+    }
+    result
+}
+
+async fn run_limited_observed(
+    node: &Path,
+    worker: &Path,
+    request: &Value,
+    deadline: Duration,
+    input_limit: usize,
+    output_limit: usize,
+    observation: &PipeObservation,
+) -> Result<Value, String> {
+    let input = serde_json::to_vec(request).map_err(|_| {
+        observation.error(
+            PipePhase::Encode,
+            PipeErrorClass::Io,
+            "Qoder签名输入编码失败",
+        )
+    })?;
     if input.len() > input_limit {
-        return Err("Qoder签名输入过大".into());
+        return Err(observation.error(
+            PipePhase::Encode,
+            PipeErrorClass::InputLimit,
+            "Qoder签名输入过大",
+        ));
     }
     let mut command = Command::new(node);
     command
@@ -130,45 +268,121 @@ async fn run_limited(
         }
         command.creation_flags(0x08000000);
     }
-    let mut child = OwnedChild(command.spawn().map_err(|_| "Qoder独立签名进程启动失败")?);
-    let mut stdin = child.0.stdin.take().ok_or("Qoder签名输入管道缺失")?;
-    let stdout = child.0.stdout.take().ok_or("Qoder签名输出管道缺失")?;
-    let stderr = child.0.stderr.take().ok_or("Qoder签名错误管道缺失")?;
+    let mut child = OwnedChild(command.spawn().map_err(|_| {
+        observation.error(
+            PipePhase::Spawn,
+            PipeErrorClass::Io,
+            "Qoder独立签名进程启动失败",
+        )
+    })?);
+    let mut stdin = child.0.stdin.take().ok_or_else(|| {
+        observation.error(
+            PipePhase::Pipes,
+            PipeErrorClass::Io,
+            "Qoder签名输入管道缺失",
+        )
+    })?;
+    let stdout = child.0.stdout.take().ok_or_else(|| {
+        observation.error(
+            PipePhase::Pipes,
+            PipeErrorClass::Io,
+            "Qoder签名输出管道缺失",
+        )
+    })?;
+    let stderr = child.0.stderr.take().ok_or_else(|| {
+        observation.error(
+            PipePhase::Pipes,
+            PipeErrorClass::Io,
+            "Qoder签名错误管道缺失",
+        )
+    })?;
     let exchange = async {
         let write = async {
-            stdin
-                .write_all(&input)
-                .await
-                .map_err(|_| "Qoder签名输入发送失败")?;
-            stdin
-                .shutdown()
-                .await
-                .map_err(|_| "Qoder签名输入关闭失败")?;
+            stdin.write_all(&input).await.map_err(|_| {
+                observation.error(
+                    PipePhase::Write,
+                    PipeErrorClass::Io,
+                    "Qoder签名输入发送失败",
+                )
+            })?;
+            stdin.shutdown().await.map_err(|_| {
+                observation.error(
+                    PipePhase::Shutdown,
+                    PipeErrorClass::Io,
+                    "Qoder签名输入关闭失败",
+                )
+            })?;
             drop(stdin);
             Ok::<_, String>(())
         };
         let wait = async {
-            child
-                .0
-                .wait()
-                .await
-                .map_err(|_| "Qoder签名进程等待失败".to_string())
+            let status = child.0.wait().await.map_err(|_| {
+                observation.error(PipePhase::Wait, PipeErrorClass::Io, "Qoder签名进程等待失败")
+            })?;
+            observation
+                .diagnostic
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .exit_code = status.code();
+            Ok::<_, String>(status)
+        };
+        let read = |phase, message| {
+            observation.error(
+                phase,
+                if message == "Qoder签名管道输出过大" {
+                    PipeErrorClass::OutputLimit
+                } else {
+                    PipeErrorClass::Io
+                },
+                message,
+            )
         };
         let (_, output, error, status) = tokio::try_join!(
             write,
-            bounded(stdout, output_limit),
-            bounded(stderr, ERROR_LIMIT),
+            async {
+                bounded(stdout, output_limit, &observation.stdout_bytes)
+                    .await
+                    .map_err(|message| read(PipePhase::ReadStdout, message))
+            },
+            async {
+                bounded(stderr, ERROR_LIMIT, &observation.stderr_bytes)
+                    .await
+                    .map_err(|message| read(PipePhase::ReadStderr, message))
+            },
             wait
         )?;
         if !status.success() || !error.is_empty() {
             // Neither stdout nor stderr is safe to put in a user error or log.
-            return Err("Qoder独立签名组件拒绝请求".into());
+            let class = if error == b"QODER_PROTOCOL_REQUEST_REJECTED\n" {
+                PipeErrorClass::WorkerRejected
+            } else if !error.is_empty() {
+                PipeErrorClass::UnclassifiedStderr
+            } else {
+                PipeErrorClass::NonzeroExit
+            };
+            return Err(observation.error(PipePhase::Worker, class, "Qoder独立签名组件拒绝请求"));
         }
-        serde_json::from_slice(&output).map_err(|_| "Qoder签名响应格式无效".into())
+        let result = serde_json::from_slice(&output).map_err(|_| {
+            observation.error(
+                PipePhase::Decode,
+                PipeErrorClass::InvalidResponse,
+                "Qoder签名响应格式无效",
+            )
+        })?;
+        observation
+            .diagnostic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .phase = PipePhase::Complete;
+        Ok(result)
     };
     match tokio::time::timeout(deadline, exchange).await {
         Ok(result) => result,
-        Err(_) => Err("Qoder独立签名超时".into()),
+        Err(_) => Err(observation.error(
+            PipePhase::Timeout,
+            PipeErrorClass::Timeout,
+            "Qoder独立签名超时",
+        )),
     }
 }
 
@@ -176,6 +390,33 @@ async fn run_limited(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::{
+        io::Write,
+        sync::{Arc, Once},
+    };
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct DiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for DiagnosticWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DiagnosticWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[tokio::test]
     async fn native_pipe_creates_runtime_fields_and_decodes_without_a_client() {
@@ -275,6 +516,19 @@ mod tests {
 
     #[tokio::test]
     async fn native_pipe_includes_escaped_raw_json_and_context_in_its_input_budget() {
+        // Keep the original invoke path observable under default lib parallelism.
+        // A persistent, narrowly filtered test dispatch avoids scoped callsite
+        // registration racing with other tests that have no default subscriber.
+        static PIPE_TRACE: Once = Once::new();
+        PIPE_TRACE.call_once(|| {
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_test_writer()
+                .with_env_filter("off,llm_gateway::private_pipe=warn")
+                .try_init()
+                .expect("install test-only private pipe diagnostics");
+        });
         let oracle: Value = serde_json::from_str(include_str!(
             "../../../scripts/qoder-protocol/synthetic-inference-oracle.json"
         ))
@@ -296,8 +550,12 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_reader_rejects_one_byte_over_limit() {
-        assert_eq!(bounded(&b"1234"[..], 4).await.unwrap(), b"1234");
-        assert!(bounded(&b"12345"[..], 4).await.is_err());
+        let bytes = AtomicUsize::new(0);
+        assert_eq!(bounded(&b"1234"[..], 4, &bytes).await.unwrap(), b"1234");
+        assert_eq!(bytes.load(Ordering::Relaxed), 4);
+        let bytes = AtomicUsize::new(0);
+        assert!(bounded(&b"12345"[..], 4, &bytes).await.is_err());
+        assert_eq!(bytes.load(Ordering::Relaxed), 5);
     }
 
     struct TestDirectory(PathBuf);
@@ -313,6 +571,254 @@ mod tests {
         let worker = directory.join("worker.cjs");
         std::fs::write(&worker, code).unwrap();
         (TestDirectory(directory), worker)
+    }
+
+    #[tokio::test]
+    async fn diagnostic_contract_distinguishes_worker_outcomes_without_raw_errors() {
+        let node = resources().unwrap().join("node/node.exe");
+        let fixtures = [
+            (
+                "process.stdout.write('{}');",
+                None,
+                PipePhase::Complete,
+                PipeErrorClass::None,
+                0,
+                2,
+                0,
+            ),
+            (
+                "process.stderr.write('QODER_PROTOCOL_REQUEST_REJECTED\\n');process.exitCode=1;",
+                Some("Qoder独立签名组件拒绝请求"),
+                PipePhase::Worker,
+                PipeErrorClass::WorkerRejected,
+                1,
+                0,
+                32,
+            ),
+            (
+                "process.stdout.write('private-stdout-sentinel');process.stderr.write('Error: private-dynamic-error-sentinel\\n');process.exitCode=17;",
+                Some("Qoder独立签名组件拒绝请求"),
+                PipePhase::Worker,
+                PipeErrorClass::UnclassifiedStderr,
+                17,
+                23,
+                38,
+            ),
+            (
+                "process.exitCode=19;",
+                Some("Qoder独立签名组件拒绝请求"),
+                PipePhase::Worker,
+                PipeErrorClass::NonzeroExit,
+                19,
+                0,
+                0,
+            ),
+            (
+                "process.stdout.write('private-invalid-json-sentinel');",
+                Some("Qoder签名响应格式无效"),
+                PipePhase::Decode,
+                PipeErrorClass::InvalidResponse,
+                0,
+                29,
+                0,
+            ),
+        ];
+        for (code, error, phase, class, exit_code, stdout_bytes, stderr_bytes) in fixtures {
+            let code = format!("process.stdin.resume();process.stdin.on('end',()=>{{{code}}});");
+            let (_directory, worker) = test_worker(&code);
+            let observation = PipeObservation::new();
+            let result = run_limited_observed(
+                &node,
+                &worker,
+                &json!({"raw":"private-request-sentinel","context":{"token":"private-context-sentinel"}}),
+                Duration::from_secs(5),
+                INPUT_LIMIT,
+                OUTPUT_LIMIT,
+                &observation,
+            )
+            .await;
+            assert_eq!(result.as_ref().err().map(String::as_str), error);
+            assert_eq!(
+                observation.snapshot(),
+                PipeDiagnostic {
+                    phase,
+                    error_class: class,
+                    exit_code: Some(exit_code),
+                    stdout_bytes,
+                    stderr_bytes,
+                }
+            );
+            assert!(!format!("{:?}", observation.snapshot()).contains("private-"));
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_logging_emits_one_safe_event_only_for_failure() {
+        // Scoped tracing subscribers share a process-wide callsite cache. Keep
+        // this capture contract independent of other parallel tests' defaults.
+        const HELPER: &str = "LLMGW_PRIVATE_PIPE_LOG_CONTRACT_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "qoder_auth::protocol::tests::diagnostic_logging_emits_one_safe_event_only_for_failure",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let mut child = OwnedChild(command.spawn().unwrap());
+            let status = tokio::time::timeout(Duration::from_secs(20), child.0.wait())
+                .await
+                .expect("isolated diagnostic capture completed within its test deadline")
+                .unwrap();
+            assert!(status.success(), "isolated diagnostic capture failed");
+            return;
+        }
+        let node = resources().unwrap().join("node/node.exe");
+        for rejected in [false, true] {
+            let code = if rejected {
+                "process.stdout.write('private-stdout-sentinel');process.stderr.write('private-dynamic-error-sentinel');process.exitCode=7;"
+            } else {
+                "process.stdout.write('{}');"
+            };
+            let (_directory, worker) = test_worker(&format!(
+                "process.stdin.resume();process.stdin.on('end',()=>{{{code}}});"
+            ));
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(DiagnosticWriter(bytes.clone()))
+                .finish();
+            let result = run(
+                &node,
+                &worker,
+                &json!({"raw":"private-request-sentinel","context":{"token":"private-context-sentinel"}}),
+                Duration::from_secs(5),
+            )
+            .with_subscriber(subscriber)
+            .await;
+            assert_eq!(result.is_err(), rejected);
+            let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert_eq!(log.lines().count(), usize::from(rejected));
+            assert!(!log.contains("private-"));
+            assert!(!log.contains(&worker.to_string_lossy().to_string()));
+            if rejected {
+                assert!(log.contains("phase=Worker"), "{log}");
+                assert!(log.contains("error_class=UnclassifiedStderr"), "{log}");
+                assert!(log.contains("exit_code=Some(7)"), "{log}");
+                assert!(log.contains("stdout_bytes=23"), "{log}");
+                assert!(log.contains("stderr_bytes=30"), "{log}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_contract_preserves_input_spawn_limit_and_timeout_boundaries() {
+        let node = resources().unwrap().join("node/node.exe");
+        let (_directory, worker) = test_worker(
+            "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('{}'));",
+        );
+        for (executable, input_limit, phase, class, message) in [
+            (
+                node.clone(),
+                1,
+                PipePhase::Encode,
+                PipeErrorClass::InputLimit,
+                "Qoder签名输入过大",
+            ),
+            (
+                worker.with_file_name("private-missing-node-sentinel.exe"),
+                INPUT_LIMIT,
+                PipePhase::Spawn,
+                PipeErrorClass::Io,
+                "Qoder独立签名进程启动失败",
+            ),
+        ] {
+            let observation = PipeObservation::new();
+            assert_eq!(
+                run_limited_observed(
+                    &executable,
+                    &worker,
+                    &json!({"raw":"private-request-sentinel"}),
+                    Duration::from_secs(5),
+                    input_limit,
+                    OUTPUT_LIMIT,
+                    &observation,
+                )
+                .await
+                .unwrap_err(),
+                message
+            );
+            assert_eq!(
+                observation.snapshot(),
+                PipeDiagnostic {
+                    phase,
+                    error_class: class,
+                    exit_code: None,
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                }
+            );
+        }
+        for (code, output_limit, phase, class, message, stdout_bytes, stderr_bytes) in [
+            (
+                "process.stdout.write('12345');",
+                4,
+                PipePhase::ReadStdout,
+                PipeErrorClass::OutputLimit,
+                "Qoder签名管道输出过大",
+                5,
+                0,
+            ),
+            (
+                "process.stderr.write('x'.repeat(4097));",
+                OUTPUT_LIMIT,
+                PipePhase::ReadStderr,
+                PipeErrorClass::OutputLimit,
+                "Qoder签名管道输出过大",
+                0,
+                4097,
+            ),
+            (
+                "process.stdout.write('123');setInterval(()=>{},1000);",
+                OUTPUT_LIMIT,
+                PipePhase::Timeout,
+                PipeErrorClass::Timeout,
+                "Qoder独立签名超时",
+                3,
+                0,
+            ),
+        ] {
+            let (_directory, worker) = test_worker(&format!(
+                "process.stdin.resume();process.stdin.on('end',()=>{{{code}}});"
+            ));
+            let observation = PipeObservation::new();
+            assert_eq!(
+                run_limited_observed(
+                    &node,
+                    &worker,
+                    &json!({}),
+                    Duration::from_secs(2),
+                    INPUT_LIMIT,
+                    output_limit,
+                    &observation,
+                )
+                .await
+                .unwrap_err(),
+                message
+            );
+            let diagnostic = observation.snapshot();
+            assert_eq!(diagnostic.phase, phase);
+            assert_eq!(diagnostic.error_class, class);
+            assert_eq!(diagnostic.stdout_bytes, stdout_bytes);
+            assert_eq!(diagnostic.stderr_bytes, stderr_bytes);
+        }
     }
 
     #[tokio::test]

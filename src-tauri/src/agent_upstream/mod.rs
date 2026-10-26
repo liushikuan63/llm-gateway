@@ -18,6 +18,7 @@
 
 pub mod adapter;
 pub mod codex;
+pub mod codex_metadata;
 pub mod fake;
 pub mod headless;
 pub mod loader;
@@ -34,6 +35,7 @@ pub use codex::CodexAdapter;
 pub use fake::FakeAdapter;
 pub use qoder::QoderAdapter;
 pub use quota::{AgentQuota, ConcurrencyGate, ConcurrencyRejection, QuotaBook, QuotaRejection};
+pub(crate) use run::run_agent_request_with_runtime_checked;
 pub use run::{run_agent, run_agent_request, run_agent_request_with_runtime, AgentRunOutcome};
 pub use runtime::{resolve_runtime, ResolvedRuntime};
 pub use workspace::WorkspaceRoot;
@@ -174,6 +176,11 @@ pub async fn call_agent(
     messages: &[crate::domain::Message],
     timeout_ms: u64,
 ) -> Result<crate::domain::ChatResponse, crate::error::GatewayError> {
+    if crate::budget::holds::active() {
+        return Err(crate::budget::holds::rejected(
+            "agent_budget_contract_unverified",
+        ));
+    }
     let adapter = registry
         .resolve(Some(runtime_id))
         .map_err(crate::error::GatewayError::ModelNotFound)?;
@@ -201,14 +208,28 @@ pub async fn call_agent_with_runtime(
         .await
         .map_err(crate::error::GatewayError::ModelNotFound)?;
     tracing::info!(runtime_id = %runtime.id, runtime_kind = %runtime.kind, "账号型上游分派");
-    send_chat(
+    let personal = crate::personal_test::current();
+    if let Some(ctx) = &personal {
+        ctx.before_runtime(pool, &runtime)
+            .await
+            .map_err(crate::error::GatewayError::Protocol)?;
+    }
+    let result = send_chat(
         runtime.adapter.as_ref(),
         &runtime.id,
         model,
         messages,
         timeout_ms,
     )
-    .await
+    .await;
+    if let Some(ctx) = personal {
+        if result.is_ok() {
+            ctx.received();
+        }
+        result.map_err(crate::error::GatewayError::no_replay)
+    } else {
+        result
+    }
 }
 
 async fn send_chat(
@@ -327,7 +348,7 @@ pub async fn run_json_cli_with_input(
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
-    let child = command.spawn().map_err(|e| {
+    let child = crate::personal_test::spawn(&mut command, program, args, label).map_err(|e| {
         // 「命令不存在」是最常见的失败，给一句能照做的提示
         format!("启动 {label} 失败（{program}）：{e}。请确认它已安装并在 PATH 里")
     })?;

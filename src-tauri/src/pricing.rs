@@ -21,6 +21,12 @@ const FEED_TIMEOUT: Duration = Duration::from_secs(20);
 const FEED_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_FEED_BYTES: usize = 24 * 1024 * 1024;
 
+#[cfg(all(test, windows))]
+tokio::task_local! {static OWNED_FEED_TEST_TRANSPORT: (reqwest::Certificate, std::net::SocketAddr);}
+#[cfg(all(test, windows))]
+#[path = "pricing/transport_tests.rs"]
+mod transport_tests;
+
 /// 定价源里的一条模型记录（只保留计价需要的字段）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedPrice {
@@ -61,7 +67,7 @@ pub struct UnmatchedModel {
     pub alias: String,
 }
 
-/// 抓取并解析定价源。只接受 JSON，超过体积上限直接失败而不是读进内存。
+/// 抓取并解析定价源。按解压后正文长度增量限额，超限不再等待 EOF。
 pub async fn fetch_feed(url: &str, proxy: Option<&str>) -> Result<Vec<FeedPrice>, String> {
     let parsed = reqwest::Url::parse(url).map_err(|_| "定价源地址无效".to_string())?;
     if parsed.scheme() != "https" {
@@ -74,9 +80,18 @@ pub async fn fetch_feed(url: &str, proxy: Option<&str>) -> Result<Vec<FeedPrice>
         .gzip(true)
         .brotli(true);
     let builder = crate::outbound::apply_proxy(builder, proxy)?;
+    // Owned tests keep all DNS/proxy/trust changes inside their client only.
+    #[cfg(all(test, windows))]
+    let builder = match OWNED_FEED_TEST_TRANSPORT.try_with(Clone::clone) {
+        Ok((root, addr)) => builder
+            .no_proxy()
+            .add_root_certificate(root)
+            .resolve("owned-upstream.invalid", addr),
+        Err(_) => builder,
+    };
     let client = builder.build().map_err(|e| e.to_string())?;
 
-    let response = client
+    let mut response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
@@ -85,12 +100,19 @@ pub async fn fetch_feed(url: &str, proxy: Option<&str>) -> Result<Vec<FeedPrice>
     if !response.status().is_success() {
         return Err(format!("定价源返回 HTTP {}", response.status().as_u16()));
     }
-    let body = response
-        .bytes()
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| format!("读取定价源失败：{e}"))?;
-    if body.len() > MAX_FEED_BYTES {
-        return Err(format!("定价源响应过大（{} 字节）", body.len()));
+        .map_err(|e| format!("读取定价源失败：{e}"))?
+    {
+        let received = body.len().saturating_add(chunk.len());
+        if received > MAX_FEED_BYTES {
+            // Bound decoded accumulation before copying another chunk. Dropping
+            // the response also closes an oversized peer that never sends EOF.
+            return Err(format!("定价源响应过大（{} 字节）", received));
+        }
+        body.extend_from_slice(&chunk);
     }
     let value: Value =
         serde_json::from_slice(&body).map_err(|e| format!("定价源不是合法 JSON：{e}"))?;
@@ -210,6 +232,27 @@ pub fn plan_updates(
     providers: &[Provider],
     feed: &[FeedPrice],
 ) -> (Vec<(String, String, ModelPrice)>, usize) {
+    let (updates, skipped) = plan_observed_updates(providers, feed);
+    (
+        updates
+            .into_iter()
+            .map(|p| (p.provider_id, p.alias, p.price))
+            .collect(),
+        skipped,
+    )
+}
+
+pub(crate) struct PlannedPrice {
+    pub provider_id: String,
+    pub alias: String,
+    pub price: ModelPrice,
+    pub feed_model_id: String,
+}
+
+pub(crate) fn plan_observed_updates(
+    providers: &[Provider],
+    feed: &[FeedPrice],
+) -> (Vec<PlannedPrice>, usize) {
     let mut updates = Vec::new();
     let mut skipped_manual = 0usize;
 
@@ -236,7 +279,12 @@ pub fn plan_updates(
                 if let Some(existing) = &model.price {
                     price.rules = existing.rules.clone();
                 }
-                updates.push((provider.id.clone(), model.alias.clone(), price));
+                updates.push(PlannedPrice {
+                    provider_id: provider.id.clone(),
+                    alias: model.alias.clone(),
+                    price,
+                    feed_model_id: found.id.clone(),
+                });
             }
         }
     }

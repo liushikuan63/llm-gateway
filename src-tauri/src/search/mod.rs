@@ -23,8 +23,22 @@
 //! - 全部不可用 ⇒ 返回 `Err`，但调用方**不阻断请求**，只回 `X-Route-Search: failed`。
 
 pub mod backend;
+pub mod cooldown;
+pub(crate) mod egress;
 pub mod executor;
+pub mod free_aggregate;
+mod hacker_news;
+pub mod mdn_mcp_contract;
+pub mod mdn_reference;
+pub(crate) mod mdn_transport;
+mod npm_packages;
+pub(crate) mod page_text;
 pub mod parse;
+pub mod resources;
+pub mod stack_exchange;
+pub mod stack_exchange_admission;
+pub mod stack_exchange_scope;
+pub mod stack_exchange_sender;
 
 pub use backend::{
     BraveBackend, DuckDuckGoBackend, SearXngBackend, SearchBackend, SearchError, SearchQuery,
@@ -85,6 +99,8 @@ pub fn backend_code(kind: SearchBackendKind) -> String {
         SearchBackendKind::Brave => "brave".to_owned(),
         SearchBackendKind::SearXng => "searxng".to_owned(),
         SearchBackendKind::BingCn => "bing_cn".to_owned(),
+        SearchBackendKind::FreeAggregate => "free_aggregate".to_owned(),
+        SearchBackendKind::MdnMcp => "mdn_mcp".to_owned(),
         SearchBackendKind::DuckDuckGo => "duckduckgo".to_owned(),
     }
 }
@@ -103,10 +119,31 @@ pub struct SearchSettingsInput {
     /// 显式要求删除已存 Key
     #[serde(default)]
     pub clear_api_key: bool,
+    #[serde(default)]
+    pub query_cache_ttl_secs: Option<u32>,
+    #[serde(default)]
+    pub coalesce_queries: Option<bool>,
+    #[serde(default)]
+    pub source_min_interval_ms: Option<u32>,
+    #[serde(default)]
+    pub page_text_enabled: Option<bool>,
+    #[serde(default)]
+    pub free_search_scope: Option<crate::config::FreeSearchScope>,
+    #[serde(default)]
+    pub free_search_locale: Option<crate::config::FreeSearchLocale>,
+    /// Missing preserves; explicit null clears. Do not merge these operations.
+    #[serde(default, deserialize_with = "proxy_patch")]
+    pub free_proxy_url: Option<Option<String>>,
+}
+
+fn proxy_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchSettingsView {
+    /// Process-local request control capability, not provider availability.
+    pub manual_search_cancel_supported: bool,
     pub enabled: bool,
     pub backend: SearchBackendKind,
     pub searxng_url: Option<String>,
@@ -117,6 +154,26 @@ pub struct SearchSettingsView {
     pub api_key_masked: Option<String>,
     /// 当前后端是否需要凭据。免 Key 后端为 false。
     pub backend_needs_key: bool,
+    pub query_cache_ttl_secs: u32,
+    pub coalesce_queries: bool,
+    pub source_min_interval_ms: u32,
+    pub page_text_enabled: bool,
+    pub free_search_scope: crate::config::FreeSearchScope,
+    pub free_search_scopes: Vec<crate::config::FreeSearchScope>,
+    pub free_search_locale: crate::config::FreeSearchLocale,
+    pub free_search_locales: Vec<crate::config::FreeSearchLocale>,
+    pub free_proxy_url: Option<String>,
+    pub resources: resources::SearchResourceStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_protection: Option<cooldown::ProtectionView>,
+    /// Local facts only, populated for the explicitly selected protected scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_overflow_state: Option<stack_exchange_scope::StatusView>,
+}
+
+#[derive(serde::Serialize)]
+pub struct SearchRequestReady {
+    pub request_id: String,
 }
 
 /// 与 `ProviderView::api_key_masked` 同款处理：只回掩码，绝不回明文。
@@ -136,6 +193,15 @@ pub fn mask_key(key: &str) -> Option<String> {
 
 /// 校验搜索设置。地址类字段只放行 http/https。
 pub fn validate(cfg: &SearchConfig) -> anyhow::Result<()> {
+    if let Some(proxy) = &cfg.free_proxy_url {
+        egress::validate_proxy(proxy).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    if cfg.source_min_interval_ms > 3_600_000 {
+        anyhow::bail!("免费源发送预留间隔必须在0到3600000毫秒之间");
+    }
+    if cfg.query_cache_ttl_secs > 3600 {
+        anyhow::bail!("本机检索缓存有效期必须在0到3600秒之间");
+    }
     if cfg.max_results == 0 || cfg.max_results > 10 {
         anyhow::bail!("搜索结果条数必须在 1 到 10 之间");
     }

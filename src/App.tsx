@@ -110,6 +110,7 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
   const [theme, setTheme] = useState<Theme>(readTheme);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [configState, setConfigState] = useState<"loading" | "ready" | "unavailable" | "preview">("loading");
+  const [configReadAttempt, setConfigReadAttempt] = useState(0);
   const [providerLoadState, setProviderLoadState] = useState<ProviderLoadState>("loading");
   const [providerCount, setProviderCount] = useState<number | null>(null);
   const [copyFeedback, setCopyFeedback] = useState<"copied" | "failed" | null>(null);
@@ -121,6 +122,12 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
   const [bootNotice, setBootNotice] = useState<string | null>(bootWarning);
   const helpMenuRef = useRef<HTMLDivElement>(null);
   const helpTriggerRef = useRef<HTMLButtonElement>(null);
+  const helpInitialFocusRef = useRef<"first" | "last">("first");
+  const configReadVersionRef = useRef(0);
+  const configReadPendingRef = useRef(false);
+  const configRetryFocusRef = useRef(false);
+  const configRetryRef = useRef<HTMLButtonElement>(null);
+  const configCopyRef = useRef<HTMLButtonElement>(null);
   const desktopRuntime = isTauri();
   const currentPage = NAVIGATION.find((item) => item.id === tab) ?? NAVIGATION[0];
   const endpoint = config ? configuredEndpoint(config) : null;
@@ -149,31 +156,53 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
     }
 
     let disposed = false;
+    const version = ++configReadVersionRef.current;
+    const current = () => !disposed && version === configReadVersionRef.current;
+    configReadPendingRef.current = true;
     setConfigState("loading");
+    setCopyFeedback(null);
+    const onConfigChanged = (event: Event) => {
+      const next = (event as CustomEvent<AppConfig>).detail;
+      if (!next) return;
+      // A confirmed newer notification owns this snapshot. An earlier read's
+      // success, failure or finally must not overwrite it or revive old state.
+      ++configReadVersionRef.current;
+      configReadPendingRef.current = false;
+      setConfig(next);
+      setConfigState("ready");
+      setCopyFeedback(null);
+    };
+    window.addEventListener("llm-gateway-config-changed", onConfigChanged);
     void api.getConfig()
       .then((next) => {
-        if (disposed) return;
+        if (!current()) return;
         setConfig(next);
         setConfigState("ready");
       })
       .catch(() => {
-        if (disposed) return;
+        if (!current()) return;
         setConfig(null);
         setConfigState("unavailable");
+      })
+      .finally(() => {
+        if (current()) configReadPendingRef.current = false;
       });
-
-    const onConfigChanged = (event: Event) => {
-      const next = (event as CustomEvent<AppConfig>).detail;
-      if (!next) return;
-      setConfig(next);
-      setConfigState("ready");
-    };
-    window.addEventListener("llm-gateway-config-changed", onConfigChanged);
     return () => {
       disposed = true;
+      ++configReadVersionRef.current;
+      configReadPendingRef.current = false;
       window.removeEventListener("llm-gateway-config-changed", onConfigChanged);
     };
-  }, [desktopRuntime]);
+  }, [desktopRuntime, configReadAttempt]);
+
+  useEffect(() => {
+    if (!configRetryFocusRef.current || configState === "loading") return;
+    configRetryFocusRef.current = false;
+    // Restore keyboard progress after disabling/unmounting the retry button,
+    // while respecting focus the user deliberately moved to another control.
+    if (document.activeElement !== document.body && document.activeElement !== configRetryRef.current) return;
+    (configState === "ready" ? configCopyRef.current : configRetryRef.current)?.focus({ preventScroll: true });
+  }, [configState, configReadAttempt]);
 
   useEffect(() => {
     if (!desktopRuntime) return;
@@ -236,7 +265,21 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
 
   useEffect(() => {
     if (!helpMenuOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (!helpMenuRef.current?.contains(document.activeElement)) {
+        setHelpMenuOpen(false);
+        return;
+      }
+      const items = helpMenuRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']");
+      const item = helpInitialFocusRef.current === "last" ? items?.[items.length - 1] : items?.[0];
+      item?.focus();
+    });
     const onPointerDown = (event: PointerEvent) => {
+      if (!helpMenuRef.current?.contains(event.target as Node)) setHelpMenuOpen(false);
+    };
+    const onFocusIn = (event: FocusEvent) => {
+      // An outside keyboard/pointer action owns its focus; dismissal must not
+      // pull it back into the menu or a pending initial-focus animation frame.
       if (!helpMenuRef.current?.contains(event.target as Node)) setHelpMenuOpen(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
@@ -246,9 +289,12 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
       helpTriggerRef.current?.focus();
     };
     document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("focusin", onFocusIn);
     document.addEventListener("keydown", onKeyDown);
     return () => {
+      window.cancelAnimationFrame(frame);
       document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("focusin", onFocusIn);
       document.removeEventListener("keydown", onKeyDown);
     };
   }, [helpMenuOpen]);
@@ -261,6 +307,14 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
     } catch {
       setCopyFeedback("failed");
     }
+  };
+
+  const retryEndpointRead = () => {
+    if (!desktopRuntime || configState !== "unavailable" || configReadPendingRef.current) return;
+    configReadPendingRef.current = true;
+    configRetryFocusRef.current = document.activeElement === configRetryRef.current;
+    setConfigState("loading");
+    setConfigReadAttempt((attempt) => attempt + 1);
   };
 
   const navigateFromHelp = (target: TabId) => {
@@ -309,17 +363,33 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
             </div>
           </div>
 
-          <section className="endpoint-card" aria-label="网关配置端点">
+          <section className="endpoint-card" aria-label="网关配置端点" aria-busy={configState === "loading"}>
             <div className="endpoint-label">网关配置端点</div>
             <div className="endpoint-value">
               <code>{endpoint ?? (configState === "loading" ? "正在读取配置" : configState === "unavailable" ? "配置暂不可读" : "桌面运行时读取")}</code>
-              <button type="button" className="shell-icon-button" onClick={() => void copyEndpoint()} disabled={!endpoint} aria-label="复制网关配置端点" title={endpoint ? "复制网关配置端点" : "读取配置后可复制"}>
+              <button ref={configCopyRef} type="button" className="shell-icon-button" onClick={() => void copyEndpoint()} disabled={!endpoint} aria-label="复制网关配置端点" title={endpoint ? "复制网关配置端点" : "读取配置后可复制"}>
                 <Icon name={copyFeedback === "copied" ? "check" : "copy"} size={16} />
               </button>
             </div>
             <span className="endpoint-hint">
               {copyFeedback === "copied" ? "已复制到剪贴板" : copyFeedback === "failed" ? "复制失败，请手动复制" : config?.allow_lan ? "局域网监听已配置，重启后生效" : "仅显示配置，未检测服务状态"}
             </span>
+            {desktopRuntime && (configState === "unavailable" || (configState === "loading" && configReadAttempt > 0)) && (
+              <>
+                {configState === "unavailable" && <span className="endpoint-hint" role="alert">未能读取端点配置；重试只读，不保存配置或启动服务。</span>}
+                <button
+                  ref={configRetryRef}
+                  type="button"
+                  className="ghost"
+                  data-testid="shell-config-retry"
+                  aria-label="重新读取端点配置"
+                  disabled={configState === "loading"}
+                  onClick={retryEndpointRead}
+                >
+                  {configState === "loading" ? "正在重新读取…" : "重新读取端点配置"}
+                </button>
+              </>
+            )}
           </section>
         </div>
       </aside>
@@ -360,15 +430,58 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
                 aria-label="打开使用帮助"
                 aria-haspopup="menu"
                 aria-expanded={helpMenuOpen}
-                onClick={() => setHelpMenuOpen((open) => !open)}
+                aria-controls={helpMenuOpen ? "help-menu-options" : undefined}
+                onClick={() => {
+                  helpInitialFocusRef.current = "first";
+                  setHelpMenuOpen((open) => !open);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+                  event.preventDefault();
+                  helpInitialFocusRef.current = event.key === "ArrowUp" ? "last" : "first";
+                  if (helpMenuOpen) {
+                    const items = helpMenuRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']");
+                    (event.key === "ArrowUp" ? items?.[items.length - 1] : items?.[0])?.focus();
+                  } else setHelpMenuOpen(true);
+                }}
               >
                 使用帮助
               </button>
               {helpMenuOpen && (
-                <div className="help-menu-popover" role="menu" aria-label="使用帮助选项" data-testid="help-menu">
+                <div
+                  id="help-menu-options"
+                  className="help-menu-popover"
+                  role="menu"
+                  aria-label="使用帮助选项"
+                  data-testid="help-menu"
+                  onKeyDown={(event) => {
+                    const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("[role='menuitem']"));
+                    const index = items.findIndex((item) => item === document.activeElement);
+                    if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+                      event.preventDefault();
+                      const target = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1
+                        : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+                      items[target]?.focus();
+                    } else if (event.key === "Tab") {
+                      event.preventDefault();
+                      // Popup items are not extra tab stops. Forward Tab resumes
+                      // after the trigger; backward Tab returns to that trigger.
+                      const trigger = helpTriggerRef.current;
+                      const popup = event.currentTarget;
+                      const candidates = Array.from(document.querySelectorAll<HTMLElement>("button, a[href], input, select, textarea, [tabindex]"))
+                        .filter((node) => node.tabIndex >= 0 && !node.matches(":disabled") && !popup.contains(node)
+                          && !node.closest("[inert]") && node.getClientRects().length > 0
+                          && getComputedStyle(node).visibility !== "hidden");
+                      const next = trigger ? candidates[candidates.indexOf(trigger) + 1] : undefined;
+                      setHelpMenuOpen(false);
+                      (event.shiftKey ? trigger : next ?? trigger)?.focus({ preventScroll: true });
+                    }
+                  }}
+                >
                   <button
                     type="button"
                     role="menuitem"
+                    tabIndex={-1}
                     data-testid="open-onboarding"
                     onClick={() => {
                       helpTriggerRef.current?.focus();
@@ -381,6 +494,7 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
                   <button
                     type="button"
                     role="menuitem"
+                    tabIndex={-1}
                     data-testid="open-user-manual"
                     onClick={() => {
                       helpTriggerRef.current?.focus();

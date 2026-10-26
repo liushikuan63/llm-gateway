@@ -1,12 +1,19 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
+export interface PlatformCredits {
+  billed: number; not_billed: number; unclassified: number;
+  billed_records: number; not_billed_records: number; unclassified_records: number;
+  missing_records: number; conflicting_records: number;
+}
 export interface ClientUsageRow {
   source: string; profile: string; model: string; provider: string | null;
-  granularity: "request" | "daily_aggregate" | "cumulative_delta" | "range_total"; day: string | null; requests: number | null;
+  granularity: "request" | "last_request" | "daily_aggregate" | "cumulative_delta" | "range_total"; day: string | null; requests: number | null;
   input_tokens: number | null; output_tokens: number | null; cache_read_tokens: number | null; cache_write_tokens: number | null;
   partial_fields: string[]; known_usage_records: number; unknown_usage_records: number;
   cache_hit_requests: number | null; cache_miss_requests: number | null; cache_unknown_requests: number | null;
   estimated_cost: number | null; estimated_currency: string | null; estimate_note: string | null; price_reference: string | null;
+  estimated_cost_min?: number | null; estimated_cost_max?: number | null;
+  platform_credits?: PlatformCredits | null;
 }
 export interface ClientUsageReport {
   generated_at: string; from_day: string; to_day: string;
@@ -16,6 +23,23 @@ export interface ClientUsageReport {
   daily_rows?: ClientUsageRow[];
 }
 export const scanClientUsage = (fromDay: string, toDay: string) => invoke<ClientUsageReport>("scan_client_usage", { fromDay, toDay });
+export interface ClientUsageJobView {
+  job_id: string;
+  state: "running" | "completed" | "cancelled" | "interrupted" | "failed";
+  phase: string;
+  from_day: string; to_day: string;
+  files_total: number; files_done: number;
+  snapshot_bytes_total: number; snapshot_bytes_read: number;
+  records_scanned: number;
+  cancel_requested: boolean; coverage_complete: boolean;
+  message: string | null;
+  report: ClientUsageReport | null;
+}
+export const startClientUsageJob = (fromDay: string, toDay: string) => invoke<ClientUsageJobView>("start_client_usage_job", { fromDay, toDay });
+export const getClientUsageJob = (jobId: string) => invoke<ClientUsageJobView>("get_client_usage_job", { jobId });
+export const getCurrentClientUsageJob = () => invoke<ClientUsageJobView | null>("get_current_client_usage_job");
+export const cancelClientUsageJob = (jobId: string) => invoke<ClientUsageJobView>("cancel_client_usage_job", { jobId });
+export const resumeClientUsageJob = (jobId: string) => invoke<ClientUsageJobView>("resume_client_usage_job", { jobId });
 
 export type Dialect = "openai" | "anthropic" | "gemini" | "ollama" | "responses";
 export type Currency = "usd" | "cny";
@@ -109,7 +133,21 @@ export interface LocalMeta {
   capabilities: string[];
 }
 
+export type ModelDeclarationField = "tools" | "thinking" | "vision" | "audio" | "video" | "stream";
+export type ModelDeclarationState = "supported" | "unsupported" | "unknown";
+export interface ModelDeclarationRecord { state: ModelDeclarationState; recorded_at_ms: number }
+export interface ModelDeclarationView {
+  binding: string; revision: string; status: "legacy" | "declared" | "invalid" | "not_applicable";
+  read_only: boolean; fields: Partial<Record<ModelDeclarationField, ModelDeclarationRecord>>;
+}
+export interface ModelDeclarationPatch {
+  binding: string; revision: string; fields: Partial<Record<ModelDeclarationField, ModelDeclarationState>>;
+}
+
 export interface ProviderView {
+  capability_declarations?: Record<string, ModelDeclarationView>;
+  /** Official account-catalog labels, indexed by stable external model alias. */
+  model_display_names?: Record<string, string>;
   id: string;
   name: string;
   dialect: Dialect;
@@ -161,6 +199,7 @@ export interface CascadePolicy {
 }
 
 export interface AppConfig {
+  proxy_control?: ProxyStartupOptions;
   bind: string;
   port: number;
   allow_lan: boolean;
@@ -178,6 +217,8 @@ export interface AppConfig {
   failover_enabled: boolean;
   catalog_auto_update: boolean;
   catalog_feed_url: string | null;
+  catalog_maintenance?: CatalogMaintenanceConfig;
+  free_routing?: { enabled: boolean };
   takeover: {
     claude_code: boolean;
     codex: boolean;
@@ -193,7 +234,7 @@ export interface AppConfig {
   benefits: BenefitsConfig;
 }
 
-export type BenefitPlatform = "qoder" | "qoder_cn" | "trae_cn";
+export type BenefitPlatform = "qoder" | "qoder_cn" | "trae_cn" | "workbuddy" | "workbuddy_cn";
 export type QoderRegion = "global" | "cn";
 export interface QoderLoginStart {
   login_id: string; region: QoderRegion; authorization_url: string; deadline_ms: number; server_ttl_seconds: number | null;
@@ -208,7 +249,26 @@ export interface QoderJobStatus {
   status: "not_logged_in" | "not_prepared" | "stale" | "expired" | "verification_required" | "prepared";
   region: QoderRegion; account_id: string;
   access_expires_at_ms: number | null; refresh_expires_at_ms: number | null;
-  can_refresh: boolean; attempt_blocked: boolean; inference_verified: boolean;
+  can_refresh: boolean; can_reissue?: boolean; reissue_attempted?: boolean; attempt_blocked: boolean; inference_verified: boolean;
+}
+export type WorkBuddyRegion = "global" | "cn";
+export interface WorkBuddyCheckinStatus {
+  account_id: string;
+  region: WorkBuddyRegion;
+  active: boolean | null;
+  today_checked_in: boolean | null;
+  streak_days: number | null;
+  daily_credit: number | null;
+  today_credit: number | null;
+  total_credits: number | null;
+  checked_at: string;
+}
+export interface WorkBuddyQuota {
+  account_id: string; region: WorkBuddyRegion; scope: "personal" | "enterprise";
+  total: number | null; used: number; remaining: number | null; unlimited: boolean;
+  is_paid_user: boolean | null; resource_details_complete: boolean; checked_at: string;
+  resources: { resource_key: string; source: "paid" | "free"; package_code: string; name: string | null;
+    total: number; used: number; remaining: number; daily_slice: boolean }[];
 }
 export interface WorkBuddyLoginStart {
   login_id: string; authorization_url: string; deadline_ms: number; server_ttl_seconds: number | null;
@@ -216,8 +276,56 @@ export interface WorkBuddyLoginStart {
 export interface TraeLoginStart {
   login_id: string; authorization_url: string; deadline_ms: number;
 }
+export interface TraeWebLoginStatus {
+  store_country?: string | null;
+  region: "cn" | "global"; authentication_mode: "web_legacy"; account_id: string;
+  status: "not_logged_in" | "authenticated" | "access_expired" | "waiting" | "exchanging" | "cancelled" | "expired" | "failed_no_retry" | "authorization_interrupted";
+  identity: WorkBuddyLoginStatus["identity"];
+  access_expires_at_ms: number | null; refresh_expires_at_ms: number | null;
+  can_refresh: boolean; native_device_verified: false; model_inference_verified: false;
+  pending_login: { login_id: string; deadline_ms: number; state: string; request_id?: string | null } | null;
+}
 export interface TraeLoginStatus extends Omit<WorkBuddyLoginStatus, "status"> {
-  status: "authenticated" | "not_logged_in" | "awaiting_authorization" | "access_expired" | "expired" | "cancelled" | "authorization_failed_no_retry";
+  status: "authenticated" | "not_logged_in" | "awaiting_authorization" | "access_expired" | "expired" | "cancelled" | "authorization_failed_no_retry" | "authorization_interrupted";
+}
+export interface TraeCatalogModel {
+  id: string; name: string; supports_vision: boolean | null; supports_thinking: boolean | null;
+}
+export interface TraeCatalogGroup {
+  function: "solo_agent_remote" | "solo_work_remote" | "solo_design_remote";
+  models: TraeCatalogModel[];
+}
+export interface TraeModelCatalogView {
+  account_id: string; region: "cn"; origin: "https://trae-api-cn.mchost.guru"; fetched_at_ms: number;
+  groups: TraeCatalogGroup[]; warnings: string[];
+}
+export interface TraeNativeModelView {
+  raw_model?: { model_name: string; config_source: 1 };
+  selector_id: string; config_name: string; display_name: string;
+  prompt_max_tokens: number | null; max_tokens: number | null;
+  declared_vision: boolean | null; declared_tools: boolean | null; declared_thinking: boolean | null;
+  reasoning_effort_options: string[];
+  protocol_carriers: { text: boolean; tools: boolean; images: boolean; audio: boolean; video: boolean };
+  account_model_evidence: "unverified";
+}
+export interface TraeNativeCatalogView {
+  account_id: string; region: "cn" | "global"; profile_id: "cn-ordinary-3.4.3-aicc20260212-v1" | "cn-web-raw-v1" | "global-web-raw-sg-v1";
+  source_function: "solo_work_remote" | "chat_v3"; fetched_at_ms: number; catalog_revision: string;
+  entries: TraeNativeModelView[]; excluded_count: number; warnings: string[];
+}
+export interface TraeProviderRegistration {
+  accountId: string; profileId: TraeNativeCatalogView["profile_id"]; catalogRevision: string;
+  selections: { selector_id: string; alias: string; allow_undeclared_images: boolean }[];
+}
+export interface TraeProviderRegistrationResult {
+  provider_id: string; runtime_id: string; model_count: number; warnings: string[];
+}
+export interface TraeRecoveryView {
+  account_id: string;
+  login_preparing: boolean;
+  refresh_in_flight: boolean;
+  refresh_interrupted: boolean;
+  login: { login_id: string; deadline_ms: number; state: "waiting" | "exchanging" | "expired" | "interrupted" | "completed" | "cancelled" | "failed_no_retry" } | null;
 }
 export interface WorkBuddyLoginStatus {
   status: "authenticated" | "not_logged_in" | "awaiting_authorization" | "access_expired";
@@ -239,6 +347,7 @@ export interface BenefitsConfig {
   auto_claim_timezone: "local" | "Asia/Shanghai";
   scheduler_mode?: "app" | "windows_task";
   account_claim_times?: Record<string, string>;
+  account_auto_claim?: Record<string, boolean>;
   accounts: BenefitAccount[];
 }
 export interface BenefitCampaign {
@@ -273,12 +382,30 @@ export interface BenefitRunRecord {
   manual: boolean;
   created_at: string;
 }
+export interface BenefitAuthSourceView {
+  account_id: string;
+  platform: string;
+  source: "none" | "saved_token" | "saved_session" | "native_login" | "invalid_binding";
+  source_revision: string;
+  identity: TraeLoginStatus["identity"];
+  access_expires_at_ms: number | null;
+  expiry_unknown: boolean;
+  candidate_identity: TraeLoginStatus["identity"];
+  candidate_eligible: boolean;
+  candidate_access_expires_at_ms: number | null;
+  candidate_expiry_unknown: boolean;
+  can_restore: boolean;
+  previous_present: boolean;
+  error_code: string | null;
+  message: string | null;
+}
 export interface BenefitAccountView {
   account_id: string;
   platform: BenefitPlatform;
   label: string;
   enabled: boolean;
   has_token: boolean;
+  auth_source: BenefitAuthSourceView;
   session_account?: { identity: { display_name: string | null; masked_email: string | null; identity_hash: string | null; captured_at: string | null }; plan_name: string | null; quota: {total:number|null;used:number|null;remaining:number|null;unit:string|null}|null; addon_quota: {total:number|null;used:number|null;remaining:number|null;unit:string|null}|null; checked_at:string } | null;
   session_error?: string | null;
   token_masked: string | null;
@@ -288,6 +415,7 @@ export interface BenefitAccountView {
   capabilities: { query: boolean; manual_claim: boolean; auto_claim: boolean; scope: string };
 }
 export interface BenefitOverview {
+  settings_revision?: string;
   enabled: boolean;
   auto_claim: boolean;
   auto_claim_after_hour: number;
@@ -462,7 +590,7 @@ export type SmartClassifier = "auto" | "jev" | "heuristic";
  * 对应回归测试见 `src-tauri/tests/config.rs` 的
  * `四个搜索后端的枚举名必须与前端下拉一致`。
  */
-export type SearchBackendKind = "tavily" | "brave" | "sear_xng" | "bing_cn" | "duck_duck_go";
+export type SearchBackendKind = "mdn_mcp" | "tavily" | "brave" | "sear_xng" | "bing_cn" | "free_aggregate" | "duck_duck_go";
 export type SearchInjectFormat = "system" | "user";
 
 export interface AutoStartConfig {
@@ -513,6 +641,13 @@ export interface SearchConfig {
   max_results: number;
   timeout_ms: number;
   inject_as: SearchInjectFormat;
+  query_cache_ttl_secs?: number;
+  coalesce_queries?: boolean;
+  source_min_interval_ms?: number;
+  page_text_enabled?: boolean;
+  free_search_scope?: "web" | "npm_packages" | "hacker_news" | "stack_overflow";
+  free_search_locale?: FreeSearchLocale;
+  free_proxy_url?: string | null;
 }
 
 export interface ProbeOutcome {
@@ -572,9 +707,29 @@ export interface SearchSettingsInput {
   inject_as: SearchInjectFormat;
   api_key: string | null;
   clear_api_key: boolean;
+  query_cache_ttl_secs?: number;
+  coalesce_queries?: boolean;
+  source_min_interval_ms?: number;
+  page_text_enabled?: boolean;
+  free_search_scope?: "web" | "npm_packages" | "hacker_news" | "stack_overflow";
+  free_search_locale?: FreeSearchLocale;
+  free_proxy_url?: string | null;
+}
+
+export type FreeSearchLocale = "source_default" | "cn_zh" | "us_en" | "gb_en";
+
+export interface StackOverflowStateView {
+  schema_version:number;
+  state:"ready"|"waiting"|"reserved"|"outcome_unknown"|"exhausted"|"unavailable";
+  not_before_utc:string|null;
+  shared_remaining:string|null;
+  quota_observed_at_utc:string|null;
+  can_recover_unsent:boolean;
+  reason:string|null;
 }
 
 export interface SearchSettingsView {
+  manual_search_cancel_supported?: boolean;
   enabled: boolean;
   backend: SearchBackendKind;
   searxng_url: string | null;
@@ -583,6 +738,18 @@ export interface SearchSettingsView {
   inject_as: SearchInjectFormat;
   api_key_masked: string | null;
   backend_needs_key: boolean;
+  query_cache_ttl_secs?: number;
+  coalesce_queries?: boolean;
+  source_min_interval_ms?: number;
+  page_text_enabled?: boolean;
+  free_search_scope?: "web" | "npm_packages" | "hacker_news" | "stack_overflow";
+  free_search_locale?: FreeSearchLocale;
+  free_search_locales?: FreeSearchLocale[];
+  free_search_scopes?: Array<"web" | "npm_packages" | "hacker_news" | "stack_overflow">;
+  free_proxy_url?: string | null;
+  resources?: {schema_version:number;entries:number;inflight:number;cache_hits:number;cache_misses:number;coalesced:number;queries_started:number;rejected:number};
+  source_protection?: {schema_version:number;sources:Array<{source:string;state:string;not_before_utc:string|null;reason?:string|null}>};
+  stack_overflow_state?: StackOverflowStateView;
 }
 
 export interface SearchResultItem {
@@ -592,11 +759,28 @@ export interface SearchResultItem {
   score: number;
 }
 
+/** Opaque text; never a fabricated SearchResultItem or verified document count. */
+export interface MdnTextReference {
+  schema_version: 1;
+  source: "mdn_mcp_experimental";
+  format: "untrusted_text";
+  text: string;
+  document_count: null;
+}
+
 export interface SearchOutcome {
   backend: SearchBackendKind;
   hits: number;
   error: string | null;
   results: SearchResultItem[];
+  /** hits counts structured items only; this reference has unknown document count. */
+  unstructured_reference?: MdnTextReference | null;
+  result_sources?: string[];
+  failed_sources?: string[];
+  reuse?: "fresh"|"shared"|"cached"|"bypass";
+  retrieved_at_utc?: string;
+  requested_locale?: FreeSearchLocale;
+  page_text?: {state:string;pages:Array<{result_index:number;state:string;read_at_utc:string|null}>};
 }
 
 export type ClassifierSource = "rule" | "jev" | "heuristic";
@@ -677,6 +861,7 @@ export interface ConfigUpdateResult {
 }
 
 export interface ProviderInput {
+  capability_declarations?: Record<string, ModelDeclarationPatch>;
   id?: string;
   name: string;
   dialect: Dialect;
@@ -771,6 +956,28 @@ export interface CreateRemoteAccessKeyInput {
   rpm_limit: number;
 }
 
+/** Read-only local reference accounting; decimal micros are exact IPC strings. */
+export interface RemoteKeyBudgetSnapshot {
+  key_id: string;
+  key_label: string;
+  key_enabled: boolean;
+  key_updated_at: string;
+  budget_enabled: boolean;
+  limit_micros: string;
+  currency: string | null;
+  period_start_utc: string;
+  observed_at_utc: string;
+  known_spend_micros: string | null;
+  ledger_settled_micros: string | null;
+  outstanding_micros: string | null;
+  outstanding_calls: number | null;
+  other_currency_outstanding_calls: number | null;
+  total_micros: string | null;
+  remaining_micros: string | null;
+  blocked_reason: string | null;
+  mode: "key_disabled" | "disabled" | "unlimited" | "blocked_unknown" | "exhausted" | "reference_headroom";
+}
+
 export interface UpdateRemoteAccessKeyInput extends CreateRemoteAccessKeyInput {
   /**
    * 预算三件套是可选的：**不传表示「不改」**。
@@ -833,6 +1040,9 @@ export interface Session {
   message_count: number;
 }
 
+export interface SessionListInput { query?: string; cursor?: string | null; limit?: number; selected_id?: string | null; }
+export interface SessionListPage { rows: Session[]; total_count: number; next_cursor: string | null; has_more: boolean; selected: Session | null; query: string; }
+
 export interface SessionMessage {
   id: number;
   session_id: string;
@@ -866,6 +1076,71 @@ export interface SnapshotApplyResult {
   restart_reasons: string[];
 }
 
+/** Native request evidence, projected from the stored attempt ledger. No credentials or price snapshots. */
+export interface NativeUsage {
+  state: "complete" | "partial" | "missing" | "invalid";
+  validity: "valid" | "state_normalized" | "invalid";
+  reason: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
+  reasoning_tokens: number | null;
+  credit: number | null;
+  reference_fee: {
+    kind: string;
+    source: string;
+    currency: string;
+    min: number;
+    max: number;
+    exact: number | null;
+    reason: string;
+  } | null;
+  reference_unavailable_reason: string | null;
+}
+
+export interface NativeCountSubtotal {
+  known_subtotal: number;
+  known_requests: number;
+  unknown_requests: number;
+  overflowed: boolean;
+}
+
+export interface NativeReferenceSubtotal {
+  currency: string;
+  min: number;
+  max: number;
+  priced_requests: number;
+  range_requests: number;
+  overflowed: boolean;
+}
+
+export interface NativeUsageAccumulator {
+  legacy_requests: number;
+  native_requests: number;
+  complete_requests: number;
+  partial_requests: number;
+  missing_requests: number;
+  invalid_requests: number;
+  normalized_requests: number;
+  unpriced_requests: number;
+  prompt_tokens: NativeCountSubtotal;
+  completion_tokens: NativeCountSubtotal;
+  total_tokens: NativeCountSubtotal;
+  cache_read_tokens: NativeCountSubtotal;
+  cache_creation_tokens: NativeCountSubtotal;
+  reasoning_tokens: NativeCountSubtotal;
+  reference_fees: NativeReferenceSubtotal[];
+}
+
+export interface NativeUsageByModel {
+  provider_id: string | null;
+  provider: string;
+  model: string | null;
+  usage: NativeUsageAccumulator;
+}
+
 export interface ProviderUsage {
   provider_id: string | null;
   provider: string;
@@ -874,6 +1149,87 @@ export interface ProviderUsage {
   prompt_tokens: number;
   completion_tokens: number;
   fallback_attempts: number;
+  native_usage?: NativeUsageAccumulator;
+}
+
+export interface RequestTimingMetric {
+  samples: number;
+  retained_samples: number;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  complete: boolean;
+}
+export interface ObservationContextSnapshot {
+  schema_version: 1;
+  scope: "ollama_wire_projection_v1";
+  provider_id: string;
+  physical_model: string;
+  fingerprint_sha256: string;
+  model_revision: null;
+}
+export interface RequestTimingGroup {
+  observation_context_state?: "observed" | "unknown" | "invalid";
+  observation_context?: ObservationContextSnapshot | null;
+  provider_id: string | null;
+  provider: string | null;
+  model: string | null;
+  mode: "streaming" | "buffered";
+  outcome: "completed" | "attempt_failed" | "failed" | "cancelled" | "incomplete" | "pending" | "outcome_unknown";
+  input_band: "under_4k" | "4k_to_32k" | "32k_to_128k" | "128k_plus" | "unknown";
+  reasoning_event: "observed" | "not_observed";
+  tool_event: "observed" | "not_observed";
+  wire_modes_state?: "observed" | "unknown" | "invalid";
+  wire_modes?: AttemptWireModes | null;
+  attempts: number;
+  metrics: { response_headers: RequestTimingMetric; first_byte?: RequestTimingMetric; first_text: RequestTimingMetric; first_reasoning: RequestTimingMetric; first_refusal: RequestTimingMetric; first_tool: RequestTimingMetric; finished: RequestTimingMetric };
+}
+export interface RequestTimingOverview {
+  generation_reports?: GenerationReportOverview;
+  schema_version: 1;
+  window: "24h";
+  since_ts: number;
+  until_ts: number;
+  total_requests: number;
+  observed_requests: number;
+  unobserved_requests: number;
+  no_details_requests: number;
+  invalid_requests: number;
+  valid_attempts: number;
+  observed_control_attempts?: number;
+  unobserved_control_attempts?: number;
+  invalid_control_attempts?: number;
+  unobserved_attempts: number;
+  invalid_attempts: number;
+  ungrouped_attempts: number;
+  group_limit_reached: boolean;
+  sample_limit_reached: boolean;
+  groups: RequestTimingGroup[];
+}
+
+export interface GenerationReportRate {
+  samples: number;
+  retained_samples: number;
+  complete: boolean;
+  p50_tokens_per_second: number | null;
+  p95_tokens_per_second: number | null;
+}
+export type GenerationReportGroup = Pick<RequestTimingGroup, "provider_id" | "provider" | "model" | "mode" | "input_band" | "reasoning_event" | "tool_event" | "wire_modes_state" | "wire_modes" | "observation_context_state" | "observation_context"> & { rate: GenerationReportRate };
+export interface GenerationReportOverview {
+  schema_version: 1;
+  parsed_attempts: number;
+  inspected_requests: number;
+  unavailable_requests: number;
+  no_details_requests: number;
+  invalid_records: number;
+  usable_requests: number;
+  usable_attempts: number;
+  absent_attempts: number;
+  unknown_attempts: number;
+  invalid_attempts: number;
+  ungrouped_attempts: number;
+  group_limit_reached: boolean;
+  sample_limit_reached: boolean;
+  groups: GenerationReportGroup[];
 }
 
 export interface StatsOverview {
@@ -882,6 +1238,10 @@ export interface StatsOverview {
   today_requests: number;
   success_rate: number;
   avg_latency_ms: number;
+  latency_sample_count: number;
+  latency_p50_ms: number | null;
+  latency_p95_ms: number | null;
+  request_timings?: RequestTimingOverview | null;
   total_fallbacks: number;
   fallback_request_count: number;
   fallback_rate: number;
@@ -889,6 +1249,8 @@ export interface StatsOverview {
   total_completion_tokens: number;
   provider_distribution: ProviderUsage[];
   spend: SpendOverview;
+  native_usage?: NativeUsageAccumulator;
+  native_usage_by_model?: NativeUsageByModel[];
 }
 
 export interface SpendBucket {
@@ -926,8 +1288,55 @@ export interface SpendOverview {
   note: string;
 }
 
+/** 网关逐跳观测时间点；未知不填0，尚未观测结束时terminal/finished为空。 */
+export interface AttemptTimingSnapshot {
+  schema_version: 1 | 2;
+  mode: "streaming" | "buffered";
+  terminal: "completed" | "failed" | "cancelled" | "incomplete" | null;
+  response_headers_ms: number | null;
+  first_byte_ms?: number | null;
+  first_text_ms: number | null;
+  first_reasoning_ms: number | null;
+  first_refusal_ms: number | null;
+  first_tool_ms: number | null;
+  finished_ms: number | null;
+}
+
+/** Fixed tags only. Raw caller controls and later normalized/effective/body stages
+ * remain distinct; the body projection does not prove supplier acceptance. */
+export type ControlDialect = "openai" | "anthropic" | "gemini" | "ollama" | "responses";
+export interface AttemptControlSet {
+  reasoning: "absent" | "disabled" | "enabled" | "adaptive" | "mixed" | "unknown";
+  tools: "absent" | "empty" | "configured" | "unknown";
+  tool_choice: "absent" | "none" | "auto" | "required" | "named" | "unknown";
+}
+export interface AttemptWireModes {
+  schema_version: 1;
+  dialect: ControlDialect;
+  declared_thinking: boolean | null;
+  caller: { dialect: ControlDialect; modes: AttemptControlSet } | null;
+  normalized_ingress: AttemptControlSet | null;
+  effective_request: AttemptControlSet;
+  wire: AttemptControlSet;
+}
+
 // 一次降级尝试；由网关在请求结束时写入审计。
+export interface AttemptGenerationSnapshot {
+  schema_version: 1;
+  source: "ollama_native_eval";
+  state: "reported" | "unknown" | "unreported" | "not_completed";
+  reason: string | null;
+  timing_mode: "buffered" | "streaming" | null;
+  output_tokens: number | null;
+  eval_duration_ns: string | null;
+  total_duration_ns: string | null;
+  load_duration_ns: string | null;
+  prompt_eval_duration_ns: string | null;
+  rate_tokens_per_second: number | null;
+}
+
 export interface AttemptRecord {
+  observation_context?: ObservationContextSnapshot | null;
   provider_id: string;
   provider: string;
   model: string;
@@ -936,6 +1345,9 @@ export interface AttemptRecord {
   latency_ms: number;
   ok: boolean;
   retryable: boolean;
+  timing?: AttemptTimingSnapshot | null;
+  generation?: AttemptGenerationSnapshot | null;
+  wire_modes?: AttemptWireModes | null;
 }
 
 export interface RequestLog {
@@ -947,8 +1359,8 @@ export interface RequestLog {
   routed_model: string | null;
   status: number | null;
   latency_ms: number | null;
-  prompt_tokens: number;
-  completion_tokens: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
   fallback_attempts: number;
   error: string | null;
   // 花费仅在模型配置了价格时返回；null 表示未计价。
@@ -959,6 +1371,7 @@ export interface RequestLog {
   // 本地估算的输入 token，与上游实际用量对照即可看出估算偏差。
   estimated_prompt_tokens: number | null;
   attempts: AttemptRecord[] | null;
+  native_usage?: NativeUsage;
 }
 
 // ---------- B3 审计检索与导出 ----------
@@ -986,6 +1399,7 @@ export interface AuditFilter {
 
 /** 一条审计记录。在 `RequestLog` 的基础上多了 B2/B3 的列。 */
 export interface AuditRow extends RequestLog {
+  route_decision?: RouteDecision | null;
   id: number;
   session_id: string | null;
   route_intent: string | null;
@@ -1001,6 +1415,59 @@ export interface AuditRow extends RequestLog {
    * 开启后返回的也是**已脱敏**的文本。
    */
   refined_prompt?: string | null;
+}
+
+export type FeedbackClass = "simple" | "vision" | "reasoning";
+export interface AuxiliaryObservation {
+  ordinal: number; purpose: "classify" | "refine"; provider_id: string | null; model: string | null; target_unavailable: boolean;
+  started_at_unix_ms: number; terminal: "started" | "returned" | "interrupted_unknown"; elapsed_ms: number | null;
+  http_status: number | null; primary_usage: {prompt_tokens:number;completion_tokens:number;total_tokens:number} | null;
+  result_ok: boolean | null; applied: boolean | null; wire_post_verified: false;
+}
+export interface HistoricalRouteScore {
+  factors: { name: string; raw: number | null; weight: number; contribution: number; reason: "missing" | "disabled" | "weighted" }[];
+  exact_match_bonus: number; total: number;
+}
+export type RouteDecision = { state: "unobserved" | "invalid" } | { state: "recorded"; snapshot: {
+  schema_version: 1 | 2; kind: "dispatch_plan" | "not_reached" | "exact_selection"; phase: string; captured_at_unix_ms: number;
+  configured_strategy: string; personal_test: boolean; classifier: string | null; intent: string | null;
+  sticky: [string, string] | null; sticky_unavailable: boolean; active_promoted: boolean;
+  free_selector: boolean; cascade_order_applied: boolean; total_candidates: number; truncated: boolean;
+  omitted_candidates: number; score_state: "not_recorded" | "not_applicable" | "recorded";
+  effective_strategy?: string | null; score_capture?: "first_sort_comparison" | null;
+  auxiliary_calls?: AuxiliaryObservation[]; auxiliary_omitted?: number;
+  candidates: { ordinal: number; target: null | { provider_id: string; model_alias: string; configured_upstream: string; exact_match: boolean }; score_state?: "not_recorded" | "recorded" | "unavailable" | "omitted_byte_budget"; score?: HistoricalRouteScore | null }[];
+} };
+export interface ConversationTaskRef {session_id:string;group_id:string}
+export interface ConversationCounts {
+ requests:number;annotated:number;class_confirmed:number;met_need:number;did_not_meet_need:number;unsure:number;missing_outcome:number;feedback_unavailable:number;
+ http_2xx:number;cancelled:number;errors:number;status_other_unknown:number;
+}
+export interface ConversationTask {task:ConversationTaskRef;profile_id:string;region:string;caller_scope:string;matching_requests:number;counts:ConversationCounts;first_ts:number;last_ts:number;last_request_id:number}
+export interface ConversationSummary {observed_at_unix_ms:number;matched_requests:number;grouped_matching_requests:number;ungrouped_matching_requests:number;ungrouped_reasons:Record<string,number>;total_tasks:number;total_stored_requests_in_tasks:number;tasks:ConversationTask[];offset:number;limit:number;has_more:boolean}
+export interface ConversationRequestPage {task:ConversationTaskRef;total_requests:number;rows:{id:number;ts:number;status:number|null;trace_id:string|null;routed_provider:string|null;routed_model:string|null;confirmed_class:string|null;outcome:string|null;feedback_revision:number|null;feedback_unavailable:boolean;matches_filter:boolean}[];has_more:boolean;next_cursor:number|null}
+
+export type FeedbackOutcome = "met_need" | "did_not_meet_need" | "unsure";
+/** Human annotations never replace the machine audit or verified usage. */
+export interface RequestFeedback {
+  request_id: number; ts: number; requested_model: string;
+  routed_provider: string | null; routed_model: string | null; status: number | null;
+  route_intent: string | null; route_classifier: string | null;
+  confirmed_class: FeedbackClass | null; outcome: FeedbackOutcome | null;
+  revision: number; source: "local_user" | null;
+  created_at: number | null; updated_at: number | null;
+}
+export interface FeedbackInput {
+  request_id: number; expected_revision: number;
+  confirmed_class: FeedbackClass | null; outcome: FeedbackOutcome | null;
+}
+export interface FeedbackCoverageCounts {
+  requests: number; annotated: number; class_confirmed: number;
+  met_need: number; did_not_meet_need: number; unsure: number; missing_outcome: number;
+}
+export interface FeedbackCoverage extends FeedbackCoverageCounts {
+  groups: Array<FeedbackCoverageCounts & {routed_provider: string | null; routed_model: string | null; confirmed_class: FeedbackClass | null}>;
+  groups_truncated: boolean;
 }
 
 /** 一页审计记录。`total` 是**命中总数**，不是本页条数。 */
@@ -1037,7 +1504,18 @@ export interface ScoreBreakdown {
   total: number;
 }
 
+/** Readonly process-local call-window reference; omitted on older backends. */
+export interface TpsReference {
+  schema_version: 1;
+  state: "no_sample" | "current" | "expired" | "source_mismatch" | "clock_unknown";
+  max_idle_seconds: number;
+  age_seconds: number | null;
+  /** Current configuration cohort, never a rolling24h count. */
+  cohort_sample_count: number | null;
+}
+
 export interface CandidateExplanation {
+  tps_reference?: TpsReference | null;
   provider_id: string;
   provider_name: string;
   model: string;
@@ -1048,6 +1526,22 @@ export interface CandidateExplanation {
   /** 是否真的会参与本轮路由。不健康 / 冷却 / 额度耗尽的会被过滤掉。 */
   eligible: boolean;
   ineligible_reason: string | null;
+  free_weight?: { value: number; usable_completion_samples: number; minimum_samples: number; metrics_used: boolean; local_quota_headroom: number } | null;
+  free_eligibility?: { eligible: boolean; reason: string; observed_at: number | null; expires_at: number | null } | null;
+}
+export interface RequestPreviewInput {
+  request: Record<string, unknown>; access_key_id: string | null; strategy: string | null;
+  include_session?: boolean; session_id?: string | null;
+}
+export interface RequestPreview {
+  schema_version: number; mode: string; estimated_prompt_tokens: number; fixed_reserve_tokens: number;
+  trimmed_messages: number; configured_strategy: string; cost_policy: "free_only" | "unrestricted";
+  order_semantics: string; intent: {class:string;classifier:string;complexity:number} | null; gate_issue: string | null;
+  rows: Array<{provider_id:string;provider_name:string;model:string;configured_upstream:string;eligible:boolean;exclusion_reason:string|null;ordinal:number|null;score:number|null;breakdown:ScoreBreakdown|null}>;
+  limitations: string[];
+  context?: {status:"found"|"missing"|"key_policy_blocked";scope:"local_unified"|"selected_access_key";
+    history_messages:number|null;replay_messages:number|null;history_capped:boolean|null;summary_present:boolean|null;
+    sticky_status:"none"|"inactive"|"eligible"|"excluded";sticky_provider_id:string|null;sticky_model:string|null};
 }
 
 // ---------- D5 可解释性与 Pareto 前沿 ----------
@@ -1057,6 +1551,7 @@ export interface CandidateExplanation {
  * 用户既不知道它们凭什么上榜，也分不清没上榜的是「更差」还是「没数据」。
  */
 export interface ParetoPointView {
+  speed_reference?: TpsReference | null;
   /** `provider_id/alias`。 */
   id: string;
   label: string;
@@ -1104,6 +1599,9 @@ export interface AgentRuntime {
 export interface SourcedCapabilityValue {
   value: number;
   source: "measured" | "manual" | "community" | "catalog";
+  /** Optional source claims, never inferred from local record time or success. */
+  observed_at?: string | null;
+  sample_count?: number | null;
 }
 
 /**
@@ -1147,6 +1645,13 @@ export interface PricingRefreshOutcome {
   skipped_manual: number;
   unmatched: Array<{ provider_id: string; provider: string; alias: string }>;
   feed_url: string;
+}
+
+export interface PriceObservationView {
+  provider_id: string; alias: string; origin: "manual_save" | "catalog_refresh";
+  recorded_at: string; feed_origin: string | null; feed_model_id: string | null;
+  dialect: ProviderView["dialect"]; base_url: string; runtime_id: string | null;
+  upstream: string; model_type: ModelType; upstream_path: string | null; price: ModelPrice;
 }
 
 export interface PricingStatus {
@@ -1292,14 +1797,68 @@ export interface XrayStatus {
   pid: number | null; version: string; protocol: string | null; proxy_url: string;
 }
 
+export interface ProxyStartupOptions {
+  start_gateway_on_launch: boolean;
+  start_system_proxy_on_launch: boolean;
+  system_proxy_server: string | null;
+}
+export interface ProxyControlStatus {
+  gateway: { running: boolean; bound_addr: string | null; last_error: string | null };
+  system: { supported: boolean; enabled: boolean | null; mode: string; manual_server: string | null; source: string; error: string | null };
+  startup: ProxyStartupOptions;
+}
+
+export interface CatalogMaintenanceConfig { enabled: boolean; provider_ids: string[]; }
+export interface CatalogApplySummary {
+  applied: boolean; conflict: boolean; added: number; updated: number; revoked: number;
+  configured: number; missing_pending: number; soft_offline: number; clock_epoch_reset: boolean;
+}
+export interface CatalogScanStatus {
+  provider_id: string; status: string; last_attempt_at: number | null; last_complete_success_at: number | null;
+  next_due_at: number | null; next_retry_at: number | null; failure_kind: string | null;
+  warning_codes: string[]; counters: CatalogApplySummary; run_id: string | null;
+  lease_expires_at: number | null; fence: number; clock_anomaly: boolean; runtime_pending: boolean;
+}
+export interface CatalogMaintenanceView { settings: CatalogMaintenanceConfig; statuses: CatalogScanStatus[]; }
+export interface CatalogScanReply { status: string; summary: CatalogApplySummary | null; failure_kind: string | null; }
+export interface CatalogInventoryEntry {
+  upstream_id: string; name: string; context_window: number; model_type: string | null;
+  fee_status: "free" | "paid" | "unknown"; fee_reason_codes: string[]; source_contract: string;
+  observed_at: number; fee_expires_at: number | null; lifecycle: string; missing_confirmations: number;
+  free_name_hint: boolean; aliases: { alias: string; enabled: boolean; managed_by: string; user_override: string }[];
+}
+export interface CatalogInventoryPage { entries: CatalogInventoryEntry[]; total: number; offset: number; limit: number; }
+
 export const api = {
+  saveFreeRouting: (settings: {enabled:boolean}) => invoke<{enabled:boolean}>("save_free_routing", { settings }),
+  catalogMaintenance: () => invoke<CatalogMaintenanceView>("catalog_maintenance_status"),
+  saveCatalogMaintenance: (settings: CatalogMaintenanceConfig) => invoke<CatalogMaintenanceView>("save_catalog_maintenance", { settings }),
+  scanCatalog: (providerId: string) => invoke<CatalogScanReply>("scan_catalog_maintenance", { providerId }),
+  cancelCatalogScan: (providerId: string) => invoke<boolean>("cancel_catalog_maintenance", { providerId }),
+  catalogInventory: (providerId: string, query = "", freeNameOnly = false, offset = 0) =>
+    invoke<CatalogInventoryPage>("catalog_inventory", { providerId, query, freeNameOnly, offset }),
+  getProxyControlStatus: () => invoke<ProxyControlStatus>("get_proxy_control_status"),
+  setGatewayProxyEnabled: (enabled: boolean) => invoke<ProxyControlStatus>("set_gateway_proxy_enabled", { enabled }),
+  setSystemProxyEnabled: (enabled: boolean) => invoke<ProxyControlStatus>("set_system_proxy_enabled", { enabled }),
+  saveProxyStartupOptions: (options: ProxyStartupOptions) => invoke<ProxyControlStatus>("save_proxy_startup_options", { options }),
   traeLoginStart: (accountId: string, consentToRegisterKey: boolean) => invoke<TraeLoginStart>("trae_login_start", { accountId, consentToRegisterKey }),
+  traeWebLoginStart: (region: "cn" | "global", accountId: string, consent: boolean, requestId: string) => invoke<TraeLoginStart>("trae_web_login_start", { region, accountId, consent, requestId }),
+  traeWebLoginStatus: (region: "cn" | "global", accountId: string) => invoke<TraeWebLoginStatus>("trae_web_login_status", { region, accountId }),
+  traeWebLoginPoll: (region: "cn" | "global", accountId: string, loginId: string) => invoke<TraeWebLoginStatus>("trae_web_login_poll", { region, accountId, loginId }),
+  traeWebLoginCancel: (region: "cn" | "global", accountId: string, loginId: string) => invoke<TraeWebLoginStatus>("trae_web_login_cancel", { region, accountId, loginId }),
+  traeWebLoginRefresh: (region: "cn" | "global", accountId: string, consent: boolean) => invoke<TraeWebLoginStatus>("trae_web_login_refresh", { region, accountId, consent }),
+  traeModelCatalog: (accountId: string) => invoke<TraeModelCatalogView>("trae_model_catalog", { accountId }),
+  traeNativeModelCatalog: (accountId: string, sourceFunction: TraeNativeCatalogView["source_function"] = "solo_work_remote") => invoke<TraeNativeCatalogView>("trae_native_model_catalog", { accountId, sourceFunction }),
+  traeWebModelCatalog: (region: "cn" | "global", accountId: string) => invoke<TraeNativeCatalogView>("trae_web_model_catalog", { region, accountId }),
+  registerTraeProvider: (request: TraeProviderRegistration) => invoke<TraeProviderRegistrationResult>("register_trae_provider", { accountId: request.accountId, profileId: request.profileId, catalogRevision: request.catalogRevision, selections: request.selections }),
   traeLoginStatus: (accountId: string) => invoke<TraeLoginStatus>("trae_login_status", { accountId }),
   traeLoginPoll: (accountId: string, loginId: string) => invoke<TraeLoginStatus>("trae_login_poll", { accountId, loginId }),
   traeLoginCancel: (accountId: string, loginId: string) => invoke<void>("trae_login_cancel", { accountId, loginId }),
   traeLoginRefresh: (accountId: string) => invoke<TraeLoginStatus>("trae_login_refresh", { accountId }),
   traeLoginCancelRefresh: (accountId: string) => invoke<void>("trae_login_cancel_refresh", { accountId }),
-  workbuddyLoginStart: (accountId: string) => invoke<WorkBuddyLoginStart>("workbuddy_login_start", { accountId }),
+  traeLoginRecovery: (accountId: string) => invoke<TraeRecoveryView>("trae_login_recovery", { accountId }),
+  traeLoginCancelRecovery: (accountId: string) => invoke<void>("trae_login_cancel_recovery", { accountId }),
+  workbuddyLoginStart: (accountId: string, region: WorkBuddyRegion = "global") => invoke<WorkBuddyLoginStart>("workbuddy_login_start", { accountId, region }),
   qoderLoginStart: (region: QoderRegion, accountId: string) => invoke<QoderLoginStart>("qoder_login_start", { region, accountId }),
   qoderLoginPoll: (region: QoderRegion, loginId: string) => invoke<QoderLoginStatus>("qoder_login_poll", { region, loginId }),
   qoderLoginCancel: (region: QoderRegion, loginId: string) => invoke<void>("qoder_login_cancel", { region, loginId }),
@@ -1308,14 +1867,24 @@ export const api = {
   qoderJobStatus: (region: QoderRegion, accountId: string) => invoke<QoderJobStatus>("qoder_job_status", { region, accountId }),
   qoderJobPrepare: (region: QoderRegion, accountId: string) => invoke<QoderJobStatus>("qoder_job_prepare", { region, accountId }),
   qoderJobRefresh: (region: QoderRegion, accountId: string) => invoke<QoderJobStatus>("qoder_job_refresh", { region, accountId }),
+  qoderJobReissue: (region: QoderRegion, accountId: string) => invoke<QoderJobStatus>("qoder_job_reissue", { region, accountId }),
   registerQoderProvider: (region: QoderRegion, accountId: string) => invoke<{provider_id:string;runtime_id:string;model_count:number;warnings:string[]}>("register_qoder_provider", { region, accountId }),
-  workbuddyLoginPoll: (loginId: string) => invoke<WorkBuddyLoginStatus>("workbuddy_login_poll", { loginId }),
-  workbuddyLoginCancel: (loginId: string) => invoke<void>("workbuddy_login_cancel", { loginId }),
-  workbuddyLoginStatus: (accountId: string) => invoke<WorkBuddyLoginStatus>("workbuddy_login_status", { accountId }),
-  workbuddyLoginRefresh: (accountId: string) => invoke<WorkBuddyLoginStatus>("workbuddy_login_refresh", { accountId }),
-  registerWorkBuddyProvider: (accountId: string) => invoke<{provider_id:string;runtime_id:string;model_count:number;warnings:string[]}>("register_workbuddy_provider", { accountId }),
+  workbuddyLoginPoll: (loginId: string, region: WorkBuddyRegion = "global") => invoke<WorkBuddyLoginStatus>("workbuddy_login_poll", { loginId, region }),
+  workbuddyLoginCancel: (loginId: string, region: WorkBuddyRegion = "global") => invoke<void>("workbuddy_login_cancel", { loginId, region }),
+  workbuddyLoginStatus: (accountId: string, region: WorkBuddyRegion = "global") => invoke<WorkBuddyLoginStatus>("workbuddy_login_status", { accountId, region }),
+  workbuddyLoginRefresh: (accountId: string, region: WorkBuddyRegion = "global") => invoke<WorkBuddyLoginStatus>("workbuddy_login_refresh", { accountId, region }),
+  workbuddyCheckinStatus: (accountId: string, region: WorkBuddyRegion) => invoke<WorkBuddyCheckinStatus>("workbuddy_checkin_status", { accountId, region }),
+  workbuddyAccountQuota: (accountId: string, region: WorkBuddyRegion) => invoke<WorkBuddyQuota>("workbuddy_account_quota", { accountId, region }),
+  registerWorkBuddyProvider: (accountId: string, region: WorkBuddyRegion = "global") => invoke<{provider_id:string;runtime_id:string;model_count:number;warnings:string[]}>("register_workbuddy_provider", { accountId, region }),
   registerClientBridge: (kind: string) => invoke<string>("register_client_bridge", { kind }),
-  desktopChat: (input: DesktopChatInput) => invoke<DesktopChatResult>("desktop_chat", { input }),
+  desktopChat: (input: DesktopChatInput, control?: { requestId: string; onReady: (ready: DesktopChatReady) => void; onEvent?: (event: DesktopChatStreamEvent) => void }) => {
+    if (!control) return invoke<DesktopChatResult>("desktop_chat", { input });
+    const onReady = new Channel<DesktopChatReady>(control.onReady);
+    return invoke<DesktopChatResult>("desktop_chat", { input, requestId: control.requestId, onReady, ...(control.onEvent ? { onEvent: new Channel<DesktopChatStreamEvent>(control.onEvent) } : {}) });
+  },
+  cancelDesktopChat: (requestId: string) => invoke<boolean>("cancel_desktop_chat", { requestId }),
+  getPersonalTest: () => invoke<PersonalTestStatus>("get_personal_test"),
+  setPersonalTest: (enabled: boolean, target: string | null) => invoke<PersonalTestStatus>("set_personal_test", { enabled, target }),
   exportDesktopChat: (dest: string, transcript: DesktopChatTranscript) => invoke<void>("export_desktop_chat", { dest, transcript }),
   clientBridgesStatus: () => invoke<BridgeStatus[]>("client_bridges_status"),
   registerQoderCli: () => invoke<string>("register_qoder_cli"),
@@ -1360,6 +1929,8 @@ export const api = {
     invoke<ConfigUpdateResult>("update_config", { cfg }),
   listRemoteAccessKeys: () =>
     invoke<RemoteAccessKeyView[]>("list_remote_access_keys"),
+  getRemoteKeyBudgetSnapshot: (id: string) =>
+    invoke<RemoteKeyBudgetSnapshot>("get_remote_key_budget_snapshot", { id }),
   createRemoteAccessKey: (input: CreateRemoteAccessKeyInput) =>
     invoke<CreateRemoteAccessKeyResult>("create_remote_access_key", { input }),
   updateRemoteAccessKey: (input: UpdateRemoteAccessKeyInput) =>
@@ -1371,6 +1942,7 @@ export const api = {
   rotateUnifiedKey: () => invoke<string>("rotate_unified_key"),
 
   listSessions: () => invoke<Session[]>("list_sessions", { limit: 100 }),
+  listSessionsPage: (input: SessionListInput) => invoke<SessionListPage>("list_sessions_page", { input }),
   getSessionMessages: (id: string) => invoke<SessionMessage[]>("get_session_messages", { id }),
   getSessionMessagesPage: (id: string, afterId: number | null = null, limit = 500) =>
     invoke<SessionMessagesPage>("get_session_messages_page", { id, afterId, limit }),
@@ -1395,6 +1967,16 @@ export const api = {
    */
   queryRequests: (filter: AuditFilter) =>
     invoke<AuditPage>("query_requests", { filter }),
+  getRequestFeedback: (requestId: number) =>
+    invoke<RequestFeedback>("get_request_feedback", { requestId }),
+  setRequestFeedback: (input: FeedbackInput) =>
+    invoke<RequestFeedback>("set_request_feedback", { input }),
+  getConversationFeedback: (filter: AuditFilter, page?: {limit?:number;offset:number}) =>
+    invoke<ConversationSummary>("get_conversation_feedback", {filter,page:page??null}),
+  getConversationRequests: (task: ConversationTaskRef, filter: AuditFilter, afterId:number|null, limit=100) =>
+    invoke<ConversationRequestPage>("get_conversation_requests", {task,filter,afterId,limit}),
+  feedbackCoverage: (filter: AuditFilter) =>
+    invoke<FeedbackCoverage>("get_feedback_coverage", { filter }),
 
   exportRequests: (filter: AuditFilter, format: "jsonl" | "csv", destPath: string) =>
     invoke<AuditExportResult>("export_requests", { filter, format, destPath }),
@@ -1427,6 +2009,8 @@ export const api = {
    */
   explainRouting: (model?: string) =>
     invoke<CandidateExplanation[]>("explain_routing", { model: model ?? null }),
+  previewRoutingRequest: (input: RequestPreviewInput) =>
+    invoke<RequestPreview>("preview_routing_request", { input }),
 
   /**
    * 导入能力账本。
@@ -1446,6 +2030,12 @@ export const api = {
   listAgentRuntimes: () => invoke<AgentRuntime[]>("list_agent_runtimes"),
 
   benefitsOverview: () => invoke<BenefitOverview>("benefits_overview"),
+  saveBenefitAccountAutoClaim: (change: { account_id: string; platform: BenefitPlatform; expected_revision: string; allowed: boolean }) =>
+    invoke<ConfigUpdateResult>("save_benefit_account_auto_claim", { change }),
+  benefitAuthSource: (accountId: string) => invoke<BenefitAuthSourceView>("benefit_auth_source", { accountId }),
+  bindTraeBenefitAuth: (accountId: string, expectedRevision: string, expectedPrincipalHash: string) => invoke<BenefitAuthSourceView>("bind_trae_benefit_auth", { accountId, expectedRevision, expectedPrincipalHash }),
+  bindWorkbuddyBenefitAuth: (accountId: string, loginAccountId: string, expectedRevision: string) => invoke<BenefitAuthSourceView>("bind_workbuddy_benefit_auth", { accountId, loginAccountId, expectedRevision }),
+  restoreBenefitAuth: (accountId: string, expectedRevision: string) => invoke<BenefitAuthSourceView>("restore_benefit_auth", { accountId, expectedRevision }),
   importBenefitClientSession: (accountId:string) => invoke<{display_name:string|null;masked_email:string|null}>("import_benefit_client_session",{accountId}),
   claimBenefitNow: (accountId: string) => invoke<BenefitClaimResult>("claim_benefit_now", { accountId }),
   setBenefitToken: (accountId: string, token: string) => invoke<void>("set_benefit_token", { accountId, token }),
@@ -1493,6 +2083,7 @@ export const api = {
 
   refreshPricing: () => invoke<PricingRefreshOutcome>("refresh_pricing"),
   pricingStatus: () => invoke<PricingStatus | null>("pricing_status"),
+  priceObservations: () => invoke<PriceObservationView[]>("price_observations"),
   listTokenCalibrations: () =>
     invoke<TokenCalibration[]>("list_token_calibrations"),
   clearTokenCalibrations: () => invoke<number>("clear_token_calibrations"),
@@ -1549,9 +2140,15 @@ export const api = {
   pullLocalModel: (endpointId: string, model: string) =>
     invoke<void>("pull_local_model", { endpointId, model }),
   getSearchSettings: () => invoke<SearchSettingsView>("get_search_settings"),
+  recoverStackOverflowUnsent: () => invoke<StackOverflowStateView>("recover_stack_overflow_unsent"),
   updateSearchSettings: (input: SearchSettingsInput) =>
     invoke<SearchSettingsView>("update_search_settings", { input }),
-  testSearchBackend: (text: string) => invoke<SearchOutcome>("test_search_backend", { text }),
+  testSearchBackend: (text: string, control?: { requestId: string; onReady: (ready: { request_id: string }) => void }) => {
+    if (!control) return invoke<SearchOutcome>("test_search_backend", { text });
+    const onReady = new Channel<{ request_id: string }>(control.onReady);
+    return invoke<SearchOutcome>("test_search_backend", { text, requestId: control.requestId, onReady });
+  },
+  cancelSearchBackend: (requestId: string) => invoke<boolean>("cancel_search_backend", { requestId }),
   classifyPreview: (text: string, hasImage: boolean, hasTools: boolean) =>
     invoke<TaskIntent>("classify_preview", { text, hasImage, hasTools }),
   jevProbe: (text: string) => invoke<JevProbeResult>("jev_probe", { text }),
@@ -1560,7 +2157,7 @@ export const api = {
   calibrateDefaultSamples: () => invoke<CalibrationReport>("calibrate_default_samples"),
 };
 
-export interface DesktopChatMessage { role: "system" | "user" | "assistant"; content: string }
+export interface DesktopChatMessage { role: "system" | "user" | "assistant"; content: string; reasoning_content?: string }
 export interface DesktopChatTranscript {
   schema_version: number;
   session_id: string;
@@ -1572,11 +2169,29 @@ export interface SessionMessagesPage {
   has_more: boolean;
   next_cursor: number | null;
 }
-export interface DesktopChatInput { model: string; messages: DesktopChatMessage[]; session_id: string; max_tokens: number }
+export interface PersonalTestStatus { enabled: boolean; target: string | null; trusted_source_ready: boolean }
+export type PersonalTestOutcome = "not_dispatched" | "dispatched_unknown" | "reply_unverified";
+export interface PersonalTestFailure { message: string; outcome: PersonalTestOutcome }
+export interface DesktopChatInput { model: string; messages: DesktopChatMessage[]; session_id: string; max_tokens: number; personal_test?: boolean }
+export interface DesktopChatReady { request_id: string; trace_id: string }
+export interface DesktopChatStreamEvent {
+  request_id: string; session_id: string; requested_model: string; routed_via: string | null;
+  sequence: number; kind: "content" | "reasoning" | "refusal"; text: string;
+}
+export type DesktopReplyFieldState = "reported" | "unavailable" | "invalid";
+// Field shape and adapter evidence are not verified terminal/billing receipts.
+export interface DesktopReplyMetadata {
+  finish_reason: DesktopReplyFieldState; usage: DesktopReplyFieldState;
+  usage_evidence?: "unobserved" | "unknown" | "complete";
+}
 export interface DesktopChatResult {
+  personal_test_outcome?: PersonalTestOutcome;
   content: string; reasoning: string | null; model: string; routed_via: string | null;
+  refusal?: string | null;
   session_id: string; trace_id: string | null; fallback_attempts: number; latency_ms: number;
-  usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | null;
+  finish_reason?: string | null;
+  response_metadata?: DesktopReplyMetadata | null;
+  usage: { prompt_tokens?: number | null; completion_tokens?: number | null; total_tokens?: number | null; [field: string]: unknown } | null;
   cached: boolean;
 }
 
@@ -1593,10 +2208,12 @@ export const CLASSIFIER_LABEL: Record<ClassifierSource, string> = {
 };
 
 export const SEARCH_BACKEND_LABEL: Record<SearchBackendKind, string> = {
+  mdn_mcp: "MDN 实验性 MCP（无需 Key）",
   tavily: "Tavily（需 Key）",
   brave: "Brave（需 Key）",
   sear_xng: "SearXNG（自建，免 Key）",
   bing_cn: "必应中国（免 Key，国内可达）",
+  free_aggregate: "免费聚合（Bing RSS + DuckDuckGo）",
   duck_duck_go: "DuckDuckGo（免 Key，可用性无保证）",
 };
 

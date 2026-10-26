@@ -18,7 +18,7 @@ const traeResources=resolve(root,"src-tauri/resources/trae-protocol");
 mkdirSync(traeResources,{recursive:true});
 for(const name of ["crypto.cjs","worker.cjs"])copyFileSync(resolve(root,"scripts/trae-protocol",name),resolve(traeResources,name));
 const paths = [...new Set(git("ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0"))]
-  .filter(p => /^(package(?:-lock)?\.json|vite\.config\.ts|tsconfig\.json|(?:index|pet)\.html|src\/|src-tauri\/(?:src\/|resources\/(?:mihomo|node|xray|qoder-rewards|qoder-protocol|trae-protocol)\/|icons\/|capabilities\/|Cargo\.(?:toml|lock)$|build\.rs$|tauri\.conf\.json$)|scripts\/(?:local-client-bridges\/|qoder-rewards\/|qoder-protocol\/|trae-protocol\/|prepare-release\.mjs$))/.test(p))
+  .filter(p => /^(package(?:-lock)?\.json|vite\.config\.ts|tsconfig\.json|(?:index|pet)\.html|src\/|src-tauri\/(?:src\/|vendor\/libsqlite3-sys\/|resources\/(?:mihomo|node|xray|qoder-rewards|qoder-protocol|trae-protocol)\/|icons\/|capabilities\/|Cargo\.(?:toml|lock)$|build\.rs$|tauri\.conf\.json$)|scripts\/(?:local-client-bridges\/|qoder-rewards\/|qoder-protocol\/|trae-protocol\/|prepare-release\.mjs$))/.test(p))
   .filter(p => existsSync(resolve(root, p))).sort();
 const version = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8")).version;
 const source = { version, head: git("rev-parse", "HEAD"), dirty: Boolean(git("status", "--porcelain")),

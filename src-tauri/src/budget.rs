@@ -1,6 +1,7 @@
 //! B2 预算闸门与 per-key 模型白名单。**判定逻辑与 I/O 分离。**
 //!
-//! 本模块只有纯函数与类型，不碰数据库、不碰 HTTP。理由：闸门判错的后果
+//! 当前文件保留纯函数与类型；已批准的 N3 `holds` 子模块负责持久预占。
+//! 纯判定不碰数据库、不碰 HTTP。理由：闸门判错的后果
 //! 是「该拦的没拦（钱花超了）」或「不该拦的拦了（正常请求被拒）」，
 //! 两种都要能单测打穿。接线部分（限额从哪来、花掉多少从哪查）在
 //! `db::repo` 与 `proxy::server`。
@@ -19,6 +20,10 @@
 //! 若该币种一分钱都没花过，视为 0。
 
 use serde::{Deserialize, Serialize};
+
+pub(crate) mod archive;
+pub(crate) mod holds;
+pub mod observation;
 
 /// 一次闸门判定的结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

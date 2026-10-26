@@ -1,8 +1,20 @@
 //! Independent Trae CN authentication. No client processes or credential files.
 //! Device-key registration needs explicit consent; imported legacy tokens are not
 //! refreshable with a newly generated device key. Private types never enter IPC.
+mod benefit_session;
 mod contract;
 mod http;
+mod model_catalog;
+mod model_session;
+pub use model_catalog::{TraeCatalogGroup, TraeCatalogModelView, TraeModelCatalogView};
+pub(crate) use model_session::{ModelAuthorization, ModelGeneration};
+mod recovery;
+mod web_auth;
+pub(crate) use benefit_session::{
+    read_benefit_candidate, NativeBenefitCandidate, NativeReadPurpose,
+};
+pub use recovery::{RecoveryLogin, RecoveryView};
+pub use web_auth::{WebLoginStatus, WebRegion};
 #[cfg(test)]
 mod tests;
 use crate::{
@@ -10,7 +22,7 @@ use crate::{
     crypto,
     db::repo,
 };
-use contract::{Device, Material, Pair};
+use contract::{CnOrigin, Device, Material, Pair};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -60,7 +72,13 @@ struct Core {
     pool: SqlitePool,
     http: parking_lot::RwLock<Result<reqwest::Client, String>>,
     gate: Mutex<()>,
-    origin: Url,
+    model_epoch: std::sync::atomic::AtomicU64,
+    model_proxy: parking_lot::Mutex<Result<Option<String>, ()>>,
+    #[cfg(test)]
+    transport_origins: Option<[Url; 2]>,
+    #[cfg(test)]
+    catalog_test_origin: Option<Url>,
+    activities: parking_lot::Mutex<HashMap<String, recovery::ActivityEntry>>,
     #[cfg(test)]
     preparation_pause:
         parking_lot::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
@@ -155,7 +173,7 @@ async fn invalidate_refresh(
 }
 impl Credential {
     fn validate(&self) -> Result<(), String> {
-        if self.issuer != contract::ISSUER
+        if CnOrigin::from_issuer(&self.issuer).is_err()
             || self.client_id != contract::CLIENT_ID
             || self.uid.is_empty()
             || !contract::valid_token(&self.pair.access)
@@ -168,13 +186,40 @@ impl Credential {
     }
 }
 impl TraeAuth {
+    /// Test transport substitution only. Principal/session production logic is
+    /// unchanged and no account material is manufactured by this constructor.
+    #[cfg(all(test, feature = "ipc-tests"))]
+    pub(crate) fn with_owned_web_transport(pool: SqlitePool, origin: Url) -> Result<Self, String> {
+        if origin.scheme() != "http"
+            || origin.host_str() != Some("127.0.0.1")
+            || !origin.port().is_some_and(|p| p > 0)
+            || origin.path() != "/"
+            || !origin.username().is_empty()
+            || origin.password().is_some()
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+        {
+            return Err("owned_web_transport_invalid".into());
+        }
+        let mut auth = Self::new(pool, None)?;
+        Arc::get_mut(&mut auth.core)
+            .ok_or("owned_web_transport_shared")?
+            .transport_origins = Some([origin.clone(), origin]);
+        Ok(auth)
+    }
     pub fn new(pool: SqlitePool, proxy: Option<&str>) -> Result<Self, String> {
         Ok(Self {
             core: Arc::new(Core {
                 pool,
                 http: parking_lot::RwLock::new(Ok(http::client(proxy)?)),
                 gate: Mutex::new(()),
-                origin: Url::parse(contract::ISSUER).map_err(|_| "Trae认证主机无效")?,
+                model_epoch: std::sync::atomic::AtomicU64::new(0),
+                model_proxy: parking_lot::Mutex::new(Ok(crate::outbound::validate_proxy(proxy)?)),
+                #[cfg(test)]
+                transport_origins: None,
+                #[cfg(test)]
+                catalog_test_origin: None,
+                activities: parking_lot::Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 preparation_pause: parking_lot::Mutex::new(None),
             }),
@@ -182,7 +227,17 @@ impl TraeAuth {
         })
     }
     pub fn set_proxy(&self, proxy: Option<&str>) {
-        *self.core.http.write() = http::client(proxy);
+        let normalized = crate::outbound::validate_proxy(proxy).map_err(|_| ());
+        let mut previous = self.core.model_proxy.lock();
+        if normalized.is_ok() && *previous == normalized {
+            return;
+        }
+        let mut current = self.core.http.write();
+        *current = http::client(proxy);
+        self.core
+            .model_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *previous = normalized;
     }
     /// The caller obtains this context from this application's encrypted benefits
     /// store, never from an IPC-provided arbitrary device object or a client file.
@@ -192,6 +247,22 @@ impl TraeAuth {
         session: &SessionCredential,
         consent_to_register_key: bool,
     ) -> Result<LoginStart, String> {
+        self.start_with_session_resolver(account, consent_to_register_key, async {
+            Ok(session.clone())
+        })
+        .await
+    }
+    /// Include this application's encrypted context lookup in the original
+    /// activity. Constructing the resolver future must not perform that lookup.
+    pub(crate) async fn start_with_session_resolver<F>(
+        &self,
+        account: &str,
+        consent_to_register_key: bool,
+        resolver: F,
+    ) -> Result<LoginStart, String>
+    where
+        F: std::future::Future<Output = Result<SessionCredential, String>>,
+    {
         if !id_valid(account) {
             return Err("Trae本机账号名称无效".into());
         }
@@ -200,6 +271,18 @@ impl TraeAuth {
                 "Trae首次独立登录需要明确同意设备公钥登记；可能影响原设备绑定，尚未发起登录".into(),
             );
         }
+        let activity = self
+            .core
+            .begin_activity(account, recovery::ActivityKind::Login)?;
+        // Epoch and activity cover the real IPC's first async context read, not
+        // only the signer that runs after context resolution.
+        let cancel_epoch = {
+            let _guard = self.core.gate.lock().await;
+            activity.check()?;
+            self.core.read(&key("refresh-cancel", account)).await?
+        };
+        let session = resolver.await?;
+        activity.check()?;
         session.validate(crate::benefits::ClaimPlatform::TraeCn)?;
         if !session.has_trae_device_context() || session.request_source != Some(1) {
             return Err("Trae独立登录需要已保存的真实普通IDE设备上下文；未启动客户端".into());
@@ -226,14 +309,22 @@ impl TraeAuth {
                 .cloned()
                 .unwrap_or_default(),
         };
-        self.start_device(account, device, session.snapshot.identity_hash.clone())
-            .await
+        self.start_device(
+            account,
+            device,
+            session.snapshot.identity_hash.clone(),
+            &activity,
+            cancel_epoch,
+        )
+        .await
     }
     async fn start_device(
         &self,
         account: &str,
         device: Device,
         expected_identity_hash: Option<String>,
+        activity: &recovery::Activity<'_>,
+        cancel_epoch: Option<String>,
     ) -> Result<LoginStart, String> {
         device.validate()?;
         if expected_identity_hash
@@ -243,10 +334,19 @@ impl TraeAuth {
             return Err("所选Trae账号的身份指纹无效，请在权益中心重新核验".into());
         }
         let expected_identity_hash = expected_identity_hash.map(|value| value.to_ascii_lowercase());
+        #[cfg(test)]
+        {
+            let pause = self.core.preparation_pause.lock().clone();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
         let material: Material = serde_json::from_value(
             crate::qoder_auth::invoke_trae(&json!({"operation":"login_material"})).await?,
         )
         .map_err(|_| "Trae私有签名组件格式无效")?;
+        activity.check()?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|_| "Trae本机授权回调无法启动")?;
@@ -257,6 +357,7 @@ impl TraeAuth {
         let id = uuid::Uuid::new_v4().to_string();
         let deadline = now() + WAIT_MS;
         let _guard = self.core.gate.lock().await;
+        activity.check()?;
         let mut tx = self
             .core
             .pool
@@ -268,6 +369,15 @@ impl TraeAuth {
             .execute(&mut *tx)
             .await
             .map_err(|_| "无法核验Trae登录账号")?;
+        let current_epoch: Option<String> =
+            sqlx::query_scalar("SELECT value_enc FROM app_secrets WHERE name=?")
+                .bind(key("refresh-cancel", account))
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| "无法核验Trae登录取消标记")?;
+        if current_epoch != cancel_epoch {
+            return Err("Trae登录在本地准备时已取消，未创建等待".into());
+        }
         let baseline: Option<String> =
             sqlx::query_scalar("SELECT value_enc FROM app_secrets WHERE name=?")
                 .bind(key("session", account))
@@ -342,7 +452,7 @@ impl TraeAuth {
             shutdown: shutdown.clone(),
         };
         let router = axum::Router::new()
-            .route("/authorize/:nonce", axum::routing::get(callback))
+            .route("/authorize", axum::routing::get(callback))
             .with_state(ctx);
         let registry = Arc::downgrade(&self.listeners);
         let done_id = id.clone();
@@ -387,7 +497,7 @@ impl TraeAuth {
             ("login_trace_id", &id),
             (
                 "auth_callback_url",
-                &format!("http://127.0.0.1:{port}/authorize/{id}"),
+                &format!("http://127.0.0.1:{port}/authorize"),
             ),
             ("device_id", &device.device_id),
             ("x_device_id", &device.device_id),
@@ -406,6 +516,9 @@ impl TraeAuth {
         self.core.status(account).await
     }
     pub async fn poll(&self, account: &str, login_id: &str) -> Result<LoginStatus, String> {
+        if !id_valid(account) || !id_valid(login_id) {
+            return Err("Trae本机账号或登录等待名称无效".into());
+        }
         let raw = self
             .core
             .read(&key("pending", login_id))
@@ -421,7 +534,14 @@ impl TraeAuth {
         }
         let mut status = self.status(account).await?;
         match pending.state.as_str() {
-            "waiting" | "exchanging" => status.status = "awaiting_authorization".into(),
+            "waiting" | "exchanging" => {
+                status.status = if self.listener_live(login_id) {
+                    "awaiting_authorization"
+                } else {
+                    "authorization_interrupted"
+                }
+                .into();
+            }
             "failed_no_retry" => status.status = "authorization_failed_no_retry".into(),
             "cancelled" => status.status = "cancelled".into(),
             "expired" => status.status = "expired".into(),
@@ -439,6 +559,9 @@ impl TraeAuth {
         login_id: &str,
         reason: &str,
     ) -> Result<String, String> {
+        if !id_valid(account) || !id_valid(login_id) {
+            return Err("Trae本机账号或登录等待名称无效".into());
+        }
         let _guard = self.core.gate.lock().await;
         let name = key("pending", login_id);
         let mut tx = self
@@ -505,7 +628,10 @@ impl TraeAuth {
         tx.commit().await.map_err(|_| "无法保存Trae刷新取消".into())
     }
     pub async fn refresh(&self, account: &str) -> Result<LoginStatus, String> {
-        self.core.refresh(account).await
+        let activity = self
+            .core
+            .begin_activity(account, recovery::ActivityKind::Refresh)?;
+        self.core.refresh(account, &activity).await
     }
 }
 #[derive(Clone)]
@@ -517,13 +643,14 @@ struct Callback {
 }
 async fn callback(
     axum::extract::State(ctx): axum::extract::State<Callback>,
-    axum::extract::Path(nonce): axum::extract::Path<String>,
     headers: axum::http::HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> impl axum::response::IntoResponse {
-    let valid = nonce == ctx.id
-        && headers.get("host").and_then(|v| v.to_str().ok())
-            == Some(format!("127.0.0.1:{}", ctx.port).as_str());
+    // The official CN page accepts only /authorize. Its query loginTraceID is
+    // still bound to this listener's random context by callback_code before the
+    // single-use reservation; moving the nonce out of the path removes no check.
+    let valid = headers.get("host").and_then(|v| v.to_str().ok())
+        == Some(format!("127.0.0.1:{}", ctx.port).as_str());
     let result = if valid {
         match ctx.core.upgrade() {
             Some(core) => core.complete(&ctx.id, query.as_deref().unwrap_or("")).await,
@@ -570,6 +697,21 @@ async fn callback(
 }
 
 impl Core {
+    fn transport_origin(&self, origin: CnOrigin) -> Result<Url, String> {
+        #[cfg(test)]
+        if let Some(origins) = &self.transport_origins {
+            let url = origins[match origin {
+                CnOrigin::TraeCn => 0,
+                CnOrigin::TraeComCn => 1,
+            }]
+            .clone();
+            if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") {
+                return Err("Trae测试传输只能使用独立回环服务".into());
+            }
+            return Ok(url);
+        }
+        Url::parse(origin.issuer()).map_err(|_| "Trae认证主机无效".into())
+    }
     async fn read(&self, name: &str) -> Result<Option<String>, String> {
         repo::get_secret(&self.pool, name)
             .await
@@ -726,13 +868,15 @@ impl Core {
         &self,
         pending: &Pending,
         expected: &str,
-        code: &str,
+        callback: &CallbackCode,
     ) -> Result<(), String> {
+        let origin = self.transport_origin(callback.origin)?;
+        let code = callback.code.as_str();
         self.pending_current(pending, expected).await?;
         let http = self.http.read().clone()?;
         let packet = http::post(
             &http,
-            &self.origin,
+            &origin,
             contract::EXCHANGE,
             "",
             &contract::auth_code_body(code, &pending.material, &pending.device)?,
@@ -750,7 +894,7 @@ impl Core {
             code,
         ];
         secrets.extend(pair.refresh.as_deref());
-        let identity = http::principal(&http, &self.origin, &pair, &secrets).await?;
+        let identity = http::principal(&http, &origin, &pair, &secrets).await?;
         self.pending_current(pending, expected).await?;
         if pending
             .expected_identity_hash
@@ -768,7 +912,7 @@ impl Core {
             }
         }
         let credential = Credential {
-            issuer: contract::ISSUER.into(),
+            issuer: callback.origin.issuer().into(),
             client_id: contract::CLIENT_ID.into(),
             uid: identity.uid,
             pair,
@@ -855,19 +999,28 @@ impl Core {
         }
         Ok(())
     }
-    async fn refresh(&self, account: &str) -> Result<LoginStatus, String> {
+    async fn refresh(
+        &self,
+        account: &str,
+        activity: &recovery::Activity<'_>,
+    ) -> Result<LoginStatus, String> {
         if !id_valid(account) {
             return Err("Trae本机账号名称无效".into());
         }
         // Prepare locally before the durable reservation. No HTTP is possible in
         // this phase, so a broken proxy or signer must not consume a refresh token.
-        let cancel_epoch = self.read(&key("refresh-cancel", account)).await?;
+        let cancel_epoch = {
+            let _guard = self.gate.lock().await;
+            activity.check()?;
+            self.read(&key("refresh-cancel", account)).await?
+        };
         let old = self
             .read(&key("session", account))
             .await?
             .ok_or("请先完成Trae独立网页登录")?;
         let credential: Credential = decode(&old)?;
         credential.validate()?;
+        let origin = self.transport_origin(CnOrigin::from_issuer(&credential.issuer)?)?;
         if credential.pair.refresh.is_none()
             || credential
                 .pair
@@ -888,8 +1041,10 @@ impl Core {
         }
         let proof=crate::qoder_auth::invoke_trae(&json!({"operation":"refresh_proof","input":{"client_id":contract::CLIENT_ID,"refresh_token":credential.pair.refresh,"private_key":credential.private_key}})).await?;
         let body = json!({"ClientID":contract::CLIENT_ID,"ClientSecret":"","RefreshToken":credential.pair.refresh,"DeviceInfo":device,"DeviceProof":proof,"IDEVersion":contract::VERSION});
+        activity.check()?;
         let attempt = {
             let _guard = self.gate.lock().await;
+            activity.check()?;
             let mut tx = self.pool.begin().await.map_err(|_| "无法预约Trae刷新")?;
             sqlx::query("UPDATE app_secrets SET updated_at=updated_at WHERE name=?")
                 .bind(key("session", account))
@@ -963,14 +1118,16 @@ impl Core {
             reservation
         };
         self.refresh_current(account, &old, &attempt).await?;
+        activity.check()?;
         let packet = http::post(
             &http,
-            &self.origin,
+            &origin,
             contract::EXCHANGE,
             &credential.pair.access,
             &body,
         )
         .await?;
+        activity.check()?;
         self.refresh_current(account, &old, &attempt).await?;
         let pair = contract::parse_pair(&packet, Some(&credential.pair), now())?;
         if pair.access_expires_at_ms.is_some_and(|v| v <= now()) {
@@ -983,7 +1140,7 @@ impl Core {
         ];
         secrets.extend(pair.refresh.as_deref());
         secrets.extend(credential.pair.refresh.as_deref());
-        let identity = http::principal(&http, &self.origin, &pair, &secrets).await?;
+        let identity = http::principal(&http, &origin, &pair, &secrets).await?;
         if identity.uid != credential.uid {
             return Err("Trae刷新主体改变，原资料保留".into());
         }
@@ -994,6 +1151,7 @@ impl Core {
             ..credential
         };
         let _guard = self.gate.lock().await;
+        activity.check()?;
         let mut tx = self
             .pool
             .begin()
@@ -1039,7 +1197,11 @@ impl Core {
     }
 }
 
-fn callback_code(id: &str, query: &str) -> Result<String, String> {
+struct CallbackCode {
+    code: String,
+    origin: CnOrigin,
+}
+fn callback_code(id: &str, query: &str) -> Result<CallbackCode, String> {
     if query.len() > 32768 {
         return Err("Trae回调超过上限".into());
     }
@@ -1070,18 +1232,27 @@ fn callback_code(id: &str, query: &str) -> Result<String, String> {
             return Err("Trae回调参数重复".into());
         }
     }
-    if params.get("loginTraceID").map(String::as_str) != Some(id)
-        || params.get("scope").is_some_and(|v| v != "marscode")
-        || params.get("host").is_some_and(|v| v != contract::ISSUER)
-    {
+    if params.get("loginTraceID").map(String::as_str) != Some(id) {
         return Err("Trae回调区域、来源或绑定不一致".into());
     }
+    // Compare decoded strings exactly, before URL parsing could normalize ports,
+    // trailing slashes or userinfo. Only current scope has evidence for both hosts.
+    let origin = match (
+        params.get("scope").map(String::as_str),
+        params.get("host").map(String::as_str),
+    ) {
+        (Some("trae"), Some(host)) => CnOrigin::from_issuer(host)?,
+        (None | Some("marscode"), None | Some(contract::ISSUER)) => CnOrigin::TraeCn,
+        _ => return Err("Trae回调区域、来源或绑定不一致".into()),
+    };
     let code: Value =
         serde_json::from_str(params.get("authCodeInfo").ok_or("Trae回调缺少PKCE授权码")?)
             .map_err(|_| "Trae回调授权码格式无效")?;
-    code.get("AuthCode")
+    let code = code
+        .get("AuthCode")
         .and_then(Value::as_str)
         .filter(|v| contract::valid_token(v))
         .map(str::to_owned)
-        .ok_or_else(|| "Trae回调授权码无效".into())
+        .ok_or_else(|| "Trae回调授权码无效".to_string())?;
+    Ok(CallbackCode { code, origin })
 }

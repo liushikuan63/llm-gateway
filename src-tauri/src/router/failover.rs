@@ -39,7 +39,7 @@ pub struct AttemptRecord {
     pub model: String,
     /// 上游 HTTP 状态码；网络层失败时为 `None`。
     pub status: Option<u16>,
-    /// 失败归类（如 `rate_limited`）；成功时为 `None`。
+    /// 有界的可读失败诊断，可包含错误详情；成功时为 `None`。
     pub reason: Option<String>,
     pub latency_ms: u64,
     pub ok: bool,
@@ -66,11 +66,38 @@ pub struct AttemptRecord {
     /// 而只有适配器自己知道（可能 L1 起不来、回落到了 L3）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
+    /// Actual HTTP observation, absent for legacy/unobserved or ambiguous attempts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<crate::proxy::timing::SharedTiming>,
+    /// Fixed control tags from this same unambiguous actual HTTP invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire_modes: Option<crate::proxy::control_modes::WireModeSnapshot>,
+    /// Same actual Ollama HTTP invocation; no generation inference from latency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<crate::proxy::generation::SharedGeneration>,
+    /// Same immutable final HTTP input projection, never a model revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_context: Option<crate::proxy::observation_context::Snapshot>,
+    /// Memory-only captured identity; only the original audit projects scoped digests.
+    #[serde(skip)]
+    pub(crate) subject: Option<crate::proxy::subject_receipt::CapturedSubject>,
 }
 
 const MAX_ATTEMPT_ERROR_CHARS: usize = 300;
 
 impl AttemptRecord {
+    fn with_observations(
+        mut self,
+        timing: Option<crate::proxy::timing::SharedTiming>,
+        subject: Option<crate::proxy::subject_receipt::CapturedSubject>,
+    ) -> Self {
+        self.subject = subject;
+        self.wire_modes = timing.as_ref().and_then(|t| t.wire_modes());
+        self.generation = timing.as_ref().and_then(|t| t.generation());
+        self.observation_context = timing.as_ref().and_then(|t| t.observation_context());
+        self.timing = timing;
+        self
+    }
     pub fn failure(
         provider: &Provider,
         model: &str,
@@ -89,6 +116,11 @@ impl AttemptRecord {
             // 失败的一跳拿不到 transport —— 适配器没走完就报错了。
             // `None` 是**如实的空**，不是「不知道」：这一跳确实没有任何传输发生过。
             transport: None,
+            timing: None,
+            wire_modes: None,
+            generation: None,
+            observation_context: None,
+            subject: None,
             // 账号型上游的一跳：记下它的运行时种类。
             // 从 `provider.runtime_id` 取 —— 那正是分派点用来选路的同一个值，
             // 不另存一份状态（两份状态迟早不一致）。
@@ -117,6 +149,11 @@ impl AttemptRecord {
             runtime_kind: provider.runtime_id.clone(),
             // 由调用方在链返回后回填（见 `success` 的注释）。
             transport: None,
+            timing: None,
+            wire_modes: None,
+            generation: None,
+            observation_context: None,
+            subject: None,
         }
     }
 
@@ -180,6 +217,7 @@ pub struct FailoverChain<'a> {
     auth_confirm_retries: u32,
     admission: Option<Arc<crate::router::Router>>,
     auth_isolation: Option<Arc<parking_lot::Mutex<AuthIsolation>>>,
+    cancellation_records: Option<Arc<parking_lot::Mutex<Vec<AttemptRecord>>>>,
 }
 
 /// 轻量标志位：流式写出前向代理层汇报
@@ -217,6 +255,7 @@ impl<'a> FailoverChain<'a> {
             auth_confirm_retries: 0,
             admission: None,
             auth_isolation: None,
+            cancellation_records: None,
         }
     }
 
@@ -239,6 +278,87 @@ impl<'a> FailoverChain<'a> {
     ) -> Self {
         self.auth_isolation = Some(isolation);
         self
+    }
+
+    /// Audit-only copy of invocations; it never participates in retry policy.
+    pub(crate) fn with_cancellation_records(
+        mut self,
+        records: Arc<parking_lot::Mutex<Vec<AttemptRecord>>>,
+    ) -> Self {
+        self.cancellation_records = Some(records);
+        self
+    }
+    fn record_attempt(&self, records: &mut Vec<AttemptRecord>, record: AttemptRecord) {
+        if let Some(journal) = &self.cancellation_records {
+            journal.lock().push(record.clone());
+        }
+        records.push(record);
+    }
+    async fn observed_send<T, F, Fut>(
+        &self,
+        candidate: &Candidate,
+        started: Instant,
+        confirm: bool,
+        make: F,
+    ) -> (
+        Result<T>,
+        Option<crate::proxy::timing::SharedTiming>,
+        Option<crate::proxy::subject_receipt::CapturedSubject>,
+    )
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // Keep exact alias configuration separate from the full provider catalog:
+        // cost admission must still see duplicate physical mappings and fail closed.
+        let make = || {
+            crate::proxy::dispatch_target::scope(
+                candidate.provider.id.clone(),
+                candidate.model.clone(),
+                make,
+            )
+        };
+        let subject = crate::proxy::subject_receipt::Observation::new(
+            candidate.provider.id.clone(),
+            candidate.model.upstream.clone(),
+        );
+        let cancelled_subject = subject.clone();
+        let (result, timing) = subject
+            .scope(async {
+                match &self.cancellation_records {
+                    None => crate::proxy::timing::observation::observe_attempt(make).await,
+                    Some(journal) => {
+                        let journal = journal.clone();
+                        let mut record = AttemptRecord::success(
+                            &candidate.provider,
+                            &candidate.model.upstream,
+                            0,
+                        );
+                        crate::proxy::timing::observation::observe_attempt_with_cancel(
+                            make,
+                            move |timing| {
+                                record.ok = false;
+                                record.reason = Some(
+                                    if confirm {
+                                        "确认复测：client_cancelled"
+                                    } else {
+                                        "client_cancelled"
+                                    }
+                                    .into(),
+                                );
+                                record.latency_ms =
+                                    started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                                record =
+                                    record.with_observations(timing, cancelled_subject.captured());
+                                journal.lock().push(record);
+                            },
+                        )
+                        .await
+                    }
+                }
+            })
+            .await;
+        (result, timing, subject.captured())
     }
 
     fn admitted(&self, candidate: &Candidate) -> bool {
@@ -326,15 +446,20 @@ impl<'a> FailoverChain<'a> {
             attempts += 1;
             let started = Instant::now();
 
-            match f(c.provider.clone(), c.model.upstream.clone()).await {
+            let (result, timing, subject) = self
+                .observed_send(c, started, false, || {
+                    f(c.provider.clone(), c.model.upstream.clone())
+                })
+                .await;
+            match result {
                 Ok(v) => {
                     let latency_ms = started.elapsed().as_millis() as u64;
                     let _ = &v; // 响应类型是泛型，这里读不到它的字段
-                    records.push(AttemptRecord::success(
-                        &c.provider,
-                        &c.model.upstream,
-                        latency_ms,
-                    ));
+                    self.record_attempt(
+                        records,
+                        AttemptRecord::success(&c.provider, &c.model.upstream, latency_ms)
+                            .with_observations(timing, subject),
+                    );
                     return Ok(AttemptOutcome {
                         value: v,
                         provider_id: c.provider.id.clone(),
@@ -344,6 +469,11 @@ impl<'a> FailoverChain<'a> {
                     });
                 }
                 Err(e) => {
+                    if matches!(e, GatewayError::FreePolicyRejected { .. }) {
+                        attempts = attempts.saturating_sub(1);
+                        last_err = Some(e);
+                        continue;
+                    }
                     tracing::warn!(
                         "尝试 {}/{} 失败 [{} / {}]: {}",
                         attempts,
@@ -352,12 +482,16 @@ impl<'a> FailoverChain<'a> {
                         c.model.upstream,
                         e
                     );
-                    records.push(AttemptRecord::failure(
-                        &c.provider,
-                        &c.model.upstream,
-                        &e,
-                        started.elapsed().as_millis() as u64,
-                    ));
+                    self.record_attempt(
+                        records,
+                        AttemptRecord::failure(
+                            &c.provider,
+                            &c.model.upstream,
+                            &e,
+                            started.elapsed().as_millis() as u64,
+                        )
+                        .with_observations(timing, subject),
+                    );
                     on_failure(&c.provider, &c.model.upstream, &e);
 
                     // 已经吐出字节的流式请求，不能再换家
@@ -445,23 +579,40 @@ impl<'a> FailoverChain<'a> {
             }
             *attempts += 1;
             let started = Instant::now();
-            match f(c.provider.clone(), c.model.upstream.clone()).await {
+            let (result, timing, subject) = self
+                .observed_send(c, started, true, || {
+                    f(c.provider.clone(), c.model.upstream.clone())
+                })
+                .await;
+            match result {
                 Ok(v) => {
-                    records.push(AttemptRecord::confirm_success(
-                        &c.provider,
-                        &c.model.upstream,
-                        started.elapsed().as_millis() as u64,
-                    ));
+                    self.record_attempt(
+                        records,
+                        AttemptRecord::confirm_success(
+                            &c.provider,
+                            &c.model.upstream,
+                            started.elapsed().as_millis() as u64,
+                        )
+                        .with_observations(timing, subject),
+                    );
                     return ConfirmOutcome::Recovered(v);
                 }
                 Err(e) => {
+                    if matches!(e, GatewayError::FreePolicyRejected { .. }) {
+                        *attempts = attempts.saturating_sub(1);
+                        return ConfirmOutcome::Undecidable(Some(e));
+                    }
                     let fatal = is_fatal_auth(&e);
-                    records.push(AttemptRecord::confirm_failure(
-                        &c.provider,
-                        &c.model.upstream,
-                        &e,
-                        started.elapsed().as_millis() as u64,
-                    ));
+                    self.record_attempt(
+                        records,
+                        AttemptRecord::confirm_failure(
+                            &c.provider,
+                            &c.model.upstream,
+                            &e,
+                            started.elapsed().as_millis() as u64,
+                        )
+                        .with_observations(timing, subject),
+                    );
                     on_failure(&c.provider, &c.model.upstream, &e);
                     if !fatal {
                         return ConfirmOutcome::Undecidable(Some(e));
@@ -485,6 +636,7 @@ enum ConfirmOutcome<T> {
 /// 把一次失败归类成人类可读的原因，写进请求日志的 error 字段
 pub fn classify(err: &GatewayError) -> &'static str {
     match err {
+        GatewayError::FreePolicyRejected { .. } => "free_policy_rejected",
         GatewayError::NoReplay { source } => classify(source),
         GatewayError::Upstream { status, .. } => match *status {
             401 | 403 => "auth_failed",

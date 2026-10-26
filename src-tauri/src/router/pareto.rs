@@ -122,6 +122,8 @@ pub struct ParetoPointView {
     pub quality: Option<f32>,
     /// 速度：实测 tok/s。`None` = 样本不足（不是「最慢」）。
     pub speed: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_reference: Option<crate::domain::TpsReference>,
     /// 单价（每百万 token，与定价模块同源）。`None` = 没有价格或币种不可比。
     pub unit_price: Option<f32>,
     pub currency: Option<String>,

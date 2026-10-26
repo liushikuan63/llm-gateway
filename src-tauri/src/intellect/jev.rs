@@ -24,6 +24,10 @@ use crate::config::validate_http_url;
 /// 重试**：凭据问题重试没意义，服务未启动则值得先拉起来再试一次。
 #[derive(Debug, thiserror::Error)]
 pub enum JevError {
+    #[error("本机参考预算缺少决策请求的计价上界合同")]
+    BudgetContractUnavailable,
+    #[error("严格免费政策禁止未确证费用的决策请求")]
+    FreePolicyRejected,
     #[error("决策端点地址无效：{0}")]
     InvalidEndpoint(String),
     #[error("决策服务不可达：{0}")]
@@ -114,12 +118,17 @@ impl JevResult {
 
 #[derive(Clone)]
 pub struct JevClient {
+    observation: Option<crate::audit::auxiliary::Journal>,
     http: reqwest::Client,
     endpoint: String,
     model: String,
     max_state_chars: usize,
     /// 记下来是为了让超时报错能报出真实预算，而不是永远显示 0ms。
     timeout_ms: u64,
+    cost_policy: Option<(
+        std::sync::Arc<crate::cost_policy::CostGate>,
+        crate::cost_policy::RequestCostPolicy,
+    )>,
 }
 
 impl std::fmt::Debug for JevClient {
@@ -148,12 +157,25 @@ impl JevClient {
             .build()
             .map_err(|e| JevError::InvalidEndpoint(e.to_string()))?;
         Ok(Self {
+            observation: None,
             http,
             endpoint: format!("{trimmed}/v1/systemone"),
             model: model.trim().to_owned(),
             max_state_chars: max_state_chars.clamp(64, 16_000),
             timeout_ms,
+            cost_policy: None,
         })
+    }
+
+    /// Covers health(), classification and every item of a calibration batch.
+    /// A live global policy may strengthen a client constructed before an await.
+    pub(crate) fn with_cost_policy(
+        mut self,
+        gate: std::sync::Arc<crate::cost_policy::CostGate>,
+        policy: crate::cost_policy::RequestCostPolicy,
+    ) -> Self {
+        self.cost_policy = Some((gate, policy));
+        self
     }
 
     pub fn endpoint(&self) -> &str {
@@ -178,37 +200,69 @@ impl JevClient {
         self.decide(body).await.is_ok()
     }
 
+    pub(crate) fn with_observation(mut self, journal: crate::audit::auxiliary::Journal) -> Self {
+        self.observation = Some(journal);
+        self
+    }
+
     /// 发一次决策。`state` 与 `questions` 由调用方构造。
     pub async fn decide(&self, body: serde_json::Value) -> Result<JevResult, JevError> {
-        let response = self
-            .http
-            .post(&self.endpoint)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| self.classify_transport(&error))?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        if status.is_success() {
-            parse_result(&text)
-        } else if status.as_u16() == 404 || looks_like_model_missing(&text) {
-            Err(JevError::NotReady {
-                status: status.as_u16(),
-                body: truncate(&text, 200),
-            })
-        } else if status.as_u16() == 401 || status.as_u16() == 403 {
-            // 凭据问题单独一类：调用方能据此决定要不要重试，
-            // 而 5xx 之类的协议错误重试没意义。
-            Err(JevError::CredentialRejected {
-                status: status.as_u16(),
-                body: truncate(&text, 200),
-            })
-        } else {
-            Err(JevError::Rejected {
-                status: status.as_u16(),
-                body: truncate(&text, 200),
-            })
+        if crate::budget::holds::active() {
+            return Err(JevError::BudgetContractUnavailable);
         }
+        if self
+            .cost_policy
+            .as_ref()
+            .is_some_and(|(gate, policy)| gate.effective(*policy).is_free())
+        {
+            return Err(JevError::FreePolicyRejected);
+        }
+        let mut observed = self.observation.as_ref().and_then(|j| {
+            j.begin(
+                crate::audit::auxiliary::Purpose::Classify,
+                None,
+                &self.model,
+            )
+        });
+        let result = async {
+            let response = self
+                .http
+                .post(&self.endpoint)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| self.classify_transport(&error))?;
+            let status = response.status();
+            if let Some(call) = observed.as_mut() {
+                call.headers(status.as_u16());
+            }
+            let text = response.text().await.unwrap_or_default();
+            if status.is_success() {
+                parse_result(&text)
+            } else if status.as_u16() == 404 || looks_like_model_missing(&text) {
+                Err(JevError::NotReady {
+                    status: status.as_u16(),
+                    body: truncate(&text, 200),
+                })
+            } else if status.as_u16() == 401 || status.as_u16() == 403 {
+                // 凭据问题单独一类：调用方能据此决定要不要重试，
+                // 而 5xx 之类的协议错误重试没意义。
+                Err(JevError::CredentialRejected {
+                    status: status.as_u16(),
+                    body: truncate(&text, 200),
+                })
+            } else {
+                Err(JevError::Rejected {
+                    status: status.as_u16(),
+                    body: truncate(&text, 200),
+                })
+            }
+        }
+        .await;
+        if let Some(call) = observed.as_mut() {
+            call.returned(Some(result.is_ok()), None);
+        }
+        result
     }
 
     fn classify_transport(&self, error: &reqwest::Error) -> JevError {

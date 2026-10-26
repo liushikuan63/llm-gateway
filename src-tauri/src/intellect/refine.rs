@@ -193,7 +193,24 @@ pub async fn refine(
     original: &str,
     cfg: &PromptRefineConfig,
 ) -> RefineOutcome {
+    refine_observed(http, target, api_key, original, cfg, None).await
+}
+pub(crate) async fn refine_observed(
+    http: &reqwest::Client,
+    target: &RefineTarget,
+    api_key: Option<String>,
+    original: &str,
+    cfg: &PromptRefineConfig,
+    journal: Option<crate::audit::auxiliary::Journal>,
+) -> RefineOutcome {
     let original = original.trim().to_owned();
+    if crate::budget::holds::active() {
+        return RefineOutcome::unchanged(
+            original,
+            "budget_refine_reference_contract_unverified",
+            None,
+        );
+    }
     if original.is_empty() {
         return RefineOutcome::unchanged(original, "原提示词为空", None);
     }
@@ -263,100 +280,204 @@ pub async fn refine(
     // outer send guard alone stops timing as soon as response headers arrive.
     let timeout = Duration::from_millis(cfg.timeout_ms.clamp(200, 30_000));
 
-    let result = tokio::time::timeout(timeout, request.timeout(timeout).send()).await;
-    let response = match result {
-        Err(_) => {
-            return RefineOutcome::unchanged(
-                original,
-                format!("改写超时（{}ms）", timeout.as_millis()),
-                Some(target.model.clone()),
-            )
-        }
-        Ok(Err(error)) => {
-            return RefineOutcome::unchanged(
-                original,
-                if error.is_timeout() {
-                    format!("改写超时（{}ms）", timeout.as_millis())
-                } else {
-                    format!("改写请求失败：{error}")
-                },
-                Some(target.model.clone()),
-            )
-        }
-        Ok(Ok(response)) => response,
-    };
-    let status = response.status();
-    if !status.is_success() {
-        return RefineOutcome::unchanged(
-            original,
-            format!("改写端点返回 HTTP {}", status.as_u16()),
-            Some(target.model.clone()),
-        );
-    }
-    let body: serde_json::Value = match response.json().await {
-        Ok(body) => body,
-        Err(error) => {
-            return RefineOutcome::unchanged(
-                original,
-                if error.is_timeout() {
-                    format!("改写超时（{}ms）", timeout.as_millis())
-                } else {
-                    format!("改写响应不是合法 JSON：{error}")
-                },
-                Some(target.model.clone()),
-            )
-        }
-    };
-    let mut node = &body;
-    // 按引用遍历：报错文案里还要用 `text_path` 拼出缺失的字段路径。
-    // 注意不能用 `json["0"]` 取数组元素——字符串下标对数组无效，
-    // 会静默返回 null，然后报「缺少字段」而不是「数组越界」。
-    for step in text_path {
-        let next = match step {
-            PathStep::Key(name) => node.get(name),
-            PathStep::Index(i) => node.get(*i),
-        };
-        match next {
-            Some(value) => node = value,
-            None => {
+    let mut observed = journal.as_ref().and_then(|j| {
+        j.begin(
+            crate::audit::auxiliary::Purpose::Refine,
+            Some(&target.provider_id),
+            &target.model,
+        )
+    });
+    let outcome = async {
+        let result = tokio::time::timeout(timeout, request.timeout(timeout).send()).await;
+        let response = match result {
+            Err(_) => {
                 return RefineOutcome::unchanged(
                     original,
-                    format!("改写响应缺少字段 {}", describe_path(text_path)),
+                    format!("改写超时（{}ms）", timeout.as_millis()),
                     Some(target.model.clone()),
                 )
             }
+            Ok(Err(error)) => {
+                return RefineOutcome::unchanged(
+                    original,
+                    if error.is_timeout() {
+                        format!("改写超时（{}ms）", timeout.as_millis())
+                    } else {
+                        format!("改写请求失败：{error}")
+                    },
+                    Some(target.model.clone()),
+                )
+            }
+            Ok(Ok(response)) => response,
+        };
+        let status = response.status();
+        if let Some(call) = observed.as_mut() {
+            call.headers(status.as_u16());
         }
-    }
-    let Some(raw) = node.as_str() else {
-        return RefineOutcome::unchanged(
-            original,
-            "改写响应里的文本不是字符串",
-            Some(target.model.clone()),
-        );
-    };
-    let mut outcome = match accept(raw, &original, cfg) {
-        Ok(prompt) => {
-            let final_chars = prompt.chars().count();
-            RefineOutcome {
-                prompt,
-                applied: true,
-                reason: None,
-                original_chars: original.chars().count(),
-                final_chars,
-                model: Some(target.model.clone()),
-                usage: None,
+        if !status.is_success() {
+            return RefineOutcome::unchanged(
+                original,
+                format!("改写端点返回 HTTP {}", status.as_u16()),
+                Some(target.model.clone()),
+            );
+        }
+        let body: serde_json::Value = match response.json().await {
+            Ok(body) => body,
+            Err(error) => {
+                return RefineOutcome::unchanged(
+                    original,
+                    if error.is_timeout() {
+                        format!("改写超时（{}ms）", timeout.as_millis())
+                    } else {
+                        format!("改写响应不是合法 JSON：{error}")
+                    },
+                    Some(target.model.clone()),
+                )
+            }
+        };
+        if let Some(call) = observed.as_mut() {
+            call.usage(
+                body.get("usage")
+                    .and_then(|u| complete_usage(u, target.dialect))
+                    .as_ref(),
+            );
+        }
+        let mut node = &body;
+        // 按引用遍历：报错文案里还要用 `text_path` 拼出缺失的字段路径。
+        // 注意不能用 `json["0"]` 取数组元素——字符串下标对数组无效，
+        // 会静默返回 null，然后报「缺少字段」而不是「数组越界」。
+        for step in text_path {
+            let next = match step {
+                PathStep::Key(name) => node.get(name),
+                PathStep::Index(i) => node.get(*i),
+            };
+            match next {
+                Some(value) => node = value,
+                None => {
+                    return RefineOutcome::unchanged(
+                        original,
+                        format!("改写响应缺少字段 {}", describe_path(text_path)),
+                        Some(target.model.clone()),
+                    )
+                }
             }
         }
-        Err(reason) => RefineOutcome::unchanged(original, reason, Some(target.model.clone())),
-    };
-    outcome.usage = body.get("usage").filter(|u| u.is_object()).map(|u| {
-        if target.dialect == crate::domain::Dialect::Anthropic {
-            crate::domain::Usage::from_anthropic(u)
-        } else {
-            crate::domain::Usage::from_openai(u)
-        }
-    });
+        let Some(raw) = node.as_str() else {
+            return RefineOutcome::unchanged(
+                original,
+                "改写响应里的文本不是字符串",
+                Some(target.model.clone()),
+            );
+        };
+        let mut outcome = match accept(raw, &original, cfg) {
+            Ok(prompt) => {
+                let final_chars = prompt.chars().count();
+                RefineOutcome {
+                    prompt,
+                    applied: true,
+                    reason: None,
+                    original_chars: original.chars().count(),
+                    final_chars,
+                    model: Some(target.model.clone()),
+                    usage: None,
+                }
+            }
+            Err(reason) => RefineOutcome::unchanged(original, reason, Some(target.model.clone())),
+        };
+        outcome.usage = body
+            .get("usage")
+            .and_then(|usage| complete_usage(usage, target.dialect));
+        outcome
+    }
+    .await;
+    if let Some(call) = observed.as_mut() {
+        call.returned(None, Some(outcome.applied));
+    }
     outcome
+}
+
+/// Internal observations must distinguish missing/invalid primary counts from
+/// explicit zero. Keep the ordinary wire converters unchanged; only refine's
+/// optional evidence is gated here. This is not a price or settlement receipt.
+fn complete_usage(
+    value: &serde_json::Value,
+    dialect: crate::domain::Dialect,
+) -> Option<crate::domain::Usage> {
+    fn count(value: &serde_json::Value) -> Option<u32> {
+        u32::try_from(value.as_u64()?).ok()
+    }
+    fn optional(value: Option<&serde_json::Value>) -> Option<u32> {
+        value.map_or(Some(0), count)
+    }
+    value.as_object()?;
+    let usage = if dialect == crate::domain::Dialect::Anthropic {
+        let input = count(value.get("input_tokens")?)?;
+        let output = count(value.get("output_tokens")?)?;
+        let read = optional(value.get("cache_read_input_tokens"))?;
+        let creation = optional(value.get("cache_creation_input_tokens"))?;
+        input
+            .checked_add(read)?
+            .checked_add(creation)?
+            .checked_add(output)?;
+        let usage = crate::domain::Usage::from_anthropic(value);
+        if let Some(reasoning) = value.get("reasoning_tokens") {
+            if count(reasoning)? > output {
+                return None;
+            }
+        }
+        usage
+    } else {
+        let input = count(value.get("prompt_tokens")?)?;
+        let output = count(value.get("completion_tokens")?)?;
+        let total = input.checked_add(output)?;
+        if let Some(reported) = value.get("total_tokens") {
+            if count(reported)? != total {
+                return None;
+            }
+        }
+        for name in [
+            "prompt_tokens_details",
+            "input_tokens_details",
+            "completion_tokens_details",
+        ] {
+            if let Some(details) = value.get(name) {
+                details.as_object()?;
+                for field in [
+                    "cached_tokens",
+                    "cache_write_tokens",
+                    "cache_creation_tokens",
+                    "reasoning_tokens",
+                ] {
+                    if let Some(part) = details.get(field) {
+                        count(part)?;
+                    }
+                }
+            }
+        }
+        for name in [
+            "cache_read_input_tokens",
+            "prompt_cache_hit_tokens",
+            "cache_creation_input_tokens",
+            "prompt_cache_write_tokens",
+        ] {
+            if let Some(part) = value.get(name) {
+                count(part)?;
+            }
+        }
+        let usage = crate::domain::Usage::from_openai(value);
+        if usage
+            .cache_read_tokens
+            .checked_add(usage.cache_creation_tokens)?
+            > input
+        {
+            return None;
+        }
+        if usage.reasoning_tokens.is_some_and(|n| n > output) {
+            return None;
+        }
+        usage
+    };
+    Some(usage)
 }
 
 fn trim(base_url: &str) -> &str {
@@ -386,6 +507,7 @@ pub fn endpoint_url(base_url: &str, dialect: crate::domain::Dialect) -> String {
 /// 取值路径的一段。刻意区分「字段名」与「数组下标」——
 /// `serde_json::Value` 的字符串下标对数组**不生效**，会静默返回 null。
 #[derive(Clone, Copy)]
+
 enum PathStep {
     Key(&'static str),
     Index(usize),
@@ -399,4 +521,56 @@ fn describe_path(path: &[PathStep]) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    #[tokio::test]
+    async fn observation_keeps_known_primary_counts_when_text_shape_is_rejected() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let app=axum::Router::new().route("/v1/chat/completions",axum::routing::post(move |axum::Json(body):axum::Json<serde_json::Value>|{let counted=counted.clone();async move {counted.fetch_add(1,Ordering::SeqCst);assert_eq!(body["model"],"actual-refiner");axum::Json(serde_json::json!({"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":3,"total_tokens":7}}))}}));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let target = RefineTarget {
+            provider_id: "owned".into(),
+            base_url: base,
+            api_key: None,
+            model: "actual-refiner".into(),
+            dialect: crate::domain::Dialect::OpenAI,
+        };
+        let journal = crate::audit::auxiliary::Journal::default();
+        let original = "请保留这个原始请求的所有要点";
+        let cfg = PromptRefineConfig {
+            min_chars: 1,
+            ..Default::default()
+        };
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let outcome =
+            refine_observed(&http, &target, None, original, &cfg, Some(journal.clone())).await;
+        assert!(!outcome.applied);
+        assert_eq!(outcome.prompt, original);
+        assert!(
+            outcome.usage.is_none(),
+            "existing rewrite outcome contract remains unchanged"
+        );
+        let (calls, _) = journal.snapshot();
+        let calls = serde_json::to_value(calls).unwrap();
+        assert_eq!(calls[0]["primary_usage"]["total_tokens"], 7);
+        assert_eq!(calls[0]["applied"], false);
+        assert_eq!(calls[0]["terminal"], "returned");
+        assert_eq!(calls[0]["wire_post_verified"], false);
+        assert!(!calls.to_string().contains(original));
+        assert!(!calls.to_string().contains("127.0.0.1"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
 }

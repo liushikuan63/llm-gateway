@@ -1,0 +1,25 @@
+.request-timing, .request-timing-unknown { flex-basis: 100%; min-width: 0; max-width: min(640px, calc(100vw - 80px)); margin: 4px 0; }
+.request-timing { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 9px 11px; }
+.request-timing summary { cursor: pointer; font-weight: 600; color: var(--text); }
+.request-timing summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.request-timing p { margin: 8px 0; line-height: 1.6; overflow-wrap: anywhere; }
+.request-timing dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 10px; margin: 10px 0 2px; }
+.request-timing dt { color: var(--muted); }
+.request-timing dd { margin: 3px 0 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; color: var(--text); }
+
+.timing-summary h3 { margin-top: 0; }
+.timing-summary p { line-height: 1.6; }
+.timing-coverage { display: flex; flex-wrap: wrap; gap: 8px 18px; font-weight: 600; }
+.timing-filters { display: flex; flex-wrap: wrap; gap: 10px; }
+.timing-filters label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.timing-filters select, .timing-filters input { max-width: min(220px, calc(100vw - 90px)); }
+.timing-table-scroll { overflow-x: auto; max-width: 100%; border: 1px solid var(--border); border-radius: 8px; }
+.timing-table-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.timing-stats-table { min-width: 1240px; width: 100%; }
+.timing-stats-table td:first-child { max-width: 190px; }
+.timing-stats-table small { display: block; color: var(--warn); }
+.timing-pagination { margin-top: 10px; flex-wrap: wrap; }
+
+.control-modes dt small { display: block; margin-top: 3px; overflow-wrap: anywhere; }
+.control-modes dd { font-size: 12px; line-height: 1.6; }
+.timing-mode-cell { min-width: 230px; max-width: 320px; }

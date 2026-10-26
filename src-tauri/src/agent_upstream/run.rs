@@ -174,10 +174,35 @@ pub async fn run_agent_request_with_runtime(
     model: &str,
     prompt: &str,
 ) -> Result<AgentRunOutcome, String> {
+    run_agent_request_with_runtime_checked(
+        pool,
+        config,
+        registry,
+        runtime_id,
+        model,
+        prompt,
+        || Ok(()),
+    )
+    .await
+}
+
+/// Production consumers can recheck an inherited policy after runtime lookup.
+/// The check runs before workspace creation or handing control to an adapter.
+pub(crate) async fn run_agent_request_with_runtime_checked(
+    pool: &sqlx::SqlitePool,
+    config: &crate::config::AgentConfig,
+    registry: &super::AdapterRegistry,
+    runtime_id: &str,
+    model: &str,
+    prompt: &str,
+    before_execute: impl Fn() -> Result<(), String>,
+) -> Result<AgentRunOutcome, String> {
     if !config.enabled {
         return Err("Agent 型入口未启用；请在配置里打开 agent.enabled".into());
     }
+    before_execute()?;
     let runtime = super::resolve_runtime(pool, registry, runtime_id).await?;
+    before_execute()?;
     let workspace = super::workspace::default_workspace_root(&config.resolve_base()?, &runtime.id)?;
     let timeout_ms = config.exec_timeout_secs.saturating_mul(1000).max(1);
     run_agent(
@@ -236,6 +261,72 @@ fn snapshot(workspace: &WorkspaceRoot) -> std::collections::BTreeMap<String, u12
 mod tests {
     use super::*;
     use crate::agent_upstream::FakeAdapter;
+
+    #[tokio::test]
+    async fn free_policy_activated_during_runtime_db_wait_prevents_workspace_or_adapter_execution()
+    {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let db = crate::db::Db::connect_in_memory().await.unwrap();
+        let registry = super::super::AdapterRegistry::with_builtins();
+        let runtime =
+            crate::domain::AgentRuntime::new("owned-free-policy", "fake", "Owned policy fixture");
+        crate::db::repo::upsert_agent_runtime(db.pool(), &runtime)
+            .await
+            .unwrap();
+        let base = std::env::temp_dir().join(format!("llmgw-free-agent-{}", uuid::Uuid::new_v4()));
+        let cfg = crate::config::AgentConfig {
+            enabled: true,
+            workspace_root: Some(base.clone()),
+            ..Default::default()
+        };
+        let free = Arc::new(AtomicBool::new(false));
+        let connection = db.pool().acquire().await.unwrap();
+        let check = || {
+            if free.load(Ordering::SeqCst) {
+                Err("owned_free_policy_rejected".into())
+            } else {
+                Ok(())
+            }
+        };
+        let mut run = Box::pin(run_agent_request_with_runtime_checked(
+            db.pool(),
+            &cfg,
+            &registry,
+            &runtime.id,
+            "owned-model",
+            "owned prompt",
+            check,
+        ));
+        assert!(matches!(
+            futures_util::poll!(run.as_mut()),
+            std::task::Poll::Pending
+        ));
+        free.store(true, Ordering::SeqCst);
+        drop(connection);
+        assert_eq!(run.await.unwrap_err(), "owned_free_policy_rejected");
+        assert!(
+            !base.exists(),
+            "a blocked send must not even create the workspace"
+        );
+        free.store(false, Ordering::SeqCst);
+        let reply = run_agent_request_with_runtime_checked(
+            db.pool(),
+            &cfg,
+            &registry,
+            &runtime.id,
+            "owned-model",
+            "owned prompt",
+            check,
+        )
+        .await
+        .unwrap();
+        assert!(reply.text.contains("owned prompt"));
+        assert!(base.join("runtimes/owned-free-policy/workspace").is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     fn workspace(name: &str) -> WorkspaceRoot {
         let p = std::env::temp_dir().join(format!("llmgw-run-agent-{name}"));

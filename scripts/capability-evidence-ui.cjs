@@ -1,0 +1,28 @@
+// Source browser with supplied metadata only; no real measurements or accounts.
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
+async function verifyCapabilityEvidence(browser,baseUrl,output,errors,fixture){
+ const context=await browser.newContext({viewport:{width:1440,height:1100},reducedMotion:'reduce'});await context.addInitScript(fixture);let page;const proof={scope:'source browser, synthetic source claims; not trusted measurement/installed acceptance',checks:[],screenshots:[],foreign_requests:0,passed:false};
+ await context.route('**/*',async route=>{if(new URL(route.request().url()).origin===new URL(baseUrl).origin)return route.fallback();proof.foreign_requests++;await route.abort();});
+ const shot=async(name,target)=>{const file=path.join(output,name);await target.screenshot({path:file});proof.screenshots.push({path:file,sha256:crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')});};
+ try{
+  page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));page.on('console',m=>{if(m.type()==='error')errors.push(m.text());});await page.goto(baseUrl);await page.locator('#boot-splash').waitFor({state:'hidden'});
+  await page.evaluate(()=>{
+   const p=window.__fixtureProviders[0],m=structuredClone(p.models[0]);m.alias='owned-source-evidence';m.upstream='physical-owned-evidence';m.capabilities={coding:0.9,source:'measured',updated_at:'2026-10-20T00:00:00Z'};p.models=[m];
+   window.__fixtureCapabilities={[p.id+'/'+m.alias]:{values:{coding:{manual:{value:0.75,source:'manual',observed_at:'2020-01-01T00:00:00Z',sample_count:0},measured:{value:0.9,source:'measured',sample_count:12}},math:{catalog:0.5},reasoning:{community:{value:0.6,source:'community',observed_at:'2099-01-01T00:00:00Z',sample_count:4294967295}},knowledge:{manual:{value:0.8,source:'manual',observed_at:'bad-time',sample_count:'12'}}}}};
+   window.__ownedEvidenceBefore=JSON.stringify([window.__fixtureProviders,window.__fixtureCapabilities]);const invoke=window.__TAURI_INTERNALS__.invoke;window.__ownedEvidenceCalls=[];window.__TAURI_INTERNALS__.invoke=(c,a)=>{window.__ownedEvidenceCalls.push(c);return invoke(c,a);};
+  });
+  await page.getByRole('navigation',{name:'主导航'}).getByRole('button',{name:'能力与取舍',exact:true}).click();await page.getByRole('textbox',{name:'搜索模型事实'}).fill('owned-source-evidence');
+  const row=page.getByTestId('capability-facts').getByRole('row').filter({has:page.getByText('owned-source-evidence',{exact:true})}),evidence=row.getByTestId('capability-source-evidence');await row.waitFor();
+  assert.equal(await evidence.count(),1,'per-source observation evidence must be reachable from actual model fact row');
+  const summary=evidence.locator('summary');await summary.focus();await page.keyboard.press('Enter');assert(await evidence.evaluate(e=>e.open));
+  const item=key=>evidence.locator(`[data-source-key="${key}"]`);
+  assert.match(await item('coding/manual').innerText(),/2020-01-01T00:00:00/);assert.match(await item('coding/manual').innerText(),/样本数：0/);assert.match(await item('coding/manual').innerText(),/未.*核验|来源声明/);assert.match(await row.getByRole('cell').nth(4).innerText(),/质量记录时间：2026-10-20/);proof.checks.push('old source observation and known zero count distinct from local record timestamp; source claim never authenticated');
+  assert.match(await item('coding/measured').innerText(),/观察时间.*未知|观察时间.*未提供/);assert.match(await item('coding/measured').innerText(),/样本数：12/);assert.match(await item('math/catalog').innerText(),/样本数.*未知|样本数.*未提供/);proof.checks.push('measured label does not manufacture observation time; legacy numeric keeps unknown count/time');
+  assert.match(await item('reasoning/community').innerText(),/2099-01-01/);assert.match(await item('reasoning/community').innerText(),/晚于|未来|时钟/);assert.match(await item('reasoning/community').innerText(),/4294967295/);assert.doesNotMatch(await evidence.innerText(),/已过期|有效期内|已验证实测/);proof.checks.push('future source claim flags clock/source uncertainty without fabricated expiry policy or score exclusion');
+  assert.match(await item('knowledge/manual').innerText(),/观察时间.*未知|观察时间.*无效/);assert.match(await item('knowledge/manual').innerText(),/样本数.*未知|样本数.*无效/);proof.checks.push('defensive invalid UI metadata remains unknown, never coerced to zero/count');
+  await shot('capability-source-evidence-source.png',evidence);await page.keyboard.press('Enter');
+  await page.setViewportSize({width:390,height:1000});await page.evaluate(()=>{document.documentElement.dataset.theme='dark';});await summary.focus();await page.keyboard.press('Enter');assert(await evidence.evaluate(e=>e.open));await shot('capability-source-evidence-narrow-dark-source.png',evidence);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  const state=await page.evaluate(()=>({unchanged:window.__ownedEvidenceBefore===JSON.stringify([window.__fixtureProviders,window.__fixtureCapabilities]),calls:window.__ownedEvidenceCalls}));assert(state.unchanged);assert(!state.calls.some(c=>/^(set_|upsert_|update_|import_|create_|delete_|refresh_|test_provider|discover_|desktop_chat|claim_|login_|prepare_)/.test(c)));proof.calls=state.calls;assert.equal(proof.foreign_requests,0);assert.deepEqual(errors,[]);proof.checks.push('keyboard disclosure/390px dark, source data unchanged and zero writes/probes/foreign requests/console errors');proof.passed=true;
+ }catch(e){proof.failure=String(e);throw e;}finally{fs.writeFileSync(path.join(output,'capability-evidence-proof.json'),JSON.stringify(proof,null,2));await context.close();}
+}
+module.exports={verifyCapabilityEvidence};

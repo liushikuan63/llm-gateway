@@ -20,6 +20,8 @@ function traeFixture() {
     if (!command.startsWith('trae_login_')) return previous(command, args);
     window.__fixtureCalls.push(command);
     switch (command) {
+      case 'trae_login_recovery': return { account_id: args.accountId, login_preparing: false, refresh_in_flight: false, refresh_interrupted: false, login: null };
+      case 'trae_login_cancel_recovery': state.cancels.push({ account: args.accountId, id: null, recovery: true }); return null;
       case 'trae_login_status': {
         state.statusCalls.push(args.accountId);
         const value = status(args.accountId);
@@ -37,9 +39,10 @@ function traeFixture() {
         const url = new URL('https://www.trae.cn/authorization');
         url.searchParams.set('client_id', 'ono9krqynydwx5'); url.searchParams.set('login_trace_id', id);
         url.searchParams.set('code_challenge', 'a'.repeat(43)); url.searchParams.set('code_challenge_method', 'S256');
-        url.searchParams.set('auth_callback_url', `http://127.0.0.1:44444/authorize/${id}`);
+        url.searchParams.set('auth_callback_url', 'http://127.0.0.1:44444/authorize');
         if (state.badUrl === 'host') url.hostname = 'example.invalid';
         if (state.badUrl === 'callback') url.searchParams.set('auth_callback_url', `http://example.invalid/authorize/${id}`);
+        if (state.badUrl === 'callback-path') url.searchParams.set('auth_callback_url', `http://127.0.0.1:44444/authorize/${id}`);
         if (state.badUrl === 'trace') url.searchParams.set('login_trace_id', 'other-owner');
         return { login_id: id, authorization_url: url.href, deadline_ms: Date.now() + (state.deadline ?? 300000) };
       }
@@ -91,7 +94,19 @@ async function verifyTraeLogin(browser, url, output, errors = []) {
   const ready = async () => { await button('检查登录状态').waitFor(); await page.waitForFunction(() => window.__trae.statusFinished.length > 0); await badge().getByText('未登录', { exact: true }).waitFor(); };
   const prepare = async () => { await consent().check(); await button('准备官方授权').click(); };
   const authorize = async () => { await prepare(); await button('打开官方授权网页').waitFor(); };
-  const shot = async name => { const p = path.join(output, name + '.png'); await login().screenshot({ path: p }); proof.screenshots.push(p); };
+  const shot = async name => {
+    const filename = path.join(output, `${name}.png`);
+    const viewport = page.viewportSize();
+    const height = await login().evaluate(element => Math.ceil(element.getBoundingClientRect().height));
+    try {
+      // Element screenshots otherwise include black pixels beyond the main scroller clip.
+      // Keep the tested width and fit the full login card inside the real renderer viewport.
+      await page.setViewportSize({ ...viewport, height: Math.max(viewport.height, height + 240) });
+      await login().scrollIntoViewIfNeeded();
+      await login().screenshot({ path: filename });
+      proof.screenshots.push(filename);
+    } finally { await page.setViewportSize(viewport); }
+  };
   try {
     await page.goto(url); await nav().getByRole('button', { name: '客户端接入', exact: true }).click(); await ready();
     await step('entry reads only configured account status and requires explicit registration consent', async () => {
@@ -110,7 +125,7 @@ async function verifyTraeLogin(browser, url, output, errors = []) {
       await authorize(); assert.equal(await page.evaluate(() => window.__fixtureOpenedOfficialUrl ?? null), null);
       await button('打开官方授权网页').click(); await page.waitForFunction(() => window.__fixtureOpenedOfficialUrl?.startsWith('https://www.trae.cn/authorization?'));
       await set({ authorize: true }); await badge().getByText('已保存登录', { exact: true }).waitFor();
-      await login().getByText('离线 Trae trae-a', { exact: false }).waitFor(); assert((await read()).starts[0].consent); await shot('trae-authenticated');
+      await login().locator('dd').filter({ hasText: '离线 Trae trae-a' }).waitFor(); assert((await read()).starts[0].consent); await shot('trae-authenticated');
     });
     await step('local preparation failure with an existing session cannot use the authenticated badge', async () => {
       await set({ noDevice: true }); await prepare(); await badge().getByText('本次授权失败', { exact: true }).waitFor();
@@ -169,7 +184,7 @@ async function verifyTraeLogin(browser, url, output, errors = []) {
       await login().getByRole('alert').filter({ hasText: '刷新未完成' }).waitFor(); assert.equal(await button('刷新登录').count(), 0);
       assert.equal((await read()).refreshes.length, 2); assert(!(await login().innerText()).includes('synthetic-private')); await set({ refreshFailure: false });
     });
-    for (const badUrl of ['host', 'callback', 'trace']) await step(`reject unsafe authorization ${badUrl} before exposing an open action`, async () => {
+    for (const badUrl of ['host', 'callback', 'callback-path', 'trace']) await step(`reject unsafe authorization ${badUrl} before exposing an open action`, async () => {
       await set({ badUrl, authorize: false }); await prepare();
       await badge().getByText('本次授权失败', { exact: true }).waitFor(); assert.equal(await button('打开官方授权网页').count(), 0);
       const old = (await read()).starts.at(-1); await page.waitForFunction(id => window.__trae.cancels.some(c => c.id === id), old.id);

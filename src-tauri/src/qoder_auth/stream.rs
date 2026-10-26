@@ -38,6 +38,177 @@ mod tests {
     }
 
     #[test]
+    fn inner_null_is_neutral_without_fabricating_text_usage_or_completion() {
+        let empty = inner(Value::Null);
+        let mut decoder = QoderSseDecoder::default();
+        assert!(decoder
+            .feed(empty.as_bytes(), false, &[])
+            .unwrap()
+            .is_empty());
+        assert!(!decoder.is_done());
+        assert!(
+            decoder.feed(&[], true, &[]).is_err(),
+            "null cannot authorize EOF success"
+        );
+
+        let source = empty.clone()
+            + &content("你🙂")
+            + &empty
+            + &content("好")
+            + &empty
+            + &finish(json!({}));
+        for split in 0..=source.len() {
+            let mut decoder = QoderSseDecoder::default();
+            let mut events = decoder
+                .feed(&source.as_bytes()[..split], false, &[])
+                .unwrap();
+            events.extend(
+                decoder
+                    .feed(&source.as_bytes()[split..], true, &[])
+                    .unwrap(),
+            );
+            let text: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    UpstreamEvent::Delta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "你🙂好");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, UpstreamEvent::Done { usage: None, .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, UpstreamEvent::Done { .. }))
+                    .count(),
+                1
+            );
+            assert!(decoder.is_done());
+        }
+        let mut decoder = QoderSseDecoder::default();
+        let events = decoder
+            .feed(
+                (content("OK") + &finish(json!({})) + &empty).as_bytes(),
+                true,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, UpstreamEvent::Done { usage: None, .. }))
+                .count(),
+            1
+        );
+        assert!(
+            decoder
+                .feed(empty.as_bytes(), true, &[])
+                .unwrap()
+                .is_empty(),
+            "existing done state ignores later bytes without manufacturing a second completion"
+        );
+        for tail in [finish(json!({})), marker()] {
+            assert!(
+                QoderSseDecoder::default()
+                    .feed((empty.clone() + &tail).as_bytes(), true, &[])
+                    .is_err(),
+                "null alone supplies neither output nor terminal evidence"
+            );
+        }
+        let source = empty.clone()
+            + &content("OK")
+            + &empty
+            + &inner(
+                json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}),
+            )
+            + &empty
+            + &finish(json!({}));
+        let events = QoderSseDecoder::default()
+            .feed(source.as_bytes(), true, &[])
+            .unwrap();
+        assert!(
+            matches!(events.last(), Some(UpstreamEvent::Done { usage: Some(usage), .. }) if usage.prompt_tokens==10 && usage.completion_tokens==2 && usage.total_tokens==12)
+        );
+        let unauthorized = format!("data:{}\n\n", json!({"statusCodeValue":401,"body":"null"}));
+        assert!(matches!(
+            QoderSseDecoder::default().feed(unauthorized.as_bytes(), false, &[]),
+            Err(GatewayError::Upstream { status: 401, .. })
+        ));
+        let secret = "owned-null-reflection-canary";
+        let reflected = format!(
+            "data:{}\n\n",
+            json!({"statusCodeValue":200,"body":"null","message":secret})
+        );
+        let error = QoderSseDecoder::default()
+            .feed(reflected.as_bytes(), false, &[secret])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("认证材料") && !error.contains(secret));
+    }
+
+    #[test]
+    fn rejection_diagnostic_distinguishes_nonobject_kinds_without_echo() {
+        for (value, kind) in [
+            (json!(["synthetic-private-payload"]), "array"),
+            (json!("null"), "string"),
+            (json!("synthetic-private-payload"), "string"),
+            (json!(true), "bool"),
+            (json!(739241), "number"),
+        ] {
+            let mut decoder = QoderSseDecoder::default();
+            let error = decoder
+                .feed(inner(value).as_bytes(), false, &[])
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(&format!("inner_not_object:{kind}")));
+            assert!(!error.to_string().contains("synthetic-private-payload"));
+            assert!(!error.to_string().contains("739241"));
+            assert!(!decoder.is_done());
+        }
+    }
+
+    #[test]
+    fn rejection_diagnostic_keeps_escaped_inner_auth_guard_and_safe_success() {
+        let secret = "private-synthetic-token";
+        let body = json!({"choices":[{"index":0,"delta":{"content":secret}}]})
+            .to_string()
+            .replace(secret, r"\u0070rivate-synthetic-token");
+        let source = format!("data:{}\n\n", json!({"statusCodeValue":200,"body":body}));
+        let outer: Value = serde_json::from_str(source[5..].trim()).unwrap();
+        assert!(!reflects(&outer, &[secret]));
+        let mut decoder = QoderSseDecoder::default();
+        let error = decoder
+            .feed(source.as_bytes(), false, &[secret])
+            .unwrap_err();
+        assert!(error.to_string().contains("inner_auth_reflection"));
+        assert!(!error.to_string().contains(secret));
+        assert!(!error.to_string().contains(r"\u0070"));
+        assert!(!decoder.is_done());
+
+        let events = QoderSseDecoder::default()
+            .feed(
+                (content("OK") + &finish(json!({}))).as_bytes(),
+                true,
+                &[secret],
+            )
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, UpstreamEvent::Delta(text) if text == "OK")));
+        assert!(matches!(
+            events.last(),
+            Some(UpstreamEvent::Done { usage: None, .. })
+        ));
+    }
+
+    #[test]
     fn fragmented_utf8_retains_late_usage_and_requires_authoritative_finish() {
         let source = inner(
             json!({"choices":[{"delta":{"content":"OK","reasoning_content":"想"},"finish_reason":""}],"usage":{"prompt_tokens":10,"completion_tokens":0}}),
@@ -692,8 +863,30 @@ impl QoderSseDecoder {
         }
         let inner: Value =
             serde_json::from_str(body).map_err(|_| protocol("内层响应不是有效JSON"))?;
-        if !inner.is_object() || reflects(&inner, secrets) {
-            return Err(protocol("内层响应无效或包含认证材料"));
+        // Both official 0.4.8 CN/Global consumers explicitly skip a parsed
+        // null body. It supplies no text, usage or completion. Outer status,
+        // reflection and frame limits above still apply; only event:finish
+        // may complete the response. Other non-object shapes stay rejected.
+        if inner.is_null() {
+            return Ok(());
+        }
+        // Keep shape and credential reflection failures distinct without ever
+        // logging the payload, field paths, or details about a matched secret.
+        if !inner.is_object() {
+            let kind = match &inner {
+                Value::Null => "null",
+                Value::Bool(_) => "bool",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            };
+            return Err(protocol(&format!(
+                "内层响应必须为对象（inner_not_object:{kind}）"
+            )));
+        }
+        if reflects(&inner, secrets) {
+            return Err(protocol("内层响应包含认证材料（inner_auth_reflection）"));
         }
         if inner.get("error").is_some_and(|v| !v.is_null()) {
             return Err(protocol("模型返回错误"));

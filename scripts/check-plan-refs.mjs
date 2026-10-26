@@ -18,7 +18,7 @@
 //     （内容对不对需要人判断，行号越界才是能机械判定的错误）
 //   - 不联网
 
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve, relative } from 'node:path';
 
@@ -38,6 +38,9 @@ const DOCS = [
   'docs/VibeCoding任务卡-账号型上游包装.md',
   'CLAUDE.md',
   'README.md',
+  'AGENTS.md',
+  'docs/2026-10-18-WorkBuddy双区额度交付验收.md',
+  ...readdirSync(join(ROOT, 'docs/wiki')).filter(name => name.endsWith('.md')).sort().map(name => `docs/wiki/${name}`),
 ];
 
 const problems = [];

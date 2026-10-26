@@ -191,14 +191,72 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
 }
 
 #[test]
+fn responses_terminal_empty_output_keeps_known_zero_and_unknown_usage_distinct() {
+    for (usage, expected) in [
+        (None, None),
+        (Some(Value::Null), None),
+        (
+            Some(json!({"input_tokens":0,"output_tokens":0,"total_tokens":0})),
+            Some((0, 0, 0)),
+        ),
+        (Some(json!({"input_tokens":3})), None),
+        (
+            Some(json!({"input_tokens":3,"output_tokens":2})),
+            Some((3, 2, 5)),
+        ),
+        (
+            Some(json!({"input_tokens":4294967296_u64,"output_tokens":2})),
+            None,
+        ),
+    ] {
+        let mut response = json!({"status":"completed","output":[],"error":null,"incomplete_details":null,"future_metadata":{"owned":true}});
+        if let Some(usage) = usage {
+            response["usage"] = usage;
+        }
+        let events = parse_sse_block(
+            Dialect::Responses,
+            format!(
+                "data: {}",
+                json!({"type":"response.completed","response":response})
+            )
+            .as_bytes(),
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Ok(UpstreamEvent::Done {
+                finish_reason,
+                usage,
+            }) => {
+                assert_eq!(finish_reason.as_deref(), Some("stop"));
+                assert_eq!(
+                    usage
+                        .as_ref()
+                        .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens)),
+                    expected
+                );
+            }
+            other => panic!("valid empty response cannot be rejected: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn responses_failed_and_error_events_are_not_successful_completions() {
     for payload in [
-        json!({"type":"response.failed", "response":{"status":"failed", "error":{"code":"server_error", "message":"fixture failure"}}}),
-        json!({"type":"error", "code":"server_error", "message":"fixture failure"}),
+        json!({"type":"response.failed", "response":{"status":"failed", "model":"owned-private-upstream-model", "error":{"code":"server_error", "message":"owned-private-upstream-message"}}}),
+        json!({"type":"error", "code":"server_error", "message":"owned-private-upstream-message"}),
     ] {
         let events = parse_sse_block(Dialect::Responses, format!("data: {payload}").as_bytes());
         assert_eq!(events.len(), 1, "errors must not disappear from the stream");
-        assert!(events.into_iter().next().unwrap().is_err());
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        assert!(
+            !error.to_string().contains("owned-private"),
+            "untrusted upstream payload remains in parser error: {error}"
+        );
+        assert!(
+            !error.retryable(),
+            "already-dispatched unknown consumption cannot authorize replay"
+        );
     }
 }
 

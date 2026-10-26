@@ -8,9 +8,15 @@
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::domain::{Health, ProviderHealth};
+use crate::domain::{Health, Provider, ProviderHealth, TpsReference, TpsReferenceState};
+
+const TPS_MAX_IDLE_SECONDS: u64 = 86400;
+
+#[path = "health/tps_source.rs"]
+mod tps_source;
+pub(crate) use tps_source::TpsLease;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -30,13 +36,20 @@ struct Entry {
     avg_tps: f32,
     /// 已累计的吞吐样本数，供 `min_efficiency_samples` 判充足性。
     tps_samples: u32,
+    /// Only an accepted TPS sample updates this monotonic process-local time.
+    last_tps_at: Option<Instant>,
     last_error: Option<String>,
     last_checked_at: i64,
 }
 
 pub struct HealthRegistry {
+    #[cfg(test)]
+    test_tps_clock: Option<std::sync::Arc<dyn Fn() -> Instant + Send + Sync>>,
+    #[cfg(test)]
+    test_clock: Option<std::sync::Arc<dyn Fn() -> i64 + Send + Sync>>,
     /// key = "provider_id::model"
     inner: DashMap<String, RwLock<Entry>>,
+    tps_sources: RwLock<tps_source::Sources>,
     /// 全局失败计数，供 UI 展示
     total_failovers: AtomicU64,
 }
@@ -50,7 +63,12 @@ impl Default for HealthRegistry {
 impl HealthRegistry {
     pub fn new() -> Self {
         Self {
+            #[cfg(test)]
+            test_tps_clock: None,
+            #[cfg(test)]
+            test_clock: None,
             inner: DashMap::new(),
+            tps_sources: RwLock::new(Default::default()),
             total_failovers: AtomicU64::new(0),
         }
     }
@@ -59,9 +77,98 @@ impl HealthRegistry {
         format!("{provider_id}::{model}")
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_clock(clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        let mut registry = Self::new();
+        registry.test_clock = Some(clock);
+        registry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tps_clock(clock: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        let mut registry = Self::new();
+        registry.test_tps_clock = Some(clock);
+        registry
+    }
+
+    fn current_seconds(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(clock) = &self.test_clock {
+            return clock();
+        }
+        now_secs()
+    }
+
+    fn tps_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.test_tps_clock {
+            return clock();
+        }
+        Instant::now()
+    }
+
+    fn tps_reference(&self, entry: Option<&Entry>) -> TpsReference {
+        let mut reference = TpsReference {
+            schema_version: 1,
+            state: TpsReferenceState::NoSample,
+            max_idle_seconds: TPS_MAX_IDLE_SECONDS,
+            age_seconds: None,
+            cohort_sample_count: Some(entry.map_or(0, |e| e.tps_samples)),
+        };
+        if let Some(e) = entry.filter(|e| e.tps_samples > 0) {
+            let age = e
+                .last_tps_at
+                .and_then(|last| self.tps_now().checked_duration_since(last));
+            reference.age_seconds = age.map(|d| d.as_secs());
+            reference.state = match age {
+                None => TpsReferenceState::ClockUnknown,
+                Some(d) if d >= Duration::from_secs(TPS_MAX_IDLE_SECONDS) => {
+                    TpsReferenceState::Expired
+                }
+                Some(_) => TpsReferenceState::Current,
+            };
+        }
+        reference
+    }
+
+    fn mask_tps_view(result: &mut ProviderHealth, source_matches: bool) {
+        if !source_matches {
+            result.tps_reference = Some(TpsReference {
+                schema_version: 1,
+                state: TpsReferenceState::SourceMismatch,
+                max_idle_seconds: TPS_MAX_IDLE_SECONDS,
+                age_seconds: None,
+                cohort_sample_count: None,
+            });
+        }
+        if result
+            .tps_reference
+            .as_ref()
+            .map_or(true, |r| r.state != TpsReferenceState::Current)
+        {
+            // Legacy numeric fields use zero for unavailable. Router still turns
+            // this into None; zero is never admitted as a measured speed.
+            result.avg_tps = 0.0;
+            result.tps_samples = 0;
+        }
+    }
+
     pub fn get(&self, provider_id: &str, model: &str) -> ProviderHealth {
+        self.get_tps_view(provider_id, model, None)
+    }
+    // Only TPS is source-scoped; health/cooldown/latency retain legacy semantics.
+    pub(crate) fn get_for_source(&self, provider: &Provider, model: &str) -> ProviderHealth {
+        self.get_tps_view(&provider.id, model, Some(provider))
+    }
+    fn get_tps_view(
+        &self,
+        provider_id: &str,
+        model: &str,
+        provider: Option<&Provider>,
+    ) -> ProviderHealth {
+        let sources = self.tps_sources.read();
         let k = Self::key(provider_id, model);
-        match self.inner.get(&k) {
+        let mut result = match self.inner.get(&k) {
             None => ProviderHealth {
                 provider_id: provider_id.into(),
                 model: model.into(),
@@ -71,6 +178,7 @@ impl HealthRegistry {
                 avg_latency_ms: 0,
                 avg_tps: 0.0,
                 tps_samples: 0,
+                tps_reference: Some(self.tps_reference(None)),
                 last_error: None,
                 last_checked_at: 0,
             },
@@ -85,11 +193,17 @@ impl HealthRegistry {
                     avg_latency_ms: e.avg_latency_ms,
                     avg_tps: e.avg_tps,
                     tps_samples: e.tps_samples,
+                    tps_reference: Some(self.tps_reference(Some(&e))),
                     last_error: e.last_error.clone(),
                     last_checked_at: e.last_checked_at,
                 }
             }
-        }
+        };
+        Self::mask_tps_view(
+            &mut result,
+            tps_source::readable(&sources, provider_id, model, provider),
+        );
+        result
     }
 
     /// 是否可用（冷却期内不可用）
@@ -100,7 +214,9 @@ impl HealthRegistry {
                 let e = e.read();
                 match e.health {
                     Health::Healthy => true,
-                    Health::RateLimited | Health::Error => now_secs() >= e.cooldown_until,
+                    Health::RateLimited | Health::Error => {
+                        self.current_seconds() >= e.cooldown_until
+                    }
                     Health::Invalid => false, // 需要用户去换 Key
                 }
             }
@@ -120,15 +236,16 @@ impl HealthRegistry {
                     avg_latency_ms: latency_ms,
                     avg_tps: 0.0,
                     tps_samples: 0,
+                    last_tps_at: None,
                     last_error: None,
-                    last_checked_at: now_secs(),
+                    last_checked_at: self.current_seconds(),
                 })
             });
         let mut e = e.write();
         e.health = Health::Healthy;
         e.consecutive_failures = 0;
         e.last_error = None;
-        e.last_checked_at = now_secs();
+        e.last_checked_at = self.current_seconds();
         e.success_rate = e.success_rate * 0.9 + 0.1;
         e.avg_latency_ms = ((e.avg_latency_ms as f32) * 0.8 + (latency_ms as f32) * 0.2) as u32;
     }
@@ -178,6 +295,19 @@ impl HealthRegistry {
         }
         if let Some(e) = self.inner.get(&Self::key(provider_id, model)) {
             let mut e = e.write();
+            let now = self.tps_now();
+            // Source publication holds its lock before this entry lock. Expiry
+            // reset and commit share this write; concurrent first samples cannot
+            // independently resurrect the old EWMA or reset each other.
+            let current = e
+                .last_tps_at
+                .and_then(|last| now.checked_duration_since(last))
+                .is_some_and(|age| age < Duration::from_secs(TPS_MAX_IDLE_SECONDS));
+            if !current {
+                e.avg_tps = 0.0;
+                e.tps_samples = 0;
+            }
+            e.last_tps_at = Some(now);
             e.avg_tps = if e.tps_samples == 0 {
                 tps
             } else {
@@ -198,6 +328,10 @@ impl HealthRegistry {
     }
 
     pub fn record_failure(&self, provider_id: &str, model: &str, err: &crate::error::GatewayError) {
+        // Local admission/storage refusal is not evidence of provider health.
+        if err.is_budget_rejection() {
+            return;
+        }
         let health = match err {
             crate::error::GatewayError::Upstream { status, .. } if *status == 429 => {
                 Health::RateLimited
@@ -223,8 +357,9 @@ impl HealthRegistry {
                     avg_latency_ms: 0,
                     avg_tps: 0.0,
                     tps_samples: 0,
+                    last_tps_at: None,
                     last_error: None,
-                    last_checked_at: now_secs(),
+                    last_checked_at: self.current_seconds(),
                 })
             });
         let mut e = e.write();
@@ -233,10 +368,10 @@ impl HealthRegistry {
         // 第一次 429 错用 30 秒，与文档的 15 -> 30 -> 60 序列不一致。
         let previous_failures = e.consecutive_failures;
         e.consecutive_failures += 1;
-        e.cooldown_until = now_secs() + Self::cooldown_for(previous_failures);
+        e.cooldown_until = self.current_seconds() + Self::cooldown_for(previous_failures);
         e.success_rate *= 0.9;
         e.last_error = Some(err.to_string());
-        e.last_checked_at = now_secs();
+        e.last_checked_at = self.current_seconds();
 
         self.total_failovers.fetch_add(1, Ordering::Relaxed);
     }
@@ -250,11 +385,11 @@ impl HealthRegistry {
                 if e.health == Health::Healthy {
                     return true;
                 }
-                if now_secs() < e.cooldown_until {
+                if self.current_seconds() < e.cooldown_until {
                     return false;
                 }
                 // 冷却结束后的 60 秒窗口内，按 20% 概率放行
-                let since = now_secs() - e.cooldown_until;
+                let since = self.current_seconds() - e.cooldown_until;
                 if since < 60 {
                     (since % 5) == 0
                 } else {
@@ -269,12 +404,13 @@ impl HealthRegistry {
     }
 
     pub fn snapshot(&self) -> Vec<ProviderHealth> {
+        let sources = self.tps_sources.read();
         self.inner
             .iter()
             .map(|kv| {
                 let (pid, model) = kv.key().split_once("::").unwrap_or((kv.key(), ""));
                 let e = kv.value().read();
-                ProviderHealth {
+                let mut result = ProviderHealth {
                     provider_id: pid.into(),
                     model: model.into(),
                     health: e.health,
@@ -283,9 +419,15 @@ impl HealthRegistry {
                     avg_latency_ms: e.avg_latency_ms,
                     avg_tps: e.avg_tps,
                     tps_samples: e.tps_samples,
+                    tps_reference: Some(self.tps_reference(Some(&e))),
                     last_error: e.last_error.clone(),
                     last_checked_at: e.last_checked_at,
-                }
+                };
+                Self::mask_tps_view(
+                    &mut result,
+                    tps_source::readable(&sources, pid, model, None),
+                );
+                result
             })
             .collect()
     }
@@ -325,6 +467,8 @@ impl HealthRegistry {
 /// 上游结果 —— 分开传值而不是传一个结构体，是因为两个调用点手里的
 /// 变量名不同（`o.value.usage` / `final_usage`），
 /// 硬凑一个结构体只会多一层转换。
+/// Compatibility entry for standalone registries. Gateway producers use the
+/// source-owned variant below; this API does not attest a published source.
 pub fn record_success_with_throughput(
     health: &HealthRegistry,
     provider_id: &str,
@@ -336,3 +480,21 @@ pub fn record_success_with_throughput(
     // 这一行是**被用例钉住的**：删它 → `流式成功路径的记账包含吞吐` 变红。
     health.record_tps(provider_id, model, completion_tokens, latency_ms);
 }
+
+/// Product stream completion retains its pre-dispatch TPS source owner. The
+/// public legacy helper above remains compatible for standalone registries.
+pub(crate) fn record_success_with_source_throughput(
+    health: &HealthRegistry,
+    provider_id: &str,
+    model: &str,
+    latency_ms: u32,
+    completion_tokens: u32,
+    source: Option<&TpsLease>,
+) {
+    health.record_success(provider_id, model, latency_ms);
+    health.record_bound_tps(source, completion_tokens, latency_ms);
+}
+
+#[cfg(test)]
+#[path = "health/idle_age_tests.rs"]
+mod idle_age_tests;

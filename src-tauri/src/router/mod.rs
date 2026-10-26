@@ -11,12 +11,15 @@
 // 埋在异步流程里几乎无法断言。
 pub mod cascade;
 // D5：质量 × 速度 × 价格的三维 Pareto 前沿（纯逻辑，无 IO）。
+#[cfg(test)]
+mod cost_context_tests;
 pub mod failover;
 pub mod pareto;
+pub(crate) mod ranking_observation;
 pub mod ratelimit;
 pub mod score;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -51,12 +54,29 @@ pub struct CandidateExplanation {
     /// 最终分（与排序用的是同一个函数）。
     pub score: f32,
     pub breakdown: ScoreBreakdown,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tps_reference: Option<crate::domain::TpsReference>,
     /// 它是否**真的会参与**本轮路由。不健康 / 冷却中 / 额度耗尽的候选
     /// 会被 `rank_with_intent` 过滤掉，而它们的分数没有意义 ——
     /// 界面必须标出来，否则用户会拿一个没参与排序的分数去推演。
     pub eligible: bool,
     /// 不参与时的原因（中文，界面直接用）。
     pub ineligible_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_weight: Option<crate::cost_policy::FreeWeight>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_eligibility: Option<crate::db::repo::catalog::FreeEligibility>,
+}
+
+/// Retains the weights and cost/TPS observation used by one ranking. This is
+/// not a health/quota reservation or a guarantee of later dispatch eligibility.
+pub(crate) struct RankedRequest {
+    pub(crate) candidates: Vec<Candidate>,
+    pub(crate) observation: Option<ranking_observation::RankingObservation>,
+    weights: Weights,
+    cost: CostContext,
+    intent: Option<TaskClass>,
+    domain: TaskDomain,
 }
 
 pub struct Router {
@@ -77,12 +97,11 @@ struct CostContext {
     range: Option<(f32, f32)>,
     /// 实测吞吐区间。样本不足的候选不参与，所以它可能比成本区间小。
     tps_range: Option<(f32, f32)>,
-    /// 最少样本数，来自 `cost_routing.min_efficiency_samples`。
-    /// `candidate_tps` 要用它与 `tps_range` **同一个门槛**，
-    /// 否则会出现「进了区间、自己却拿不到分」。
-    min_tps_samples: u32,
-    /// 健康注册表，供 `candidate_tps` 查单个候选的吞吐。
-    health: Arc<HealthRegistry>,
+    /// This decision's observed TPS, including explicit unknowns. Capture once
+    /// per physical provider/model; aliases and repeated sort comparisons must
+    /// not acquire later samples against an already captured normalization range.
+    tps: HashMap<String, HashMap<String, Option<f32>>>,
+    tps_references: HashMap<String, HashMap<String, Option<crate::domain::TpsReference>>>,
     /// 本次请求是否适用成本偏置。
     cost_bias: bool,
     /// D3：请求的 prompt token 估算值，供分档价选档。
@@ -94,12 +113,23 @@ struct CostContext {
 impl CostContext {
     /// 单个候选的实测吞吐。
     ///
-    /// **与 `tps_range` 用同一个门槛函数** `usable_tps` ——
-    /// 两边各判一次的话会出现「这个候选进了区间、自己却返回 None」，
-    /// 于是它拿到 `1.0` 而别人按相对位置算分，排序失去意义**且不报错**。
+    /// Read the same captured value used to form `tps_range`; a completion
+    /// during sort/explanation belongs to the next decision, including when
+    /// it crosses the minimum-sample threshold.
+    fn candidate_tps_reference(&self, c: &Candidate) -> Option<crate::domain::TpsReference> {
+        self.tps_references
+            .get(&c.provider.id)
+            .and_then(|m| m.get(&c.model.upstream))
+            .cloned()
+            .flatten()
+    }
+
     fn candidate_tps(&self, c: &Candidate) -> Option<f32> {
-        let h = self.health.get(&c.provider.id, &c.model.upstream);
-        usable_tps(&h, self.min_tps_samples)
+        self.tps
+            .get(&c.provider.id)
+            .and_then(|models| models.get(&c.model.upstream))
+            .copied()
+            .flatten()
     }
 
     /// 单个候选的参考成本。**与 `range` 用同一个函数** ——
@@ -370,7 +400,8 @@ impl Router {
                     continue;
                 }
                 let hit = match requested {
-                    "auto" | "fastest" | "smartest" | "reliable" | "balanced" | "smart" => true,
+                    "auto" | "free" | "fastest" | "smartest" | "reliable" | "balanced"
+                    | "smart" => true,
                     name => {
                         if exact_name {
                             m.alias == name || m.upstream == name
@@ -388,7 +419,13 @@ impl Router {
                         requested_model: requested.to_owned(),
                         exact_match: !matches!(
                             requested,
-                            "auto" | "fastest" | "smartest" | "reliable" | "balanced" | "smart"
+                            "auto"
+                                | "free"
+                                | "fastest"
+                                | "smartest"
+                                | "reliable"
+                                | "balanced"
+                                | "smart"
                         ),
                         virtual_strategy,
                     });
@@ -495,14 +532,13 @@ impl Router {
                 let price = m.price.as_ref().and_then(|pr| {
                     reference_unit_price(pr, 0, minute_of_day).map(|v| (v, pr.currency))
                 });
+                let health = self.health.get_for_source(p, &m.upstream);
                 crate::router::pareto::ParetoPointView {
                     id: format!("{}/{}", p.id, m.alias),
                     label: format!("{} · {}", p.name, m.alias),
                     quality: score::capability_base(m),
-                    speed: usable_tps(
-                        &self.health.get(&p.id, &m.upstream),
-                        cfg.cost_routing.min_efficiency_samples,
-                    ),
+                    speed: usable_tps(&health, cfg.cost_routing.min_efficiency_samples),
+                    speed_reference: health.tps_reference,
                     unit_price: if mixed { None } else { price.map(|(v, _)| v) },
                     currency: price.map(|(_, c)| c.code().to_string()),
                 }
@@ -570,7 +606,7 @@ impl Router {
     #[allow(clippy::too_many_arguments)]
     pub fn rank_with_intent(
         &self,
-        mut candidates: Vec<Candidate>,
+        candidates: Vec<Candidate>,
         cfg: &AppConfig,
         required: RequiredCapabilities,
         sticky: Option<(&str, &str)>,
@@ -578,6 +614,76 @@ impl Router {
         prompt_tokens: u32,
         domain: TaskDomain,
     ) -> Vec<Candidate> {
+        self.rank_with_snapshot(
+            candidates,
+            cfg,
+            required,
+            sticky,
+            intent,
+            prompt_tokens,
+            domain,
+        )
+        .candidates
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rank_with_snapshot(
+        &self,
+        candidates: Vec<Candidate>,
+        cfg: &AppConfig,
+        required: RequiredCapabilities,
+        sticky: Option<(&str, &str)>,
+        intent: Option<TaskClass>,
+        prompt_tokens: u32,
+        domain: TaskDomain,
+    ) -> RankedRequest {
+        self.rank_with_observation(
+            candidates,
+            cfg,
+            required,
+            sticky,
+            intent,
+            prompt_tokens,
+            domain,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rank_observed(
+        &self,
+        candidates: Vec<Candidate>,
+        cfg: &AppConfig,
+        required: RequiredCapabilities,
+        sticky: Option<(&str, &str)>,
+        intent: Option<TaskClass>,
+        prompt_tokens: u32,
+        domain: TaskDomain,
+    ) -> RankedRequest {
+        self.rank_with_observation(
+            candidates,
+            cfg,
+            required,
+            sticky,
+            intent,
+            prompt_tokens,
+            domain,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rank_with_observation(
+        &self,
+        mut candidates: Vec<Candidate>,
+        cfg: &AppConfig,
+        required: RequiredCapabilities,
+        sticky: Option<(&str, &str)>,
+        intent: Option<TaskClass>,
+        prompt_tokens: u32,
+        domain: TaskDomain,
+        observe: bool,
+    ) -> RankedRequest {
         // 1) 硬约束：缺少任一所需模态（工具/视觉/音频/视频）的直接剔除
         candidates.retain(|c| satisfies_hard_constraints(c, &required));
 
@@ -633,9 +739,24 @@ impl Router {
         let minute_of_day = crate::proxy::server::utc_minute_of_day();
         let cost = self.cost_context(&candidates, cfg, intent, prompt_tokens, minute_of_day);
 
+        let mut observation =
+            observe.then(|| ranking_observation::RankingObservation::new(strategy, &candidates));
         candidates.sort_by(|a, b| {
-            let sa = self.score_of(a, &w, intent, &cost, domain);
-            let sb = self.score_of(b, &w, intent, &cost, domain);
+            let (sa, sb) = if let Some(observed) = observation.as_mut() {
+                // score() already delegates to explain().total. Observe those
+                // same evaluations in the same order, never score after sorting.
+                let a_score = score::explain(a, &self.score_input(a, &cost, intent, domain), &w);
+                let b_score = score::explain(b, &self.score_input(b, &cost, intent, domain), &w);
+                let values = (a_score.total, b_score.total);
+                observed.record(a, a_score);
+                observed.record(b, b_score);
+                values
+            } else {
+                (
+                    self.score_of(a, &w, intent, &cost, domain),
+                    self.score_of(b, &w, intent, &cost, domain),
+                )
+            };
             let score_order = sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal);
             if custom_rules_active {
                 custom_rule_boost(b, &custom_rules)
@@ -662,7 +783,14 @@ impl Router {
             }
         }
 
-        candidates
+        RankedRequest {
+            candidates,
+            observation,
+            weights: w,
+            cost,
+            intent,
+            domain,
+        }
     }
 
     fn score_of(
@@ -692,7 +820,7 @@ impl Router {
         let key = rate_key(&c.provider, &c.model);
         let q = quota_of(&c.provider);
         ScoreInput {
-            health: Some(self.health.get(&c.provider.id, &c.model.upstream)),
+            health: Some(self.health.get_for_source(&c.provider, &c.model.upstream)),
             headroom: self.limiter.headroom(&key, &q),
             intent,
             domain,
@@ -721,20 +849,38 @@ impl Router {
         prompt_tokens: u32,
         minute_of_day: u16,
     ) -> CostContext {
+        let mut tps: HashMap<String, HashMap<String, Option<f32>>> = HashMap::new();
+        let mut tps_references =
+            HashMap::<String, HashMap<String, Option<crate::domain::TpsReference>>>::new();
+        for c in candidates {
+            tps.entry(c.provider.id.clone())
+                .or_default()
+                .entry(c.model.upstream.clone())
+                .or_insert_with(|| {
+                    let health = self.health.get_for_source(&c.provider, &c.model.upstream);
+                    let rate = usable_tps(&health, cfg.cost_routing.min_efficiency_samples);
+                    tps_references
+                        .entry(c.provider.id.clone())
+                        .or_default()
+                        .insert(c.model.upstream.clone(), health.tps_reference);
+                    rate
+                });
+        }
+        let tps_range = score::value_range(
+            tps.values()
+                .flat_map(|models| models.values().filter_map(|value| *value)),
+        );
         CostContext {
             range: comparable_cost_range(candidates, prompt_tokens as i64, minute_of_day),
             // D3：实测吞吐区间。**样本数不足的候选整条跳过**
             // （与「无价格 = 不主张币种」同款处理）：
             // 一两个样本的 tok/s 抖动极大，用它排序等于随机。
             // 阈值来自配置的 `min_efficiency_samples`（默认 5）。
-            tps_range: score::value_range(candidates.iter().filter_map(|c| {
-                let h = self.health.get(&c.provider.id, &c.model.upstream);
-                usable_tps(&h, cfg.cost_routing.min_efficiency_samples)
-            })),
-            min_tps_samples: cfg.cost_routing.min_efficiency_samples,
+            tps_range,
+            tps,
+            tps_references,
             prompt_tokens: prompt_tokens as i64,
             minute_of_day,
-            health: self.health.clone(),
             cost_bias: score::cost_bias_applies(
                 intent,
                 prompt_tokens,
@@ -771,16 +917,18 @@ impl Router {
             ModelType::Chat,
             cfg.smart_routing.enabled,
         )?;
-        let participating = self.rank(
+        let decision = self.rank_with_snapshot(
             candidates.clone(),
             cfg,
             RequiredCapabilities::default(),
             None,
+            None,
+            0,
+            TaskDomain::General,
         );
-        let (strategy, _) = self.effective_strategy(&candidates, cfg);
-        let w = Weights::with_cost_routing(Weights::for_strategy(strategy), &cfg.cost_routing);
-        let minute_of_day = crate::proxy::server::utc_minute_of_day();
-        let cost = self.cost_context(&participating, cfg, None, 0, minute_of_day);
+        let participating = &decision.candidates;
+        let w = &decision.weights;
+        let cost = &decision.cost;
 
         let mut out: Vec<CandidateExplanation> = candidates
             .iter()
@@ -808,16 +956,19 @@ impl Router {
                 } else {
                     None
                 };
-                let input = self.score_input(c, &cost, None, TaskDomain::General);
+                let input = self.score_input(c, cost, None, TaskDomain::General);
                 CandidateExplanation {
                     provider_id: c.provider.id.clone(),
                     provider_name: c.provider.name.clone(),
                     model: c.model.alias.clone(),
                     upstream: c.model.upstream.clone(),
-                    score: score::score(c, &input, &w),
-                    breakdown: score::explain(c, &input, &w),
+                    score: score::score(c, &input, w),
+                    breakdown: score::explain(c, &input, w),
+                    tps_reference: cost.candidate_tps_reference(c),
                     eligible: reason.is_none(),
                     ineligible_reason: reason.map(str::to_string),
+                    free_weight: None,
+                    free_eligibility: None,
                 }
             })
             .collect();
@@ -827,6 +978,38 @@ impl Router {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(out)
+    }
+
+    /// Explain already-ranked request candidates with the existing factor code.
+    /// This is current preview metadata, not an immutable historical decision.
+    pub(crate) fn explain_ranked_request(
+        &self,
+        decision: &RankedRequest,
+    ) -> Vec<CandidateExplanation> {
+        let cost = &decision.cost;
+        let weights = &decision.weights;
+        let intent = decision.intent;
+        let domain = decision.domain;
+        decision
+            .candidates
+            .iter()
+            .map(|c| {
+                let input = self.score_input(c, cost, intent, domain);
+                CandidateExplanation {
+                    provider_id: c.provider.id.clone(),
+                    provider_name: c.provider.name.clone(),
+                    model: c.model.alias.clone(),
+                    upstream: c.model.upstream.clone(),
+                    score: score::score(c, &input, weights),
+                    breakdown: score::explain(c, &input, weights),
+                    tps_reference: cost.candidate_tps_reference(c),
+                    eligible: true,
+                    ineligible_reason: None,
+                    free_weight: None,
+                    free_eligibility: None,
+                }
+            })
+            .collect()
     }
 
     /// 请求成功后记账（供后续额度判断）
@@ -845,6 +1028,12 @@ impl Router {
     pub fn record_tokens(&self, provider: &Provider, model: &ModelRef, tokens: u32) {
         self.limiter
             .record_tokens(&rate_key(provider, model), tokens);
+    }
+
+    /// Same local quota as admission, read without consuming execution permits.
+    pub fn quota_headroom(&self, provider: &Provider, model: &ModelRef) -> f32 {
+        self.limiter
+            .headroom(&rate_key(provider, model), &quota_of(provider))
     }
 
     pub fn mark_rate_limited(&self, provider: &Provider, model: &ModelRef) {

@@ -58,6 +58,9 @@ async fn run_client(
         ClaimPlatform::Qoder => ("Qoder", "Qoder.exe", "9341"),
         ClaimPlatform::QoderCn => ("Qoder CN", "Qoder CN.exe", "9342"),
         ClaimPlatform::TraeCn => ("Trae CN", "Trae CN.exe", "9343"),
+        ClaimPlatform::Workbuddy | ClaimPlatform::WorkbuddyCn => {
+            return Err("WorkBuddy 请关联本网关已保存的独立登录，无需启动客户端".into());
+        }
     };
     let mut roots = vec![
         PathBuf::from("D:/Program Files"),

@@ -14,6 +14,19 @@ use tokio::sync::watch;
 
 use crate::benefit_config::{BenefitAccount, BenefitsConfig};
 use crate::{crypto, db::repo};
+mod principal;
+mod receipt;
+mod reservation;
+mod source;
+mod workbuddy;
+pub(crate) use receipt::ReceiptOrigin;
+pub use source::BenefitAuthSourceView;
+#[cfg(test)]
+mod account_auto_claim_tests;
+#[cfg(test)]
+mod http_guard_tests;
+#[cfg(test)]
+mod source_tests;
 
 const BODY_LIMIT: usize = 512 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -25,6 +38,8 @@ pub enum ClaimPlatform {
     Qoder,
     QoderCn,
     TraeCn,
+    Workbuddy,
+    WorkbuddyCn,
 }
 
 impl ClaimPlatform {
@@ -33,6 +48,8 @@ impl ClaimPlatform {
             Self::Qoder => "qoder",
             Self::QoderCn => "qoder_cn",
             Self::TraeCn => "trae_cn",
+            Self::Workbuddy => "workbuddy",
+            Self::WorkbuddyCn => "workbuddy_cn",
         }
     }
 
@@ -41,6 +58,8 @@ impl ClaimPlatform {
             Self::Qoder => "Qoder 国际版",
             Self::QoderCn => "Qoder 国内版",
             Self::TraeCn => "Trae 中国版",
+            Self::Workbuddy => "WorkBuddy 国际版",
+            Self::WorkbuddyCn => "WorkBuddy 中国版",
         }
     }
 
@@ -49,6 +68,8 @@ impl ClaimPlatform {
             Self::Qoder => "openapi.qoder.sh",
             Self::QoderCn => "openapi.qoder.com.cn",
             Self::TraeCn => "api.trae.cn",
+            Self::Workbuddy => "www.workbuddy.ai",
+            Self::WorkbuddyCn => "copilot.tencent.com",
         }
     }
 
@@ -57,12 +78,20 @@ impl ClaimPlatform {
             "qoder" => Some(Self::Qoder),
             "qoder_cn" => Some(Self::QoderCn),
             "trae_cn" => Some(Self::TraeCn),
+            "workbuddy" => Some(Self::Workbuddy),
+            "workbuddy_cn" => Some(Self::WorkbuddyCn),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 3] {
-        [Self::Qoder, Self::QoderCn, Self::TraeCn]
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Qoder,
+            Self::QoderCn,
+            Self::TraeCn,
+            Self::Workbuddy,
+            Self::WorkbuddyCn,
+        ]
     }
 }
 
@@ -211,6 +240,7 @@ pub struct BenefitCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenefitAccountView {
+    pub auth_source: BenefitAuthSourceView,
     pub account_id: String,
     pub platform: String,
     pub label: String,
@@ -229,6 +259,7 @@ pub struct BenefitAccountView {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenefitOverview {
+    pub settings_revision: String,
     pub enabled: bool,
     pub auto_claim: bool,
     pub auto_claim_after_hour: u32,
@@ -426,6 +457,21 @@ pub trait BenefitTransport: Send + Sync {
         proxy: Option<&str>,
         campaign_id: Option<&str>,
     ) -> Result<Value, String>;
+    /// Injected transports perform this check immediately before their mutation.
+    /// Production adapters must repeat it after their internal awaits at the
+    /// final mutation; this default preserves offline transport implementations.
+    async fn request_guarded(
+        &self,
+        platform: ClaimPlatform,
+        token: &str,
+        proxy: Option<&str>,
+        campaign_id: &str,
+        guard: &ClaimDispatchGuard,
+    ) -> Result<Value, String> {
+        guard.check_for(token).await?;
+        self.request(platform, token, proxy, Some(campaign_id))
+            .await
+    }
     async fn session_account(
         &self,
         _platform: ClaimPlatform,
@@ -433,6 +479,21 @@ pub trait BenefitTransport: Send + Sync {
         _proxy: Option<&str>,
     ) -> Result<Option<crate::client_session::SessionAccountView>, String> {
         Ok(None)
+    }
+}
+
+/// Sealed per-attempt provenance; no Deserialize, public constructor or IPC.
+#[derive(Clone)]
+pub struct ClaimDispatchGuard {
+    pool: SqlitePool,
+    epoch: source::SendEpoch,
+}
+impl ClaimDispatchGuard {
+    pub async fn check_for(&self, wire: &str) -> Result<(), String> {
+        if !self.epoch.matches_wire(wire) {
+            return Err(source::error("source_changed"));
+        }
+        self.epoch.check(&self.pool).await
     }
 }
 
@@ -444,6 +505,30 @@ pub struct HttpBenefitTransport {
 
 #[async_trait]
 impl BenefitTransport for HttpBenefitTransport {
+    async fn request_guarded(
+        &self,
+        platform: ClaimPlatform,
+        token: &str,
+        proxy: Option<&str>,
+        campaign_id: &str,
+        guard: &ClaimDispatchGuard,
+    ) -> Result<Value, String> {
+        if platform == ClaimPlatform::TraeCn {
+            #[cfg(test)]
+            if let Some(endpoint) = self.mock_endpoint.as_deref() {
+                return crate::trae_benefits::request_checked_at_for_test(
+                    token,
+                    campaign_id,
+                    endpoint,
+                    guard,
+                )
+                .await;
+            }
+            return crate::trae_benefits::request_checked(token, proxy, campaign_id, guard).await;
+        }
+        self.request_scoped(platform, token, proxy, Some(campaign_id), Some(guard))
+            .await
+    }
     async fn session_account(
         &self,
         platform: ClaimPlatform,
@@ -463,7 +548,28 @@ impl BenefitTransport for HttpBenefitTransport {
         proxy: Option<&str>,
         campaign_id: Option<&str>,
     ) -> Result<Value, String> {
+        self.request_scoped(platform, token, proxy, campaign_id, None)
+            .await
+    }
+}
+impl HttpBenefitTransport {
+    async fn request_scoped(
+        &self,
+        platform: ClaimPlatform,
+        token: &str,
+        proxy: Option<&str>,
+        campaign_id: Option<&str>,
+        guard: Option<&ClaimDispatchGuard>,
+    ) -> Result<Value, String> {
+        if workbuddy::region(platform.key()).is_some() {
+            return Err("WorkBuddy 权益仅支持关联本网关的独立登录".into());
+        }
         if platform == ClaimPlatform::TraeCn {
+            #[cfg(test)]
+            if let Some(endpoint) = self.mock_endpoint.as_deref() {
+                return crate::trae_benefits::request_at_for_test(token, campaign_id, endpoint)
+                    .await;
+            }
             return crate::trae_benefits::request(token, proxy, campaign_id).await;
         }
         if token.trim_start().starts_with('{') {
@@ -499,10 +605,14 @@ impl BenefitTransport for HttpBenefitTransport {
             Some(id) => client.post(format!("{base}/{id}/claim")),
             None => client.get(base),
         };
-        let response = request
+        let request = request
             .headers(crate::client_session::request_headers(token, platform)?)
             .header(reqwest::header::HOST, platform.host())
-            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(guard) = guard {
+            guard.check_for(token).await?;
+        }
+        let response = request
             .send()
             .await
             .map_err(|_| "权益请求连接失败或超时；未自动重发领取".to_string())?;
@@ -563,6 +673,8 @@ pub async fn claim(
 type FlightResult = Result<BenefitClaimResult, String>;
 
 struct Flight {
+    source_revision: String,
+    epoch_fingerprint: Option<String>,
     result: watch::Receiver<Option<FlightResult>>,
 }
 
@@ -592,6 +704,9 @@ pub struct BenefitsCenter {
     transport: Arc<dyn BenefitTransport>,
     flights: Flights,
     windows: Windows,
+    gates: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    workbuddy_endpoint: Option<String>,
 }
 
 impl BenefitsCenter {
@@ -605,6 +720,9 @@ impl BenefitsCenter {
             transport,
             flights: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             windows: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            gates: parking_lot::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            workbuddy_endpoint: None,
         }
     }
 
@@ -615,14 +733,16 @@ impl BenefitsCenter {
         token: &str,
     ) -> Result<(), String> {
         let account = account(cfg, account_id)?;
+        if workbuddy::region(&account.platform).is_some() {
+            return Err("WorkBuddy 权益仅支持关联本网关的独立登录".into());
+        }
         ensure_token(token)?;
+        if token.trim_start().starts_with(['{', '[']) {
+            return Err("手工 token 不接受 JSON；请使用登录上下文导入或显式关联".into());
+        }
         let encrypted =
             crypto::encrypt(token.trim()).map_err(|_| "无法加密权益 token".to_string())?;
-        repo::set_secret(&self.pool, &secret_name(account), &encrypted)
-            .await
-            .map_err(|_| "无法保存加密权益 token".to_string())?;
-        self.windows.lock().remove(&account_key(account));
-        Ok(())
+        self.replace(account, Some(&encrypted)).await
     }
 
     pub async fn set_session(
@@ -633,24 +753,19 @@ impl BenefitsCenter {
     ) -> Result<(), String> {
         let account = account(cfg, account_id)?;
         let platform = ClaimPlatform::parse(&account.platform).ok_or("权益平台尚未适配")?;
+        if workbuddy::region(platform.key()).is_some() {
+            return Err("WorkBuddy 权益仅支持关联本网关的独立登录".into());
+        }
         session.validate(platform)?;
         let raw = serde_json::to_string(session).map_err(|_| "登录上下文格式无效")?;
         crate::client_session::SessionCredential::parse(&raw, platform)?;
         let encrypted = crypto::encrypt(&raw).map_err(|_| "无法加密登录上下文")?;
-        repo::set_secret(&self.pool, &secret_name(account), &encrypted)
-            .await
-            .map_err(|_| "无法保存加密登录上下文")?;
-        self.windows.lock().remove(&account_key(account));
-        Ok(())
+        self.replace(account, Some(&encrypted)).await
     }
 
     pub async fn clear_token(&self, cfg: &BenefitsConfig, account_id: &str) -> Result<(), String> {
         let account = account(cfg, account_id)?;
-        repo::delete_secret(&self.pool, &secret_name(account))
-            .await
-            .map_err(|_| "无法删除权益 token".to_string())?;
-        self.windows.lock().remove(&account_key(account));
-        Ok(())
+        self.replace(account, None).await
     }
 
     pub(crate) async fn session_for_native(
@@ -662,11 +777,17 @@ impl BenefitsCenter {
         if !cfg.enabled || !account.enabled || account.platform != "trae_cn" {
             return Err("Trae 权益账号未启用".into());
         }
-        let encrypted = repo::get_secret(&self.pool, &secret_name(account))
+        let mut tx = source::begin(&self.pool).await?;
+        let snapshot = source::read(
+            &mut tx,
+            account,
+            crate::trae_auth::NativeReadPurpose::ExplicitReauthenticationDevice,
+        )
+        .await?;
+        tx.commit()
             .await
-            .map_err(|_| "无法读取加密登录")?
-            .ok_or("请先复用 Trae 客户端登录")?;
-        let raw = crypto::decrypt(&encrypted).map_err(|_| "无法解密登录，请重新导入")?;
+            .map_err(|_| source::error("source_storage"))?;
+        let raw = snapshot.wire?;
         crate::client_session::SessionCredential::parse(&raw, ClaimPlatform::TraeCn)
     }
 
@@ -691,62 +812,69 @@ impl BenefitsCenter {
         validate(cfg)?;
         let mut accounts = Vec::new();
         for account in &cfg.accounts {
-            let encrypted = repo::get_secret(&self.pool, &secret_name(account))
+            if workbuddy::region(&account.platform).is_some() {
+                accounts.push(workbuddy::overview(self, cfg, account, proxy).await?);
+                continue;
+            }
+            let mut tx = source::begin(&self.pool).await?;
+            let resolved = source::read(
+                &mut tx,
+                account,
+                crate::trae_auth::NativeReadPurpose::Benefits,
+            )
+            .await?;
+            tx.commit()
                 .await
-                .map_err(|_| "无法读取权益 token 状态".to_string())?;
-            let has_token = encrypted.is_some();
+                .map_err(|_| source::error("source_storage"))?;
+            let has_token = resolved.raw.is_some();
             let last_run = self.runs(Some(&account.id), 1).await?.into_iter().next();
             let (status, error) = if !cfg.enabled || !account.enabled {
-                (None, None)
-            } else if let Some(encrypted) = encrypted.as_ref() {
-                match crypto::decrypt(encrypted) {
-                    Ok(token) => {
-                        match status_with(self.transport.as_ref(), account, &token, proxy).await {
+                (None, resolved.view.message.clone())
+            } else {
+                match &resolved.wire {
+                    Ok(wire) => {
+                        match status_with(self.transport.as_ref(), account, wire, proxy).await {
                             Ok(status) => (Some(status), None),
                             Err(error) => (None, Some(safe_transport_error(&error))),
                         }
                     }
-                    Err(_) => (None, Some("无法解密权益 token，请重新设置".into())),
+                    Err(error) => (None, Some(error.clone())),
                 }
-            } else {
-                (None, Some("请先手工设置该账号的访问 token".into()))
             };
             let (session_account, session_error) = if status.is_some() {
-                if let Some(raw) = encrypted
-                    .as_ref()
-                    .and_then(|secret| crypto::decrypt(secret).ok())
+                match self
+                    .transport
+                    .session_account(
+                        ClaimPlatform::parse(&account.platform).expect("validated platform"),
+                        resolved
+                            .wire
+                            .as_ref()
+                            .expect("successful status requires wire"),
+                        proxy,
+                    )
+                    .await
                 {
-                    match self
-                        .transport
-                        .session_account(
-                            ClaimPlatform::parse(&account.platform).expect("validated platform"),
-                            &raw,
-                            proxy,
-                        )
-                        .await
-                    {
-                        Ok(view) => (view, None),
-                        Err(_) => (
-                            None,
-                            Some("账号资料读取失败，请刷新或重新复用客户端登录".into()),
-                        ),
-                    }
-                } else {
-                    (None, None)
+                    Ok(view) => (view, None),
+                    Err(_) => (
+                        None,
+                        Some("账号资料读取失败，请刷新或重新复用客户端登录".into()),
+                    ),
                 }
             } else {
                 (None, None)
             };
             let trae_direct = account.platform == "trae_cn"
-                && encrypted
+                && resolved
+                    .wire
                     .as_ref()
-                    .and_then(|secret| crypto::decrypt(secret).ok())
+                    .ok()
                     .and_then(|raw| {
-                        crate::client_session::SessionCredential::parse(&raw, ClaimPlatform::TraeCn)
+                        crate::client_session::SessionCredential::parse(raw, ClaimPlatform::TraeCn)
                             .ok()
                     })
                     .is_some_and(|session| session.has_trae_device_context());
             accounts.push(BenefitAccountView {
+                auth_source: resolved.view,
                 account_id: account.id.clone(),
                 platform: account.platform.clone(),
                 label: account.label.clone(),
@@ -760,13 +888,14 @@ impl BenefitsCenter {
                 error,
                 capabilities: BenefitCapabilities {
                     query: true,
-                    manual_claim: true,
-                    auto_claim: true,
+                    // Legacy saved sessions remain observable, but the client
+                    // mutation fallback cannot enforce this saved-source epoch.
+                    manual_claim: account.platform != "trae_cn" || trae_direct,
+                    auto_claim: account.platform != "trae_cn" || trae_direct,
                     scope: if trae_direct {
                         "完整登录上下文每日直连签到；无需运行客户端；积分不代表总余额".into()
                     } else if account.platform == "trae_cn" {
-                        "原生客户端每日签到；后台临时启动，不使用 HTTP 桥接；积分不代表总余额"
-                            .into()
+                        "Trae 会话缺少可直连设备上下文：可查询，领取已暂停；请到客户端接入页显式关联本网关独立登录，或在账号权益中重新复用客户端登录；已有旧预约时仍需等新活动窗口；积分不代表总余额".into()
                     } else {
                         "已适配活动赠送权益；不代表账号总余额".into()
                     },
@@ -774,6 +903,7 @@ impl BenefitsCenter {
             });
         }
         Ok(BenefitOverview {
+            settings_revision: cfg.settings_revision(),
             enabled: cfg.enabled,
             auto_claim: cfg.auto_claim,
             auto_claim_after_hour: cfg.auto_claim_after_hour,
@@ -812,25 +942,86 @@ impl BenefitsCenter {
         manual: bool,
         now: DateTime<Local>,
     ) -> FlightResult {
+        self.claim_with_origin(cfg, proxy, account_id, manual, now, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn claim_with_origin(
+        &self,
+        cfg: &BenefitsConfig,
+        proxy: Option<&str>,
+        account_id: &str,
+        manual: bool,
+        now: DateTime<Local>,
+        origin: Option<ReceiptOrigin>,
+    ) -> FlightResult {
         let account = account(cfg, account_id)?.clone();
         if !cfg.enabled || !account.enabled {
             return Err("权益中心或该账号未启用；未发起网络请求".into());
         }
-        if !manual && (!cfg.auto_claim || !cfg.account_is_due(account_id, now)) {
+        if !manual
+            && (!cfg.auto_claim
+                || !cfg.account_auto_claim_allowed(account_id)
+                || !cfg.account_is_due(account_id, now))
+        {
             return Err("自动领取未启用或尚未到开始时间；未发起网络请求".into());
         }
         let key = account_key(&account);
-        let (flight, sender) = {
-            let mut flights = self.flights.lock();
-            if let Some(flight) = flights.get(&key) {
-                (flight.clone(), None)
+        let gate = self.gate(&account);
+        let guard = gate.lock().await;
+        let existing = self.flights.lock().get(&key).cloned();
+        let (flight, sender, snapshot, admission, claim_source, send_epoch) =
+            if let Some(flight) = existing {
+                let mut tx = source::begin(&self.pool).await?;
+                let current = source::read(
+                    &mut tx,
+                    &account,
+                    crate::trae_auth::NativeReadPurpose::Benefits,
+                )
+                .await?;
+                let current_epoch = current.send_epoch(&account);
+                if current.view.source_revision != flight.source_revision
+                    || current_epoch.as_ref().map(source::SendEpoch::fingerprint)
+                        != flight.epoch_fingerprint
+                {
+                    return Err(source::error("source_changed"));
+                }
+                tx.commit()
+                    .await
+                    .map_err(|_| source::error("source_storage"))?;
+                (flight, None, None, 0, None, None)
             } else {
+                let mut tx = source::begin(&self.pool).await?;
+                let snapshot = source::read(
+                    &mut tx,
+                    &account,
+                    crate::trae_auth::NativeReadPurpose::Benefits,
+                )
+                .await?;
+                let admission = reservation::watermark(&mut tx).await?;
+                let claim_source = snapshot.claim_source(&account);
+                let send_epoch = snapshot.send_epoch(&account);
+                tx.commit()
+                    .await
+                    .map_err(|_| source::error("source_storage"))?;
                 let (sender, result) = watch::channel(None);
-                let flight = Arc::new(Flight { result });
-                flights.insert(key.clone(), flight.clone());
-                (flight, Some(sender))
-            }
-        };
+                let flight = Arc::new(Flight {
+                    result,
+                    source_revision: snapshot.view.source_revision.clone(),
+                    epoch_fingerprint: send_epoch.as_ref().map(source::SendEpoch::fingerprint),
+                });
+                self.flights.lock().insert(key.clone(), flight.clone());
+                (
+                    flight,
+                    Some(sender),
+                    Some(snapshot.wire),
+                    admission,
+                    claim_source,
+                    send_epoch,
+                )
+            };
+        drop(guard);
         if let Some(sender) = sender {
             let cleanup = FlightCleanup {
                 flights: self.flights.clone(),
@@ -841,10 +1032,18 @@ impl BenefitsCenter {
             let transport = self.transport.clone();
             let windows = self.windows.clone();
             let proxy = proxy.map(str::to_string);
+            let receipt_day = receipt::day(cfg, now);
+            #[cfg(test)]
+            let workbuddy_endpoint = self.workbuddy_endpoint.clone();
+            #[cfg(not(test))]
+            let workbuddy_endpoint: Option<String> = None;
             // Finish and persist even if the IPC/HTTP caller disconnects after remote POST.
             tokio::spawn(async move {
                 let _cleanup = cleanup;
                 let result = execute(Execution {
+                    token: snapshot.expect("new flight captures source"),
+                    claim_source,
+                    send_epoch,
                     pool: &pool,
                     transport: transport.as_ref(),
                     windows: &windows,
@@ -852,6 +1051,10 @@ impl BenefitsCenter {
                     proxy: proxy.as_deref(),
                     manual,
                     now,
+                    admission,
+                    receipt_day,
+                    origin,
+                    workbuddy_endpoint: workbuddy_endpoint.as_deref(),
                 })
                 .await;
                 let _ = sender.send(Some(result));
@@ -881,11 +1084,11 @@ impl BenefitsCenter {
             return Ok(Vec::new());
         }
         let mut results = Vec::new();
-        for account in cfg
-            .accounts
-            .iter()
-            .filter(|account| account.enabled && cfg.account_is_due(&account.id, now))
-        {
+        for account in cfg.accounts.iter().filter(|account| {
+            account.enabled
+                && cfg.account_auto_claim_allowed(&account.id)
+                && cfg.account_is_due(&account.id, now)
+        }) {
             results.push(self.claim_at(cfg, proxy, &account.id, false, now).await?);
         }
         Ok(results)
@@ -937,6 +1140,10 @@ fn safe_transport_error(error: &str) -> String {
         "领取响应缺少 replayed 标志，无法确认是否发放",
         "平台领取接口不存在（HTTP 404），请核对适配器版本",
         "Trae 原生账号绑定缺失，请重新复用客户端登录",
+        "权益来源或独立登录已变化，请刷新后重试",
+        "Trae 独立登录已过期，请显式重新登录或恢复原凭据",
+        "可信原生领取缺少可直连设备上下文，未启动客户端",
+        crate::trae_benefits::DEVICE_CONTEXT_REQUIRED,
         "Trae 直连领取被平台拒绝；未自动重发",
         "Trae 直连领取未获同日状态确认；未自动重发",
         "Trae 直连领取数量未获确认；未自动重发",
@@ -995,6 +1202,9 @@ fn reject_reflected_token(value: &Value, token: &str) -> Result<(), String> {
 }
 
 struct Execution<'a> {
+    token: Result<String, String>,
+    claim_source: Option<source::NativeClaimSource>,
+    send_epoch: Option<source::SendEpoch>,
     pool: &'a SqlitePool,
     transport: &'a dyn BenefitTransport,
     windows: &'a Windows,
@@ -1002,10 +1212,77 @@ struct Execution<'a> {
     proxy: Option<&'a str>,
     manual: bool,
     now: DateTime<Local>,
+    admission: i64,
+    receipt_day: String,
+    origin: Option<ReceiptOrigin>,
+    workbuddy_endpoint: Option<&'a str>,
+}
+
+struct ClaimRecorder<'a> {
+    pool: &'a SqlitePool,
+    account: &'a BenefitAccount,
+    manual: bool,
+    now: DateTime<Local>,
+    source: Option<&'a source::NativeClaimSource>,
+}
+impl ClaimRecorder<'_> {
+    async fn window_settled(&self, window: &str) -> Result<bool, String> {
+        let Some(source) = self.source else {
+            return repo::benefit_window_settled(self.pool, &self.account.id, window)
+                .await
+                .map_err(|_| "无法读取权益幂等记录".into());
+        };
+        let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM benefit_runs r JOIN benefit_run_principals p ON p.run_id=r.id WHERE r.account_id=? AND r.platform=? AND r.window_key=? AND r.verdict IN ('granted','replayed') AND p.platform=r.platform AND p.principal_hash=?")
+            .bind(&self.account.id).bind(&self.account.platform).bind(window).bind(source.principal()).fetch_one(self.pool).await.map_err(|_| "无法读取权益幂等记录")?;
+        Ok(count != 0)
+    }
+    async fn record(
+        &self,
+        campaign: Option<&BenefitCampaign>,
+        verdict: BenefitVerdict,
+        outcome: Option<ClaimOutcome>,
+        message: &str,
+    ) -> FlightResult {
+        let Some(source) = self.source else {
+            return record(
+                self.pool,
+                self.account,
+                campaign,
+                verdict,
+                outcome,
+                message,
+                self.manual,
+                self.now,
+            )
+            .await;
+        };
+        let mut result = build_result(
+            self.account,
+            campaign,
+            verdict,
+            outcome,
+            message,
+            self.manual,
+            self.now,
+        )?;
+        let mut tx = source::begin(self.pool).await?;
+        result.run.id = repo::insert_benefit_run_on(&mut tx, &result.run)
+            .await
+            .map_err(|_| "无法保存权益执行记录，请刷新平台状态确认领取结果")?;
+        principal::annotate(&mut tx, source, &result.run).await?;
+        principal::remember_settled(&mut tx, source, &result.run).await?;
+        tx.commit()
+            .await
+            .map_err(|_| "无法保存权益执行记录，请刷新平台状态确认领取结果")?;
+        Ok(result)
+    }
 }
 
 async fn execute(execution: Execution<'_>) -> FlightResult {
     let Execution {
+        token,
+        claim_source,
+        send_epoch,
         pool,
         transport,
         windows,
@@ -1013,78 +1290,82 @@ async fn execute(execution: Execution<'_>) -> FlightResult {
         proxy,
         manual,
         now,
+        admission,
+        receipt_day,
+        origin,
+        workbuddy_endpoint,
     } = execution;
     let platform =
         ClaimPlatform::parse(&account.platform).ok_or_else(|| "权益平台尚未适配".to_string())?;
+    if workbuddy::region(platform.key()).is_some() {
+        return workbuddy::execute(
+            pool,
+            account,
+            token,
+            proxy,
+            manual,
+            now,
+            admission,
+            &receipt_day,
+            origin.as_ref(),
+            workbuddy_endpoint,
+        )
+        .await;
+    }
+    let recorder = ClaimRecorder {
+        pool,
+        account,
+        manual,
+        now,
+        source: claim_source.as_ref(),
+    };
+    // Local reference validation precedes all settled-window shortcuts.
+    let token = match token {
+        Ok(token) => token,
+        Err(message) => {
+            return recorder
+                .record(None, BenefitVerdict::Error, None, &message)
+                .await
+        }
+    };
+    if let Some(epoch) = send_epoch.as_ref() {
+        epoch.check(pool).await?;
+    }
     let cached = windows.lock().get(&account_key(account)).cloned();
     if let Some(cached) = cached.filter(|campaign| campaign.is_active(now.timestamp())) {
         if let Some(window_key) = cached.window_key(platform) {
-            if repo::benefit_window_settled(pool, &account.id, &window_key)
+            if recorder
+                .window_settled(&window_key)
                 .await
                 .map_err(|_| "无法读取权益幂等记录".to_string())?
             {
-                return record(
-                    pool,
-                    account,
-                    Some(&cached),
-                    BenefitVerdict::Skipped,
-                    None,
-                    "该活动窗口已领取，本次未发起网络请求",
-                    manual,
-                    now,
-                )
-                .await;
+                return recorder
+                    .record(
+                        Some(&cached),
+                        BenefitVerdict::Skipped,
+                        None,
+                        "该活动窗口已领取，本次未发起网络请求",
+                    )
+                    .await;
             }
         }
     }
-    let token = match repo::get_secret(pool, &secret_name(account)).await {
-        Ok(Some(encrypted)) => match crypto::decrypt(&encrypted) {
-            Ok(token) => token,
-            Err(_) => {
-                return record(
-                    pool,
-                    account,
-                    None,
-                    BenefitVerdict::Error,
-                    None,
-                    "无法解密权益 token，请重新设置",
-                    manual,
-                    now,
-                )
-                .await
-            }
-        },
-        Ok(None) => {
-            return record(
-                pool,
-                account,
-                None,
-                BenefitVerdict::Error,
-                None,
-                "请先手工设置该账号的访问 token",
-                manual,
-                now,
-            )
-            .await
-        }
-        Err(_) => return Err("无法读取加密权益 token".into()),
-    };
     let status = match status_with(transport, account, &token, proxy).await {
         Ok(status) => status,
         Err(error) => {
-            return record(
-                pool,
-                account,
-                None,
-                BenefitVerdict::Error,
-                None,
-                &safe_transport_error(&error),
-                manual,
-                now,
-            )
-            .await
+            return recorder
+                .record(
+                    None,
+                    BenefitVerdict::Error,
+                    None,
+                    &safe_transport_error(&error),
+                )
+                .await
         }
     };
+    if let Some(epoch) = send_epoch.as_ref() {
+        epoch.check(pool).await?;
+    }
     let campaign = status
         .campaigns
         .iter()
@@ -1095,135 +1376,158 @@ async fn execute(execution: Execution<'_>) -> FlightResult {
             .iter()
             .find(|campaign| campaign.is_claimed() && campaign.is_active(now.timestamp()))
         {
-            return record(
-                pool,
-                account,
-                Some(claimed),
-                BenefitVerdict::Replayed,
+            return recorder
+                .record(
+                    Some(claimed),
+                    BenefitVerdict::Replayed,
+                    None,
+                    "平台活动显示已领取，本次没有再次发放，也未调用领取接口",
+                )
+                .await;
+        }
+        return recorder
+            .record(
                 None,
-                "平台活动显示已领取，本次没有再次发放，也未调用领取接口",
-                manual,
-                now,
+                BenefitVerdict::NoClaimable,
+                None,
+                "当前没有处于有效窗口的可领活动；未调用领取接口",
             )
             .await;
-        }
-        return record(
-            pool,
-            account,
-            None,
-            BenefitVerdict::NoClaimable,
-            None,
-            "当前没有处于有效窗口的可领活动；未调用领取接口",
-            manual,
-            now,
-        )
-        .await;
     };
     let window_key = campaign
         .window_key(platform)
         .ok_or_else(|| "活动没有有效的领取窗口".to_string())?;
-    if repo::benefit_window_settled(pool, &account.id, &window_key)
+    if recorder
+        .window_settled(&window_key)
         .await
         .map_err(|_| "无法读取权益幂等记录".to_string())?
     {
         windows
             .lock()
             .insert(account_key(account), campaign.clone());
-        return record(
-            pool,
-            account,
-            Some(campaign),
-            BenefitVerdict::Skipped,
-            None,
-            "该活动窗口已有领取记录，本次未调用领取接口",
-            manual,
-            now,
-        )
-        .await;
-    }
-    // One POST per execution. On uncertain failures, a later call first performs GET again.
-    let outcome = match transport
-        .request(platform, &token, proxy, Some(&campaign.campaign_id))
-        .await
-    {
-        Ok(value) => match parse_claim(platform, &campaign.campaign_id, &value) {
-            Ok(outcome) => {
-                if reject_reflected_token(&value, &token).is_err() {
-                    return record(
-                        pool,
-                        account,
-                        Some(campaign),
-                        BenefitVerdict::Error,
-                        None,
-                        "平台权益响应包含敏感凭据，已拒绝展示",
-                        manual,
-                        now,
-                    )
-                    .await;
-                }
-                if outcome.campaign_key != campaign.campaign_key {
-                    return record(
-                        pool,
-                        account,
-                        Some(campaign),
-                        BenefitVerdict::Error,
-                        None,
-                        "领取响应与当前活动 key 不一致",
-                        manual,
-                        now,
-                    )
-                    .await;
-                }
-                outcome
-            }
-            Err(error) => {
-                return record(
-                    pool,
-                    account,
-                    Some(campaign),
-                    BenefitVerdict::Error,
-                    None,
-                    &safe_transport_error(&error),
-                    manual,
-                    now,
-                )
-                .await
-            }
-        },
-        Err(error) => {
-            return record(
-                pool,
-                account,
+        return recorder
+            .record(
                 Some(campaign),
-                BenefitVerdict::Error,
+                BenefitVerdict::Skipped,
                 None,
-                &safe_transport_error(&error),
-                manual,
-                now,
+                "该活动窗口已有领取记录，本次未调用领取接口",
             )
-            .await
-        }
-    };
-    let verdict = if outcome.granted {
-        BenefitVerdict::Granted
-    } else {
-        BenefitVerdict::Replayed
-    };
-    let message = outcome.message.clone();
-    let result = record(
+            .await;
+    }
+    let mut tx = source::begin(pool).await?;
+    let allowed = receipt::permits(
+        &mut tx,
         pool,
+        account,
+        &receipt_day,
+        manual,
+        admission,
+        origin.as_ref(),
+    )
+    .await?;
+    if let Some(epoch) = send_epoch.as_ref() {
+        epoch.check(&mut *tx).await?;
+    }
+    let principal_owner = if allowed {
+        if let Some(source) = claim_source.as_ref() {
+            principal::acquire(&mut tx, account, &window_key, source).await?
+        } else {
+            principal::deny_unverified_if_reserved(&mut tx, account, &window_key).await?;
+            None
+        }
+    } else {
+        None
+    };
+    let owner = if allowed && (claim_source.is_none() || principal_owner.is_some()) {
+        if let Some(source) = claim_source.as_ref() {
+            reservation::acquire_native(&mut tx, account, &window_key, manual, admission, source)
+                .await?
+        } else {
+            reservation::acquire(&mut tx, account, &window_key, manual, admission).await?
+        }
+    } else {
+        None
+    };
+    if owner.is_some() {
+        tx.commit()
+            .await
+            .map_err(|_| "无法保存权益预约，未发送领取请求")?;
+    } else {
+        // No orphan principal reservation when the slot/receipt denies admission.
+        tx.rollback()
+            .await
+            .map_err(|_| "无法保存权益预约，未发送领取请求")?;
+    }
+    let Some(owner) = owner else {
+        return recorder
+            .record(
+                Some(campaign),
+                BenefitVerdict::Skipped,
+                None,
+                "该活动已有执行或当日收据，本次未调用领取接口",
+            )
+            .await;
+    };
+    let owner = match (claim_source.as_ref(), principal_owner.as_ref()) {
+        (Some(source), Some(principal)) => owner.dispatch_native(pool, principal, source).await?,
+        (None, None) => owner.dispatch(pool).await?,
+        _ => return Err("无法确认主体领取预约，未再次发送领取请求".into()),
+    };
+    // Every POST outcome uses the same atomic owner completion path.
+    let response = if let Some(epoch) = send_epoch.as_ref() {
+        let guard = ClaimDispatchGuard {
+            pool: pool.clone(),
+            epoch: epoch.clone(),
+        };
+        transport
+            .request_guarded(platform, &token, proxy, &campaign.campaign_id, &guard)
+            .await
+    } else {
+        transport
+            .request(platform, &token, proxy, Some(&campaign.campaign_id))
+            .await
+    };
+    let parsed = response.and_then(|value| {
+        reject_reflected_token(&value, &token)?;
+        let outcome = parse_claim(platform, &campaign.campaign_id, &value)?;
+        if outcome.campaign_key != campaign.campaign_key {
+            return Err("领取响应与当前活动 key 不一致".into());
+        }
+        Ok(outcome)
+    });
+    let (verdict, outcome, message) = match parsed {
+        Ok(outcome) => (
+            if outcome.granted {
+                BenefitVerdict::Granted
+            } else {
+                BenefitVerdict::Replayed
+            },
+            Some(outcome.clone()),
+            outcome.message,
+        ),
+        Err(error) => (BenefitVerdict::Error, None, safe_transport_error(&error)),
+    };
+    let result = build_result(
         account,
         Some(campaign),
         verdict,
-        Some(outcome),
+        outcome,
         &message,
         manual,
         now,
-    )
-    .await?;
-    windows
-        .lock()
-        .insert(account_key(account), campaign.clone());
+    )?;
+    let result = match (claim_source.as_ref(), principal_owner.as_ref()) {
+        (Some(source), Some(principal)) => {
+            owner.finish_native(pool, result, principal, source).await?
+        }
+        (None, None) => owner.finish(pool, result).await?,
+        _ => return Err("无法确认主体领取预约，未再次发送领取请求".into()),
+    };
+    if result.run.verdict.settles_window() {
+        windows
+            .lock()
+            .insert(account_key(account), campaign.clone());
+    }
     Ok(result)
 }
 
@@ -1238,9 +1542,25 @@ async fn record(
     manual: bool,
     now: DateTime<Local>,
 ) -> FlightResult {
+    let mut result = build_result(account, campaign, verdict, outcome, message, manual, now)?;
+    result.run.id = repo::insert_benefit_run(pool, &result.run)
+        .await
+        .map_err(|_| "无法保存权益执行记录，请刷新平台状态确认领取结果".to_string())?;
+    Ok(result)
+}
+
+fn build_result(
+    account: &BenefitAccount,
+    campaign: Option<&BenefitCampaign>,
+    verdict: BenefitVerdict,
+    outcome: Option<ClaimOutcome>,
+    message: &str,
+    manual: bool,
+    now: DateTime<Local>,
+) -> FlightResult {
     let platform =
         ClaimPlatform::parse(&account.platform).ok_or_else(|| "权益平台尚未适配".to_string())?;
-    let mut run = BenefitRunRecord {
+    let run = BenefitRunRecord {
         id: 0,
         account_id: account.id.clone(),
         platform: account.platform.clone(),
@@ -1257,9 +1577,6 @@ async fn record(
         manual,
         created_at: now.with_timezone(&Utc).to_rfc3339(),
     };
-    run.id = repo::insert_benefit_run(pool, &run)
-        .await
-        .map_err(|_| "无法保存权益执行记录，请刷新平台状态确认领取结果".to_string())?;
     Ok(BenefitClaimResult { run, outcome })
 }
 

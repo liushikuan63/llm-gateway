@@ -349,6 +349,10 @@ pub enum SearchBackendKind {
     /// **不是** `bingcn`。写错会让 TOML 解析失败、整个应用起不来——
     /// 这个坑真踩过，见 0.3.0验证记录 §4.11。
     BingCn,
+    /// Explicit two-source free aggregation; never selected as a credential fallback.
+    FreeAggregate,
+    /// Explicit experimental fixed-purpose MDN MCP; never a fallback.
+    MdnMcp,
     #[default]
     DuckDuckGo,
 }
@@ -363,6 +367,28 @@ pub enum SearchInjectFormat {
     User,
 }
 
+/// Explicit destination selection, never inferred from Latin text or a failure.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FreeSearchScope {
+    #[default]
+    Web,
+    NpmPackages,
+    HackerNews,
+    StackOverflow,
+}
+
+/// Request preference, not a guarantee about result geography or language.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FreeSearchLocale {
+    #[default]
+    SourceDefault,
+    CnZh,
+    UsEn,
+    GbEn,
+}
+
 /// **只含非密钥字段**。搜索 API Key 存 SQLite `app_secrets`（AES-256-GCM 密文），
 /// 绝不进 config.toml —— 后者会随项目快照一起传播。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -375,6 +401,18 @@ pub struct SearchConfig {
     pub max_results: u32,
     pub timeout_ms: u64,
     pub inject_as: SearchInjectFormat,
+    /// Explicit free-aggregate memory cache; 0 preserves fresh-query behavior.
+    pub query_cache_ttl_secs: u32,
+    /// Share an identical pending free query, without a detached worker.
+    pub coalesce_queries: bool,
+    /// Operator admission spacing, not a supplier quota or billing unit.
+    pub source_min_interval_ms: u32,
+    pub free_search_scope: FreeSearchScope,
+    pub free_search_locale: FreeSearchLocale,
+    /// Explicit search-only, unauthenticated endpoint. None retains direct egress.
+    pub free_proxy_url: Option<String>,
+    /// Explicit persisted opt-in; fetched excerpts remain request-local.
+    pub page_text_enabled: bool,
 }
 
 impl SearchConfig {
@@ -393,6 +431,13 @@ impl Default for SearchConfig {
             max_results: 5,
             timeout_ms: 8000,
             inject_as: SearchInjectFormat::System,
+            query_cache_ttl_secs: 0,
+            coalesce_queries: false,
+            source_min_interval_ms: 0,
+            free_search_scope: FreeSearchScope::Web,
+            free_search_locale: FreeSearchLocale::SourceDefault,
+            free_proxy_url: None,
+            page_text_enabled: false,
         }
     }
 }
@@ -420,13 +465,58 @@ pub fn is_explicit_model_name(requested: &str) -> bool {
             | "custom"
             | "smart"
             | "cascade"
+            | "free"
     )
 }
 
 /// 应用级配置（落盘为 config.toml，可被「项目快照」整体打包/还原）
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxyControlConfig {
+    pub start_gateway_on_launch: bool,
+    pub start_system_proxy_on_launch: bool,
+    pub system_proxy_server: Option<String>,
+}
+
+/// Supplier inventory maintenance is separate from the legacy signed pricing feed.
+/// Both the switch and a selected supplier are required for automatic reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CatalogMaintenanceConfig {
+    pub enabled: bool,
+    pub provider_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FreeRoutingConfig {
+    pub enabled: bool,
+}
+
+impl CatalogMaintenanceConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut unique = std::collections::HashSet::new();
+        if self.provider_ids.len() > 128 {
+            anyhow::bail!("自动目录维护最多选择128家供应商");
+        }
+        for id in &self.provider_ids {
+            if id.is_empty()
+                || id.len() > 512
+                || id.trim() != id
+                || id.chars().any(char::is_control)
+                || !unique.insert(id)
+            {
+                anyhow::bail!("目录维护供应商ID无效或重复");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub proxy_control: ProxyControlConfig,
     /// 网关监听地址。默认只绑回环地址，避免裸奔公网。
     pub bind: String,
     pub port: u16,
@@ -470,6 +560,8 @@ pub struct AppConfig {
     /// 模型目录自动更新（对齐 FreeLLMAPI 的 signed catalog feed）
     pub catalog_auto_update: bool,
     pub catalog_feed_url: Option<String>,
+    pub catalog_maintenance: CatalogMaintenanceConfig,
+    pub free_routing: FreeRoutingConfig,
     /// 热切换：把已接管的 CLI 工具的 base_url 指向本地网关
     pub takeover: TakeoverConfig,
     /// 本地模型运行时扫描与登记
@@ -764,6 +856,7 @@ pub enum RoutingStrategy {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            proxy_control: ProxyControlConfig::default(),
             bind: "127.0.0.1".into(),
             port: 15721,
             allow_lan: false,
@@ -781,6 +874,8 @@ impl Default for AppConfig {
             failover_enabled: true,
             catalog_auto_update: false,
             catalog_feed_url: None,
+            catalog_maintenance: CatalogMaintenanceConfig::default(),
+            free_routing: FreeRoutingConfig::default(),
             takeover: TakeoverConfig::default(),
             local_models: LocalModelConfig::default(),
             smart_routing: SmartRoutingConfig::default(),
@@ -951,6 +1046,9 @@ impl AppConfig {
     pub fn normalize_local(&mut self) {
         self.search.max_results = self.search.normalized_max_results();
         self.search.timeout_ms = self.search.timeout_ms.clamp(500, 60_000);
+        if let Some(proxy) = &mut self.search.free_proxy_url {
+            *proxy = proxy.trim().to_owned();
+        }
         self.local_models.probe_timeout_ms = self.local_models.probe_timeout_ms.clamp(200, 30_000);
         self.smart_routing.timeout_ms = self.smart_routing.timeout_ms.clamp(100, 30_000);
         self.smart_routing.min_confidence = self.smart_routing.min_confidence.clamp(0.0, 1.0);
@@ -974,6 +1072,9 @@ impl AppConfig {
     /// 地址类字段只接受 http/https。本地端点与 SearXNG 实例都由用户填写，
     /// 不校验就等于给了任意协议拼接的口子。返回面向用户的中文错误。
     pub fn validate_local(&self) -> anyhow::Result<()> {
+        if let Some(proxy) = &self.search.free_proxy_url {
+            crate::search::egress::validate_proxy(proxy).map_err(|e| anyhow::anyhow!(e))?;
+        }
         for endpoint in &self.local_models.endpoints {
             if endpoint.base_url.trim().is_empty() {
                 anyhow::bail!("本地端点「{}」的地址不能为空", endpoint.label);
@@ -981,6 +1082,12 @@ impl AppConfig {
             validate_http_url(&endpoint.base_url)?;
         }
         validate_http_url(&self.smart_routing.jev.base_url)?;
+        if self.search.query_cache_ttl_secs > 3600 {
+            anyhow::bail!("本机检索缓存有效期必须在0到3600秒之间");
+        }
+        if self.search.source_min_interval_ms > 3_600_000 {
+            anyhow::bail!("免费源发送预留间隔必须在0到3600000毫秒之间");
+        }
         if let Some(url) = self.search.searxng_url.as_deref() {
             validate_http_url(url)?;
         }
@@ -997,6 +1104,7 @@ impl AppConfig {
         }
         self.auth_failure.validate()?;
         self.benefits.validate()?;
+        self.catalog_maintenance.validate()?;
         Ok(())
     }
 

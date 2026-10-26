@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import { api, QoderJobStatus, QoderLoginStatus, QoderRegion } from "../api";
 import "./workbuddy-login.css";
 
 type Phase = "idle" | "starting" | "waiting" | "poll_error" | "expired" | "cancelled";
-type Action = "check" | "start" | "cancel" | "refresh" | "prepare" | "refresh_model" | "register";
+type Action = "check" | "start" | "cancel" | "refresh" | "prepare" | "refresh_model" | "reissue_model" | "register";
 const ACCOUNT_PATTERN = /^[A-Za-z0-9_\x2d]{1,64}$/;
 const MODEL_LABELS: Record<QoderJobStatus["status"], string> = {
   not_logged_in: "请先网页登录", not_prepared: "尚未准备", stale: "登录已变化，请重新准备",
@@ -28,9 +28,22 @@ function clearTimers(session: LoginSession) {
   session.deadlineTimer = null;
 }
 
-function cancelQuietly(region: QoderRegion, session: LoginSession | null) {
-  if (session?.loginId) void api.qoderLoginCancel(region, session.loginId).catch(() => {});
+// Process-local region ownership survives a page remount. It is neither a
+// persisted credential store nor permission to retry a failed authorization.
+const regionOperations:Record<QoderRegion,Set<symbol>>={cn:new Set(),global:new Set()};
+const failedCancellations:Record<QoderRegion,Set<string>>={cn:new Set(),global:new Set()};
+const cancelling:Record<QoderRegion,Map<string,Promise<boolean>>>={cn:new Map(),global:new Map()};
+const operationListeners=new Set<()=>void>();
+function notifyOperations(){operationListeners.forEach(listener=>listener());}
+function subscribeOperations(listener:()=>void){operationListeners.add(listener);return()=>{operationListeners.delete(listener);};}
+function beginRegionOperation(region:QoderRegion){const token=Symbol();regionOperations[region].add(token);notifyOperations();return()=>{if(regionOperations[region].delete(token))notifyOperations();};}
+function cancelLoginId(region:QoderRegion,id:string):Promise<boolean>{
+  const prior=cancelling[region].get(id);if(prior)return prior;
+  const finish=beginRegionOperation(region);
+  const attempt=(async()=>{try{await api.qoderLoginCancel(region,id);failedCancellations[region].delete(id);return true;}catch{failedCancellations[region].add(id);return false;}finally{cancelling[region].delete(id);notifyOperations();finish();}})();
+  cancelling[region].set(id,attempt);return attempt;
 }
+function cancelQuietly(region:QoderRegion,session:LoginSession|null){if(session?.loginId)void cancelLoginId(region,session.loginId);}
 
 function officialAuthorizationUrl(value: string, region: QoderRegion): string {
   const url = new URL(value);
@@ -73,7 +86,8 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
   const [busy, setBusy] = useState<Action | null>(null);
   const [opening, setOpening] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [cancelRetry, setCancelRetry] = useState<string | null>(null);
+  const regionBusy=useSyncExternalStore(subscribeOperations,()=>regionOperations[region].size>0);
+  const cancelRetry=useSyncExternalStore(subscribeOperations,()=>failedCancellations[region].size);
   const mounted = useRef(false);
   const generation = useRef(0);
   const active = useRef<LoginSession | null>(null);
@@ -105,7 +119,7 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
     const id = generation.current;
     if (!ACCOUNT_PATTERN.test(account)) return;
     const timer = setTimeout(() => {
-      if (!isCurrent(id) || active.current || action.current) return;
+      if (!isCurrent(id) || active.current || action.current || regionOperations[region].size || failedCancellations[region].size) return;
       action.current = "check";
       setBusy("check");
       void Promise.all([api.qoderLoginStatus(region, account), api.qoderJobStatus(region, account)]).then(([result, model]) => {
@@ -131,7 +145,6 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
     setLoginView(null);
     setBusy(null);
     setOpening(false);
-    setCancelRetry(null);
     setNotice(null);
   };
 
@@ -181,7 +194,7 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
 
   const startLogin = async () => {
     const account = accountId.trim();
-    if (!ACCOUNT_PATTERN.test(account) || action.current || active.current || cancelRetry) return;
+    if (!ACCOUNT_PATTERN.test(account) || action.current || active.current || failedCancellations[region].size || regionOperations[region].size) return;
     const id = ++generation.current;
     action.current = "start";
     setBusy("start");
@@ -189,6 +202,7 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
     setJob(null);
     setPhase("starting");
     setNotice(null);
+    const finish=beginRegionOperation(region);
     const session: LoginSession = { generation: id, accountId: account, loginId: null, deadline: Date.now() + 300_000, polling: false, pollTimer: null, deadlineTimer: null };
     active.current = session;
     session.deadlineTimer = setTimeout(() => expireSession(session), 300_000);
@@ -214,36 +228,21 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
       setLoginView(null);
       setNotice({ error: true, text: "无法创建安全的网页登录，请重试。仅允许打开所选区域的 Qoder 官方 HTTPS 授权页面。" });
     } finally {
+      finish();
       if (isCurrent(id)) { action.current = null; setBusy(null); }
     }
   };
 
   const cancelLogin = async () => {
-    if (action.current === "cancel") return;
-    const session = releaseSession();
-    const loginId = session?.loginId ?? cancelRetry;
-    const id = ++generation.current;
-    action.current = "cancel";
-    openingGeneration.current = null;
-    setBusy("cancel");
-    setOpening(false);
-    setLoginView(null);
-    setPhase("cancelled");
-    setNotice(null);
-    try {
-      if (loginId) await api.qoderLoginCancel(region, loginId);
-      if (isCurrent(id)) {
-        setCancelRetry(null);
-        setNotice({ error: false, text: "已取消本次网页登录。需要时可重新登录。" });
-      }
-    } catch {
-      if (isCurrent(id)) {
-        setCancelRetry(loginId);
-        setNotice({ error: true, text: "已停止等待，但取消请求未完成，请点击「重试取消」。" });
-      }
-    } finally {
-      if (isCurrent(id)) { action.current = null; setBusy(null); }
-    }
+    if(action.current === "cancel")return;
+    const session=releaseSession();
+    const ids=[...new Set([...(session?.loginId?[session.loginId]:[]),...failedCancellations[region]])];
+    const id=++generation.current;action.current="cancel";openingGeneration.current=null;
+    setBusy("cancel");setOpening(false);setLoginView(null);setPhase("cancelled");setNotice(null);
+    try{
+      const done=await Promise.all(ids.map(loginId=>cancelLoginId(region,loginId)));
+      if(isCurrent(id))setNotice(ids.length===0?{error:false,text:"已停止等待，正在结束本次登录准备。"}:done.every(Boolean)?{error:false,text:"已取消本次网页登录。需要时可重新登录。"}:{error:true,text:"已停止等待，但取消请求未完成，请点击「重试取消」。"});
+    }finally{if(isCurrent(id)){action.current=null;setBusy(null);}}
   };
 
   const openAuthorization = async () => {
@@ -268,7 +267,7 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
 
   const accountAction = async (kind: "check" | "refresh") => {
     const account = accountId.trim();
-    if (!ACCOUNT_PATTERN.test(account) || action.current || active.current || cancelRetry) return;
+    if (!ACCOUNT_PATTERN.test(account) || action.current || active.current || failedCancellations[region].size || regionOperations[region].size) return;
     const id = ++generation.current;
     action.current = kind;
     setBusy(kind);
@@ -293,10 +292,12 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
     }
   };
 
-  const modelAction = async (kind: "prepare" | "refresh_model" | "register") => {
+  const modelAction = async (kind: "prepare" | "refresh_model" | "reissue_model" | "register") => {
     const account = accountId.trim();
-    if (!ACCOUNT_PATTERN.test(account) || action.current || active.current || cancelRetry || status?.status !== "logged_in") return;
-    if (kind === "register" ? job?.status !== "prepared" : job?.attempt_blocked || (kind === "refresh_model" && !job?.can_refresh)) return;
+    if (!ACCOUNT_PATTERN.test(account) || action.current || active.current || failedCancellations[region].size || regionOperations[region].size || status?.status !== "logged_in") return;
+    if (kind === "register" ? job?.status !== "prepared"
+      : kind === "reissue_model" ? !job?.can_reissue
+      : job?.attempt_blocked || (kind === "refresh_model" && !job?.can_refresh)) return;
     const id = ++generation.current;
     action.current = kind; setBusy(kind); setNotice(null);
     try {
@@ -306,7 +307,8 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
         setNotice({ error: false, text: `已接入 ${result.model_count} 个模型，请到供应商页查看。${result.warnings.length ? `目录有 ${result.warnings.length} 条提示，请核对能力与价格来源。` : ""}本次仅读取目录并保存配置，未发送模型请求。` });
         changed.current?.();
       } else {
-        const result = kind === "prepare" ? await api.qoderJobPrepare(region, account) : await api.qoderJobRefresh(region, account);
+        const result = kind === "prepare" ? await api.qoderJobPrepare(region, account)
+          : kind === "reissue_model" ? await api.qoderJobReissue(region, account) : await api.qoderJobRefresh(region, account);
         if (!isCurrent(id)) return;
         if (result.region !== region || result.account_id !== account) throw new Error("Account mismatch");
         setJob(result);
@@ -314,7 +316,8 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
       }
     } catch {
       if (isCurrent(id)) {
-        if (kind !== "register") setJob(old => old ? { ...old, attempt_blocked: true, can_refresh: false } : null);
+        if (kind !== "register") setJob(old => old ? { ...old, attempt_blocked: true, can_refresh: false, can_reissue: false,
+          reissue_attempted: kind === "reissue_model" || old.reissue_attempted } : null);
         setNotice({ error: true, text: kind === "register" ? "模型目录接入失败，已有配置保留。请检查认证状态后重试接入。" : "模型认证失败或结果不明，已停止，不会自动重放。请检查登录状态后按提示处理。" });
       }
     } finally { if (isCurrent(id)) { action.current = null; setBusy(null); } }
@@ -322,7 +325,7 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
 
   const pending = phase === "starting" || phase === "waiting" || phase === "poll_error";
   const validAccount = ACCOUNT_PATTERN.test(accountId.trim());
-  const disabled = !!busy || pending || !!cancelRetry || !validAccount;
+  const disabled = !!busy || pending || regionBusy || !!cancelRetry || !validAccount;
   const label = pending ? (phase === "starting" ? "正在准备网页登录" : "等待网页授权") : phase === "expired" ? "等待已结束" : phase === "cancelled" ? "已取消等待" : status ? STATUS_LABELS[status.status] : "状态待确认";
 
   return <section className="workbuddy-login" aria-labelledby={`${inputId}-heading`} data-testid={`qoder-login-${region}`}>
@@ -344,12 +347,15 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
     </form>
     {status?.status === "logged_in" && !pending && <div className="workbuddy-login__authorization">
       <strong>独立模型接入</strong>
-      <p role="status">{job ? MODEL_LABELS[job.status] : "模型认证状态待检查"}{job?.attempt_blocked ? "；认证操作已锁定，请检查状态后处理" : ""}。{job?.access_expires_at_ms != null && `有效期：${displayTime(job.access_expires_at_ms)}。`}</p>
+      <p role="status">{job ? MODEL_LABELS[job.status] : "模型认证状态待检查"}{job?.attempt_blocked && !job?.can_reissue ? "；认证操作已锁定，请检查状态后处理" : ""}。{job?.access_expires_at_ms != null && `有效期：${displayTime(job.access_expires_at_ms)}。`}</p>
       <div className="workbuddy-login__actions">
-        <button type="button" disabled={disabled || !job || job.attempt_blocked || job.status === "prepared"} aria-busy={busy === "prepare"} onClick={() => void modelAction("prepare")}>{busy === "prepare" ? "正在准备…" : "准备模型认证"}</button>
+        <button type="button" disabled={disabled || !job || job.attempt_blocked || job.can_reissue || job.reissue_attempted || job.status === "prepared"} aria-busy={busy === "prepare"} onClick={() => void modelAction("prepare")}>{busy === "prepare" ? "正在准备…" : "准备模型认证"}</button>
         {job?.can_refresh && <button type="button" disabled={disabled || job.attempt_blocked} aria-busy={busy === "refresh_model"} onClick={() => void modelAction("refresh_model")}>{busy === "refresh_model" ? "正在刷新…" : "刷新模型认证"}</button>}
+        {(job?.can_reissue || job?.reissue_attempted) && <button type="button" disabled={disabled || !job.can_reissue} aria-busy={busy === "reissue_model"} onClick={() => void modelAction("reissue_model")}>{busy === "reissue_model" ? "正在重新签发…" : "重新签发模型认证"}</button>}
         <button type="button" className="primary" disabled={disabled || job?.status !== "prepared"} aria-busy={busy === "register"} onClick={() => void modelAction("register")}>{busy === "register" ? "正在接入…" : "接入账号模型"}</button>
       </div>
+      {job?.can_reissue && <p>设备登录仍有效，正常调用前会自动恢复模型认证，无需重复网页登录。「重新签发模型认证」是手动兜底；同代恢复失败或结果不明时不重复尝试。</p>}
+      {job?.reissue_attempted && !job.can_reissue && <p role="status">本代重新签发已尝试或取消，不会自动重放。请先检查状态；仍未恢复时再重新网页登录。</p>}
       <p>准备认证与读取目录不发送模型请求。目录接入后可在供应商页设置模型；实际生成可能消耗账号额度。目录中的免费标记与积分倍率不等于现金价格。</p>
     </div>}
     {pending && <div className="workbuddy-login__authorization">
@@ -359,7 +365,8 @@ export default function QoderLogin({ region, onChanged }: { region: QoderRegion;
         <button type="button" disabled={busy === "cancel"} onClick={() => void cancelLogin()}>取消登录</button>
       </div>
     </div>}
-    {cancelRetry && <button type="button" disabled={!!busy} onClick={() => void cancelLogin()}>重试取消</button>}
+    {cancelRetry > 0 && <p role="alert">原登录取消尚未确认；同区新操作保持停用，可明确重试取消。此处不证明供应商凭据已撤销。</p>}
+    {cancelRetry > 0 && <button type="button" disabled={!!busy||regionBusy} onClick={() => void cancelLogin()}>重试取消</button>}
     {notice && <p className={`workbuddy-login__notice ${notice.error ? "is-error" : ""}`} role={notice.error ? "alert" : "status"}>{notice.text}</p>}
     {status && !pending && <dl className="workbuddy-login__details">
       <div><dt>登录用户</dt><dd>{status.identity?.display_name || "未提供"}{status.identity?.masked_email && <span>{status.identity.masked_email}</span>}</dd></div>

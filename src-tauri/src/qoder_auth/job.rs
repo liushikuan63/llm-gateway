@@ -14,6 +14,8 @@ pub struct JobStatus {
     pub access_expires_at_ms: Option<i64>,
     pub refresh_expires_at_ms: Option<i64>,
     pub can_refresh: bool,
+    pub can_reissue: bool,
+    pub reissue_attempted: bool,
     pub attempt_blocked: bool,
     pub inference_verified: bool,
 }
@@ -172,6 +174,32 @@ fn operation(device_generation: &str, old: Option<&JobCredential>) -> String {
     format!("{:x}", digest.finalize())
 }
 
+#[derive(Clone, Copy)]
+enum JobAction {
+    Prepare,
+    Refresh,
+    Reissue,
+}
+
+fn reissue_eligible(device: &Credential, old: Option<&JobCredential>) -> bool {
+    device.access_expires_at_ms.is_some_and(|at| at > now_ms())
+        && old.is_some_and(|job| {
+            validate_job(job, device).is_ok()
+                && job.principal_verified
+                && job.access_expires_at_ms.is_some_and(|at| at <= now_ms())
+                && (job.refresh.is_none()
+                    || job.refresh_expires_at_ms.is_some_and(|at| at <= now_ms()))
+        })
+}
+
+fn reissue_operation(device_generation: &str, old: &JobCredential) -> String {
+    let mut digest = Sha256::new();
+    digest.update(device_generation.as_bytes());
+    digest.update(b":explicit-reissue-v1:");
+    digest.update(old.access.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
 impl QoderAuth {
     async fn job_device(
         &self,
@@ -220,6 +248,18 @@ impl QoderAuth {
         } else {
             false
         };
+        let reissue_attempted =
+            if let (Some(device), Some(job), Some(attempt)) = (&device, matching, &attempt) {
+                let gen = generation(device)?;
+                attempt.generation == gen
+                    && (attempt.cancelled || attempt.operation == reissue_operation(&gen, job))
+            } else {
+                false
+            };
+        let can_reissue = device
+            .as_ref()
+            .is_some_and(|d| reissue_eligible(d, matching))
+            && !reissue_attempted;
         Ok(JobStatus {
             status: if device.is_none() {
                 "not_logged_in"
@@ -248,28 +288,49 @@ impl QoderAuth {
                     && !blocked
                     && !j.refresh_expires_at_ms.is_some_and(|t| t <= now_ms())
             }),
+            can_reissue,
+            reissue_attempted,
             attempt_blocked: blocked,
             inference_verified: false,
         })
     }
 
     pub async fn job_prepare(&self, region: Region, account: &str) -> Result<JobStatus, String> {
-        self.job_update(region, account, false).await
+        // Demand-based renewal only. Local status reads never issue credentials.
+        let (_, device) = self.job_device(region, account).await?;
+        let raw = self.read(&key(region, "job", account)).await?;
+        let old: Option<JobCredential> = raw.as_deref().map(decode).transpose()?;
+        if device
+            .access_expires_at_ms
+            .is_some_and(|at| at > now_ms().saturating_add(60_000))
+            && reissue_eligible(&device, old.as_ref())
+        {
+            self.job_update(region, account, JobAction::Reissue).await
+        } else {
+            self.job_update(region, account, JobAction::Prepare).await
+        }
     }
+    /// Manual fallback; demand preauthorization shares the same guarded reissue action.
+    pub async fn job_reissue(&self, region: Region, account: &str) -> Result<JobStatus, String> {
+        self.job_update(region, account, JobAction::Reissue).await
+    }
+
     pub async fn job_refresh(&self, region: Region, account: &str) -> Result<JobStatus, String> {
-        self.job_update(region, account, true).await
+        self.job_update(region, account, JobAction::Refresh).await
     }
 
     async fn job_update(
         &self,
         region: Region,
         account: &str,
-        force: bool,
+        action: JobAction,
     ) -> Result<JobStatus, String> {
+        let force = matches!(action, JobAction::Refresh);
+        let reissue = matches!(action, JobAction::Reissue);
         // Device refresh has its own gate. Never enter it while holding this gate.
         let (_, device) = self.job_device(region, account).await?;
         let initial_job = self.read(&key(region, "job", account)).await?;
-        if !force
+        if matches!(action, JobAction::Prepare)
             && device
                 .access_expires_at_ms
                 .is_some_and(|t| t <= now_ms().saturating_add(60_000))
@@ -285,11 +346,12 @@ impl QoderAuth {
         let old_raw = self.read(&job_name).await?;
         let stored: Option<JobCredential> = old_raw.as_deref().map(decode).transpose()?;
         let old = stored.as_ref().filter(|j| validate_job(j, &device).is_ok());
-        if force
+        if (force || reissue)
             && initial_job.is_some()
             && initial_job != old_raw
             && old.is_some_and(|j| {
                 j.principal_verified
+                    && (!reissue || j.access_expires_at_ms.is_some())
                     && !j
                         .access_expires_at_ms
                         .is_some_and(|t| t <= now_ms().saturating_add(60_000))
@@ -300,6 +362,7 @@ impl QoderAuth {
         if !force
             && old.is_some_and(|j| {
                 j.principal_verified
+                    && (!reissue || j.access_expires_at_ms.is_some())
                     && !j
                         .access_expires_at_ms
                         .is_some_and(|t| t <= now_ms().saturating_add(60_000))
@@ -310,7 +373,14 @@ impl QoderAuth {
         if force && old.is_none() {
             return Err("没有可刷新的本代Qoder模型认证".into());
         }
-        let refresh = if let Some(old) = old {
+        if reissue && !reissue_eligible(&device, old) {
+            return Err(
+                "仅已核验且明确到期、无法刷新的模型认证可重新签发；请检查设备登录状态".into(),
+            );
+        }
+        let refresh = if reissue {
+            None
+        } else if let Some(old) = old {
             if old.refresh_expires_at_ms.is_some_and(|t| t <= now_ms()) {
                 return Err("Qoder模型刷新凭据已到期，请重新登录".into());
             }
@@ -323,7 +393,11 @@ impl QoderAuth {
             None
         };
         let gen = generation(&device)?;
-        let op = operation(&gen, old);
+        let op = if reissue {
+            reissue_operation(&gen, old.ok_or("缺少可重新签发的模型认证")?)
+        } else {
+            operation(&gen, old)
+        };
         let attempt_name = key(region, "job-attempt", account);
         let previous = self.read(&attempt_name).await?;
         if let Some(raw) = &previous {
@@ -392,7 +466,9 @@ impl QoderAuth {
             || current_job != old_raw
             || device.access_expires_at_ms.is_some_and(|t| t <= now_ms())
             || now_ms() >= attempt.deadline_ms
-            || old.is_some_and(|j| j.refresh_expires_at_ms.is_some_and(|t| t <= now_ms()))
+            || (reissue && !reissue_eligible(&device, old))
+            || (!reissue
+                && old.is_some_and(|j| j.refresh_expires_at_ms.is_some_and(|t| t <= now_ms())))
         {
             return Err("Qoder模型认证预约发生竞争或设备已到期，未发送请求".into());
         }
@@ -406,7 +482,9 @@ impl QoderAuth {
         if active_attempt.as_deref() != Some(&reserved)
             || now_ms() >= attempt.deadline_ms
             || device.access_expires_at_ms.is_some_and(|t| t <= now_ms())
-            || old.is_some_and(|j| j.refresh_expires_at_ms.is_some_and(|t| t <= now_ms()))
+            || (reissue && !reissue_eligible(&device, old))
+            || (!reissue
+                && old.is_some_and(|j| j.refresh_expires_at_ms.is_some_and(|t| t <= now_ms())))
         {
             return Err("Qoder模型认证预约已取消或到期，未发送请求".into());
         }
@@ -431,7 +509,19 @@ impl QoderAuth {
                 "Qoder模型认证被拒绝（HTTP {http}），不重放且保留原认证"
             ));
         }
-        let mut job = parse_job(&device, &value, old)?;
+        let mut job = parse_job(&device, &value, if reissue { None } else { old })?;
+        if old.is_some_and(|old| old.access == job.access) {
+            return Err("Qoder模型认证未返回新代次，原认证保留".into());
+        }
+        if reissue
+            && (self.read(&attempt_name).await?.as_deref() != Some(reserved.as_str())
+                || self.read(&session_name).await?.as_deref() != Some(baseline.as_str())
+                || self.read(&job_name).await? != old_raw
+                || now_ms() >= attempt.deadline_ms
+                || !reissue_eligible(&device, old))
+        {
+            return Err("Qoder重新签发已取消、改变或到期，原资料保留".into());
+        }
         let mut checked = device.clone();
         let mut secrets = vec![device.access.as_str(), job.access.as_str()];
         secrets.extend(device.refresh.as_deref());
@@ -490,6 +580,7 @@ impl QoderAuth {
             || current.as_deref() != Some(&baseline)
             || current_job != old_raw
             || now_ms() >= attempt.deadline_ms
+            || (reissue && !reissue_eligible(&device, old))
             || job.access_expires_at_ms.is_some_and(|t| t <= now_ms())
             || device.access_expires_at_ms.is_some_and(|t| t <= now_ms())
         {
@@ -558,6 +649,7 @@ mod tests {
         refreshes: AtomicUsize,
         profiles: AtomicUsize,
         tag_requests: AtomicUsize,
+        tag_last_auth: std::sync::Mutex<String>,
         catalog_requests: AtomicUsize,
         catalog_http: AtomicU16,
         reflect_signing: AtomicU8,
@@ -643,7 +735,12 @@ mod tests {
     ) -> Json<Value> {
         assert_eq!(region, m.region.key());
         assert_eq!(organization, "org-1");
-        assert_eq!(headers["authorization"], "Bearer job-access-old");
+        let bearer = headers["authorization"].to_str().unwrap();
+        assert!(matches!(
+            bearer,
+            "Bearer job-access-old" | "Bearer job-access-new"
+        ));
+        *m.tag_last_auth.lock().unwrap() = bearer.into();
         m.tag_requests.fetch_add(1, Ordering::SeqCst);
         Json(json!({"tags":["synthetic-organization-tag"]}))
     }
@@ -730,6 +827,7 @@ mod tests {
             refreshes: AtomicUsize::new(0),
             profiles: AtomicUsize::new(0),
             tag_requests: AtomicUsize::new(0),
+            tag_last_auth: std::sync::Mutex::new(String::new()),
             catalog_requests: AtomicUsize::new(0),
             catalog_http: AtomicU16::new(200),
             reflect_signing: AtomicU8::new(0),
@@ -1461,5 +1559,378 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!((before + 60000..=now_ms() + 60000).contains(&device_expiry));
+    }
+    async fn expire_saved_job(f: &Fixture, region: Region) {
+        let mut job = saved(f).await;
+        job.access_expires_at_ms = Some(now_ms() - 2000);
+        job.refresh_expires_at_ms = Some(now_ms() - 1000);
+        repo::set_secret(
+            &f.auth.pool,
+            &key(region, "job", "main"),
+            &encode(&job).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_reissue_recovers_both_regions_without_relogin_or_old_refresh() {
+        for region in [Region::Global, Region::Cn] {
+            let f = fixture(region).await;
+            f.auth.job_prepare(region, "main").await.unwrap();
+            expire_saved_job(&f, region).await;
+            let device_before = f.auth.read(&key(region, "session", "main")).await.unwrap();
+            *f.mock.issue.lock().unwrap() =
+                json!({"token":"job-access-new","expires_in":3_600_000});
+            let status = f.auth.job_reissue(region, "main").await.unwrap();
+            assert_eq!(status.status, "prepared");
+            assert_eq!(f.mock.issues.load(Ordering::SeqCst), 2);
+            assert_eq!(f.mock.refreshes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                f.auth.read(&key(region, "session", "main")).await.unwrap(),
+                device_before
+            );
+            let next = saved(&f).await;
+            assert_eq!(next.access, "job-access-new");
+            assert_eq!(next.refresh, None);
+            assert_eq!(next.refresh_expires_at_ms, None);
+        }
+    }
+    #[tokio::test]
+    async fn reissue_failure_is_persistent_one_shot_even_after_deadline_and_preserves_pair() {
+        let f = fixture(Region::Global).await;
+        f.auth.job_prepare(Region::Global, "main").await.unwrap();
+        expire_saved_job(&f, Region::Global).await;
+        let before = f
+            .auth
+            .read(&key(Region::Global, "job", "main"))
+            .await
+            .unwrap();
+        f.mock.code.store(500, Ordering::SeqCst);
+        assert!(
+            f.auth
+                .job_status(Region::Global, "main")
+                .await
+                .unwrap()
+                .can_reissue
+        );
+        assert!(f.auth.job_reissue(Region::Global, "main").await.is_err());
+        let attempt_key = key(Region::Global, "job-attempt", "main");
+        let mut attempt: Attempt =
+            decode(&f.auth.read(&attempt_key).await.unwrap().unwrap()).unwrap();
+        attempt.deadline_ms = 1;
+        repo::set_secret(&f.auth.pool, &attempt_key, &encode(&attempt).unwrap())
+            .await
+            .unwrap();
+        let mut other = QoderAuth::new(f.auth.pool.clone(), None).unwrap();
+        other.test_origin = f.auth.test_origin.clone();
+        assert!(other.job_reissue(Region::Global, "main").await.is_err());
+        assert!(other.job_prepare(Region::Global, "main").await.is_err());
+        let status = other.job_status(Region::Global, "main").await.unwrap();
+        assert!(!status.can_reissue);
+        assert!(status.reissue_attempted);
+        assert_eq!(
+            f.auth
+                .read(&key(Region::Global, "job", "main"))
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(f.mock.issues.load(Ordering::SeqCst), 2);
+        assert_eq!(f.mock.refreshes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reissue_ineligible_unknown_healthy_unverified_or_expired_device_sends_nothing() {
+        for mode in 0..6 {
+            let f = fixture(Region::Global).await;
+            f.auth.job_prepare(Region::Global, "main").await.unwrap();
+            expire_saved_job(&f, Region::Global).await;
+            let mut job = saved(&f).await;
+            let (raw, mut device) = f.auth.job_device(Region::Global, "main").await.unwrap();
+            match mode {
+                0 => job.access_expires_at_ms = None,
+                1 => job.refresh_expires_at_ms = None,
+                2 => job.access_expires_at_ms = Some(now_ms() + 120_000),
+                3 => job.principal_verified = false,
+                4 => device.access_expires_at_ms = None,
+                _ => device.access_expires_at_ms = Some(now_ms() - 1),
+            };
+            repo::set_secret(
+                &f.auth.pool,
+                &key(Region::Global, "job", "main"),
+                &encode(&job).unwrap(),
+            )
+            .await
+            .unwrap();
+            if mode >= 4 {
+                f.auth
+                    .replace(
+                        &key(Region::Global, "session", "main"),
+                        &raw,
+                        &encode(&device).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                !f.auth
+                    .job_status(Region::Global, "main")
+                    .await
+                    .unwrap()
+                    .can_reissue
+            );
+            if mode == 2 {
+                assert_eq!(
+                    f.auth
+                        .job_reissue(Region::Global, "main")
+                        .await
+                        .unwrap()
+                        .status,
+                    "prepared"
+                );
+            } else {
+                assert!(
+                    f.auth.job_reissue(Region::Global, "main").await.is_err(),
+                    "ineligible mode {mode} must reject without issuing credentials"
+                );
+            }
+            assert_eq!(f.mock.issues.load(Ordering::SeqCst), 1);
+            assert_eq!(f.mock.refreshes.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn reissue_cross_instance_cancel_and_late_reply_keep_original_credentials() {
+        let f = fixture(Region::Global).await;
+        f.auth.job_prepare(Region::Global, "main").await.unwrap();
+        expire_saved_job(&f, Region::Global).await;
+        let before = f
+            .auth
+            .read(&key(Region::Global, "job", "main"))
+            .await
+            .unwrap();
+        *f.mock.issue.lock().unwrap() = json!({"token":"job-access-new","refresh_token":"job-refresh-new","expires_in":3_600_000});
+        f.mock.hold.store(true, Ordering::SeqCst);
+        let auth = f.auth.clone();
+        let task = tokio::spawn(async move { auth.job_reissue(Region::Global, "main").await });
+        f.mock.entered.notified().await;
+        let mut other = QoderAuth::new(f.auth.pool.clone(), None).unwrap();
+        other.test_origin = f.auth.test_origin.clone();
+        assert!(other.job_reissue(Region::Global, "main").await.is_err());
+        assert_eq!(
+            f.auth
+                .read(&key(Region::Global, "job", "main"))
+                .await
+                .unwrap(),
+            before
+        );
+        other.job_cancel(Region::Global, "main").await.unwrap();
+        f.mock.release.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(f.mock.issues.load(Ordering::SeqCst), 2);
+        assert_eq!(f.mock.profiles.load(Ordering::SeqCst), 1);
+        // Explicit cancellation preserves the established API contract: the model
+        // credential is removed, and a late issue reply must never recreate it.
+        assert!(f
+            .auth
+            .read(&key(Region::Global, "job", "main"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            !other
+                .job_status(Region::Global, "main")
+                .await
+                .unwrap()
+                .can_reissue
+        );
+    }
+
+    #[tokio::test]
+    async fn reissue_same_access_and_foreign_job_owner_never_replace_old_pair() {
+        for same_access in [true, false] {
+            let f = fixture(Region::Global).await;
+            f.auth.job_prepare(Region::Global, "main").await.unwrap();
+            expire_saved_job(&f, Region::Global).await;
+            let before = f
+                .auth
+                .read(&key(Region::Global, "job", "main"))
+                .await
+                .unwrap();
+            if !same_access {
+                *f.mock.issue.lock().unwrap() =
+                    json!({"token":"job-access-new","expires_in":3_600_000});
+                f.mock.wrong_job_owner.store(true, Ordering::SeqCst);
+            }
+            assert!(f.auth.job_reissue(Region::Global, "main").await.is_err());
+            assert_eq!(
+                f.auth
+                    .read(&key(Region::Global, "job", "main"))
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert!(
+                f.auth
+                    .job_status(Region::Global, "main")
+                    .await
+                    .unwrap()
+                    .reissue_attempted
+            );
+            assert_eq!(f.mock.issues.load(Ordering::SeqCst), 2);
+        }
+    }
+    #[tokio::test]
+    async fn reissue_without_refresh_rebuilds_signing_cache_with_new_job_access() {
+        let f = fixture(Region::Global).await;
+        f.auth.job_prepare(Region::Global, "main").await.unwrap();
+        f.auth
+            .model_signing_prepare(Region::Global, "main")
+            .await
+            .unwrap();
+        assert_eq!(f.mock.tag_requests.load(Ordering::SeqCst), 1);
+        let signing_key = key(Region::Global, "job-signing", "main");
+        let old_signing = f.auth.read(&signing_key).await.unwrap();
+        let mut old = saved(&f).await;
+        old.access_expires_at_ms = Some(now_ms() - 1);
+        old.refresh = None;
+        old.refresh_expires_at_ms = None;
+        repo::set_secret(
+            &f.auth.pool,
+            &key(Region::Global, "job", "main"),
+            &encode(&old).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            f.auth
+                .job_status(Region::Global, "main")
+                .await
+                .unwrap()
+                .can_reissue
+        );
+        *f.mock.issue.lock().unwrap() = json!({"token":"job-access-new","expires_in":3_600_000});
+        f.auth.job_reissue(Region::Global, "main").await.unwrap();
+        f.auth
+            .model_signing_prepare(Region::Global, "main")
+            .await
+            .unwrap();
+        assert_eq!(
+            *f.mock.tag_last_auth.lock().unwrap(),
+            "Bearer job-access-new"
+        );
+        assert_eq!(f.mock.tag_requests.load(Ordering::SeqCst), 2);
+        assert_ne!(f.auth.read(&signing_key).await.unwrap(), old_signing);
+        f.auth
+            .model_signing_prepare(Region::Global, "main")
+            .await
+            .unwrap();
+        assert_eq!(f.mock.tag_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn reissue_device_change_during_http_stops_verification_and_preserves_old_job() {
+        let f = fixture(Region::Global).await;
+        f.auth.job_prepare(Region::Global, "main").await.unwrap();
+        expire_saved_job(&f, Region::Global).await;
+        let before = f
+            .auth
+            .read(&key(Region::Global, "job", "main"))
+            .await
+            .unwrap();
+        *f.mock.issue.lock().unwrap() = json!({"token":"job-access-new","expires_in":3_600_000});
+        f.mock.hold.store(true, Ordering::SeqCst);
+        let auth = f.auth.clone();
+        let task = tokio::spawn(async move { auth.job_reissue(Region::Global, "main").await });
+        f.mock.entered.notified().await;
+        let (raw, mut device) = f.auth.job_device(Region::Global, "main").await.unwrap();
+        device.access = "device-access-changed".into();
+        f.auth
+            .replace(
+                &key(Region::Global, "session", "main"),
+                &raw,
+                &encode(&device).unwrap(),
+            )
+            .await
+            .unwrap();
+        f.mock.release.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(f.mock.profiles.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.auth
+                .read(&key(Region::Global, "job", "main"))
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(f.mock.issues.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn reissue_device_expiry_after_reservation_sends_no_request() {
+        let mut f = fixture(Region::Global).await;
+        f.auth.job_prepare(Region::Global, "main").await.unwrap();
+        expire_saved_job(&f, Region::Global).await;
+        let (raw, mut device) = f.auth.job_device(Region::Global, "main").await.unwrap();
+        let expiry = now_ms() + 2000;
+        device.access_expires_at_ms = Some(expiry);
+        f.auth
+            .replace(
+                &key(Region::Global, "session", "main"),
+                &raw,
+                &encode(&device).unwrap(),
+            )
+            .await
+            .unwrap();
+        let pause = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        f.auth.job_commit_pause = Some(pause.clone());
+        let auth = f.auth.clone();
+        let task = tokio::spawn(async move { auth.job_reissue(Region::Global, "main").await });
+        tokio::time::timeout(Duration::from_secs(5), pause.0.notified())
+            .await
+            .unwrap();
+        while now_ms() <= expiry {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pause.1.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(f.mock.issues.load(Ordering::SeqCst), 1);
+        assert_eq!(f.mock.refreshes.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn demand_prepare_automatically_reissues_expired_model_pair_once() {
+        let f = fixture(Region::Global).await;
+        f.auth.job_prepare(Region::Global, "main").await.unwrap();
+        expire_saved_job(&f, Region::Global).await;
+        *f.mock.issue.lock().unwrap() = json!({"token":"job-access-new","expires_in":3_600_000});
+        assert_eq!(
+            f.auth
+                .job_prepare(Region::Global, "main")
+                .await
+                .unwrap()
+                .status,
+            "prepared"
+        );
+        assert_eq!(f.mock.issues.load(Ordering::SeqCst), 2);
+        assert_eq!(f.mock.refreshes.load(Ordering::SeqCst), 0);
+        f.auth.job_prepare(Region::Global, "main").await.unwrap();
+        assert_eq!(f.mock.issues.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn simultaneous_demand_recovery_shares_one_issue_and_both_observe_prepared_state() {
+        let f = fixture(Region::Global).await;
+        f.auth.job_prepare(Region::Global, "main").await.unwrap();
+        expire_saved_job(&f, Region::Global).await;
+        *f.mock.issue.lock().unwrap() = json!({"token":"job-access-new","expires_in":3_600_000});
+        let other = f.auth.clone();
+        let (a, b) = tokio::join!(
+            f.auth.job_prepare(Region::Global, "main"),
+            other.job_prepare(Region::Global, "main")
+        );
+        assert_eq!(a.unwrap().status, "prepared");
+        assert_eq!(b.unwrap().status, "prepared");
+        assert_eq!(f.mock.issues.load(Ordering::SeqCst), 2);
+        assert_eq!(f.mock.refreshes.load(Ordering::SeqCst), 0);
     }
 }
