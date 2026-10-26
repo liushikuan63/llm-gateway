@@ -27,4 +27,8 @@
 [现有声明契约](../../src-tauri/tests/capability_declarations.rs)与[读回 UI 合成测试](../../scripts/s6-declaration-readback-ui.cjs)分别验证后端、源码页面；本轮复用 S8 已验的未知、字节预算及顺序合同。历史 S6 批准／收据是本地保存证据，不冒充本轮原会话独立读回；旧输入哈希未全部匹配当前树，因此当前 S6 契约已重新有限运行。浏览器夹具不等于真实账号、原生 Tauri 或安装版通过；r3 已装、r4 冻结候选不包含这次后续源码。
 
 
-[本轮源码、统一清单与独立证据](../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/priority-six-regions-v1/s6-s8-history-readback-source-v1.json)。
+本轮源码、统一清单与独立证据（本机未发布证据路径：`../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/priority-six-regions-v1/s6-s8-history-readback-source-v1.json`）。
+
+
+<!-- local-evidence-publication-boundary -->
+> “本机未发布证据路径”保留原验收资料的定位，但不是源码仓库内链或公开下载；完整收据仍在原工作区，不能因此推断对应验收通过。仓库源码路径、行号、内链及疑似凭据检查均不豁免。

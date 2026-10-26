@@ -79,7 +79,7 @@ Trae raw native exact 不经过 ranked 候选链。现从真实 `NativeSelection
 
 2026-10-25 S3／UX6 的结算结果独立性源码修复：统计页仍等待四个读取全部结算并核当前筛选active，保留原inFlight／5秒轮询保护；覆盖的成功或失败随后独立提交，不再先要求总览、审计查询和校准三个面板都成功。其他面板的错误仍显示，覆盖自身失败会撤下旧成功数值并显示不可用。没有新增查询／重试／写入；不处理永不结算的调用，也不表示所有统计面板均已独立。
 
-六项新合成场景从2过／4失败到6过，原覆盖5项、类型／隔离前端／86单测与131语法／脱敏及独立审阅通过；455项原生输入未变，不重跑长Rust套件。仅本机计数可用性，真实人工标签／数据库未读写，不输出质量评分。v1候选计划已存在且未重做；完整历史评分v2、跨任务与模型版本质量汇总的窗口／偏差口径仍待原具体决策，不能把缺测或HTTP成功补成质量。r3／r4不含本增量，未打包安装、供应商／新认证外发，仍8/100。[源码、Goal分类与实际证据](../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/priority-six-regions-v1/s3-coverage-independent-read-source-v1.json)。
+六项新合成场景从2过／4失败到6过，原覆盖5项、类型／隔离前端／86单测与131语法／脱敏及独立审阅通过；455项原生输入未变，不重跑长Rust套件。仅本机计数可用性，真实人工标签／数据库未读写，不输出质量评分。v1候选计划已存在且未重做；完整历史评分v2、跨任务与模型版本质量汇总的窗口／偏差口径仍待原具体决策，不能把缺测或HTTP成功补成质量。r3／r4不含本增量，未打包安装、供应商／新认证外发，仍8/100。源码、Goal分类与实际证据（本机未发布证据路径：`../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/priority-six-regions-v1/s3-coverage-independent-read-source-v1.json`）。
 
 [覆盖消费者](../../src/pages/FeedbackCoverage.tsx) 通过 `get_feedback_coverage` 复用审计 RequestFilter，统计全部匹配请求，不受列表 limit／offset 影响。时间条件作用于请求记录时间，不是反馈编辑时间；没有引入额外默认时间窗或质量阈值。只读现有 requests 与 request_feedback，未新增 schema。
 
@@ -135,3 +135,7 @@ S6／S8历史读回交叉收口：当前本地能力声明的配置修订变化�
 只读归组对四个固定新profile严格校验版本、用途、摘要及当行绑定；多个attempt、两种回执混杂、非法／未知／缺字段保持未知，不取当前配置、账号或文本补历史。WorkBuddy Global三项wire UUID及Qoder每次新建request／session UUID仍只作原协议关联，不作为稳定主体。用户显式session、本地随机匿名锚点和user字段派生键仍服从原上下文合同，后者不是独立证明整个用户只有一个完整任务。请求级反馈不变成会话质量结果。
 
 自有Gateway／假上游验证WorkBuddy和Qoder两区stream／nonstream双turn归组，Qoder合成认证代次重建仍同主体；取消／重试另以真实FailoverChain加合成sender验证journal，不冒称每种transport断流都已有完整组合验证。两transport实际捕获／解码请求体的负控验证不含回执字段，headers接线另作静态确认。严格读侧拒绝session／trace／目标／attempt重绑、未来合同和多跳歧义；旧8项兼容、MockRuntime IPC、13项源码浏览器与适用门禁已验。完整默认离线Rust及所有skip／首败以源码回执为准，不合成新真实认证／调用次数。未读正式账号／历史，未迁移正式库、打包或安装；六区真实可用性与r3／r4旧包边界不因本源码扩展升级。
+
+
+<!-- local-evidence-publication-boundary -->
+> “本机未发布证据路径”保留原验收资料的定位，但不是源码仓库内链或公开下载；完整收据仍在原工作区，不能因此推断对应验收通过。仓库源码路径、行号、内链及疑似凭据检查均不豁免。

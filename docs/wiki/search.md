@@ -302,7 +302,7 @@ check／all-target Clippy（含IPC feature）、fmt和适用文档门禁通过�
 
 原核心6、serde1及源码浏览器7保留不重跑；本次用已固定的同字节feature测试EXE，仅执行此前缺失的`locale_production_ipc_narrow_save_and_legacy_contract`，实际1/0、0 ignored／明确早退。该命令使用真实生产宏／MockRuntime及自有DB／配置目录，不调用真实搜索。编译输入到当前源的差异只允许已核实的两份文档，所有代码仍匹配；测试旁manifest只作用任务自有复制EXE，未改系统加载配置。按各自实际执行输入证明相关Rust整文件、共享命令、TS API和UI字节一致后，首片有限Rust并集为8、源码UI为7，不累加重复阶段，也不称一次全量或安装版验收。
 
-[复用与实际IPC证据](../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/priority-six-regions-v1/m3-locale-reuse-proof-v1.json)记录准确范围；最初复用核对误用较早Rust输入对比后续UI脚本的两次诊断独立保留，未改产品断言或用零测试作绿。当前资格的check／含IPC Clippy／fmt与TS/artifact前端按未变代码复用，文档单独验证。没有真实Bing／DDG请求、账号／模型、正式DB／密钥或新安装；六区仍优先，完整目标保持未完成。
+复用与实际IPC证据（本机未发布证据路径：`../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/priority-six-regions-v1/m3-locale-reuse-proof-v1.json`）记录准确范围；最初复用核对误用较早Rust输入对比后续UI脚本的两次诊断独立保留，未改产品断言或用零测试作绿。当前资格的check／含IPC Clippy／fmt与TS/artifact前端按未变代码复用，文档单独验证。没有真实Bing／DDG请求、账号／模型、正式DB／密钥或新安装；六区仍优先，完整目标保持未完成。
 
 
 ## 原队列 MDN 合同核验（尚未接线，2026-10-26）
@@ -371,3 +371,7 @@ r8已独立NSIS实装（安装1、installer exit0、NSS及26资源匹配），�
 MDN唯一公开输入Array.prototype.map，无账号／Key／Cookie／模型或认证；initialize／initialized／search在既定单事务中成功。3是固定生产合同支持的逻辑客户端POST数，不是抓包；服务端扇出、费用、quota／原始backoff保持未知，不从成功推断零费用或不限流。来源可能记录查询／IP／软件元数据；第一方分析opt-out不等于不留存。直接原生IPC真实来源与合成截图分别记录，不称真实结果UI端到端或完整LLM注入已验。
 
 本次安装、启动和匿名来源票据已消费，禁止复用；Global未知认证失败不重试不清标记，模型账本27/100。原始证据 `E:/codex/2026-10-14/task/work/m5-mdn-candidate-r8-v1/qa-entry-r8-v1/install-run-v1/receipt.json` 与 `E:/codex/2026-10-14/task/work/m5-mdn-candidate-r8-v1/qa-entry-r8-v1/native-run-v1/native-proof.json`，交付目录内追加实装回执，构建当时的未安装/待批说明保留历史边界。
+
+
+<!-- local-evidence-publication-boundary -->
+> “本机未发布证据路径”保留原验收资料的定位，但不是源码仓库内链或公开下载；完整收据仍在原工作区，不能因此推断对应验收通过。仓库源码路径、行号、内链及疑似凭据检查均不豁免。

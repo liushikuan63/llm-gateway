@@ -27,7 +27,7 @@ npm run verify:release
 
 本机首次直接运行测试 EXE 在加载阶段以 0xC0000139 退出，未执行用例：新路径引入的 TaskDialogIndirect 需要 Common Controls v6，而该测试 EXE 没有应用清单。保留原失败；只将 EXE 原字节复制到任务自有目录，旁置 `<test.exe>.manifest` 声明 Common Controls 6.0.0.0、asInvoker／uiAccess=false，再以原过滤参数 `commands::feedback_ipc_tests --nocapture --test-threads=1` 执行，实际 2/0/0。未修改原 EXE、系统 DLL、全局 PATH、注册表或正式安全设置。
 
-精确副本／清单 hash 与官方说明见[本机隔离输入](../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/s3-feedback-ipc-v1/loader-recovery-input-v1.json)，执行命令／原始日志见[对照收据](../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/s3-feedback-ipc-v1/feedback-ipc-sidecar-v1.json)。其他机器应先核对其测试产物和清单条件，不能直接复用该文件名或本机收据作为通过。此为 MockRuntime 命令桥接证据，不是实际 WebView2／实装验收；不能把初次零执行当失败用例，也不把重复基础 SQL 另加到旧测试总数。
+精确副本／清单 hash 与官方说明见本机隔离输入（本机未发布证据路径：`../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/s3-feedback-ipc-v1/loader-recovery-input-v1.json`），执行命令／原始日志见对照收据（本机未发布证据路径：`../../../artifacts/Project-Enhancement-20261013/execution-schedule-20261018/multi-account-local-v1/native-rotation6-v1/s3-feedback-ipc-v1/feedback-ipc-sidecar-v1.json`）。其他机器应先核对其测试产物和清单条件，不能直接复用该文件名或本机收据作为通过。此为 MockRuntime 命令桥接证据，不是实际 WebView2／实装验收；不能把初次零执行当失败用例，也不把重复基础 SQL 另加到旧测试总数。
 
 ## 已实际验证的版本
 
@@ -43,3 +43,7 @@ M0 实测 release 编译 238 秒、前端构建 0.661 秒、安装及 MSI 管理
 复用证据需要同时核对源文件、测试/夹具、依赖锁、工具链和构建变量。最终 UI 对应 Windows 资产；安装版 EXE、资源和源清单对应同一包。版本号、HEAD、编译成功或截图存在单独都不够。
 
 库回归子进程结果不能重复加到根测试数量中；专项通过不能写成 whole Cargo 通过。MSI 管理提取和字节等价验证不等于 MSI APP 已运行或 MSI 整机安装。静默调用不等于真实云端额度、刷新、领取或模型成功。
+
+
+<!-- local-evidence-publication-boundary -->
+> “本机未发布证据路径”保留原验收资料的定位，但不是源码仓库内链或公开下载；完整收据仍在原工作区，不能因此推断对应验收通过。仓库源码路径、行号、内链及疑似凭据检查均不豁免。
