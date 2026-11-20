@@ -32,6 +32,8 @@ pub mod catalog_maintenance;
 #[cfg(all(test, feature = "ipc-tests"))]
 #[path = "commands/feedback_ipc_tests.rs"]
 mod feedback_ipc_tests;
+#[cfg(all(test, windows, feature = "ipc-tests"))]
+pub(crate) use feedback_ipc_tests::replace_owned_proxy_via_ipc;
 #[path = "commands/free_routing.rs"]
 pub mod free_routing;
 #[path = "commands/qoder_labels.rs"]

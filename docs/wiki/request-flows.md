@@ -791,6 +791,10 @@ N3的具体政策与附加表源码／隔离测试已由用户明确批准；原
 
 ### N4 共享出口与在途热切换
 
+[Windows 自有 CONNECT 回归](../../src-tauri/src/proxy/upstream/network_tests.rs)在客户端收到 A 的首个 SSE 事件后切换内存配置，新请求只经 B 完成；释放后旧流仍经 A 完成。B 拒绝 CONNECT 时网关返回 503，两个 HTTPS 源站都不接收额外 POST。同一目标在拒绝前后的直连正控均可达。
+
+同模块的 `ipc-tests` 回归调用生产 `update_config` 命令：保存 A、拒绝带路径的代理地址并保留原 TOML 和两份运行时配置、再保存 B。下一网关从生产配置加载器读取临时 TOML，并核对请求只经 B 的 CONNECT 和 HTTPS 源站、响应完整以及停机后的用量审计。这覆盖 MockRuntime 命令和自有回环；实际桌面 WebView、系统代理及外部代理仍需独立验收。
+
 
 
 

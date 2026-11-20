@@ -1,5 +1,5 @@
 //! Actual production command macros/argument decoding + owned SQLite, with
-//! Tauri MockRuntime only. No initialize_backend, OS window, proxy or live CLI.
+//! Tauri MockRuntime only. No initialize_backend, OS window, system proxy or live CLI.
 use super::*;
 use crate::{db::Db, proxy_control::gateway::GatewayService};
 use serde_json::{json, Value};
@@ -1786,3 +1786,72 @@ mod conversation_feedback_ipc_tests;
 
 #[path = "stack_state_ipc_tests.rs"]
 mod stack_state_ipc_tests;
+
+#[cfg(windows)]
+pub(crate) fn replace_owned_proxy_via_ipc(cfg: AppConfig, initial: &str, target: &str) {
+    let supplied = PathBuf::from(std::env::var_os("LLMGW_DATA_DIR").expect("owned IPC data dir"));
+    assert!(supplied.is_absolute());
+    let dir = supplied.canonicalize().unwrap();
+    assert!(dir.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    assert!(dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.starts_with("llmgw-personal-test-")));
+    let path = crate::config::config_path();
+    assert_eq!(path.parent().unwrap().canonicalize().unwrap(), dir);
+    assert!(!path.is_symlink(), "owned config must not be a link");
+    assert_eq!(cfg.port, 0);
+    assert!(!cfg.benefits.enabled && !cfg.benefits.auto_claim && cfg.benefits.accounts.is_empty());
+
+    let h = OwnedIpc::with_gateway(|gateway| gateway.update_cfg(cfg));
+    let app = h._app.state::<AppState>();
+    let candidate = |proxy: String| {
+        let mut next = app.config.read().clone();
+        next.http_proxy = Some(proxy);
+        json!({"cfg": next})
+    };
+    let assert_saved = |raw: &str| {
+        let result = h
+            .invoke("update_config", candidate(format!("  {raw}  ")))
+            .unwrap();
+        let expected = format!("{raw}/");
+        assert_eq!(result["config"]["http_proxy"], expected);
+        assert_eq!(result["restart_required"], false);
+        assert_eq!(result["restart_reasons"], json!([]));
+        assert_eq!(
+            app.config.read().http_proxy.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            app.gateway.cfg_snapshot().http_proxy.as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(app.gateway.listener_snapshot().is_none());
+        let persisted: AppConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted.http_proxy.as_deref(), Some(expected.as_str()));
+        assert_eq!(persisted.port, 0);
+    };
+    assert_saved(initial);
+    let original = std::fs::read(&path).unwrap();
+    let rejected = h
+        .invoke(
+            "update_config",
+            candidate(format!("{target}/not-an-endpoint")),
+        )
+        .unwrap_err();
+    assert!(rejected
+        .as_str()
+        .is_some_and(|message| message.contains("代理地址")));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let original_proxy = format!("{initial}/");
+    assert_eq!(
+        app.config.read().http_proxy.as_deref(),
+        Some(original_proxy.as_str())
+    );
+    assert_eq!(
+        app.gateway.cfg_snapshot().http_proxy.as_deref(),
+        Some(original_proxy.as_str())
+    );
+    assert_saved(target);
+}

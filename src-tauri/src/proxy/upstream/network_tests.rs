@@ -518,3 +518,119 @@ async fn n4_http_proxy_switch_preserves_open_stream_and_refusal_never_goes_direc
         .await;
     tls.stop().await;
 }
+
+#[cfg(feature = "ipc-tests")]
+#[tokio::test]
+async fn n4_proxy_config_production_ipc_persists_to_fresh_gateway_connect() {
+    let mut tls = OwnedTls::new(false);
+    let host = "owned-upstream.invalid";
+    let a = OwnedProxy::new(tls.port("a")).await;
+    let b = OwnedProxy::new(tls.port("b")).await;
+    let mut original = AppConfig {
+        port: 0,
+        unified_key: "owned-proxy-matrix-key".into(),
+        routing_strategy: RoutingStrategy::Priority,
+        failover_enabled: false,
+        ..Default::default()
+    };
+    original.cache.enabled = false;
+    original.search.enabled = false;
+    original.smart_routing.enabled = false;
+    original.dedup.mode = crate::proxy::dedup::DedupMode::Off;
+    let (a_url, b_url) = (a.url.clone(), b.url.clone());
+    tokio::task::spawn_blocking(move || {
+        crate::commands::replace_owned_proxy_via_ipc(original, &a_url, &b_url);
+    })
+    .await
+    .unwrap();
+
+    // The MockRuntime that issued the save is gone. The next gateway gets only
+    // the file read by the production startup loader, not a saved IPC DTO or
+    // its previous state/client pool.
+    let (on_disk, warning) = AppConfig::load_or_init_with_warning().unwrap();
+    assert!(warning.is_none(), "{warning:?}");
+    assert_eq!(
+        on_disk.http_proxy.as_deref(),
+        Some(format!("{}/", b.url).as_str())
+    );
+    assert_eq!(on_disk.port, 0);
+    assert_eq!(on_disk.bind, "127.0.0.1");
+    assert_eq!(
+        tls.state().await,
+        json!({"a": 0, "b": 0, "offered": 0, "error": ""})
+    );
+
+    let db = Db::connect_in_memory().await.unwrap();
+    let provider: Provider = serde_json::from_value(json!({
+        "id": "owned-ipc-proxy", "name": "owned-ipc-proxy",
+        "base_url": format!("https://{host}/v1"), "dialect": "openai",
+        "api_key_enc": "", "enabled": true, "priority": 0, "rpm_limit": 0,
+        "intelligence": 50, "created_at": "2026-10-20T00:00:00Z",
+        "updated_at": "2026-10-20T00:00:00Z",
+        "models": [{"alias": "owned-model", "upstream": "wire-model", "enabled": true,
+            "context_window": 32768, "supports_tools": false, "supports_vision": false,
+            "supports_thinking": false, "supports_stream": true, "model_type": "chat"}]
+    }))
+    .unwrap();
+    repo::upsert_provider(db.pool(), &provider).await.unwrap();
+
+    // A direct request would go to the owned A origin. Keep hostname and TLS
+    // verification; the scoped inputs only affect construction of this client.
+    let direct = std::net::SocketAddr::from(([127, 0, 0, 1], tls.port("a")));
+    let state = Arc::new(OWNED_NETWORK_TEST_ROOT.sync_scope(tls.root(), || {
+        OWNED_NETWORK_TEST_RESOLVE.sync_scope((host.to_owned(), direct), || {
+            GatewayState::new(db.clone(), on_disk)
+        })
+    }));
+    state.reload_providers().await.unwrap();
+    let service = GatewayService::new(state.clone());
+    let started = service.set_enabled(true).await.unwrap();
+    let bound: std::net::SocketAddr = started.bound_addr.unwrap().parse().unwrap();
+    assert!(bound.ip().is_loopback() && bound.port() != 0);
+    let (status, body) = request(
+        format!("http://{bound}"),
+        "ipc-fresh-gateway",
+        false,
+        Arc::new(Notify::new()),
+    )
+    .await;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), service.set_enabled(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!stopped.running);
+    assert!(stopped.last_error.is_none(), "{stopped:?}");
+    assert!(state.listener_snapshot().is_none());
+
+    assert_eq!(status, 200, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "via-B");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+    assert_eq!(a.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        tls.state().await,
+        json!({"a": 0, "b": 1, "offered": 0, "error": ""})
+    );
+    let audits: Vec<(i64, String, String, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT status,routed_provider,routed_model,prompt_tokens,completion_tokens,error FROM requests",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        audits,
+        vec![(
+            200,
+            "owned-ipc-proxy".into(),
+            "wire-model".into(),
+            3,
+            2,
+            None
+        )]
+    );
+    tls.stop().await;
+    eprintln!("N4 owned IPC proxy: A saved; invalid rejected unchanged; B saved and read on fresh gateway; CONNECT A=0 B=1; model POST A=0 B=1; audit=1; closed");
+}
