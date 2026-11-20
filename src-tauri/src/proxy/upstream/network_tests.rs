@@ -15,7 +15,7 @@ use std::{
     os::windows::process::CommandExt,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -109,6 +109,7 @@ impl OwnedTls {
     async fn state(&self) -> Value {
         reqwest::Client::builder()
             .no_proxy()
+            .timeout(Duration::from_secs(3))
             .build()
             .unwrap()
             .get(format!("http://127.0.0.1:{}/state", self.port("control")))
@@ -122,6 +123,7 @@ impl OwnedTls {
     async fn release(&self) {
         reqwest::Client::builder()
             .no_proxy()
+            .timeout(Duration::from_secs(3))
             .build()
             .unwrap()
             .post(format!("http://127.0.0.1:{}/release", self.port("control")))
@@ -134,6 +136,7 @@ impl OwnedTls {
     async fn stop(&mut self) {
         reqwest::Client::builder()
             .no_proxy()
+            .timeout(Duration::from_secs(3))
             .build()
             .unwrap()
             .post(format!("http://127.0.0.1:{}/stop", self.port("control")))
@@ -156,6 +159,7 @@ impl OwnedTls {
 struct OwnedProxy {
     url: String,
     calls: Arc<AtomicUsize>,
+    reject: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 impl Drop for OwnedProxy {
@@ -168,12 +172,15 @@ impl OwnedProxy {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
+        let reject = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let calls = calls.clone();
+            let reject = reject.clone();
             async move {
                 loop {
                     let (mut wire, _) = listener.accept().await.unwrap();
                     let calls = calls.clone();
+                    let reject = reject.clone();
                     tokio::spawn(async move {
                         let mut header = Vec::new();
                         while !header.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -185,6 +192,12 @@ impl OwnedProxy {
                         assert!(String::from_utf8_lossy(&header)
                             .starts_with("CONNECT owned-upstream.invalid:443 HTTP/1.1\r\n"));
                         calls.fetch_add(1, Ordering::SeqCst);
+                        if reject.load(Ordering::SeqCst) {
+                            wire.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await
+                                .unwrap();
+                            return;
+                        }
                         let mut target =
                             TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, origin))
                                 .await
@@ -197,7 +210,12 @@ impl OwnedProxy {
                 }
             }
         });
-        Self { url, calls, task }
+        Self {
+            url,
+            calls,
+            reject,
+            task,
+        }
     }
 }
 async fn request(
@@ -294,4 +312,209 @@ async fn n4_socks_tls_gateway_preserves_inflight_owner_wire_target_and_audit() {
         })).await;
         tls.stop().await;
     }
+}
+
+#[tokio::test]
+async fn n4_http_proxy_switch_preserves_open_stream_and_refusal_never_goes_direct() {
+    let mut tls = OwnedTls::new(true);
+    let root = tls.root();
+    let host = "owned-upstream.invalid";
+    // Keep an ordinary HTTPS authority for CONNECT. The test DNS override
+    // maps direct client traffic for that same authority to the live A origin.
+    let direct_address = std::net::SocketAddr::from(([127, 0, 0, 1], tls.port("a")));
+    let direct = reqwest::Client::builder()
+        .no_proxy()
+        .resolve(host, direct_address)
+        .add_root_certificate(root.clone())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let direct_control = |question: &'static str| {
+        direct
+            .post(format!("https://{host}/v1/chat/completions"))
+            .json(&json!({"model": "wire-model", "stream": true,
+                "messages": [{"role": "user", "content": question}]}))
+    };
+    let assert_done = |body: &str, expected: &str, unexpected: &str| {
+        assert!(body.contains(expected), "missing stream source: {body}");
+        assert!(!body.contains(unexpected), "mixed stream sources: {body}");
+        assert!(
+            !body.contains("\"error\""),
+            "unexpected stream error: {body}"
+        );
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+    };
+
+    OWNED_NETWORK_TEST_ROOT
+        .scope(
+            root,
+            OWNED_NETWORK_TEST_RESOLVE.scope((host.to_owned(), direct_address), async {
+                let a = OwnedProxy::new(tls.port("a")).await;
+                let b = OwnedProxy::new(tls.port("b")).await;
+                let provider: Provider = serde_json::from_value(json!({
+                    "id": "owned-switch-provider", "name": "owned-switch-provider",
+                    "base_url": format!("https://{host}/v1"), "dialect": "openai",
+                    "api_key_enc": "", "enabled": true, "priority": 0, "rpm_limit": 0,
+                    "intelligence": 50, "created_at": "2026-10-20T00:00:00Z",
+                    "updated_at": "2026-10-20T00:00:00Z",
+                    "models": [{"alias": "owned-model", "upstream": "wire-model", "enabled": true,
+                        "context_window": 32768, "supports_tools": false, "supports_vision": false,
+                        "supports_thinking": false, "supports_stream": true, "model_type": "chat"}]
+                }))
+                .unwrap();
+                let db = Db::connect_in_memory().await.unwrap();
+                repo::upsert_provider(db.pool(), &provider).await.unwrap();
+                let mut cfg = AppConfig {
+                    port: 0,
+                    unified_key: "owned-proxy-matrix-key".into(),
+                    routing_strategy: RoutingStrategy::Priority,
+                    http_proxy: Some(a.url.clone()),
+                    failover_enabled: false,
+                    ..Default::default()
+                };
+                cfg.cache.enabled = false;
+                cfg.search.enabled = false;
+                cfg.smart_routing.enabled = false;
+                cfg.dedup.mode = crate::proxy::dedup::DedupMode::Off;
+                let state = Arc::new(GatewayState::new(db, cfg));
+                state.reload_providers().await.unwrap();
+                let service = GatewayService::new(state.clone());
+                let started = service.set_enabled(true).await.unwrap();
+                let chat_url =
+                    format!("http://{}/v1/chat/completions", started.bound_addr.unwrap());
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .unwrap();
+                let send = |question: &'static str| {
+                    client
+                        .post(&chat_url)
+                        .bearer_auth("owned-proxy-matrix-key")
+                        .header("x-session-id", format!("owned-{question}"))
+                        .json(
+                            &json!({"model": "owned-model", "stream": true, "max_tokens": 16,
+                            "messages": [{"role": "user", "content": question}]}),
+                        )
+                };
+
+                let before = direct_control("direct-before")
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                assert_done(&before, "via-A", "via-B");
+                assert_eq!(
+                    (
+                        a.calls.load(Ordering::SeqCst),
+                        b.calls.load(Ordering::SeqCst)
+                    ),
+                    (0, 0)
+                );
+
+                let mut old = send("held").send().await.unwrap();
+                assert_eq!(old.status(), reqwest::StatusCode::OK);
+                let mut prefix = Vec::new();
+                while !prefix.windows(5).any(|w| w == b"via-A") {
+                    let chunk = old.chunk().await.unwrap().expect("first A event");
+                    prefix.extend_from_slice(&chunk);
+                    assert!(prefix.len() <= 16_384, "bounded first event");
+                }
+                let before_switch = tls.state().await;
+                assert_eq!(
+                    before_switch,
+                    json!({"a": 2, "b": 0, "offered": 1, "error": ""})
+                );
+                assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+                assert!(!String::from_utf8_lossy(&prefix).contains("data: [DONE]"));
+
+                // Existing production runtime publication entrypoint; test config stays in memory.
+                let mut next = state.cfg_snapshot();
+                next.http_proxy = Some(b.url.clone());
+                state.update_cfg(next);
+                assert_eq!(
+                    state.cfg_snapshot().http_proxy.as_deref(),
+                    Some(b.url.as_str())
+                );
+                let fresh = send("new")
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                assert_done(&fresh, "via-B", "via-A");
+                assert_eq!(
+                    tls.state().await,
+                    json!({"a": 2, "b": 1, "offered": 1, "error": ""})
+                );
+
+                tls.release().await;
+                let suffix = old.text().await.unwrap();
+                assert!(
+                    suffix.contains("data: [DONE]"),
+                    "A must finish after release: {suffix}"
+                );
+                prefix.extend_from_slice(suffix.as_bytes());
+                assert_done(&String::from_utf8(prefix).unwrap(), "via-A", "via-B");
+                assert_eq!(
+                    (
+                        a.calls.load(Ordering::SeqCst),
+                        b.calls.load(Ordering::SeqCst)
+                    ),
+                    (1, 1)
+                );
+
+                // The origin closes the successful B response's connection,
+                // so this request exercises a new tunnel attempt through B.
+                b.reject.store(true, Ordering::SeqCst);
+                let rejected = send("refused").send().await.unwrap();
+                assert_eq!(rejected.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    rejected.json::<Value>().await.unwrap(),
+                    json!({"error": {
+                        "message": "上游服务 owned-switch-provider/wire-model 返回 HTTP 503",
+                        "type": "upstream_error", "code": null
+                    }})
+                );
+                assert_eq!(
+                    (
+                        a.calls.load(Ordering::SeqCst),
+                        b.calls.load(Ordering::SeqCst)
+                    ),
+                    (1, 2)
+                );
+                assert_eq!(
+                    tls.state().await,
+                    json!({"a": 2, "b": 1, "offered": 1, "error": ""})
+                );
+
+                let after = direct_control("direct-after")
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                assert_done(&after, "via-A", "via-B");
+                let stopped = service.set_enabled(false).await.unwrap();
+                assert!(!stopped.running);
+                assert!(stopped.last_error.is_none(), "{stopped:?}");
+                assert!(state.listener_snapshot().is_none());
+                assert_eq!(
+                    tls.state().await,
+                    json!({"a": 3, "b": 1, "offered": 1, "error": ""})
+                );
+            }),
+        )
+        .await;
+    tls.stop().await;
 }
