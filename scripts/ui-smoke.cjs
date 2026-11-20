@@ -2782,6 +2782,12 @@ if (require.main === module) (async () => {
   try {
     if (process.env.LLMGW_UI_FOCUS) {
       const focus = process.env.LLMGW_UI_FOCUS, errors = [];
+      if (focus === 'stats-model-spend') {
+        await require('./stats-model-spend-ui.cjs').verifyStatsModelSpend(browser, baseUrl, output, errors, fixture);
+        assert.deepEqual(errors, []);
+        console.log('UI_FOCUS_OK: stats-model-spend');
+        return;
+      }
       if(focus==='model-declarations') {await require('./model-declarations-ui.cjs').verifyModelDeclarations(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: model-declarations');return;}
       if(focus==='shell-endpoint-read') {await require('./shell-endpoint-read-ui.cjs').verifyShellEndpointRead(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: shell-endpoint-read');return;}
       if(focus==='help-menu-keyboard') {const proof=await require('./help-menu-ui.cjs').verifyHelpMenu(browser,baseUrl,output);assert.equal(proof.passed,true);console.log('UI_FOCUS_OK: help-menu-keyboard');return;}
@@ -2929,6 +2935,7 @@ if (require.main === module) (async () => {
     await failedSettingsPage.screenshot({ path: path.join(output, "settings-load-recovered.png"), fullPage: true });
     await failedSettingsContext.close();
     await verifyAsyncPages(browser, errors);
+    await require('./stats-model-spend-ui.cjs').verifyStatsModelSpend(browser, baseUrl, output, errors, fixture);
     await require('./settings-save-readback-ui.cjs').verifySettingsSaveReadback(browser,baseUrl,output,errors,fixture);
     await require('./settings-mutation-recovery-ui.cjs').verifySettingsMutationRecovery(browser,baseUrl,output,errors,fixture);
     await require('./cli-readback-ui.cjs').verifyCliReadback(browser,baseUrl,output,errors,fixture);

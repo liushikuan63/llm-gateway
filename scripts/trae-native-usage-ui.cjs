@@ -157,7 +157,13 @@ function sourceContracts() {
     const detail = html(components.NativeRequestUsage, { usage: personal });
     assert.equal(detail.includes('个人测试'), true, 'the known personal marker must be explained as unverified personal usage');
     const pageHtml = renderPage(stats, rows);
-    assert.equal(pageHtml.includes('Trae'), false, 'personal-only activity must not acquire a Trae provenance label');
+    const nativeSummary = pageHtml.match(/<section\b[^>]*\bdata-testid="native-usage-summary"[^>]*>[\s\S]*?<\/section>/)?.[0];
+    const requestRow = pageHtml.match(/<tr\b[^>]*\bclass="request-row(?: [^"]*)?"[^>]*>[\s\S]*?<\/tr>/)?.[0];
+    assert.ok(nativeSummary, 'personal native usage summary must render');
+    assert.ok(requestRow?.includes('owned-personal'), 'personal request row must render');
+    for (const region of [nativeSummary, requestRow]) {
+      assert.doesNotMatch(region, /Trae/, 'personal-only activity must not acquire a Trae provenance label');
+    }
     assert.equal(pageHtml.includes('请求时参考单价'), false, 'no saved price is claimed for unverified personal usage');
     assert.equal(pageHtml.includes('用量／费用未核验'), true);
     assert.equal(/987,654,321|98,765|PRIVATE-RATE/.test(pageHtml), false);

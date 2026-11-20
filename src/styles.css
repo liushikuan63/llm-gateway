@@ -493,6 +493,9 @@ tbody tr:hover { background: var(--accent-soft); }
 .spend-empty { font-size: 14px; }
 .spend-note { font-size: 11px; line-height: 1.7; margin: 0 0 14px; }
 .unpriced-hint { color: var(--warn); }
+.model-spend-scroll { max-inline-size: 100%; overflow-x: auto; }
+.model-spend-table :is(th, td):nth-child(-n + 2) { min-inline-size: 9rem; overflow-wrap: anywhere; }
+.model-spend-table :is(th, td):last-child { white-space: nowrap; }
 .requests-table .request-row.clickable { cursor: pointer; }
 .requests-table .request-row.clickable:hover { background: var(--panel-2); }
 .attempt-toggle { padding: 2px 6px; font-size: 11px; }
