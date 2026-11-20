@@ -513,6 +513,8 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 
 Anthropic 的 `message_delta` 只更新结束原因和累计用量，独立的 `message_stop` 才确认流完成；事件顺序依据[官方流式协议](https://platform.claude.com/docs/en/build-with-claude/streaming)，本地夹具不是供应商抓包。[解析器](../../src-tauri/src/proxy/upstream.rs) 将前者投影为已有 `Finish`／`Usage`，后者仍为 `Done`，复用各出口已有结束原因与用量合并。缺少 stop 的 EOF 不再提前输出成功完成帧；沿原不完整流路径记录失败、保留部分正文且不更新成功粘性，不在正文后切换备用重放。正常结束、长度停止及工具结束原因不改含义。协议终态不是 VerifiedEntitlement 或供应商结算凭证，不新增收费单位或政策。
 
+Anthropic 的 `tool_use` 从显式 `input: {}` 开始时，解析器先发送工具标识，等到同索引的 `content_block_stop` 才补出参数 `{}`。非空 `input_json_delta` 仍按原索引拼接为实际参数。缺少 `input` 或在对应块结束前断流时，参数仍未确认。工具块结束只确认该块的参数，消息完成仍由 `message_stop` 确认。
+
 
 
 

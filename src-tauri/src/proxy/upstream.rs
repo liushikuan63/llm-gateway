@@ -11,6 +11,7 @@ use axum::body::Bytes;
 use futures_util::Stream;
 use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Url;
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::pin::Pin;
 use std::time::Duration;
@@ -829,6 +830,7 @@ impl UpstreamClient {
             let _free_permit=free_permit;
             let mut budget_report=crate::budget::holds::StreamReport::default();
             let mut buffer = Vec::new();
+            let mut anthropic_empty_inputs = BTreeSet::new();
 
             while let Some(chunk) = bytes.next().await {
                 match chunk {
@@ -838,7 +840,7 @@ impl UpstreamClient {
                         buffer.extend_from_slice(&chunk);
                         let events = match dialect {
                             Dialect::Ollama => drain_ollama_lines(&mut buffer, generation.as_ref()),
-                            _ => drain_sse_blocks(dialect, &mut buffer),
+                            _ => drain_sse_blocks(dialect, &mut buffer, &mut anthropic_empty_inputs),
                         };
                         for event in events {
                             if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
@@ -863,7 +865,11 @@ impl UpstreamClient {
             if !buffer.is_empty() {
                 let events = match dialect {
                     Dialect::Ollama => parse_ollama_line(&buffer, generation.as_ref()),
-                    _ => parse_sse_block(dialect, &buffer),
+                    _ => parse_sse_block_with_state(
+                        dialect,
+                        &buffer,
+                        Some(&mut anthropic_empty_inputs),
+                    ),
                 };
                 for event in events {
                     if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
@@ -937,12 +943,20 @@ pub enum UpstreamEvent {
 }
 
 /// 从跨网络分块的缓存中取出所有完整 SSE 事件，残留半包继续留给下一次读取。
-fn drain_sse_blocks(dialect: Dialect, buffer: &mut Vec<u8>) -> Vec<Result<UpstreamEvent>> {
+fn drain_sse_blocks(
+    dialect: Dialect,
+    buffer: &mut Vec<u8>,
+    anthropic_empty_inputs: &mut BTreeSet<usize>,
+) -> Vec<Result<UpstreamEvent>> {
     let mut out = Vec::new();
 
     while let Some((end, delimiter_len)) = find_sse_delimiter(buffer) {
         let event: Vec<u8> = buffer.drain(..end + delimiter_len).collect();
-        out.extend(parse_sse_block(dialect, &event[..end]));
+        out.extend(parse_sse_block_with_state(
+            dialect,
+            &event[..end],
+            Some(anthropic_empty_inputs),
+        ));
     }
     out
 }
@@ -974,6 +988,14 @@ fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
 
 /// 解析一段完整 SSE 事件。JSON 解码失败时不 panic；上游偶发的非 JSON 心跳直接忽略。
 pub fn parse_sse_block(dialect: Dialect, bytes: &[u8]) -> Vec<Result<UpstreamEvent>> {
+    parse_sse_block_with_state(dialect, bytes, None)
+}
+
+fn parse_sse_block_with_state(
+    dialect: Dialect,
+    bytes: &[u8],
+    anthropic_empty_inputs: Option<&mut BTreeSet<usize>>,
+) -> Vec<Result<UpstreamEvent>> {
     let text = String::from_utf8_lossy(bytes);
     let mut event_name: Option<&str> = None;
     let mut data = String::new();
@@ -1003,7 +1025,7 @@ pub fn parse_sse_block(dialect: Dialect, bytes: &[u8]) -> Vec<Result<UpstreamEve
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    parse_event_value(dialect, event_name, v)
+    parse_event_value(dialect, event_name, v, anthropic_empty_inputs)
 }
 
 fn parse_ollama_line(
@@ -1020,7 +1042,7 @@ fn parse_ollama_line(
             if let Some(generation) = generation {
                 generation.observe(&v);
             }
-            parse_event_value(Dialect::Ollama, None, v)
+            parse_event_value(Dialect::Ollama, None, v, None)
         }
         // 截断或厂商自定义诊断行不应导致代理 panic；后续完整行仍可继续输出。
         Err(_) => Vec::new(),
@@ -1031,6 +1053,7 @@ fn parse_event_value(
     dialect: Dialect,
     event_name: Option<&str>,
     v: serde_json::Value,
+    anthropic_empty_inputs: Option<&mut BTreeSet<usize>>,
 ) -> Vec<Result<UpstreamEvent>> {
     // A successful HTTP header is not a successful model result. Native
     // error envelopes must not disappear behind a later DONE/stop/done:true.
@@ -1059,7 +1082,12 @@ fn parse_event_value(
     match dialect {
         Dialect::OpenAI => parse_openai_chunk(v, &mut out),
         Dialect::Responses => parse_responses_chunk(event_name, v, &mut out),
-        Dialect::Anthropic => parse_anthropic_chunk(event_name, v, &mut out),
+        Dialect::Anthropic => parse_anthropic_chunk(
+            event_name,
+            v,
+            &mut out,
+            anthropic_empty_inputs.unwrap_or(&mut BTreeSet::new()),
+        ),
         Dialect::Gemini => parse_gemini_chunk(v, &mut out),
         Dialect::Ollama => parse_ollama_chunk(v, &mut out),
     }
@@ -1349,14 +1377,22 @@ fn parse_anthropic_chunk(
     event: Option<&str>,
     v: serde_json::Value,
     out: &mut Vec<Result<UpstreamEvent>>,
+    empty_inputs: &mut BTreeSet<usize>,
 ) {
+    let wire_index = v.get("index").and_then(|index| index.as_u64());
+    // Keep the existing index mapping for start/delta events. Only an explicit
+    // wire index can confirm an empty input at block stop.
+    let index = wire_index.map(|index| index as usize).unwrap_or(0);
+    let explicit_index = wire_index.and_then(|index| usize::try_from(index).ok());
     match event.unwrap_or("") {
         "message_start" => {
+            empty_inputs.clear();
             if let Some(usage) = anthropic_usage(v.get("message").and_then(|m| m.get("usage"))) {
                 out.push(Ok(UpstreamEvent::Usage(usage)));
             }
         }
         "content_block_start" => {
+            empty_inputs.remove(&index);
             let block = v.get("content_block");
             let is_tool_use = block
                 .and_then(|block| block.get("type"))
@@ -1366,7 +1402,6 @@ fn parse_anthropic_chunk(
                 return;
             }
 
-            let index = stream_tool_index(&v);
             let id = block
                 .and_then(|block| block.get("id"))
                 .and_then(|id| id.as_str());
@@ -1377,8 +1412,13 @@ fn parse_anthropic_chunk(
                 // Anthropic 在 start 事件里通常给出空 input，随后再用
                 // input_json_delta 传完整参数。空对象不能提前写成 "{}"，否则
                 // 下游按增量拼接时会得到无效 JSON。
-                let arguments =
-                    anthropic_start_arguments(block.and_then(|block| block.get("input")));
+                let input = block.and_then(|block| block.get("input"));
+                if let Some(index) = explicit_index.filter(
+                    |_| matches!(input, Some(serde_json::Value::Object(input)) if input.is_empty()),
+                ) {
+                    empty_inputs.insert(index);
+                }
+                let arguments = anthropic_start_arguments(input);
                 out.push(Ok(UpstreamEvent::ToolCalls(serde_json::Value::Array(
                     vec![openai_tool_call(index, Some(id), Some(name), arguments)],
                 ))));
@@ -1401,15 +1441,23 @@ fn parse_anthropic_chunk(
                 .and_then(|partial_json| partial_json.as_str())
             {
                 if !partial_json.is_empty() {
+                    empty_inputs.remove(&index);
                     // 只携带当前分片及原 content block 的索引。既有
                     // merge_tool_call_deltas 会按 index 拼接 arguments。
                     out.push(Ok(UpstreamEvent::ToolCalls(serde_json::Value::Array(
-                        vec![openai_tool_call_arguments(
-                            stream_tool_index(&v),
-                            partial_json,
-                        )],
+                        vec![openai_tool_call_arguments(index, partial_json)],
                     ))));
                 }
+            }
+        }
+        "content_block_stop"
+            if v.get("type").and_then(|kind| kind.as_str()) == Some("content_block_stop") =>
+        {
+            // The explicit empty placeholder is confirmed only when its block closes.
+            if let Some(index) = explicit_index.filter(|index| empty_inputs.remove(index)) {
+                out.push(Ok(UpstreamEvent::ToolCalls(serde_json::Value::Array(
+                    vec![openai_tool_call_arguments(index, "{}")],
+                ))));
             }
         }
         "message_delta" => {
@@ -1432,6 +1480,7 @@ fn parse_anthropic_chunk(
             }
         }
         "message_stop" => {
+            empty_inputs.clear();
             out.push(Ok(UpstreamEvent::Done {
                 // message_delta owns the reported stop_reason, if any.
                 finish_reason: None,
@@ -1564,13 +1613,6 @@ fn openai_tool_call_arguments(index: usize, partial_json: &str) -> serde_json::V
         "index": index,
         "function": { "arguments": partial_json },
     })
-}
-
-fn stream_tool_index(v: &serde_json::Value) -> usize {
-    v.get("index")
-        .and_then(|index| index.as_u64())
-        .map(|index| index as usize)
-        .unwrap_or(0)
 }
 
 fn tool_arguments(value: Option<&serde_json::Value>) -> String {

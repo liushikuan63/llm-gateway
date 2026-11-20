@@ -364,6 +364,162 @@ data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"outpu
     assert!(matches!(stop[0], Ok(UpstreamEvent::Done { .. })));
 }
 
+async fn anthropic_tool_sse(frames: Vec<&'static str>) -> Vec<UpstreamEvent> {
+    let app = Router::new()
+        .route(
+            "/v1/messages",
+            post(
+                |State(frames): State<Vec<&'static str>>,
+                 Json(request): Json<serde_json::Value>| async move {
+                    assert_eq!(request["model"], "local-model");
+                    assert_eq!(request["stream"], true);
+                    let chunks = frames
+                        .into_iter()
+                        .map(|frame| Ok::<_, Infallible>(Bytes::from_static(frame.as_bytes())));
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(futures_util::stream::iter(chunks)),
+                    )
+                },
+            ),
+        )
+        .with_state(frames);
+    let (base_url, server) = spawn_axum(app).await;
+    let provider = local_provider(Dialect::Anthropic, format!("{base_url}/v1"));
+    let client = UpstreamClient::new();
+    let mut stream = client
+        .call_stream(
+            &provider,
+            &chat_request(),
+            "local-model",
+            Duration::from_secs(2),
+            &llm_gateway_lib::config::OllamaOptionsConfig::default(),
+        )
+        .await
+        .expect("local Anthropic SSE should be callable");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.expect("local Anthropic SSE should parse"));
+    }
+    server.abort();
+    let _ = server.await;
+    events
+}
+
+#[tokio::test]
+async fn anthropic_sse_confirms_empty_tool_input_only_at_matching_block_stop() {
+    const START: &str = concat!(
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_local","name":"fixture_tool","input":{}}}"#,
+        "\n\n",
+    );
+    const START_WITHOUT_INPUT: &str = concat!(
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_local","name":"fixture_tool"}}"#,
+        "\n\n",
+    );
+    const TEXT_START: &str = concat!(
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+    );
+    const STOP_AT_EOF: &str = concat!(
+        "event: content_block_stop\n",
+        r#"data: {"type":"content_block_stop","index":3}"#,
+    );
+    const STOP: &str = concat!(
+        "event: content_block_stop\n",
+        r#"data: {"type":"content_block_stop","index":3}"#,
+        "\n\n",
+    );
+    const WRONG_INDEX_STOP: &str = concat!(
+        "event: content_block_stop\n",
+        r#"data: {"type":"content_block_stop","index":2}"#,
+        "\n\n",
+    );
+    const FINISH: &str = concat!(
+        "event: message_delta\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        "\n\n",
+    );
+    const DONE: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const ARGUMENT_1: &str = concat!(
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Qing"}}"#,
+        "\n\n",
+    );
+    const ARGUMENT_2: &str = concat!(
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"dao\"}"}}"#,
+        "\n\n",
+    );
+
+    let cases: [(_, _, &[&str], _); 6] = [
+        (
+            "EOF before matching stop",
+            vec![START, WRONG_INDEX_STOP],
+            &[],
+            false,
+        ),
+        ("missing input", vec![START_WITHOUT_INPUT, STOP], &[], false),
+        ("superseded tool", vec![START, TEXT_START, STOP], &[], false),
+        (
+            "populated arguments",
+            vec![START, ARGUMENT_1, ARGUMENT_2, STOP, FINISH, DONE],
+            &[r#"{"city":"Qing"#, r#"dao"}"#],
+            true,
+        ),
+        (
+            "EOF after matching stop",
+            vec![START, STOP_AT_EOF],
+            &["{}"],
+            false,
+        ),
+        (
+            "complete empty input",
+            vec![START, STOP, FINISH, DONE],
+            &["{}"],
+            true,
+        ),
+    ];
+    for (label, frames, fragments, complete) in cases {
+        let events = anthropic_tool_sse(frames).await;
+        let opening = json!([{
+            "index": 3,
+            "id": "toolu_local",
+            "type": "function",
+            "function": { "name": "fixture_tool", "arguments": "" },
+        }]);
+        let expected_calls = std::iter::once(opening)
+            .chain(
+                fragments
+                    .iter()
+                    .map(|fragment| json!([{ "index": 3, "function": { "arguments": fragment } }])),
+            )
+            .collect::<Vec<_>>();
+        let actual_calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                UpstreamEvent::ToolCalls(calls) => Some(calls.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actual_calls, expected_calls, "{label}");
+        let after_tools = &events[actual_calls.len()..];
+        if complete {
+            assert!(
+                matches!(after_tools, [
+                UpstreamEvent::Finish { finish_reason },
+                UpstreamEvent::Done { finish_reason: None, usage: None },
+            ] if finish_reason.as_deref() == Some("tool_calls")),
+                "{label}: {events:?}"
+            );
+        } else {
+            assert!(after_tools.is_empty(), "{label}: {events:?}");
+        }
+    }
+}
+
 #[test]
 fn gemini_function_call_becomes_openai_tool_call_delta() {
     let mut events = parse_sse_block(
