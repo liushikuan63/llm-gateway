@@ -110,6 +110,14 @@ fn options(principal: &str, images: bool) -> Value {
         "catalog_revision":"12345678-1234-4234-9234-123456789abc","fetched_at_ms":1,"allow_undeclared_images":images}}})
 }
 async fn setup(images: bool) -> Setup {
+    let path = std::env::temp_dir().join(format!(
+        "llmgw-owned-native-gateway-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    setup_with_database(images, &path).await
+}
+
+async fn setup_with_database(images: bool, path: &std::path::Path) -> Setup {
     use base64::Engine;
     std::env::set_var(
         "LLMGW_MASTER_KEY",
@@ -134,11 +142,7 @@ async fn setup(images: bool) -> Setup {
     let upstream_task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let path = std::env::temp_dir().join(format!(
-        "llmgw-owned-native-gateway-{}.db",
-        uuid::Uuid::new_v4()
-    ));
-    let db = crate::db::Db::connect_path(&path).await.unwrap();
+    let db = crate::db::Db::connect_path(path).await.unwrap();
     eprintln!("owned Native WAL fixture: {}", path.display());
     let mut cfg = AppConfig {
         port: 0,
@@ -1259,6 +1263,409 @@ async fn cancellation_drops_response_reader_releases_permit_and_records_partial_
     );
     assert_eq!(t.fixture.calls.load(Ordering::SeqCst), 1);
 }
+
+const NATIVE_EXIT_ROLE: &str = "LLMGW_NATIVE_CANCEL_EXIT_ROLE";
+const NATIVE_EXIT_NONCE: &str = "LLMGW_NATIVE_CANCEL_EXIT_NONCE";
+const NATIVE_EXIT_TRACE: &str = "LLMGW_NATIVE_CANCEL_EXIT_TRACE";
+const NATIVE_EXIT_TEST: &str =
+    "proxy::server::native_exact::tests::owned_native_cancel_exit_preserves_atomic_v1_audit";
+const NATIVE_EXIT_PROMPT_TOKENS: i64 = 37;
+
+fn native_exit_root(nonce: &str) -> std::path::PathBuf {
+    let id = uuid::Uuid::parse_str(nonce).expect("owned exit fixture nonce must be a UUID");
+    assert_eq!(nonce, id.simple().to_string());
+    std::env::temp_dir().join(format!("llmgw-personal-test-native-cancel-exit-{nonce}"))
+}
+
+struct NativeExitChild(std::process::Child);
+
+impl Drop for NativeExitChild {
+    fn drop(&mut self) {
+        // A failed assertion also reaps the same direct child.
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+async fn native_exit_commit_gate(
+    pool: &sqlx::SqlitePool,
+) -> (
+    tokio::sync::oneshot::Receiver<(i64, bool)>,
+    std::sync::mpsc::Sender<()>,
+) {
+    use sqlx::sqlite::SqliteOperation;
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let entered = Arc::new(parking_lot::Mutex::new(Some(entered)));
+    let (release, wait_for_release) = std::sync::mpsc::channel();
+    let wait_for_release = Arc::new(parking_lot::Mutex::new(wait_for_release));
+    let mut connections = Vec::new();
+    // Hold all writers at once so the hooks cover the actual pooled writer.
+    assert_eq!(pool.options().get_max_connections(), 8);
+    for _ in 0..pool.options().get_max_connections() {
+        connections.push(pool.acquire().await.unwrap());
+    }
+    for connection in &mut connections {
+        let pending = Arc::new(parking_lot::Mutex::new((None, false)));
+        let updated = pending.clone();
+        let rolled_back = pending.clone();
+        let entered = entered.clone();
+        let wait_for_release = wait_for_release.clone();
+        let mut handle = connection.lock_handle().await.unwrap();
+        handle.set_update_hook(move |update| {
+            if update.database == "main" {
+                match (update.table, update.operation) {
+                    ("requests", SqliteOperation::Insert) => {
+                        updated.lock().0 = Some(update.rowid);
+                    }
+                    ("usage_daily", SqliteOperation::Insert | SqliteOperation::Update) => {
+                        updated.lock().1 = true;
+                    }
+                    _ => (),
+                }
+            }
+        });
+        handle.set_rollback_hook(move || {
+            *rolled_back.lock() = (None, false);
+        });
+        handle.set_commit_hook(move || {
+            let (rowid, wrote_usage) = std::mem::take(&mut *pending.lock());
+            if let Some(rowid) = rowid {
+                if let Some(entered) = entered.lock().take() {
+                    if entered.send((rowid, wrote_usage)).is_ok() {
+                        // This runs on SQLx's SQLite worker. Until the child
+                        // releases it, the real COMMIT cannot proceed. Unwinding
+                        // drops the sender, so SQLx returns false and rolls back.
+                        return wait_for_release.lock().recv().is_ok();
+                    }
+                    return false;
+                }
+            }
+            true
+        });
+    }
+    (observed, release)
+}
+
+type NativeExitDailyUsageRow = (String, String, String, String, i64, i64, i64, i64, f64);
+
+async fn check_native_exit_wal(
+    path: &std::path::Path,
+    trace: &str,
+    committed_rowid: Option<i64>,
+) -> Value {
+    use sqlx::{sqlite::SqliteConnectOptions, Connection, Row};
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .pragma("query_only", "ON");
+    let mut reader = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .unwrap();
+    let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut reader)
+        .await
+        .unwrap();
+    let integrity: Vec<String> = sqlx::query_scalar("PRAGMA quick_check")
+        .fetch_all(&mut reader)
+        .await
+        .unwrap();
+    assert_eq!(journal, "wal");
+    assert_eq!(integrity, ["ok"]);
+    let requests = sqlx::query("SELECT id, ts, trace_id, status, error, routed_provider, routed_model, prompt_tokens, completion_tokens, attempts_json FROM requests ORDER BY id")
+        .fetch_all(&mut reader)
+        .await
+        .unwrap();
+    let usage: Vec<NativeExitDailyUsageRow> =
+        sqlx::query_as("SELECT day, provider_id, model, currency, requests, prompt_tokens, completion_tokens, errors, cost FROM usage_daily")
+            .fetch_all(&mut reader)
+            .await
+            .unwrap();
+    reader.close().await.unwrap();
+    if let Some(rowid) = committed_rowid {
+        assert_eq!(requests.len(), 1, "exactly one owned audit after COMMIT");
+        let request = &requests[0];
+        assert_eq!(request.get::<i64, _>("id"), rowid);
+        assert_eq!(request.get::<&str, _>("trace_id"), trace);
+        assert_eq!(request.get::<i64, _>("status"), 499);
+        assert_eq!(request.get::<&str, _>("error"), "native_client_cancelled");
+        assert_eq!(request.get::<&str, _>("routed_provider"), "native-provider");
+        assert_eq!(request.get::<&str, _>("routed_model"), "Exact-A");
+        assert_eq!(
+            request.get::<i64, _>("prompt_tokens"),
+            NATIVE_EXIT_PROMPT_TOKENS
+        );
+        assert_eq!(request.get::<i64, _>("completion_tokens"), 0);
+        let attempts: Value =
+            serde_json::from_str(request.get::<&str, _>("attempts_json")).unwrap();
+        assert_eq!(attempts.as_array().unwrap().len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt["trace_id"], trace);
+        assert_eq!(attempt["ok"], false);
+        let native = &attempt["native_exact"];
+        assert_eq!(native["version"], 1);
+        assert_eq!(native["attempt"], 1);
+        assert_eq!(native["upstream_post_started"], true);
+        assert_eq!(native["scalar_usage_placeholder"], true);
+        let evidence = native["usage_evidence"].as_object().unwrap();
+        assert_eq!(evidence["state"], "partial");
+        assert_eq!(evidence["prompt_tokens"], NATIVE_EXIT_PROMPT_TOKENS);
+        assert_eq!(evidence.get("completion_tokens"), Some(&Value::Null));
+        assert_eq!(evidence.get("total_tokens"), Some(&Value::Null));
+        let day = chrono::DateTime::from_timestamp(request.get::<i64, _>("ts"), 0)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        // V1 usage has no trace column. A fresh database with one request and
+        // one matching day/provider/model bucket establishes this pairing.
+        assert_eq!(
+            usage,
+            vec![(
+                day,
+                "native-provider".into(),
+                "Exact-A".into(),
+                String::new(),
+                1,
+                NATIVE_EXIT_PROMPT_TOKENS,
+                0,
+                1,
+                0.0,
+            )]
+        );
+    } else {
+        assert!(requests.is_empty(), "audit visible before COMMIT");
+        assert!(usage.is_empty(), "usage visible before COMMIT");
+    }
+    json!({
+        "journal":journal, "quick_check":integrity, "request_rows":requests.len(),
+        "usage_rows":usage.len(), "trace":trace,
+        "status":committed_rowid.map(|_| 499),
+        "prompt_tokens":committed_rowid.map(|_| NATIVE_EXIT_PROMPT_TOKENS),
+        "usage_state":committed_rowid.map(|_| "partial"),
+    })
+}
+
+async fn run_native_cancel_exit_child(role: &str) {
+    assert!(matches!(role, "before_commit" | "after_commit"));
+    let nonce = std::env::var(NATIVE_EXIT_NONCE).unwrap();
+    let trace = std::env::var(NATIVE_EXIT_TRACE).unwrap();
+    let dir = native_exit_root(&nonce).join(role);
+    assert_eq!(
+        std::env::current_dir().unwrap().canonicalize().unwrap(),
+        dir.canonicalize().unwrap()
+    );
+    assert_eq!(
+        std::env::var_os("LLMGW_DATA_DIR"),
+        Some(dir.join("data").into_os_string())
+    );
+    let owner: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("owner.json")).unwrap()).unwrap();
+    assert_eq!(
+        owner,
+        json!({"fixture":"native-cancel-exit-v1", "role":role, "nonce":nonce, "trace":trace})
+    );
+    let path = dir.join("owned.sqlite3");
+    assert!(
+        !path.exists(),
+        "child must initialize a fresh owned database"
+    );
+    let t = setup_with_database(false, &path).await;
+    check_native_exit_wal(&path, &trace, None).await;
+    let (commit_entered, release_commit) = native_exit_commit_gate(t.state.db.pool()).await;
+    let sentinel = format!("s2-owned-visible-{trace}");
+    t.fixture.stall.store(true, Ordering::SeqCst);
+    t.fixture.packets.lock().push_back(
+        // Usage has to cross the parser before the client can observe the
+        // sentinel. No terminal frame is sent on this upstream connection.
+        frame(
+            "token_usage",
+            json!({"prompt_tokens":NATIVE_EXIT_PROMPT_TOKENS}),
+        ) + &frame("output", json!({"response":sentinel})),
+    );
+    let mut body = request();
+    body["stream"] = json!(true);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/v1/chat/completions", t.url))
+            .bearer_auth("fixture-gateway-key")
+            .header("x-trace-id", &trace)
+            .header("connection", "close")
+            .json(&body)
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-trace-id"], trace.as_str());
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let mut reader = response.bytes_stream();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut received = Vec::new();
+        loop {
+            received.extend_from_slice(&reader.next().await.unwrap().unwrap());
+            assert!(received.len() <= 64 * 1024);
+            let wire = std::str::from_utf8(&received).unwrap();
+            assert!(!wire.contains("[DONE]"));
+            if client_logical_channels(wire)
+                .get("content")
+                .is_some_and(|content| content == &sentinel)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("client must see the owned sentinel before cancelling");
+    assert_eq!(t.fixture.calls.load(Ordering::SeqCst), 1);
+    {
+        let requests = t.fixture.requests.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "POST");
+        assert_eq!(requests[0].1, MODEL_PATH);
+    }
+    drop(reader);
+    let (rowid, wrote_usage) = tokio::time::timeout(Duration::from_secs(5), commit_entered)
+        .await
+        .expect("client cancellation must reach the SQLite commit hook")
+        .unwrap();
+    assert!(
+        rowid > 0 && wrote_usage,
+        "same writer must stage audit and usage"
+    );
+    let committed_rowid = if role == "after_commit" {
+        release_commit.send(()).unwrap();
+        t.state
+            .audit_tasks()
+            .drain(Duration::from_secs(5))
+            .await
+            .unwrap();
+        Some(rowid)
+    } else {
+        None
+    };
+    let witness = check_native_exit_wal(&path, &trace, committed_rowid).await;
+    let ready = json!({
+        "role":role, "nonce":nonce, "pid":std::process::id(), "trace":trace,
+        "commit_hook_rowid":rowid, "commit_hook_staged_usage":wrote_usage,
+        "sentinel":sentinel, "witness":witness,
+    });
+    let pending = dir.join("ready.tmp");
+    std::fs::write(&pending, ready.to_string()).unwrap();
+    std::fs::rename(&pending, dir.join("ready.json")).unwrap();
+    // Keep the server, pool and (before COMMIT) the blocked hook alive.
+    std::future::pending::<()>().await;
+    drop((release_commit, t, client));
+}
+
+#[tokio::test]
+async fn owned_native_cancel_exit_preserves_atomic_v1_audit() {
+    use std::process::{Command, Stdio};
+    if let Ok(role) = std::env::var(NATIVE_EXIT_ROLE) {
+        run_native_cancel_exit_child(&role).await;
+        return;
+    }
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let root = native_exit_root(&nonce);
+    std::fs::create_dir(&root).unwrap();
+    eprintln!("owned native cancel exit fixture: {}", root.display());
+    for role in ["before_commit", "after_commit"] {
+        let trace = crate::trace::new_trace_id();
+        let dir = root.join(role);
+        std::fs::create_dir(&dir).unwrap();
+        let owner =
+            json!({"fixture":"native-cancel-exit-v1", "role":role, "nonce":nonce, "trace":trace});
+        std::fs::write(dir.join("owner.json"), owner.to_string()).unwrap();
+        let child_log = dir.join("child.log");
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&child_log)
+            .unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let mut child = NativeExitChild(
+            command
+                .args(["--exact", NATIVE_EXIT_TEST, "--nocapture"])
+                .current_dir(&dir)
+                .env(NATIVE_EXIT_ROLE, role)
+                .env(NATIVE_EXIT_NONCE, &nonce)
+                .env(NATIVE_EXIT_TRACE, &trace)
+                .env("LLMGW_DATA_DIR", dir.join("data"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .stdin(Stdio::null())
+                .stderr(output.try_clone().unwrap())
+                .stdout(output)
+                .spawn()
+                .unwrap(),
+        );
+        let ready_path = dir.join("ready.json");
+        let ready: Value = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "owned {role} child exited before its commit receipt: {}",
+                    child_log.display()
+                );
+                match std::fs::read(&ready_path) {
+                    Ok(receipt) => break serde_json::from_slice(&receipt).unwrap(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => panic!("owned {role} receipt read failed: {error}"),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("owned {role} receipt timed out: {}", child_log.display()));
+        assert_eq!(ready["role"], role);
+        assert_eq!(ready["nonce"], nonce);
+        assert_eq!(ready["pid"], child.0.id());
+        assert_eq!(ready["trace"], trace);
+        assert_eq!(ready["sentinel"], format!("s2-owned-visible-{trace}"));
+        assert_eq!(ready["commit_hook_staged_usage"], true);
+        let rowid = ready["commit_hook_rowid"].as_i64().unwrap();
+        assert!(rowid > 0);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "owned child must be alive"
+        );
+        child.0.kill().unwrap();
+        let status = child.0.wait().unwrap();
+        assert!(
+            !status.success(),
+            "owned child must exit by forced termination"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(9));
+        }
+        let committed_rowid = (role == "after_commit").then_some(rowid);
+        let reopened =
+            check_native_exit_wal(&dir.join("owned.sqlite3"), &trace, committed_rowid).await;
+        assert_eq!(
+            ready["witness"], reopened,
+            "live and reopened WAL must agree"
+        );
+        eprintln!(
+            "owned native cancel exit {role}: pid={} exit={status} rowid={rowid} {reopened}",
+            ready["pid"]
+        );
+    }
+}
+
 #[tokio::test]
 async fn overall_timeout_is_bounded_without_retry_and_expiry_has_zero_post() {
     let t = setup(false).await;
