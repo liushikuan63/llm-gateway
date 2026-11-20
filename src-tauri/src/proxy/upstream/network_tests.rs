@@ -521,6 +521,206 @@ async fn n4_http_proxy_switch_preserves_open_stream_and_refusal_never_goes_direc
 
 #[cfg(feature = "ipc-tests")]
 #[tokio::test]
+async fn n4_proxy_config_production_ipc_persists_to_fresh_gateway_socks_forward_and_refusal() {
+    use crate::outbound::socks_tests::{Mode, OwnedSocks};
+
+    let host = "owned-upstream.invalid";
+    for scheme in ["socks5", "socks5h"] {
+        let mut tls = OwnedTls::new(false);
+        let target_port = tls.port("a");
+        let direct = std::net::SocketAddr::from(([127, 0, 0, 1], target_port));
+        let forwarded = std::net::SocketAddr::from(([127, 0, 0, 1], tls.port("b")));
+        // The same named target is directly reachable at A. The owned proxy
+        // forwards only to B, giving direct and proxied traffic distinct receipts.
+        let mut forward = OwnedSocks::new(scheme, forwarded, target_port, Mode::Forward).await;
+        let mut reject = OwnedSocks::new(scheme, forwarded, target_port, Mode::RejectConnect).await;
+        let expected_wire_target = if scheme == "socks5h" {
+            (3, host.to_owned(), target_port)
+        } else {
+            (1, direct.ip().to_string(), target_port)
+        };
+        let direct_request = || {
+            reqwest::Client::builder()
+                .no_proxy()
+                .resolve(host, direct)
+                .add_root_certificate(tls.root())
+                .timeout(Duration::from_secs(4))
+                .build()
+                .unwrap()
+                .post(format!("https://{host}:{target_port}/v1/chat/completions"))
+                .json(&json!({
+                    "model": "wire-model",
+                    "messages": [{"role": "user", "content": "direct-control"}],
+                    "stream": false,
+                    "max_tokens": 16
+                }))
+        };
+        let before: Value = direct_request()
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(before["choices"][0]["message"]["content"], "via-A");
+        assert_eq!(
+            tls.state().await,
+            json!({"a": 1, "b": 0, "offered": 0, "error": ""})
+        );
+
+        let provider: Provider = serde_json::from_value(json!({
+            "id": "owned-socks-ipc-provider", "name": "owned-socks-ipc-provider",
+            "base_url": format!("https://{host}:{target_port}/v1"), "dialect": "openai",
+            "api_key_enc": "", "enabled": true, "priority": 0, "rpm_limit": 0,
+            "intelligence": 50, "created_at": "2026-10-20T00:00:00Z",
+            "updated_at": "2026-10-20T00:00:00Z",
+            "models": [{"alias": "owned-model", "upstream": "wire-model", "enabled": true,
+                "context_window": 32768, "supports_tools": false, "supports_vision": false,
+                "supports_thinking": false, "supports_stream": true, "model_type": "chat"}]
+        }))
+        .unwrap();
+        for (proxy, label, expected_status) in [
+            (&forward, "socks-forward", 200),
+            (&reject, "socks-refused", 503),
+        ] {
+            let mut cfg = AppConfig {
+                port: 0,
+                unified_key: "owned-proxy-matrix-key".into(),
+                routing_strategy: RoutingStrategy::Priority,
+                failover_enabled: false,
+                ..Default::default()
+            };
+            cfg.cache.enabled = false;
+            cfg.search.enabled = false;
+            cfg.smart_routing.enabled = false;
+            cfg.dedup.mode = crate::proxy::dedup::DedupMode::Off;
+            let initial = forward.url.clone();
+            let target = proxy.url.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::commands::replace_owned_proxy_via_ipc(cfg, &initial, &target);
+            })
+            .await
+            .unwrap();
+
+            // The save runtime has gone away. No in-memory client or config
+            // from that runtime is passed to the gateway receiving the request.
+            let (on_disk, warning) = AppConfig::load_or_init_with_warning().unwrap();
+            assert!(warning.is_none(), "{warning:?}");
+            assert_eq!(on_disk.http_proxy.as_deref(), Some(proxy.url.as_str()));
+            assert_eq!(on_disk.port, 0);
+            assert_eq!(on_disk.bind, "127.0.0.1");
+            let db = Db::connect_in_memory().await.unwrap();
+            repo::upsert_provider(db.pool(), &provider).await.unwrap();
+            let state = Arc::new(OWNED_NETWORK_TEST_ROOT.sync_scope(tls.root(), || {
+                OWNED_NETWORK_TEST_RESOLVE.sync_scope((host.to_owned(), direct), || {
+                    GatewayState::new(db.clone(), on_disk)
+                })
+            }));
+            state.reload_providers().await.unwrap();
+            let service = GatewayService::new(state.clone());
+            let started = service.set_enabled(true).await.unwrap();
+            let bound: std::net::SocketAddr = started.bound_addr.unwrap().parse().unwrap();
+            assert!(bound.ip().is_loopback() && bound.port() != 0);
+            let (status, body) = request(
+                format!("http://{bound}"),
+                label,
+                false,
+                Arc::new(Notify::new()),
+            )
+            .await;
+            let stopped = tokio::time::timeout(Duration::from_secs(5), service.set_enabled(false))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!stopped.running);
+            assert!(stopped.last_error.is_none(), "{stopped:?}");
+            assert!(state.listener_snapshot().is_none());
+
+            assert_eq!(status, expected_status, "{scheme} {label}: {body}");
+            let body: Value = serde_json::from_str(&body).unwrap();
+            let stats = proxy.stats();
+            assert_eq!(stats.accepted, 1, "{scheme} {label}: {stats:?}");
+            assert_eq!(
+                stats.targets.as_slice(),
+                std::slice::from_ref(&expected_wire_target)
+            );
+            assert!(stats.errors.is_empty(), "{stats:?}");
+            assert_eq!(
+                tls.state().await,
+                json!({"a": 1, "b": 1, "offered": 0, "error": ""})
+            );
+
+            let rows = sqlx::query_as::<_, (
+                i64,
+                Option<String>,
+                Option<String>,
+                i64,
+                i64,
+                Option<String>,
+                i64,
+            )>(
+                "SELECT status,routed_provider,routed_model,prompt_tokens,completion_tokens,error,fallback_attempts FROM requests",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(rows.len(), 1, "{scheme} {label}: {rows:?}");
+            if expected_status == 200 {
+                assert_eq!(body["choices"][0]["message"]["content"], "via-B");
+                assert_eq!(body["choices"][0]["finish_reason"], "stop");
+                assert_eq!(body["usage"]["prompt_tokens"], 3);
+                assert_eq!(body["usage"]["completion_tokens"], 2);
+                assert_eq!(reject.stats().accepted, 0);
+                assert_eq!(
+                    rows[0],
+                    (
+                        200,
+                        Some(provider.id.clone()),
+                        Some("wire-model".into()),
+                        3,
+                        2,
+                        None,
+                        0
+                    )
+                );
+            } else {
+                assert_eq!(body["error"]["type"], "upstream_error");
+                assert_eq!(forward.stats().accepted, 1);
+                assert_eq!((&rows[0].0, &rows[0].1, &rows[0].2), (&503, &None, &None));
+                assert_eq!((rows[0].3, rows[0].4, rows[0].6), (0, 0, 0));
+                assert!(rows[0].5.is_some(), "{rows:?}");
+            }
+        }
+
+        // Use a newly built direct client so the post-refusal control must
+        // establish its own connection to the original destination.
+        let after: Value = direct_request()
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(after["choices"][0]["message"]["content"], "via-A");
+        assert_eq!(
+            tls.state().await,
+            json!({"a": 2, "b": 1, "offered": 0, "error": ""})
+        );
+        forward.stop().await;
+        reject.stop().await;
+        tls.stop().await;
+        eprintln!(
+            "N4 owned IPC SOCKS cold load: scheme={scheme}, forward=200, refusal=503 upstream_error, forwarded POST=1 then 0, direct controls=2, audits=2, closed"
+        );
+    }
+}
+
+#[cfg(feature = "ipc-tests")]
+#[tokio::test]
 async fn n4_proxy_config_production_ipc_persists_to_fresh_gateway_connect() {
     let mut tls = OwnedTls::new(false);
     let host = "owned-upstream.invalid";

@@ -1810,11 +1810,20 @@ pub(crate) fn replace_owned_proxy_via_ipc(cfg: AppConfig, initial: &str, target:
         next.http_proxy = Some(proxy);
         json!({"cfg": next})
     };
+    // Test inputs are host:port URLs with no path. The HTTP URL has an
+    // implicit root path, whereas a SOCKS URL retains an empty path.
+    let normalized = |raw: &str| {
+        if raw.starts_with("socks5://") || raw.starts_with("socks5h://") {
+            raw.to_owned()
+        } else {
+            format!("{raw}/")
+        }
+    };
     let assert_saved = |raw: &str| {
         let result = h
             .invoke("update_config", candidate(format!("  {raw}  ")))
             .unwrap();
-        let expected = format!("{raw}/");
+        let expected = normalized(raw);
         assert_eq!(result["config"]["http_proxy"], expected);
         assert_eq!(result["restart_required"], false);
         assert_eq!(result["restart_reasons"], json!([]));
@@ -1844,7 +1853,7 @@ pub(crate) fn replace_owned_proxy_via_ipc(cfg: AppConfig, initial: &str, target:
         .as_str()
         .is_some_and(|message| message.contains("代理地址")));
     assert_eq!(std::fs::read(&path).unwrap(), original);
-    let original_proxy = format!("{initial}/");
+    let original_proxy = normalized(initial);
     assert_eq!(
         app.config.read().http_proxy.as_deref(),
         Some(original_proxy.as_str())
