@@ -25,6 +25,8 @@ struct MockState {
 enum OpenAiBehavior {
     Complete(&'static str),
     CompleteWithCachedUsage(&'static str),
+    ResponsesStatus(&'static str),
+    ResponsesComplete(&'static str),
     Status(StatusCode),
     Html,
     TruncatedJson,
@@ -169,6 +171,27 @@ async fn mock_openai_chat(
             },
         }))
         .into_response(),
+        OpenAiBehavior::ResponsesStatus(status) => Json(serde_json::json!({
+            "id": "resp-status",
+            "object": "response",
+            "model": "integration-model",
+            "status": status,
+            "output": [],
+        }))
+        .into_response(),
+        OpenAiBehavior::ResponsesComplete(content) => Json(serde_json::json!({
+            "id": "resp-complete",
+            "object": "response",
+            "model": "integration-model",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": content }],
+            }],
+            "usage": { "input_tokens": 3, "output_tokens": 2, "total_tokens": 5 },
+        }))
+        .into_response(),
         OpenAiBehavior::Status(status) => (
             status,
             Json(serde_json::json!({
@@ -237,6 +260,7 @@ async fn spawn_openai_upstream(behavior: OpenAiBehavior) -> (String, MockState, 
     let state = MockState::default();
     let app = Router::new()
         .route("/v1/chat/completions", post(mock_openai_chat))
+        .route("/v1/responses", post(mock_openai_chat))
         .route("/v1/embeddings", post(mock_openai_embeddings))
         .route("/v1/images/generations", post(mock_openai_images))
         .route("/v1/audio/speech", post(mock_openai_speech))
@@ -566,6 +590,86 @@ async fn malformed_successful_upstreams_are_retryable_and_fall_back_at_gateway_b
         bad_task.abort();
         good_task.abort();
     }
+}
+
+#[tokio::test]
+async fn buffered_responses_nonterminal_status_falls_back_and_audits_attempt_chain() {
+    let (primary_url, primary_state, primary_task) =
+        spawn_openai_upstream(OpenAiBehavior::ResponsesStatus("failed")).await;
+    let (backup_url, backup_state, backup_task) =
+        spawn_openai_upstream(OpenAiBehavior::ResponsesComplete("responses backup reply")).await;
+    let (db, config, gateway_task, base_url) = spawn_gateway(vec![
+        provider("responses-primary", primary_url, Dialect::Responses, 1),
+        provider("responses-backup", backup_url, Dialect::Responses, 2),
+    ])
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/responses"))
+        .bearer_auth(&config.unified_key)
+        .json(&serde_json::json!({
+            "model": "integration-model",
+            "input": "retry a nonterminal response",
+            "max_output_tokens": 42,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-routed-via"],
+        "responses-backup/integration-model"
+    );
+    assert_eq!(response.headers()["x-fallback-attempts"], "2");
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(
+        body["output"][0]["content"][0]["text"],
+        "responses backup reply"
+    );
+    assert_eq!(body["usage"]["input_tokens"], 3);
+    assert_eq!(body["usage"]["output_tokens"], 2);
+    assert_eq!(primary_state.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_state.hits.load(Ordering::SeqCst), 1);
+
+    // 审计写入是异步的；等待唯一成功记录落库后再核对完整降级链。
+    let mut logged = None;
+    for _ in 0..80 {
+        let rows = repo::recent_requests(db.pool(), 10).await.unwrap();
+        if let Some(row) = rows
+            .into_iter()
+            .find(|row| row["routed_provider"] == "responses-backup")
+        {
+            logged = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let logged = logged.expect("备用 Responses 成功必须写入审计");
+    assert_eq!(logged["routed_provider"], "responses-backup");
+    assert_eq!(logged["routed_model"], "integration-model");
+    assert_eq!(logged["status"], 200);
+    assert_eq!(logged["prompt_tokens"], 3);
+    assert_eq!(logged["completion_tokens"], 2);
+    assert_eq!(logged["fallback_attempts"], 1);
+    assert!(logged["error"].is_null());
+
+    let attempts = logged["attempts"]
+        .as_array()
+        .expect("Responses 回退必须记录逐跳 attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["provider_id"], "responses-primary");
+    assert_eq!(attempts[0]["ok"], false);
+    assert_eq!(attempts[0]["status"], 502);
+    assert_eq!(attempts[0]["retryable"], true);
+    assert_eq!(attempts[1]["provider_id"], "responses-backup");
+    assert_eq!(attempts[1]["ok"], true);
+
+    gateway_task.abort();
+    primary_task.abort();
+    backup_task.abort();
 }
 
 /// 上游 **404「我这儿没这个模型」** 是「换一家」的典型理由，不是客户端错：

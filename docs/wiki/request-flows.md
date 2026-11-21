@@ -545,6 +545,8 @@ Anthropic 的 `message_delta` 只更新结束原因和累计用量，独立的 `
 
 Responses 的 `response.failed`／`error` 也沿用同一已派发未知保护：旧 Gateway 首正文前确实触发第二次 POST，现以固定 502／`NoReplay` 拒绝重放。直接解析器原先仍携带任意上游 model／message，现不再保留它们；实际目标由可信的分派／尝试元数据归属，不能借错误载荷伪造。既有正文后失败保护本来通过，本批保留该正向事实，不冒充新修复。正常完成、原生 SSE 的工具参数装配以及合法 `response.incomplete` 的 length／usage 终态均保留；未把所有 incomplete 当失败。新增 Gateway 正常／前后正文错误和直接解析器均用自有 fixture，其他畸形或自相矛盾的终态、真实版本及实装继续未验。
 
+缓冲（非流式）Responses 响应只有 `status` 为 `completed` 或 `incomplete` 且 `output` 为数组时才算成功；空数组仍是合法终态。`failed`、`cancelled`、`queued`、`in_progress` 或未知状态会先映射为可回退的 502，并沿真实 attempts 记录失败跳和备用成功跳，避免写入伪造的 assistant／200 审计。已派发且受预算约束的请求仍遵守 `NoReplay`，不会因该校验放宽重放；本地回环已覆盖主 Responses 非终态到备用 Responses 的一次回退、路由头、3/2 用量和审计链，真实供应商与安装版仍未验。
+
 
 
 

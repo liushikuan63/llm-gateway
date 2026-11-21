@@ -1848,10 +1848,15 @@ fn ensure_successful_response(
         Dialect::Ollama => value
             .get("message")
             .is_some_and(|message| message.is_object()),
-        // Responses 成功时必有 `output` 数组（空数组也算成功 ——
-        // 内容被上限截断时就是这样）。这里判「字段在不在」而不是「非空」，
-        // 否则空输出会被误判成上游错误。
-        Dialect::Responses => value.get("output").is_some_and(|o| o.is_array()),
+        // Responses 的缓冲终态必须是已完成或已中断；两者都允许空
+        // `output`（例如输出被上限截断时）。未知或进行中的状态不能
+        // 被当作成功，否则会写入错误的 assistant/200 审计并阻断降级。
+        Dialect::Responses => {
+            matches!(
+                value.get("status").and_then(|status| status.as_str()),
+                Some("completed") | Some("incomplete")
+            ) && value.get("output").is_some_and(|output| output.is_array())
+        }
     };
 
     if application_error || !expected_payload {
@@ -1863,6 +1868,76 @@ fn ensure_successful_response(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod responses_buffer_status_tests {
+    use super::ensure_successful_response;
+    use crate::domain::{Dialect, Provider};
+
+    fn responses_provider() -> Provider {
+        let now = chrono::Utc::now();
+        Provider {
+            id: "owned-responses-status-provider".into(),
+            name: "owned Responses status provider".into(),
+            dialect: Dialect::Responses,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key_enc: String::new(),
+            enabled: true,
+            priority: 1,
+            models: Vec::new(),
+            rpm_limit: 0,
+            intelligence: 0,
+            note: None,
+            runtime_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn buffered_responses_nonterminal_statuses_are_not_success() {
+        let provider = responses_provider();
+        for status in ["failed", "cancelled", "queued", "in_progress", "unknown"] {
+            let value = serde_json::json!({
+                "id": "resp_owned_status",
+                "status": status,
+                "output": [],
+            });
+            assert!(
+                ensure_successful_response(
+                    &value,
+                    &provider,
+                    "owned-responses-model",
+                    &value.to_string(),
+                )
+                .is_err(),
+                "buffered Responses status {status} must not be treated as success"
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_responses_completed_and_incomplete_empty_output_are_successful() {
+        let provider = responses_provider();
+        for status in ["completed", "incomplete"] {
+            let value = serde_json::json!({
+                "id": "resp_owned_status",
+                "status": status,
+                "output": [],
+            });
+            assert!(
+                ensure_successful_response(
+                    &value,
+                    &provider,
+                    "owned-responses-model",
+                    &value.to_string(),
+                )
+                .is_ok(),
+                "buffered Responses status {status} with empty output is valid"
+            );
+        }
+    }
 }
 
 /// 上游错误体是否在说「上下文超了」。
