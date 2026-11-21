@@ -797,6 +797,8 @@ N3的具体政策与附加表源码／隔离测试已由用户明确批准；原
 
 同组的 `ipc-tests` 回归对 `socks5` 和 `socks5h` 分别进行 IPC 保存、非法地址拒绝和冷读。两个协议的 SOCKS CONNECT 帧分别携带本地解析的 IPv4 和原始域名。有效代理只转发至自有 B 源站并记录一条 200 用量审计，拒绝代理返回 `503 upstream_error` 并记录一条失败审计。拒绝时 A、B 均无新增模型 POST。拒绝前后用独立客户端直连原目标 A 确认可达。证据来自 Windows 自有回环、合成证书和临时配置目录。外部代理、实际 DNS 和安装态仍待验收。
 
+新增的 [`n4_socks_proxy_switch_refusal_preserves_inflight_owner_and_never_goes_direct`](../../src-tauri/src/proxy/upstream/network_tests.rs) 回归在 `socks5` 与 `socks5h` 下先让 A 的流请求进入在途，再把内存配置切到拒绝 CONNECT 的 B。新请求必须返回 `503 upstream_error`，A 的旧请求仍保持未完成并在释放后由 A 返回 `200`；A、B 的 SOCKS 目标类型分别保持 IPv4 或原始域名，TLS 原点只收到 A 的一次模型 POST，B 和直连路径均为 0。该项使用 Windows 自有 SOCKS/TLS loopback 与测试 DNS，证明的是代理切换和失败隔离，不覆盖外部代理、真实 DNS、安装态或审计持久化。
+
 
 
 

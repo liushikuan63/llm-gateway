@@ -315,6 +315,169 @@ async fn n4_socks_tls_gateway_preserves_inflight_owner_wire_target_and_audit() {
 }
 
 #[tokio::test]
+async fn n4_socks_proxy_switch_refusal_preserves_inflight_owner_and_never_goes_direct() {
+    use crate::outbound::socks_tests::{Mode, OwnedSocks};
+
+    for scheme in ["socks5", "socks5h"] {
+        let mut tls = OwnedTls::new(true);
+        let root = tls.root();
+        let target_port = tls.port("a");
+        let direct = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, target_port));
+        OWNED_NETWORK_TEST_ROOT
+            .scope(
+                root,
+                OWNED_NETWORK_TEST_RESOLVE.scope(("owned-upstream.invalid".to_owned(), direct), async {
+                    let mut a = OwnedSocks::new(
+                        scheme,
+                        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, tls.port("a"))),
+                        target_port,
+                        Mode::Forward,
+                    )
+                    .await;
+                    let mut b = OwnedSocks::new(
+                        scheme,
+                        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, tls.port("b"))),
+                        target_port,
+                        Mode::RejectConnect,
+                    )
+                    .await;
+                    let db = Db::connect_in_memory().await.unwrap();
+                    let provider: Provider = serde_json::from_value(json!({
+                        "id": "owned-socks-switch-provider",
+                        "name": "owned-socks-switch-provider",
+                        "base_url": format!("https://owned-upstream.invalid:{target_port}/v1"),
+                        "api_key_enc": "",
+                        "dialect": "openai",
+                        "enabled": true,
+                        "priority": 0,
+                        "rpm_limit": 0,
+                        "intelligence": 50,
+                        "created_at": "2026-10-20T00:00:00Z",
+                        "updated_at": "2026-10-20T00:00:00Z",
+                        "models": [{
+                            "alias": "owned-model",
+                            "upstream": "wire-model",
+                            "enabled": true,
+                            "context_window": 32768,
+                            "supports_tools": false,
+                            "supports_vision": false,
+                            "supports_audio": false,
+                            "supports_video": false,
+                            "supports_thinking": false,
+                            "supports_stream": true,
+                            "model_type": "chat",
+                            "price": null
+                        }]
+                    }))
+                    .unwrap();
+                    repo::upsert_provider(db.pool(), &provider).await.unwrap();
+                    let mut cfg = AppConfig {
+                        port: 0,
+                        unified_key: "owned-proxy-matrix-key".into(),
+                        routing_strategy: RoutingStrategy::Priority,
+                        http_proxy: Some(a.url.clone()),
+                        failover_enabled: false,
+                        ..Default::default()
+                    };
+                    cfg.cache.enabled = false;
+                    cfg.search.enabled = false;
+                    cfg.smart_routing.enabled = false;
+                    cfg.dedup.mode = crate::proxy::dedup::DedupMode::Off;
+                    let state = Arc::new(GatewayState::new(db.clone(), cfg));
+                    state.reload_providers().await.unwrap();
+                    let service = GatewayService::new(state.clone());
+                    let started = service.set_enabled(true).await.unwrap();
+                    let base = format!("http://{}", started.bound_addr.unwrap());
+                    let seen = Arc::new(Notify::new());
+                    let old = tokio::spawn({
+                        let base = base.clone();
+                        let seen = seen.clone();
+                        async move { request(base, "held", true, seen).await }
+                    });
+                    let arrived = tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            let actual = tls.state().await;
+                            assert_eq!(actual["error"], "");
+                            if actual["a"] == 1 && actual["offered"] == 1 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        seen.notified().await;
+                    })
+                    .await;
+                    if arrived.is_err() {
+                        if !old.is_finished() {
+                            old.abort();
+                            let _ = old.await;
+                        }
+                        panic!(
+                            "owned SOCKS refusal arrival failed: scheme={scheme}, A={:?}, TLS={}",
+                            a.stats(),
+                            tls.state().await
+                        );
+                    }
+                    assert!(!old.is_finished());
+
+                    let mut switched = state.cfg_snapshot();
+                    switched.http_proxy = Some(b.url.clone());
+                    state.update_cfg(switched);
+                    let rejected = request(base, "new", true, Arc::new(Notify::new())).await;
+                    assert_eq!(rejected.0, 503, "{rejected:?}");
+                    assert!(rejected.1.contains("upstream_error"), "{rejected:?}");
+                    assert!(!old.is_finished());
+                    assert_eq!(tls.state().await["a"], 1);
+                    assert_eq!(tls.state().await["b"], 0);
+
+                    let expected = if scheme == "socks5h" {
+                        (3, "owned-upstream.invalid".to_owned(), target_port)
+                    } else {
+                        (1, "127.0.0.1".to_owned(), target_port)
+                    };
+                    let a_stats = a.stats();
+                    let b_stats = b.stats();
+                    assert_eq!(a_stats.accepted, 1);
+                    assert_eq!(a_stats.targets, vec![expected.clone()]);
+                    assert!(a_stats.errors.is_empty(), "{a_stats:?}");
+                    assert_eq!(b_stats.accepted, 1);
+                    assert_eq!(b_stats.targets, vec![expected]);
+                    assert!(b_stats.errors.is_empty(), "{b_stats:?}");
+
+                    tls.release().await;
+                    let completed = tokio::time::timeout(Duration::from_secs(3), old)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(completed.0, 200, "{completed:?}");
+                    assert!(completed.1.contains("via-A"));
+                    assert!(!completed.1.contains("via-B"));
+                    let final_state = tls.state().await;
+                    assert_eq!(final_state["a"], 1);
+                    assert_eq!(final_state["b"], 0);
+                    assert_eq!(final_state["error"], "");
+                    let stopped = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        service.set_enabled(false),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(!stopped.running);
+                    assert!(stopped.last_error.is_none());
+                    assert!(state.listener_snapshot().is_none());
+                    a.stop().await;
+                    b.stop().await;
+                    eprintln!(
+                        "N4 owned SOCKS refusal: scheme={scheme}, old=A, new=B-reject, A=1, B=0, direct=0, stop=true"
+                    );
+                },),
+            )
+            .await;
+        tls.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn n4_http_proxy_switch_preserves_open_stream_and_refusal_never_goes_direct() {
     let mut tls = OwnedTls::new(true);
     let root = tls.root();
