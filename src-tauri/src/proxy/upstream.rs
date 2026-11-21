@@ -1852,10 +1852,21 @@ fn ensure_successful_response(
         // `output`（例如输出被上限截断时）。未知或进行中的状态不能
         // 被当作成功，否则会写入错误的 assistant/200 审计并阻断降级。
         Dialect::Responses => {
-            matches!(
-                value.get("status").and_then(|status| status.as_str()),
-                Some("completed") | Some("incomplete")
-            ) && value.get("output").is_some_and(|output| output.is_array())
+            let status = value.get("status").and_then(|status| status.as_str());
+            let details_valid = match status {
+                Some("completed") => value
+                    .get("incomplete_details")
+                    .map_or(true, serde_json::Value::is_null),
+                Some("incomplete") => value
+                    .get("incomplete_details")
+                    .and_then(|details| details.get("reason"))
+                    .and_then(|reason| reason.as_str())
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                _ => false,
+            };
+            matches!(status, Some("completed") | Some("incomplete"))
+                && value.get("output").is_some_and(|output| output.is_array())
+                && details_valid
         }
     };
 
@@ -1920,12 +1931,81 @@ mod responses_buffer_status_tests {
     #[test]
     fn buffered_responses_completed_and_incomplete_empty_output_are_successful() {
         let provider = responses_provider();
-        for status in ["completed", "incomplete"] {
-            let value = serde_json::json!({
-                "id": "resp_owned_status",
-                "status": status,
+        let completed = serde_json::json!({
+            "id": "resp_owned_status",
+            "status": "completed",
+            "output": [],
+        });
+        assert!(
+            ensure_successful_response(
+                &completed,
+                &provider,
+                "owned-responses-model",
+                &completed.to_string(),
+            )
+            .is_ok(),
+            "buffered completed response with empty output is valid"
+        );
+
+        let incomplete = serde_json::json!({
+            "id": "resp_owned_status",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+        });
+        assert!(
+            ensure_successful_response(
+                &incomplete,
+                &provider,
+                "owned-responses-model",
+                &incomplete.to_string(),
+            )
+            .is_ok(),
+            "buffered incomplete response with a reason and empty output is valid"
+        );
+    }
+
+    #[test]
+    fn buffered_responses_incomplete_details_match_streaming_terminal_rules() {
+        let provider = responses_provider();
+        let malformed = [
+            serde_json::json!({
+                "status": "incomplete",
                 "output": [],
-            });
+            }),
+            serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": null,
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": ""},
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "  "},
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": 7},
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "completed",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "completed",
+                "incomplete_details": {},
+                "output": [],
+            }),
+        ];
+
+        for value in malformed {
             assert!(
                 ensure_successful_response(
                     &value,
@@ -1933,8 +2013,8 @@ mod responses_buffer_status_tests {
                     "owned-responses-model",
                     &value.to_string(),
                 )
-                .is_ok(),
-                "buffered Responses status {status} with empty output is valid"
+                .is_err(),
+                "malformed buffered Responses terminal details must be rejected: {value}"
             );
         }
     }

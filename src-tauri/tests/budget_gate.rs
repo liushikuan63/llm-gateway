@@ -250,21 +250,14 @@ async fn spawn_held(
     mutate: impl FnOnce(&mut AppConfig),
     release: Option<Arc<tokio::sync::Semaphore>>,
 ) -> Harness {
-    spawn_held_with_dialect(keys, mutate, release, Dialect::OpenAI).await
+    spawn_held_with_responses_status(keys, mutate, release, None).await
 }
 
-async fn spawn_responses(
-    keys: Vec<RemoteAccessKey>,
-    mutate: impl FnOnce(&mut AppConfig),
-) -> Harness {
-    spawn_held_with_dialect(keys, mutate, None, Dialect::Responses).await
-}
-
-async fn spawn_held_with_dialect(
+async fn spawn_held_with_responses_status(
     keys: Vec<RemoteAccessKey>,
     mutate: impl FnOnce(&mut AppConfig),
     release: Option<Arc<tokio::sync::Semaphore>>,
-    dialect: Dialect,
+    responses_status: Option<&'static str>,
 ) -> Harness {
     let mock = Mock::default();
     let calls = mock.calls.clone();
@@ -289,11 +282,11 @@ async fn spawn_held_with_dialect(
                     "created": 1, "data": [{"b64_json": "bW9jay1pbWFnZQ=="}]
                 })).into_response();
             }
-            if uri.path().ends_with("/responses") {
+            if let Some(status) = responses_status.filter(|_| uri.path().ends_with("/responses")) {
                 return Json(serde_json::json!({
-                    "id": "resp-budget-failed",
+                    "id": "resp-budget-invalid",
                     "object": "response",
-                    "status": "failed",
+                    "status": status,
                     "output": [],
                     "usage": {
                         "input_tokens": 0,
@@ -319,6 +312,11 @@ async fn spawn_held_with_dialect(
     tokio::time::sleep(Duration::from_millis(60)).await;
 
     let database = db::Db::connect_in_memory().await.unwrap();
+    let dialect = if responses_status.is_some() {
+        Dialect::Responses
+    } else {
+        Dialect::OpenAI
+    };
     repo::upsert_provider(
         database.pool(),
         &provider_with_dialect(format!("http://{addr}"), dialect),
@@ -651,15 +649,58 @@ async fn 累计超过预算后返回_429_且_不写_requests_行() {
 
 #[tokio::test]
 async fn responses_budget_nonterminal_failure_is_no_replay_and_keeps_hold_dispatched() {
-    let h = spawn_responses(
+    assert_responses_budget_no_replay("failed").await;
+}
+
+#[tokio::test]
+async fn responses_budget_incomplete_without_reason_is_no_replay_and_keeps_hold_dispatched() {
+    assert_responses_budget_no_replay("incomplete").await;
+}
+
+async fn assert_responses_budget_no_replay(primary_status: &'static str) {
+    let h = spawn_held_with_responses_status(
         vec![access_key(
             "rk-main",
             true,
             (MICROS_PER_UNIT, "USD", vec![]),
         )],
-        |_| {},
+        |config| {
+            config.failover_enabled = true;
+            config.max_fallback_attempts = 2;
+        },
+        None,
+        Some(primary_status),
     )
     .await;
+
+    let backup_calls = Arc::new(AtomicUsize::new(0));
+    let backup_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut backup = provider_with_dialect(
+        format!("http://{}", backup_listener.local_addr().unwrap()),
+        Dialect::Responses,
+    );
+    backup.id = "responses-backup".into();
+    backup.name = "responses-backup".into();
+    backup.priority = 1;
+    let hits = backup_calls.clone();
+    let backup_task = tokio::spawn(async move {
+        let app = Router::new().fallback(post(move |Json(_): Json<serde_json::Value>| {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async {
+                Json(serde_json::json!({
+                    "id": "resp-budget-backup",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+                }))
+            }
+        }));
+        axum::serve(backup_listener, app).await.unwrap();
+    });
+    repo::upsert_provider(h.db.pool(), &backup).await.unwrap();
+    h.gateway.reload_providers().await.unwrap();
+
     let body = serde_json::json!({
         "model": "beta",
         "input": "budgeted Responses failure",
@@ -668,7 +709,7 @@ async fn responses_budget_nonterminal_failure_is_no_replay_and_keeps_hold_dispat
 
     let response = auxiliary_request(&h, "/v1/responses", &body).await;
     let (status, _code, error_body) = error_code(response).await;
-    assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{primary_status}");
     assert_eq!(error_body["error"]["type"], "upstream_error");
     assert!(error_body["error"]["code"].is_null());
     assert_eq!(
@@ -676,6 +717,7 @@ async fn responses_budget_nonterminal_failure_is_no_replay_and_keeps_hold_dispat
         1,
         "an enforced-budget no-replay failure must not send a second request"
     );
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let (request_id, hold_state, reserved, reported, hold_audit_id) = loop {
@@ -717,6 +759,8 @@ async fn responses_budget_nonterminal_failure_is_no_replay_and_keeps_hold_dispat
     assert!(row.7.as_deref().is_some_and(|trace| !trace.is_empty()));
     let attempts: serde_json::Value = serde_json::from_str(row.5.as_deref().unwrap()).unwrap();
     assert_eq!(attempts.as_array().unwrap().len(), 1);
+    assert_eq!(attempts[0]["provider_id"], "mock");
+    assert_eq!(attempts[0]["status"], 502);
     assert_eq!(attempts[0]["ok"], false);
     assert_eq!(attempts[0]["retryable"], false);
 
@@ -732,6 +776,7 @@ async fn responses_budget_nonterminal_failure_is_no_replay_and_keeps_hold_dispat
     .await
     .unwrap();
     assert_eq!(usage, ("unknown".into(), "beta".into(), 1, 0, 0, 1));
+    backup_task.abort();
 }
 
 #[tokio::test]

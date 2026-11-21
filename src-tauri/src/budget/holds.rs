@@ -551,8 +551,35 @@ mod tests {
         eprintln!("owned durable budget fixture: {}", path.display());
         let database = db::Db::connect_path(&path).await.unwrap();
         let (state, p, k, count) = fixture(database).await;
+        // Hold the key's origin month fixed across admission and reopen. A
+        // previous wall-clock month may precede this key's complete history.
+        let month = super::super::month_start_secs(k.created_at.timestamp());
+        assert_eq!(super::super::month_start_secs(month), month);
+        let previous = chrono::DateTime::from_timestamp(month, 0)
+            .unwrap()
+            .checked_sub_months(chrono::Months::new(1))
+            .unwrap()
+            .timestamp();
+        let next = chrono::DateTime::from_timestamp(month, 0)
+            .unwrap()
+            .checked_add_months(chrono::Months::new(1))
+            .unwrap()
+            .timestamp();
+        let watermark: i64 =
+            sqlx::query_scalar("SELECT complete_from_month FROM budget_key_history WHERE key_id=?")
+                .bind(&k.id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(watermark, month);
+        let uncovered = used_for_auth(state.db.pool(), &k.id, previous, "usd")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            uncovered.to_openai_error()["error"]["reason"],
+            "budget_history_incomplete"
+        );
         let mut ctx = request(&state, k.clone());
-        let month = super::super::month_start_secs(1_791_000_000);
         Arc::get_mut(&mut ctx).unwrap().month = month;
         let body = serde_json::json!({"max_tokens":2});
         let permit = scope(ctx, before_http(&p, "owned", &body))
@@ -571,18 +598,9 @@ mod tests {
             2
         );
         assert_eq!(
-            used_for_auth(
-                reopened.pool(),
-                &k.id,
-                chrono::DateTime::from_timestamp(month, 0)
-                    .unwrap()
-                    .checked_add_months(chrono::Months::new(1))
-                    .unwrap()
-                    .timestamp(),
-                "usd"
-            )
-            .await
-            .unwrap(),
+            used_for_auth(reopened.pool(), &k.id, next, "usd")
+                .await
+                .unwrap(),
             0
         );
         let row: (i64, String, Option<i64>) = sqlx::query_as(

@@ -594,8 +594,17 @@ async fn malformed_successful_upstreams_are_retryable_and_fall_back_at_gateway_b
 
 #[tokio::test]
 async fn buffered_responses_nonterminal_status_falls_back_and_audits_attempt_chain() {
+    assert_buffered_responses_fallback("failed").await;
+}
+
+#[tokio::test]
+async fn buffered_responses_incomplete_without_reason_falls_back_and_audits_attempt_chain() {
+    assert_buffered_responses_fallback("incomplete").await;
+}
+
+async fn assert_buffered_responses_fallback(primary_status: &'static str) {
     let (primary_url, primary_state, primary_task) =
-        spawn_openai_upstream(OpenAiBehavior::ResponsesStatus("failed")).await;
+        spawn_openai_upstream(OpenAiBehavior::ResponsesStatus(primary_status)).await;
     let (backup_url, backup_state, backup_task) =
         spawn_openai_upstream(OpenAiBehavior::ResponsesComplete("responses backup reply")).await;
     let (db, config, gateway_task, base_url) = spawn_gateway(vec![
@@ -604,12 +613,16 @@ async fn buffered_responses_nonterminal_status_falls_back_and_audits_attempt_cha
     ])
     .await;
 
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
         .post(format!("{base_url}/v1/responses"))
         .bearer_auth(&config.unified_key)
         .json(&serde_json::json!({
             "model": "integration-model",
-            "input": "retry a nonterminal response",
+            "input": "retry an invalid buffered response",
             "max_output_tokens": 42,
         }))
         .send()
@@ -638,11 +651,9 @@ async fn buffered_responses_nonterminal_status_falls_back_and_audits_attempt_cha
     let mut logged = None;
     for _ in 0..80 {
         let rows = repo::recent_requests(db.pool(), 10).await.unwrap();
-        if let Some(row) = rows
-            .into_iter()
-            .find(|row| row["routed_provider"] == "responses-backup")
-        {
-            logged = Some(row);
+        if !rows.is_empty() {
+            assert_eq!(rows.len(), 1, "only the final request is audited");
+            logged = rows.into_iter().next();
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
