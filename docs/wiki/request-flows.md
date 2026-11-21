@@ -547,6 +547,8 @@ Responses 的 `response.failed`／`error` 也沿用同一已派发未知保护�
 
 缓冲（非流式）Responses 响应只有 `status` 为 `completed` 或 `incomplete` 且 `output` 为数组时才算成功；空数组仍是合法终态。`failed`、`cancelled`、`queued`、`in_progress` 或未知状态会先映射为可回退的 502，并沿真实 attempts 记录失败跳和备用成功跳，避免写入伪造的 assistant／200 审计。已派发且受预算约束的请求仍遵守 `NoReplay`，不会因该校验放宽重放；本地回环已覆盖主 Responses 非终态到备用 Responses 的一次回退、路由头、3/2 用量和审计链，真实供应商与安装版仍未验。
 
+预算约束下的缓冲 Responses 非终态回归继续走同一 `NoReplay` 边界：自有远程 Key 预占并派发后，HTTP 200 的 `status=failed` 空输出即使带 `0/0` usage 也只产生一次上游 POST 和 502 错误审计；不写成功路由，不触发备用或直连重放，`budget_holds` 保持 `dispatched`、报告费用为空，并把错误审计关联回该占用。自有 loopback、内存 SQLite 与合成远程 Key 仅证明本地事务语义，不证明真实供应商、正式库、安装版或账单。
+
 
 
 
