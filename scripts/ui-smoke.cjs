@@ -374,6 +374,153 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       status: 200, latency_ms: 220, prompt_tokens: 234, completion_tokens: 67, fallback_attempts: 0, error: null,
       cost: null, currency: null, rate_label: null, estimated_prompt_tokens: 210, attempts: null },
   ];
+  const makeAuditV2 = function auditV2Fixture(inputRows, filter = {}, options = {}) {
+  const limits = { record_bytes: 256 * 1024, payload_bytes: 8 * 1024 * 1024 };
+  const tokenFields = ['prompt_tokens', 'completion_tokens', 'total_tokens', 'cache_read_tokens', 'cache_creation_tokens', 'reasoning_tokens'];
+  const reasons = ['record_limit', 'payload_budget', 'unsupported_type', 'decode_error', 'json_invalid', 'shape_invalid', 'native_limit'];
+  const clone = value => structuredClone(value);
+  const unavailable = (row, body) => ({ ...row, schema_version: 2, attempts: [], native_usage: undefined,
+    prompt_tokens: null, completion_tokens: null, cost: null, currency: null, rate_label: null,
+    attempts_body: body, usage_evidence: { kind: 'unavailable' } });
+  const metadataRows = inputRows.map((raw, index) => {
+    const row = { id: index + 1, session_id: 'sess-fixture', route_intent: 'simple', route_classifier: 'heuristic',
+      route_search: null, route_search_hits: null, route_refined: false, route_refine_note: null,
+      access_key_id: null, refined_prompt: null, trace_id: null, ...clone(raw) };
+    // Tests may supply a fully explicit v2 DTO, including deliberately omitted
+    // bodies. Preserve that evidence rather than infer a legacy scalar fallback.
+    if (row.schema_version === 2) {
+      if (!row.attempts_body || !row.usage_evidence) throw new Error('Synthetic v2 row lacks explicit body/evidence');
+      return row;
+    }
+    const native = row.native_usage;
+    const attempts = Array.isArray(row.attempts) ? row.attempts : [];
+    const body = row.fixture_attempts_body || (native || Array.isArray(row.attempts)
+      ? { state: 'available', reason: null, byte_length: new TextEncoder().encode(JSON.stringify(attempts)).length }
+      : { state: 'absent', reason: null, byte_length: null });
+    delete row.fixture_attempts_body;
+    if (body.state !== 'available') return unavailable(row, body);
+    return { ...row, schema_version: 2, attempts, attempts_body: body,
+      prompt_tokens: native ? native.prompt_tokens : row.prompt_tokens,
+      completion_tokens: native ? native.completion_tokens : row.completion_tokens,
+      cost: native ? null : row.cost, currency: native ? null : row.currency, rate_label: native ? null : row.rate_label,
+      usage_evidence: native ? { kind: 'native', native: clone(native) } : { kind: 'legacy_unverified' } };
+  });
+  const matches = row => {
+    if (typeof filter.from_ts === 'number' && row.ts < filter.from_ts) return false;
+    if (typeof filter.to_ts === 'number' && row.ts > filter.to_ts) return false;
+    if (filter.provider && row.routed_provider !== filter.provider) return false;
+    if (filter.model && row.routed_model !== filter.model) return false;
+    if (filter.only_errors && row.error == null) return false;
+    if (filter.only_fallbacks && !(row.fallback_attempts > 0)) return false;
+    if (filter.currency && row.currency !== filter.currency) return false;
+    if (typeof filter.min_cost === 'number' && !(row.cost !== null && row.cost >= filter.min_cost)) return false;
+    if (typeof filter.max_cost === 'number' && !(row.cost !== null && row.cost <= filter.max_cost)) return false;
+    if (filter.trace_id && row.trace_id !== filter.trace_id) return false;
+    if (filter.status) {
+      const status = String(filter.status).toLowerCase(), family = /^([1-5])xx$/.exec(status);
+      if (family ? row.status == null || Math.floor(row.status / 100) !== Number(family[1]) : String(row.status) !== status) return false;
+    }
+    return true;
+  };
+  const filtered = metadataRows.filter((_row, index) => matches(inputRows[index]));
+  const bound = rows => {
+    let bytes = 0;
+    return rows.map(row => {
+      if (row.attempts_body.state !== 'available') return clone(row);
+      const length = row.attempts_body.byte_length ?? 0;
+      if (length > limits.record_bytes) return unavailable(row, { state: 'omitted', reason: 'record_limit', byte_length: length });
+      bytes += length;
+      if (bytes > limits.payload_bytes) return unavailable(row, { state: 'omitted', reason: 'payload_budget', byte_length: length });
+      return clone(row);
+    });
+  };
+  const fieldCoverage = (rows, field, nativeOnly = false) => {
+    const relevant = nativeOnly ? rows.filter(row => row.usage_evidence.kind === 'native') : rows;
+    const coverage = { known_subtotal: 0, known_requests: 0, unknown_requests: 0, overflowed: false };
+    for (const row of relevant) {
+      const native = row.usage_evidence.kind === 'native' ? row.usage_evidence.native : null;
+      const value = native?.reason === 'personal_test_unverified' ? null : native?.[field];
+      if (Number.isSafeInteger(value) && value >= 0) {
+        coverage.known_requests++;
+        if (!Number.isSafeInteger(coverage.known_subtotal + value)) coverage.overflowed = true;
+        else coverage.known_subtotal += value;
+      } else coverage.unknown_requests++;
+    }
+    return nativeOnly ? coverage : { ...coverage,
+      reliable_total: coverage.unknown_requests === 0 && !coverage.overflowed ? coverage.known_subtotal : null };
+  };
+  const accumulate = rows => {
+    const body = { available_requests: 0, absent_requests: 0, omitted_requests: 0,
+      ...Object.fromEntries(reasons.map(reason => [`${reason}_requests`, 0])) };
+    const native = { legacy_requests: 0, native_requests: 0, complete_requests: 0, partial_requests: 0,
+      missing_requests: 0, invalid_requests: 0, normalized_requests: 0, unpriced_requests: 0, reference_fees: [] };
+    const coverage = { legacy_unverified_requests: 0, unavailable_requests: 0, version_unsupported_requests: 0,
+      body, native_usage: native, api_reference_fee_unknown_requests: 0 };
+    const fees = new Map();
+    for (const row of rows) {
+      body[`${row.attempts_body.state}_requests`]++;
+      if (row.attempts_body.reason) body[`${row.attempts_body.reason}_requests`]++;
+      if (row.usage_evidence.kind === 'legacy_unverified') { coverage.legacy_unverified_requests++; native.legacy_requests++; }
+      else if (row.usage_evidence.kind === 'unavailable') coverage.unavailable_requests++;
+      else {
+        const usage = row.usage_evidence.native;
+        native.native_requests++;
+        if (`${usage.state}_requests` in native) native[`${usage.state}_requests`]++;
+        if (usage.validity === 'state_normalized') native.normalized_requests++;
+        if (usage.reason === 'version_unsupported') coverage.version_unsupported_requests++;
+        const fee = usage.reason === 'personal_test_unverified' ? null : usage.reference_fee;
+        if (fee) {
+          const total = fees.get(fee.currency) || { currency: fee.currency, min: 0, max: 0, priced_requests: 0, range_requests: 0, overflowed: false };
+          total.min += fee.min; total.max += fee.max; total.priced_requests++;
+          if (fee.min !== fee.max) total.range_requests++;
+          if (!Number.isFinite(total.min) || !Number.isFinite(total.max)) total.overflowed = true;
+          fees.set(fee.currency, total);
+        } else native.unpriced_requests++;
+      }
+      if (row.usage_evidence.kind !== 'native' || !row.usage_evidence.native.reference_fee || row.usage_evidence.native.reason === 'personal_test_unverified') coverage.api_reference_fee_unknown_requests++;
+    }
+    native.reference_fees = [...fees.values()];
+    for (const field of tokenFields) { coverage[field] = fieldCoverage(rows, field); native[field] = fieldCoverage(rows, field, true); }
+    return coverage;
+  };
+  const bounded = bound(filtered);
+  const groups = byModel => {
+    const result = new Map();
+    for (const row of bounded) {
+      const key = JSON.stringify([row.routed_provider, ...(byModel ? [row.routed_model] : [])]);
+      if (!result.has(key)) result.set(key, []);
+      result.get(key).push(row);
+    }
+    return [...result.values()].map(rows => ({ provider_id: rows[0].routed_provider,
+      ...(byModel ? { model: rows[0].routed_model } : {}), usage_coverage: accumulate(rows) }));
+  };
+  // Journal entries have their own created-at time scope and never inherit
+  // provider/model/status/currency filters or inflate request_count.
+  const journal = (options.journalEntries || []).filter(entry =>
+    (typeof filter.from_ts !== 'number' || entry.created_at >= filter.from_ts) &&
+    (typeof filter.to_ts !== 'number' || entry.created_at <= filter.to_ts));
+  const journal_counts = { scope: 'intent_created_at', from_ts: filter.from_ts ?? null, to_ts: filter.to_ts ?? null,
+    total_entries: journal.length, unassociated_entries: journal.filter(entry => entry.audit_request_id == null).length,
+    unknown_unassociated_entries: journal.filter(entry => entry.audit_request_id == null && entry.delivery_state === 'unknown').length,
+    known_not_sent_entries: journal.filter(entry => entry.delivery_state === 'known_not_sent').length,
+    unreviewed_known_not_sent_entries: journal.filter(entry => entry.delivery_state === 'known_not_sent' && !entry.reviewed).length,
+    linked_body_missing_entries: journal.filter(entry => entry.audit_request_id != null && entry.linked_request_missing).length };
+  const stats = { schema_version: 2, request_count: filtered.length,
+    successful_requests: filtered.filter(row => row.error == null && row.status >= 200 && row.status < 300).length,
+    fallback_requests: filtered.filter(row => row.fallback_attempts > 0).length, usage_coverage: accumulate(bounded),
+    limits, by_provider: groups(false), by_model: groups(true), journal_counts };
+  const offset = filter.offset ?? 0, limit = filter.limit ?? 100;
+  const pageRows = bound(filtered.slice(offset, offset + limit));
+  const page = { schema_version: 2, rows: pageRows, total: filtered.length, truncated: offset + pageRows.length < filtered.length,
+    limits, usage_coverage: accumulate(pageRows) };
+  return { page, stats, rows: bounded };
+};
+  window.__fixtureAuditV2 = makeAuditV2;
+  window.__fixtureJournalEntries = [
+    {created_at:1789000000,audit_request_id:null,delivery_state:"unknown"},
+    {created_at:1788999000,audit_request_id:null,delivery_state:"known_not_sent",reviewed:false},
+    {created_at:1788998000,audit_request_id:99,delivery_state:"unknown",linked_request_missing:true},
+  ];
   // 桌宠夹具：一个工作中状态、运行中的 CLI 与桌面应用进程各一个、一个已安装宠物包与一个进行中的任务。
   window.__fixturePetStatus = {
     status: "working",
@@ -449,6 +596,18 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     message(4, "assistant", "这里是最新的完整答复。\n\n" + "长文本应保留换行，在有限宽度内自然换行；工具调用记录可单独展开。\n".repeat(24)),
   ];
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
+  // Shared synthetic chat reply. Both the channel command (`desktop_chat`) and
+  // the buffered one (`desktop_chat_v2`) must record __fixtureChatInputs and
+  // honour the same hold/failure hooks, otherwise a scenario that switches
+  // transport silently starts asserting against a different fixture.
+  const fixtureChatReply = async (args) => {
+    (window.__fixtureChatInputs ??= []).push(structuredClone(args.input));
+    if (window.__fixtureChatHold) await new Promise(resolve => { window.__fixtureChatRelease = resolve; });
+    if (window.__fixtureChatFailure) throw new Error("HTTP 503：模拟上游不可用");
+    return { content: "收到，模型已接入。", reasoning: window.__fixtureChatReasoning ?? null, model: "fixture-model", routed_via: "workbuddy/fixture-model",
+      session_id: args.input.session_id, trace_id: "fixture-trace", fallback_attempts: 0, latency_ms: 27,
+      usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }, cached: false, ...(window.__fixtureChatReplyMetadata ?? {}) };
+  };
   window.__TAURI_INTERNALS__ = {
     // @tauri-apps/api 的事件与窗口模块依赖这两个基础设施桩。
     transformCallback: (callback) => { const id = Math.floor(Math.random() * 1e9); window[`_${id}`] = callback; return id; },
@@ -580,13 +739,29 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         if (window.__fixtureWbRegisterHold) await new Promise(resolve => { window.__fixtureWbRegisterRelease = resolve; });
         return { provider_id: args.region === "cn" ? "offline-wb-cn-provider" : "offline-wb-provider", runtime_id: args.region === "cn" ? "offline-wb-cn-runtime" : "offline-wb-runtime", model_count: 27, warnings: [] };
       }
+      // Chat keeps a receipt-backed send gate: for the non-streaming path the
+      // send button stays disabled until this read has answered once
+      // (Chat.tsx `receiptReady`). A fixture that never answers it leaves the
+      // button permanently disabled, so every chat scenario fails on a harness
+      // bug rather than on product behaviour. Return a valid empty page.
+      case "list_desktop_chat_receipts": {
+        (window.__fixtureReceiptReads ??= 0);
+        window.__fixtureReceiptReads++;
+        if (window.__fixtureReceiptFailure) throw new Error("模拟本机操作记录不可读");
+        return (window.__fixtureReceiptPage ?? []);
+      }
+      case "desktop_chat_v2": {
+        // Non-streaming chat goes through the versioned buffered command, not
+        // the channel-based `desktop_chat`. Build the reply with the same
+        // helper so hold/failure hooks and __fixtureChatInputs recording behave
+        // identically; calling back into invoke() instead would push
+        // `desktop_chat` into __fixtureCalls and make the "opening chat never
+        // dispatches" assertions lie.
+        const reply = await fixtureChatReply(args);
+        return { kind: "reply", operation_id: args.requestId, receipt: window.__fixtureChatReceipt ?? "recorded", result: reply };
+      }
       case "desktop_chat": {
-        (window.__fixtureChatInputs ??= []).push(structuredClone(args.input));
-        if (window.__fixtureChatHold) await new Promise(resolve => { window.__fixtureChatRelease = resolve; });
-        if (window.__fixtureChatFailure) throw new Error("HTTP 503：模拟上游不可用");
-        return { content: "收到，模型已接入。", reasoning: window.__fixtureChatReasoning ?? null, model: "fixture-model", routed_via: "workbuddy/fixture-model",
-          session_id: args.input.session_id, trace_id: "fixture-trace", fallback_attempts: 0, latency_ms: 27,
-          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }, cached: false, ...(window.__fixtureChatReplyMetadata ?? {}) };
+        return fixtureChatReply(args);
       }
       case "export_desktop_chat": {
         if (window.__fixtureChatExportFailure) throw new Error("模拟本地对话文件不可写");
@@ -853,6 +1028,10 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
       // （`values[维度][来源] = { value, source }`）—— 形状不对时页面会静默
       // 显示「数据不足」，那与「真的没有数据」看起来一模一样。
       case "export_capabilities": return JSON.stringify(window.__fixtureCapabilities ?? {});
+      case "export_capabilities_with_coverage": {
+        const ledgers = structuredClone(window.__fixtureCapabilities ?? {});
+        return { ledgers, observed: Object.keys(ledgers).length, discarded: [] };
+      }
       // D5：三维前沿。三个维度都在后端算，夹具给的是**已经算好的视图** ——
       // 形状必须与 `ParetoView` 一致，否则页面会静默渲染成空表。
       case "capability_pareto":
@@ -1011,6 +1190,40 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         auditRequest.completed = true;
         return { rows: withAuditCols, total, truncated: offset + page.length < total };
       }
+      case "query_requests_v2": {
+        const f = args.filter || {};
+        const request = {command: "query_requests_v2", filter: structuredClone(f), completed: false};
+        (window.__fixtureAuditRequests ??= []).push(request);
+        const response = makeAuditV2(window.__fixtureRequests, f, {journalEntries:window.__fixtureJournalEntries});
+        const delayMs = window.__fixtureAuditDelays?.shift() ?? 0;
+        if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
+        if (window.__fixtureAuditHold) await new Promise(resolve => (window.__fixtureAuditPending ??= []).push(resolve));
+        request.completed = true;
+        return response.page;
+      }
+      case "usage_stats_v2": {
+        const f = args.filter || {};
+        const request = {command: "usage_stats_v2", filter: structuredClone(f), completed: false};
+        (window.__fixtureUsageRequests ??= []).push(request);
+        const response = makeAuditV2(window.__fixtureRequests, f, {journalEntries:window.__fixtureJournalEntries});
+        const delayMs = window.__fixtureUsageDelays?.shift() ?? 0;
+        if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
+        if (window.__fixtureUsageHold) await new Promise(resolve => (window.__fixtureUsagePending ??= []).push(resolve));
+        if (window.__fixtureUsageFailure) throw new Error("模拟用量核验覆盖读取失败");
+        request.completed = true;
+        return response.stats;
+      }
+      case "export_requests_v2": {
+        if (window.__fixtureExportFailure) throw new Error("模拟审计导出失败");
+        const f = args.filter || {};
+        const response = makeAuditV2(window.__fixtureRequests, {...f,limit:null,offset:0}, {journalEntries:window.__fixtureJournalEntries});
+        if (window.__fixtureExportOversized || response.rows.some(row => row.attempts_body.reason === "record_limit" || row.attempts_body.reason === "payload_budget" || row.attempts_body.reason === "unsupported_type")) {
+          throw new Error("审计原始导出包含超限或不可读取正文，请缩小筛选范围后重试");
+        }
+        const n = response.stats.request_count;
+        window.__lastExport = {command: "export_requests_v2", format:args.format,dest:args.destPath,filter:structuredClone(f),written:n};
+        return {written:n,path:args.destPath,columns_doc:args.format === "csv" ? args.destPath.replace(/\.csv$/, "") + "_columns.md" : null};
+      }
       case "export_requests": {
         if (window.__fixtureExportFailure) throw new Error("模拟审计导出失败");
         const f = args.filter || {};
@@ -1045,6 +1258,11 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         if (window.__fixtureSaveHold) await new Promise(resolve => { window.__fixtureSaveRelease = resolve; });
         return window.__fixtureSavePath !== undefined ? window.__fixtureSavePath : "C:/fixture/audit-export";
       case "plugin:opener|open_url": window.__fixtureOpenedOfficialUrl = args.url; return null;
+      case "stats_overview_v2": {
+        if (window.__fixtureStatsFailure) throw new Error("模拟统计概要读取失败");
+        const overviewRows = window.__fixtureOverviewRequests ?? window.__fixtureRequests;
+        return {...structuredClone(window.__fixtureStats),usage_stats:makeAuditV2(overviewRows, {}, {journalEntries:window.__fixtureJournalEntries}).stats};
+      }
       case "stats_overview":
         if (window.__fixtureStatsFailure) throw new Error("模拟统计概要读取失败");
         return structuredClone(window.__fixtureStats);
@@ -1293,10 +1511,10 @@ async function verifyAsyncPages(browser, errors) {
   await page.locator(".requests-table tbody tr.request-row").first().waitFor();
   await page.evaluate(() => { window.__fixtureAuditDelays = [350, 0]; });
   await page.locator("#audit-status").fill("4xx");
-  await page.waitForFunction(() => window.__fixtureAuditRequests.some(r => r.filter.status === "4xx" && !r.completed));
+  await page.waitForFunction(() => window.__fixtureAuditRequests.some(r => r.command === "query_requests_v2" && r.filter.status === "4xx" && !r.completed));
   await page.locator("#audit-status").fill("5xx");
-  await page.waitForFunction(() => window.__fixtureAuditRequests.some(r => r.filter.status === "5xx" && r.completed));
-  await page.waitForFunction(() => window.__fixtureAuditRequests.some(r => r.filter.status === "4xx" && r.completed));
+  await page.waitForFunction(() => window.__fixtureAuditRequests.some(r => r.command === "query_requests_v2" && r.filter.status === "5xx" && r.completed));
+  await page.waitForFunction(() => window.__fixtureAuditRequests.some(r => r.command === "query_requests_v2" && r.filter.status === "4xx" && r.completed));
   await page.waitForTimeout(50);
   assert.equal(await page.locator(".requests-table tbody tr.request-row").count(), 0,
     "旧4xx查询晚返回后不能覆盖当前5xx筛选的空结果");
@@ -1554,8 +1772,16 @@ async function verifyChatPage(browser, errors) {
   assert.notEqual(third.session_id, inputs[0].session_id);
   await page.screenshot({ path: path.join(output, "chat-error.png"), fullPage: true });
   await page.evaluate(() => { window.__fixtureChatFailure = false; });
+  const isolate = chat.getByRole("button", { name: "保留草稿并建立隔离会话", exact: true });
+  await isolate.waitFor();
+  await isolate.click();
+  assert.equal(await chat.locator("#chat-prompt").inputValue(), "失败时保留输入", "isolation must preserve the retry draft");
+  await page.waitForFunction(() => { const button = document.querySelector('[data-testid="chat-page"] button[type=submit]'); return Boolean(button && !button.disabled); });
   await chat.getByRole("button", { name: "发送消息", exact: true }).click();
   await chat.getByText("收到，模型已接入。", { exact: true }).waitFor();
+  const retry = await page.evaluate(() => window.__fixtureChatInputs[3]);
+  assert.notEqual(retry.session_id, third.session_id, "retry after unknown must use an isolated session");
+  assert.equal(retry.messages.at(-1).content, "失败时保留输入", "isolated retry must retain the draft");
   await page.screenshot({ path: path.join(output, "chat-desktop.png"), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: path.join(output, "chat-narrow.png"), fullPage: true });
@@ -1584,20 +1810,25 @@ async function verifyUsageEnhancements(browser, errors) {
   await nav.getByRole('button',{name:'用量与审计',exact:true}).click();
   await page.getByText(/有效样本 3/).waitFor();
   await page.getByText(/P50 220ms · P95 410ms/).waitFor();
-  await page.getByText('当前 1–120 条 / 共 250 条',{exact:true}).waitFor();
+  await page.getByText('当前 1–120 / 共 250 条',{exact:true}).waitFor();
+  const initialV2Calls=await page.evaluate(()=>window.__fixtureCalls);
+  for(const command of ['stats_overview_v2','query_requests_v2','usage_stats_v2']) assert(initialV2Calls.includes(command), `Stats must invoke ${command}`);
+  for(const command of ['stats_overview','query_requests','export_requests']) assert(!initialV2Calls.includes(command), `Stats must not invoke legacy ${command}`);
+
   assert.equal(await page.evaluate(()=>window.__fixtureClientScanCalls??0),0,'page entry does not scan local client logs');
-  await page.locator('#audit-next').click();await page.getByText('当前 121–240 条 / 共 250 条',{exact:true}).waitFor();
+  await page.locator('#audit-next').click();await page.getByText('当前 121–240 / 共 250 条',{exact:true}).waitFor();
   await page.locator('#audit-export-jsonl').click();
   await page.waitForFunction(()=>window.__lastExport?.filter.offset===0);
   assert.equal(await page.evaluate(()=>window.__lastExport.filter.limit),null,'export covers all filtered rows');
-  await page.locator('#audit-next').click();await page.getByText('当前 241–250 条 / 共 250 条',{exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>window.__lastExport.command),'export_requests_v2','Stats export uses the bounded v2 command');
+  await page.locator('#audit-next').click();await page.getByText('当前 241–250 / 共 250 条',{exact:true}).waitFor();
   assert(await page.locator('#audit-next').isDisabled());
   await page.locator('#audit-from-time').fill('2026-10-13T00:00');await page.locator('#audit-to-time').fill('2026-10-13T23:59');
-  await page.getByText('当前 1–120 条 / 共 125 条',{exact:true}).waitFor();
+  await page.getByText('当前 1–120 / 共 125 条',{exact:true}).waitFor();
   const latest=await page.evaluate(()=>window.__fixtureAuditRequests.at(-1).filter);
   assert.equal(latest.offset,0);assert.equal(latest.from_ts,Math.floor(new Date('2026-10-13T00:00').getTime()/1000));
-  await page.locator('#audit-from-time').fill('2026-10-14T00:00');await page.getByText(/开始时间不能晚于结束时间/).waitFor();assert(await page.locator('#audit-export-jsonl').isDisabled());
-  await page.locator('#audit-reset').click();await page.getByText('当前 1–120 条 / 共 250 条',{exact:true}).waitFor();
+  await page.locator('#audit-from-time').fill('2026-10-14T00:00');await page.getByText(/时间范围无效或开始时间晚于结束时间/).waitFor();assert(await page.locator('#audit-export-jsonl').isDisabled());
+  await page.locator('#audit-reset').click();await page.getByText('当前 1–120 / 共 250 条',{exact:true}).waitFor();
   const panel=page.getByTestId('client-usage-panel');
   await panel.locator('#client-usage-from').fill('2026-10-13');await panel.locator('#client-usage-to').fill('2026-10-13');
   await page.evaluate(()=>{window.__fixtureClientScanHold=true;});await panel.locator('#client-usage-scan').click();
@@ -1996,8 +2227,13 @@ async function verifyIntegratedRuntimes(browser, errors) {
   await context.addInitScript(fixture);
   const page = await context.newPage();
   const consoleErrors = [];
+  const failedRequests = [];
   page.on("pageerror", e => errors.push(`integrated-runtimes: ${e.message}`));
   page.on("console", m => { if (m.type() === "error") consoleErrors.push(m.text()); });
+  page.on("requestfailed", request => {
+    const url = new URL(request.url());
+    failedRequests.push({ origin: url.origin, path: url.pathname, error: request.failure()?.errorText ?? null });
+  });
   page.on("dialog", d => d.accept());
   await page.goto(baseUrl);
   const nav = page.getByRole("navigation", { name: "主导航" });
@@ -2084,7 +2320,7 @@ async function verifyIntegratedRuntimes(browser, errors) {
     assert(await panel.evaluate(e => e.scrollWidth <= e.clientWidth + 1), `Xray panel overflow at ${width}px`);
     await panel.screenshot({ path: path.join(output, `xray-${width}.png`) });
   }
-  assert.deepEqual(consoleErrors, []);
+  assert.deepEqual(consoleErrors, [], `integrated runtime console errors; failed requests=${JSON.stringify(failedRequests)}`);
   await context.close();
 }
 
@@ -2782,6 +3018,7 @@ if (require.main === module) (async () => {
   try {
     if (process.env.LLMGW_UI_FOCUS) {
       const focus = process.env.LLMGW_UI_FOCUS, errors = [];
+      if(focus==='client-usage-review') {await require('./client-usage-review-ui.cjs').verifyClientUsageReview(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: client-usage-review');return;}
       if(focus==='model-declarations') {await require('./model-declarations-ui.cjs').verifyModelDeclarations(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: model-declarations');return;}
       if(focus==='shell-endpoint-read') {await require('./shell-endpoint-read-ui.cjs').verifyShellEndpointRead(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: shell-endpoint-read');return;}
       if(focus==='help-menu-keyboard') {const proof=await require('./help-menu-ui.cjs').verifyHelpMenu(browser,baseUrl,output);assert.equal(proof.passed,true);console.log('UI_FOCUS_OK: help-menu-keyboard');return;}
@@ -2828,11 +3065,12 @@ if (require.main === module) (async () => {
       if(focus==='onboarding-navigation') {await require('./onboarding-readiness-ui.cjs').verifyOnboardingNavigation(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-navigation');return;}
       if(focus==='onboarding-unknown') {await require('./onboarding-readiness-ui.cjs').verifyOnboardingUnknown(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-unknown');return;}
       if(focus==='onboarding-compat') {await require('./onboarding-readiness-ui.cjs').verifyOnboardingCompatibility(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-compat');return;}
+      if(focus==='onboarding-independent') {await require('./onboarding-readiness-ui.cjs').verifyOnboardingIndependent(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-independent');return;}
       if(focus==='chat-favorites') {await require('./chat-favorites-ui.cjs').verifyChatFavorites(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-favorites; screenshots=${output}`);return;}
       if(focus==='chat-price-source') {await require('./chat-price-source-ui.cjs').verifyChatPriceSource(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-price-source; screenshots=${output}`);return;}
       if(focus==='chat-price') {await require('./chat-price-view-ui.cjs').verifyChatPriceView(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-price; screenshots=${output}`);return;}
       if(focus==='chat-model-filter') {await require('./chat-model-filter-ui.cjs').verifyChatModelFilter(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: chat-model-filter');return;}
-      if(focus==='onboarding-readiness') {await require('./onboarding-readiness-ui.cjs').verifyOnboardingReadiness(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-readiness');return;}
+      if(focus==='onboarding-readiness') {const guide=require('./onboarding-readiness-ui.cjs');await guide.verifyOnboardingReadiness(browser,baseUrl,output,errors,fixture);await guide.verifyOnboardingIndependent(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: onboarding-readiness');return;}
       if(focus==='tps-idle-age') {await require('./tps-idle-age-ui.cjs').verifyTpsIdleAge(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: tps-idle-age; screenshots=${output}`);return;}
       if(focus==='capability-explain-state') {await require('./capability-explain-state-ui.cjs').verifyCapabilityExplainState(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: capability-explain-state; screenshots=${output}`);return;}
       if(focus==='conversation-feedback') {await require('./conversation-feedback-ui.cjs').verifyConversationFeedback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: conversation-feedback');return;}
@@ -2891,6 +3129,7 @@ if (require.main === module) (async () => {
     await require("./request-timing-ui.cjs").verifyRequestTiming(browser,baseUrl,output,[],fixture);
     await require("./request-timing-stats-ui.cjs").verifyRequestTimingStats(browser,baseUrl,output,[],fixture);
     await require("./trae-native-usage-ui.cjs").verifyTraeNativeUsage(browser, baseUrl, output, [], fixture);
+    await require("./client-usage-review-ui.cjs").verifyClientUsageReview(browser, baseUrl, path.join(output, 'client-usage-review'), [], fixture);
     await require("./account-runtime-options-ui.cjs").verifyAccountRuntimeOptions(browser, baseUrl, output, [], fixture);
     await require("./trae-benefits-binding-ui.cjs").verifyTraeBenefitsBinding(browser, baseUrl, output, [], fixture);
     await require("./proxy-controls-ui.cjs").verifyProxyControls(browser, baseUrl, output, [], fixture);
@@ -3431,9 +3670,9 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     assert(legacyFactsText.includes("未确认支持：") && legacyFactsText.includes("旧布尔 false 未区分缺失和否定来源") && legacyFactsText.includes("不等于已实测不支持"), "旧布尔值不得伪称官方明确不支持");
     await factsSearch.fill("");
     const capSummary = await page.locator(".capability-summary").innerText();
-    assert(/2 个模型有能力数据/.test(capSummary), `汇总要给出模型总数：${capSummary}`);
+    assert(/2 个模型的账本含条目或异常/.test(capSummary), `汇总要给出模型总数：${capSummary}`);
     assert(/1 个存在冲突/.test(capSummary), `汇总要给出冲突数：${capSummary}`);
-    assert(/1 个各来源一致/.test(capSummary), `汇总要给出「一致」的个数：${capSummary}`);
+    assert(/1 个至少一维有多个来源标签且数值未冲突/.test(capSummary), `汇总要区分多标签未冲突：${capSummary}`);
 
     const conflictCards = page.locator(".capability-card");
     assert.equal(await conflictCards.count(), 1, "夹具里只有一个真冲突（coding 0.9 vs 0.4）");
@@ -3452,7 +3691,7 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     );
     assert(conflictText.includes("生效"), `必须标出哪个来源生效：${conflictText}`);
     // 反向断言：两个来源给出**同一个值**不是冲突。
-    // 少了这一条，把「互相印证」也标成冲突的实现照样全绿。
+    // 少了这一条，把「多个标签数值未冲突」也标成冲突的实现照样全绿。
     assert(!conflictText.includes("claude-sonnet"), "一致的模型不该出现在冲突卡里");
     const agreeing = page.locator(".capability-agreeing");
     assert.equal(await agreeing.count(), 1, "一致的模型要收进折叠区，而不是消失");
@@ -3812,10 +4051,11 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     assert(unpricedHint.includes("未计入本地花费") && unpricedHint.includes("历史记录不会自动重算"));
     // 花表明细与未计价请求
     assert((await page.locator(".card").filter({ hasText: "近 30 天花费 · 按模型" }).innerText()).includes("vendor/chat:free"));
-    assert((await page.locator(".requests-table").innerText()).includes("未计价"));
+    assert((await page.locator(".requests-table").innerText()).includes("费用未核验"));
     // 计价档位与估算值都要能看到，便于对账。
     const requestsText = await page.locator(".requests-table").innerText();
-    assert(requestsText.includes("谷时 · 输入≥272K 档"), requestsText);
+    assert(requestsText.includes("历史用量未核验"), requestsText);
+    assert(!requestsText.includes("谷时 · 输入≥272K 档"), "v2 legacy scalar price is not verified usage");
     assert(requestsText.includes("估 1,450"), requestsText);
     // Token 计数校准表：样本与比值来自真实日志，重置需要确认。
     const calibrationCard = page.locator(".card").filter({ hasText: "Token 计数校准" });
@@ -3878,14 +4118,14 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await page.locator("#audit-export-csv").click();
     await page.waitForTimeout(400);
     const csvExport = await page.evaluate(() => window.__lastExport);
-    assert(csvExport && csvExport.format === "csv", `应记录一次 CSV 导出：${JSON.stringify(csvExport)}`);
+    assert(csvExport && csvExport.command === "export_requests_v2" && csvExport.format === "csv", `应记录一次 CSV 导出：${JSON.stringify(csvExport)}`);
     assert((await page.locator(".msg.ok").innerText()).includes("_columns.md"),
       "CSV 导出的提示里要带列说明文件路径");
 
     await page.locator("#audit-export-jsonl").click();
     await page.waitForTimeout(400);
     const jsonlExport = await page.evaluate(() => window.__lastExport);
-    assert(jsonlExport && jsonlExport.format === "jsonl", "应记录一次 JSONL 导出");
+    assert(jsonlExport && jsonlExport.command === "export_requests_v2" && jsonlExport.format === "jsonl", "应记录一次 JSONL 导出");
     const okText = await page.locator(".msg.ok").innerText();
     assert(!okText.includes("_columns.md"), `JSONL 不该有列说明文件：${okText}`);
 
@@ -3895,14 +4135,17 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     await page.locator("#audit-export-jsonl").click();
     await page.waitForTimeout(400);
     const filteredExport = await page.evaluate(() => window.__lastExport);
-    assert(filteredExport.filter && filteredExport.filter.only_errors === true,
+    assert(filteredExport.command === "export_requests_v2" && filteredExport.filter && filteredExport.filter.only_errors === true,
       `导出必须带上当前筛选条件：${JSON.stringify(filteredExport.filter)}`);
     await page.locator("#audit-reset").click();
     await page.waitForTimeout(400);
-    // 401 那一行：失败且不可重试时必须明确显示「已停止降级」。
+    // 非重试401应只展示一次失败尝试；不要求产品伪造“停止降级”文案。
     await page.locator(".attempt-toggle").nth(1).click();
-    const blocked = await page.locator(".attempt-row").last().innerText();
-    assert(blocked.includes("已停止降级"), `401 后必须显示停止降级：${blocked}`);
+    const blockedDetails = page.locator(".attempt-row").last();
+    const blocked = await blockedDetails.innerText();
+    assert.equal(await blockedDetails.locator(".attempt-chain > li").count(), 1, "401 must not produce a fallback attempt");
+    assert(blocked.includes("记录状态 401"), `401 status must be visible: ${blocked}`);
+    assert(blocked.includes("记录的重试标记：否"), `non-retryable marker must be visible: ${blocked}`);
     assert(blocked.includes("invalid api key"));
     await page.screenshot({ path: path.join(output, "stats-spend-desktop.png"), fullPage: true });
     for (const width of [900, 390]) {

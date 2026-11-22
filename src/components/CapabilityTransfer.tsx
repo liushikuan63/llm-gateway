@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type ImportCapabilitiesResult } from "../api";
+import { api, type ImportCapabilitiesResult, type CapabilityLedgerSnapshot } from "../api";
 import "./capability-transfer.css";
 
 function resultOf(value: unknown): ImportCapabilitiesResult {
@@ -9,7 +9,9 @@ function resultOf(value: unknown): ImportCapabilitiesResult {
   return v;
 }
 export default function CapabilityTransfer({ disabled, onImported }: { disabled: boolean; onImported: () => void }) {
-  const [draft, setDraft] = useState(""), [exported, setExported] = useState("");
+  const [draft, setDraft] = useState("");
+  const [lastExport, setLastExport] = useState<{ text: string; snapshot: CapabilityLedgerSnapshot } | null>(null);
+  const exported = lastExport?.text ?? "";
   const [pending, setPending] = useState<"file" | "import" | "export" | null>(null);
   const [result, setResult] = useState<ImportCapabilitiesResult | null>(null);
   const [error, setError] = useState<string | null>(null), [notice, setNotice] = useState("");
@@ -47,12 +49,11 @@ export default function CapabilityTransfer({ disabled, onImported }: { disabled:
   const exportFile = async () => {
     if (!begin("export")) return;
     try {
-      const text = await api.exportCapabilities();
-      if (typeof text !== "string") throw new Error("导出返回不是 JSON 文本");
-      const data: unknown = JSON.parse(text);
-      if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("导出顶层不是账本对象");
+      const snapshot = await api.exportCapabilitiesWithCoverage();
+      // Keep the sorted backend map order and the existing import-compatible bare-map shape.
+      const text = JSON.stringify(snapshot.ledgers, null, 2);
       if (mounted.current) {
-        setExported(text); setNotice("已读取当前账本并请求下载 JSON；也可在下方复制保存。导入草稿未改。");
+        setLastExport({ text, snapshot }); setNotice("已读取当前账本并请求下载 JSON；也可在下方复制保存。导入草稿未改。");
         const url = URL.createObjectURL(new Blob([text], { type: "application/json;charset=utf-8" }));
         const a = document.createElement("a"); a.href = url; a.download = "llm-gateway-capabilities.json"; a.click();
         setTimeout(() => URL.revokeObjectURL(url), 0);
@@ -70,6 +71,7 @@ export default function CapabilityTransfer({ disabled, onImported }: { disabled:
       {exported && <><label htmlFor="capability-export-json">最近一次成功读取的导出 JSON</label><textarea ref={output} id="capability-export-json" rows={6} readOnly value={exported}/></>}
     </fieldset>
     {pending && <p role="status">{pending === "file" ? "正在读入文件，尚未导入…" : pending === "import" ? "正在导入，等待后端确认…" : "正在读取导出账本…"}</p>}
+    {lastExport && <p data-testid="capability-export-coverage" role="status">最近成功导出：读取 {lastExport.snapshot.observed} 条账本记录，JSON 包含 {Object.keys(lastExport.snapshot.ledgers).length} 个模型账本；损坏未包含 {lastExport.snapshot.discarded.length} 条。覆盖信息只在此处说明，文件仍为原账本格式。</p>}
     {error && <p className="msg error breakable" role="alert">{error}</p>}
     {!pending && notice && <p role="status">{notice}</p>}
     {result && <section aria-label="能力导入结果" data-testid="capability-import-result"><p>已写入模型：{result.written}；未知模型：{result.skipped.length}；跳过维度：{result.skipped_dimensions.length}；跳过来源：{result.skipped_sources.length}。</p>{([["未知模型", result.skipped], ["跳过维度", result.skipped_dimensions], ["跳过来源", result.skipped_sources]] as const).map(([label, values]) => values.length > 0 && <div key={label}><strong>{label}</strong><ul>{values.map((v, i) => <li className="breakable" key={`${v}-${i}`}>{v}</li>)}</ul></div>)}</section>}

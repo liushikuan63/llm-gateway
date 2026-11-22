@@ -133,10 +133,11 @@ export interface LocalMeta {
   capabilities: string[];
 }
 
-export type ModelDeclarationField = "tools" | "thinking" | "vision" | "audio" | "video" | "stream";
+export type ModelDeclarationField = "tools" | "thinking" | "vision" | "audio" | "video" | "stream" | "parallel_tools" | "structured_output" | "audio_output";
 export type ModelDeclarationState = "supported" | "unsupported" | "unknown";
 export interface ModelDeclarationRecord { state: ModelDeclarationState; recorded_at_ms: number }
 export interface ModelDeclarationView {
+  supported_fields?: ModelDeclarationField[];
   binding: string; revision: string; status: "legacy" | "declared" | "invalid" | "not_applicable";
   read_only: boolean; fields: Partial<Record<ModelDeclarationField, ModelDeclarationRecord>>;
 }
@@ -1238,6 +1239,8 @@ export interface StatsOverview {
   today_requests: number;
   success_rate: number;
   avg_latency_ms: number;
+  observed_latency_avg_ms?: number | null;
+  observed_latency_sample_count?: number;
   latency_sample_count: number;
   latency_p50_ms: number | null;
   latency_p95_ms: number | null;
@@ -1350,6 +1353,19 @@ export interface AttemptRecord {
   wire_modes?: AttemptWireModes | null;
 }
 
+/** Standard new attempt producer shape; historical JSON is not validated by this type. */
+export type StandardAttemptRecord = AttemptRecord & {
+  /** Legacy audit key holds the runtime ID, not the adapter kind. */
+  runtime_kind?: string | null;
+  /** Same-attempt observed adapter kind; absent means unknown. */
+  adapter_kind?: string | null;
+};
+
+/**
+ * Legacy source-compatible shape. Historical attempts are unvalidated JSON,
+ * so this type must not be treated as a runtime decoder. New readers should
+ * use RawRequestLog and narrow `attempts` before accessing its contents.
+ */
 export interface RequestLog {
   ts: number;
   // 仅返回脱敏来源，例如 remote-key:<id> 或 local-unified-key；绝不返回原始 Key。
@@ -1373,6 +1389,9 @@ export interface RequestLog {
   attempts: AttemptRecord[] | null;
   native_usage?: NativeUsage;
 }
+
+/** Historical attempts may be an array, scalar, object, null or malformed. */
+export type RawRequestLog = Omit<RequestLog, "attempts"> & { attempts: unknown };
 
 // ---------- B3 审计检索与导出 ----------
 
@@ -1416,6 +1435,13 @@ export interface AuditRow extends RequestLog {
    */
   refined_prompt?: string | null;
 }
+
+/**
+ * Existing AuditRow remains source-compatible. The raw view requires an
+ * explicit guard even though the current query backend emits an outer array;
+ * invoke<T> does not validate old, mocked or malformed responses.
+ */
+export type RawAuditRow = Omit<AuditRow, "attempts"> & { attempts: unknown };
 
 export type FeedbackClass = "simple" | "vision" | "reasoning";
 export interface AuxiliaryObservation {
@@ -1477,6 +1503,59 @@ export interface AuditPage {
   /** 还有更多页。 */
   truncated: boolean;
 }
+
+/** The same query response, with untrusted attempt data exposed as unknown. */
+export type RawAuditPage = Omit<AuditPage, "rows"> & { rows: RawAuditRow[] };
+
+/** V2 evidence never promotes omitted or historical usage to reliable zero. */
+export interface AttemptsBodyV2 {
+  state: "available" | "absent" | "omitted";
+  reason: "record_limit" | "payload_budget" | "unsupported_type" | "decode_error" | "json_invalid" | "shape_invalid" | "native_limit" | null;
+  byte_length: number | null;
+}
+export interface CountCoverageV2 {
+  known_subtotal: number; known_requests: number; unknown_requests: number;
+  overflowed: boolean; reliable_total: number | null;
+}
+export interface UsageCoverageV2 {
+  legacy_unverified_requests: number; unavailable_requests: number; version_unsupported_requests: number;
+  body: {
+    available_requests: number; absent_requests: number; omitted_requests: number;
+    record_limit_requests: number; payload_budget_requests: number; unsupported_type_requests: number;
+    decode_error_requests: number; json_invalid_requests: number; shape_invalid_requests: number; native_limit_requests: number;
+  };
+  prompt_tokens: CountCoverageV2; completion_tokens: CountCoverageV2; total_tokens: CountCoverageV2;
+  cache_read_tokens: CountCoverageV2; cache_creation_tokens: CountCoverageV2; reasoning_tokens: CountCoverageV2;
+  native_usage: NativeUsageAccumulator; api_reference_fee_unknown_requests: number;
+}
+export type RawAuditRowV2 = RawAuditRow & {
+  schema_version: 2; attempts_body: AttemptsBodyV2;
+  usage_evidence: { kind: "native" | "legacy_unverified" | "unavailable"; native?: NativeUsage };
+};
+export interface AuditPageV2 {
+  schema_version: 2; rows: RawAuditRowV2[]; total: number; truncated: boolean;
+  limits: {record_bytes: number; payload_bytes: number}; usage_coverage: UsageCoverageV2;
+}
+export interface UsageStatsV2 {
+  schema_version: 2; request_count: number; successful_requests: number; fallback_requests: number;
+  usage_coverage: UsageCoverageV2; limits: {record_bytes: number; payload_bytes: number};
+  by_provider: {provider_id: string | null; usage_coverage: UsageCoverageV2}[];
+  by_model: {provider_id: string | null; model: string | null; usage_coverage: UsageCoverageV2}[];
+  journal_counts: {
+    scope: "intent_created_at"; from_ts: number | null; to_ts: number | null;
+    total_entries: number; unassociated_entries: number; unknown_unassociated_entries: number;
+    known_not_sent_entries: number; unreviewed_known_not_sent_entries: number; linked_body_missing_entries: number;
+  };
+}
+export type StatsOverviewV2 = StatsOverview & {usage_stats: UsageStatsV2};
+
+export interface ClientUsageReviewItem {
+  attempt_id: string; scope_id: string; created_at: number; gate_reason: "quota" | "concurrency";
+}
+export interface ClientUsageReviewPage {
+  schema_version: 2; items: ClientUsageReviewItem[]; next_after: string | null;
+}
+export type ClientUsageReviewResult = {status: "reviewed"; reviewed_count: number} | {status: "cancelled"};
 
 export interface AuditExportResult {
   written: number;
@@ -1614,6 +1693,29 @@ export interface SourcedCapabilityValue {
  */
 export interface CapabilitySet {
   values: Record<string, Record<string, SourcedCapabilityValue | number>>;
+}
+
+/** One checked read: valid ledgers and discarded-row coverage stay together. */
+export interface CapabilityLedgerSnapshot {
+  ledgers: Record<string, CapabilitySet>;
+  observed: number;
+  discarded: Array<{ key: string; reason: string }>;
+}
+
+/** IPC is runtime data; never turn an unconfirmed coverage response into zero loss. */
+export function capabilityLedgerSnapshotOf(value: unknown): CapabilityLedgerSnapshot {
+  const object = (entry: unknown): entry is Record<string, unknown> =>
+    entry !== null && typeof entry === "object" && !Array.isArray(entry);
+  if (!object(value) || !object(value.ledgers) || !Number.isSafeInteger(value.observed) ||
+      typeof value.observed !== "number" || value.observed < 0 || !Array.isArray(value.discarded) ||
+      !Object.values(value.ledgers).every(ledger => object(ledger) && object(ledger.values)) ||
+      !value.discarded.every(row => object(row) && typeof row.key === "string" &&
+        typeof row.reason === "string" && /^(?:null_ledger|(?:io|syntax|shape|truncated) at line \d+ column \d+)$/.test(row.reason)) ||
+      value.observed < Object.keys(value.ledgers).length || value.observed < value.discarded.length) {
+    throw new Error("能力账本覆盖返回无法确认；未将损坏或缺失账本视为零。");
+  }
+  // observed counts physical records, while ledgers is a key map: no equality assumption.
+  return value as unknown as CapabilityLedgerSnapshot;
 }
 
 /**
@@ -1829,6 +1931,15 @@ export interface CatalogInventoryEntry {
 }
 export interface CatalogInventoryPage { entries: CatalogInventoryEntry[]; total: number; offset: number; limit: number; }
 
+/**
+ * Widen legacy results without replacing their dispatch path. The legacy DTO
+ * is not a runtime decoder; only the attempts field is widened here.
+ */
+export const recentRequestsRaw = (...args: Parameters<typeof api.recentRequests>): Promise<RawRequestLog[]> =>
+  api.recentRequests(...args);
+export const queryRequestsRaw = (...args: Parameters<typeof api.queryRequests>): Promise<RawAuditPage> =>
+  api.queryRequests(...args);
+
 export const api = {
   saveFreeRouting: (settings: {enabled:boolean}) => invoke<{enabled:boolean}>("save_free_routing", { settings }),
   catalogMaintenance: () => invoke<CatalogMaintenanceView>("catalog_maintenance_status"),
@@ -1877,6 +1988,8 @@ export const api = {
   workbuddyAccountQuota: (accountId: string, region: WorkBuddyRegion) => invoke<WorkBuddyQuota>("workbuddy_account_quota", { accountId, region }),
   registerWorkBuddyProvider: (accountId: string, region: WorkBuddyRegion = "global") => invoke<{provider_id:string;runtime_id:string;model_count:number;warnings:string[]}>("register_workbuddy_provider", { accountId, region }),
   registerClientBridge: (kind: string) => invoke<string>("register_client_bridge", { kind }),
+  listDesktopChatReceipts: (before: number | null = null) => invoke<DesktopChatReceipt[]>("list_desktop_chat_receipts", { before }),
+  desktopChatV2: (input: DesktopChatInput, requestId: string) => invoke<DesktopChatV2Outcome>("desktop_chat_v2", { input, requestId }),
   desktopChat: (input: DesktopChatInput, control?: { requestId: string; onReady: (ready: DesktopChatReady) => void; onEvent?: (event: DesktopChatStreamEvent) => void }) => {
     if (!control) return invoke<DesktopChatResult>("desktop_chat", { input });
     const onReady = new Channel<DesktopChatReady>(control.onReady);
@@ -1955,6 +2068,12 @@ export const api = {
     invoke<SnapshotApplyResult>("apply_snapshot", { id }),
 
   statsOverview: () => invoke<StatsOverview>("stats_overview"),
+  statsOverviewV2: () => invoke<StatsOverviewV2>("stats_overview_v2"),
+  listClientUsageReviewable: (after: string | null = null) => invoke<ClientUsageReviewPage>("list_client_usage_reviewable", {after}),
+  reviewClientUsageJournal: (attemptId: string, requestId: string, ready: (ready: {request_id: string}) => void) =>
+    invoke<ClientUsageReviewResult>("review_client_usage_journal", {attemptId, requestId, onReady: new Channel<{request_id: string}>(ready)}),
+  cancelClientUsageReview: (requestId: string) => invoke<boolean>("cancel_client_usage_review", {requestId}),
+  usageStatsV2: (filter: AuditFilter) => invoke<UsageStatsV2>("usage_stats_v2", {filter}),
   recentRequests: (limit = 100) => invoke<RequestLog[]>("recent_requests", { limit }),
   // ---------- B3 审计检索与导出 ----------
 
@@ -1967,12 +2086,17 @@ export const api = {
    */
   queryRequests: (filter: AuditFilter) =>
     invoke<AuditPage>("query_requests", { filter }),
+  queryRequestsV2: (filter: AuditFilter) => invoke<AuditPageV2>("query_requests_v2", {filter}),
   getRequestFeedback: (requestId: number) =>
     invoke<RequestFeedback>("get_request_feedback", { requestId }),
   setRequestFeedback: (input: FeedbackInput) =>
     invoke<RequestFeedback>("set_request_feedback", { input }),
   getConversationFeedback: (filter: AuditFilter, page?: {limit?:number;offset:number}) =>
     invoke<ConversationSummary>("get_conversation_feedback", {filter,page:page??null}),
+  getSearchSourcePauses: () => invoke<ManualSourcePause[]>("get_search_source_pauses"),
+  resumeSearchSourcePause: (source:string,revision:string) => invoke<ManualSourcePause>("resume_search_source_pause",{source,revision}),
+  getConversationVerdict: (task: ConversationTaskRef) => invoke<ConversationVerdictView>("get_conversation_verdict", {task}),
+  setConversationVerdict: (input: ConversationVerdictInput) => invoke<ConversationVerdictView>("set_conversation_verdict", {input}),
   getConversationRequests: (task: ConversationTaskRef, filter: AuditFilter, afterId:number|null, limit=100) =>
     invoke<ConversationRequestPage>("get_conversation_requests", {task,filter,afterId,limit}),
   feedbackCoverage: (filter: AuditFilter) =>
@@ -1980,6 +2104,8 @@ export const api = {
 
   exportRequests: (filter: AuditFilter, format: "jsonl" | "csv", destPath: string) =>
     invoke<AuditExportResult>("export_requests", { filter, format, destPath }),
+  exportRequestsV2: (filter: AuditFilter, format: "jsonl" | "csv", destPath: string) =>
+    invoke<AuditExportResult>("export_requests_v2", {filter, format, destPath}),
 
   // ---------- D2 能力集导出 / 导入 ----------
 
@@ -1991,6 +2117,9 @@ export const api = {
    * 界面可以直接把它当文本给用户复制或写文件。
    */
   exportCapabilities: () => invoke<string>("export_capabilities"),
+  /** Additive checked command. The legacy command and bare-map file format stay unchanged. */
+  exportCapabilitiesWithCoverage: () =>
+    invoke<unknown>("export_capabilities_with_coverage").then(capabilityLedgerSnapshotOf),
 
   /**
    * D5：质量 × 速度 × 价格的三维前沿。
@@ -2172,6 +2301,8 @@ export interface SessionMessagesPage {
 export interface PersonalTestStatus { enabled: boolean; target: string | null; trusted_source_ready: boolean }
 export type PersonalTestOutcome = "not_dispatched" | "dispatched_unknown" | "reply_unverified";
 export interface PersonalTestFailure { message: string; outcome: PersonalTestOutcome }
+export interface DesktopChatReceipt { cursor: number; operation_id: string; state: "claimed" | "completed" }
+export type DesktopChatV2Outcome = { kind: "reply"; operation_id: string; receipt: "recorded" | "unknown"; result: DesktopChatResult } | { kind: "unknown"; operation_id: string; message: string };
 export interface DesktopChatInput { model: string; messages: DesktopChatMessage[]; session_id: string; max_tokens: number; personal_test?: boolean }
 export interface DesktopChatReady { request_id: string; trace_id: string }
 export interface DesktopChatStreamEvent {
@@ -2253,16 +2384,21 @@ export function formatMoney(cost: number, currency: string | null): string {
   return `${symbol}${cost.toFixed(2)}${suffix}`;
 }
 
-/** 单 token 单价换算到「每 100 万 token」后的紧凑展示，用于模型目录。 */
+/** 每 100 万 token 单价的紧凑展示，用于模型目录。 */
 export function formatPricePerMillion(price: { prompt: number; completion: number; currency: string }): string {
-  const symbol = CURRENCY_SYMBOL[price.currency] ?? "";
+  const currency = price.currency;
+  const knownCurrency = typeof currency === "string" && Object.prototype.hasOwnProperty.call(CURRENCY_SYMBOL, currency);
+  const symbol = knownCurrency ? CURRENCY_SYMBOL[currency] : "";
   const compact = (value: number) => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "未知";
     if (value === 0) return "0";
-    if (value >= 1) return value.toFixed(2);
-    const fixed = value.toFixed(4);
-    return fixed.replace(/0+$/, "").replace(/\.$/, "");
+    if (value >= 1) {
+      const fixed = value.toFixed(2);
+      return Number(fixed) === value ? fixed : String(value);
+    }
+    return String(value);
   };
-  return `${symbol}${compact(price.prompt)}/${compact(price.completion)} 每 100 万`;
+  return `${symbol}${compact(price.prompt)}/${compact(price.completion)} 每 100 万${knownCurrency ? "" : "（币种未知）"}`;
 }
 
 /** UTC 分钟数 ↔ HH:MM 文本。界面统一用 UTC，避免与厂商公告的时区对不上。 */
@@ -2288,3 +2424,18 @@ export const HEALTH_LABEL: Record<string, string> = {
   invalid: "Key 失效",
   error: "异常",
 };
+
+export type ConversationVerdictOutcome = "met_need" | "did_not_meet_need" | "unsure";
+export interface ConversationVerdictView {
+ task: ConversationTaskRef; revision:number; outcome:ConversationVerdictOutcome|null;
+ source:"local_user"|null; recorded_at_ms:number|null; evaluated_membership:string|null;
+ membership:string; through_request_id:number; state:"unreviewed"|"reviewed"|"continued";
+}
+export interface ConversationVerdictInput {
+ task:ConversationTaskRef; expected_revision:number; membership:string; outcome:ConversationVerdictOutcome|null;
+}
+
+export interface ManualSourcePause {
+ source:string; state:"paused"|"pause_pending"|"not_paused"|"unavailable";
+ revision:string|null; reason:"http_429"|"http_503"|"challenge"|null; can_resume:boolean;
+}

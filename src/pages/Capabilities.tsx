@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, CandidateExplanation, CapabilitySet, PriceObservationView, TpsReference, formatPricePerMillion, ParetoView, ProviderView } from "../api";
+import { api, CandidateExplanation, CapabilitySet, CapabilityLedgerSnapshot, PriceObservationView, TpsReference, formatPricePerMillion, ParetoView, ProviderView } from "../api";
 import { errorText } from "./providerPresets";
 import "./capabilities.css";
 import CapabilityTransfer from "../components/CapabilityTransfer";
@@ -12,6 +12,10 @@ const FACTOR_LABEL: Record<string, string> = {
   health: "健康", headroom: "剩余额度", capability: "能力", latency: "延迟",
   intent_fit: "任务匹配", cost: "成本", efficiency: "效率",
 };
+
+function safeLabel(labels: Record<string, string>, key: string): string {
+  return Object.prototype.hasOwnProperty.call(labels, key) ? labels[key] : key;
+}
 
 /**
  * D2：多来源能力账本的**冲突视图**。
@@ -43,34 +47,59 @@ interface DimensionRow {
   dimension: string;
   items: SourceEvidenceItem[];
   conflict: boolean;
+  uncertain: boolean;
+}
+
+// The IPC payload is still runtime data: do not silently filter malformed entries.
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /** 把一个模型的账本摊成「维度 → 各来源的值」。 */
 function rowsOf(set: CapabilitySet | undefined): DimensionRow[] {
-  const values = set?.values ?? {};
-  return Object.entries(values)
-    .map(([dimension, bySource]) => {
-      const items = Object.entries(bySource ?? {})
-        // 老形态是裸数字，新形态是 `{ value, source }`。两种都要认 ——
-        // 导出文件可能来自更老的版本。
-        .map(([source, raw]) => ({
-          source,
-          value: typeof raw === "number" ? raw : raw?.value,
-          observed_at: typeof raw === "number" ? undefined : raw?.observed_at,
-          sample_count: typeof raw === "number" ? undefined : raw?.sample_count,
-        }))
-        .filter((item): item is { source: string; value: number; observed_at: string | null | undefined; sample_count: number | null | undefined } =>
-          typeof item.value === "number" && Number.isFinite(item.value)
-          && item.value >= 0 && item.value <= 1 && TRUST_ORDER.includes(item.source))
-        .sort((a, b) => TRUST_ORDER.indexOf(a.source) - TRUST_ORDER.indexOf(b.source));
-      // 冲突 = **不止一个来源，且它们说的不全一样**。
-      // 两个来源给出同一个值是互相印证，不是冲突。
-      const conflict = items.length > 1 && new Set(items.map((i) => i.value)).size > 1;
-      return { dimension, items, conflict };
-    })
-    .filter((row) => row.items.length > 0)
-    // 有冲突的排前面：这一页存在的理由就是它们。
-    .sort((a, b) => Number(b.conflict) - Number(a.conflict));
+  if (set === undefined) return [];
+  if (!record(set) || !record(set.values)) return [{ dimension: "账本", items: [], conflict: false, uncertain: true }];
+  return Object.entries(set.values).map(([dimension, bySource]) => {
+    if (!record(bySource) || Object.keys(bySource).length === 0)
+      return { dimension, items: [], conflict: false, uncertain: true };
+    let uncertain = !Object.prototype.hasOwnProperty.call(DIMENSION_LABEL, dimension);
+    const items: SourceEvidenceItem[] = [];
+    for (const [source, raw] of Object.entries(bySource)) {
+      const legacy = typeof raw === "number";
+      const object = record(raw) ? raw : null;
+      const value = legacy ? raw : object?.value;
+      // Legacy numbers lack an internal source; keep as evidence but cannot confirm ordering.
+      if (legacy) uncertain = true;
+      if (!TRUST_ORDER.includes(source) || (!legacy && (!object || object.source !== source)) ||
+          typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+        uncertain = true;
+        continue;
+      }
+      items.push({ source, value,
+        observed_at: typeof object?.observed_at === "string" ? object.observed_at : undefined,
+        sample_count: typeof object?.sample_count === "number" ? object.sample_count : undefined });
+    }
+    items.sort((a, b) => TRUST_ORDER.indexOf(a.source) - TRUST_ORDER.indexOf(b.source));
+    const first = Math.fround(items[0]?.value ?? 0);
+    const conflict = !uncertain && items.length > 1 && items.some(item =>
+      Math.abs(Math.fround(Math.fround(item.value) - first)) > 2 ** -23);
+    return { dimension, items, conflict, uncertain };
+  }).sort((a, b) => Number(b.conflict) - Number(a.conflict));
+}
+
+// Preserve distinct f32 values when two-decimal display would hide a difference.
+function evidenceValue(row: DimensionRow, item: SourceEvidenceItem): string {
+  const value = Math.fround(item.value);
+  const short = value.toFixed(2);
+  return row.items.some(other => Math.fround(other.value) !== value && Math.fround(other.value).toFixed(2) === short)
+    ? String(value) : short;
+}
+
+// A missing cache price is a local calculation fallback, not a configured cache quote.
+// Keep explicit zero and tiny positive numbers; malformed values are not a free price.
+function configuredCacheUnit(value: unknown) {
+  if (value === null || value === undefined) return "基础价未单列（本机基础参考回退输入价）";
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? String(value) : "价格格式无效，单价未知";
 }
 
 /** Labels the read snapshot; UI does not run a wall-clock expiry or infer freshness. */
@@ -88,7 +117,9 @@ function TpsFreshness({ reference }: { reference?: TpsReference | null }) {
 
 export default function CapabilitiesPage() {
   const [priceObservations, setPriceObservations] = useState<PriceObservationView[] | null>(null);
-  const [ledger, setLedger] = useState<Record<string, CapabilitySet> | null>(null);
+  const [ledgerSnapshot, setLedgerSnapshot] = useState<CapabilityLedgerSnapshot | null>(null);
+  const ledger = ledgerSnapshot?.ledgers ?? null;
+  const discardedKeys = new Set(ledgerSnapshot?.discarded.map(row => row.key) ?? []);
   const [pareto, setPareto] = useState<ParetoView | null>(null);
   const [explain, setExplain] = useState<CandidateExplanation[] | null>(null);
   const [explainModel, setExplainModel] = useState("");
@@ -115,14 +146,14 @@ export default function CapabilitiesPage() {
     setError(null);
     try {
       const [raw, view, ranking, facts, observations] = await Promise.allSettled([
-        api.exportCapabilities().then(value => JSON.parse(value) as Record<string, CapabilitySet>),
+        api.exportCapabilitiesWithCoverage(),
         api.capabilityPareto(),
         api.explainRouting(model.trim() || undefined),
         api.listProviders(),
         api.priceObservations().then(value => { if (!Array.isArray(value)) throw new Error("价格来源记录形状未确认"); return value; }),
       ]);
       if (!isCurrent()) return;
-      if (raw.status === "fulfilled") setLedger(raw.value);
+      if (raw.status === "fulfilled") setLedgerSnapshot(raw.value);
       if (view.status === "fulfilled") setPareto(view.value);
       const matchesDraft = canonical(modelDraft.current) === query;
       if (ranking.status === "fulfilled" && matchesDraft) {
@@ -149,8 +180,12 @@ export default function CapabilitiesPage() {
 
   const entries = Object.entries(ledger ?? {}).map(([key, set]) => ({ key, rows: rowsOf(set) }));
   const withData = entries.filter((entry) => entry.rows.length > 0);
-  const conflicting = withData.filter((entry) => entry.rows.some((row) => row.conflict));
-  const agreeing = withData.length - conflicting.length;
+  const uncertain = withData.filter(entry => entry.rows.some(row => row.uncertain));
+  const certain = withData.filter(entry => !entry.rows.some(row => row.uncertain));
+  const conflicting = certain.filter(entry => entry.rows.some(row => row.conflict));
+  const nonConflicting = certain.filter(entry => !entry.rows.some(row => row.conflict));
+  const multiLabel = nonConflicting.filter(entry => entry.rows.some(row => row.items.length > 1));
+  const singleOnly = nonConflicting.filter(entry => entry.rows.every(row => row.items.length === 1));
   const facts = (providers ?? []).flatMap(provider => provider.models.map(model => ({
     provider, model, rows: rowsOf(ledger?.[`${provider.id}/${model.alias}`]),
   }))).filter(({ provider, model }) => `${provider.name} ${model.alias} ${model.upstream}`.toLowerCase().includes(query.trim().toLowerCase()));
@@ -170,6 +205,16 @@ export default function CapabilitiesPage() {
 
       {error && <div className="capability-error" role="alert">部分数据读取失败：{error}</div>}
 
+      {ledgerSnapshot && <section className="card" data-testid="ledger-coverage" aria-labelledby="ledger-coverage-title">
+        <h3 id="ledger-coverage-title">能力账本读取覆盖</h3>
+        <p>最近成功读取：{ledgerSnapshot.observed} 条账本记录；保留 {Object.keys(ledgerSnapshot.ledgers).length} 个模型账本；损坏未纳入 {ledgerSnapshot.discarded.length} 条。</p>
+        {ledgerSnapshot.discarded.length > 0 && <>
+          <p role="status">损坏账本未纳入当前质量来源，覆盖未知；其他有效账本仍可查看。</p>
+          <ul data-testid="ledger-discarded">{ledgerSnapshot.discarded.map((row, index) =>
+            <li className="breakable" key={`${row.key}-${index}`}>{row.key}：{row.reason}</li>)}</ul>
+        </>}
+      </section>}
+
       <CapabilityTransfer disabled={busy} onImported={() => void load()} />
 
       {providers !== null && <section className="capability-facts" data-testid="capability-facts" aria-labelledby="capability-facts-title">
@@ -181,7 +226,7 @@ export default function CapabilitiesPage() {
           <tbody>{visibleFacts.map(({ provider, model, rows }) => {
             const chatDeclaration = usesChatDeclaration(model);
             const contextKnown = Number.isSafeInteger(model.context_window) && model.context_window > 0;
-            const covered = rows.filter(row => DIMENSION_LABEL[row.dimension]).length;
+            const covered = rows.filter(row => row.items.length > 0 && Object.prototype.hasOwnProperty.call(DIMENSION_LABEL, row.dimension)).length;
             const configuredQuality = Object.keys(DIMENSION_LABEL).filter(dimension => {
               const value = model.capabilities?.[dimension as "coding" | "reasoning" | "knowledge" | "math"];
               return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
@@ -189,10 +234,10 @@ export default function CapabilitiesPage() {
             const price = model.price;
             return <tr key={`${provider.id}/${model.alias}`}>
               <td><strong>{model.alias}</strong><small>{provider.name}{!provider.enabled || !model.enabled ? " · 已停用" : ""}</small>{model.alias !== model.upstream && <small>上游：{model.upstream}</small>}</td>
-              <td>{price ? <><span>{formatPricePerMillion(price)}</span><small>{price.currency.toUpperCase()} · {price.source === "manual" ? "手工配置" : "目录参考价"}</small><small>缓存读 / 写：{price.cache_read ?? price.prompt} / {price.cache_creation ?? price.prompt} 每 100 万</small>{(price.tiers.length > 0 || price.rules.length > 0) && <small>含分档 / 时段条件，实际费用按请求计算</small>}<PriceObservation provider={provider} model={model} observations={priceObservations} />{!chatDeclaration && <small>token参考配置，是否适用于此类型计价尚未核验</small>}</> : <span className="missing">未配置价格；费用未知</span>}</td>
+              <td>{price ? <><span>{formatPricePerMillion(price)}</span><small>{price.currency.toUpperCase()} · {price.source === "manual" ? "手工配置" : price.source === "catalog" ? "目录参考价" : "价格来源未知"}</small><small data-testid="configured-cache-price">缓存读取：{configuredCacheUnit(price.cache_read)}；缓存写入：{configuredCacheUnit(price.cache_creation)}（每 100 万 token）</small>{(price.tiers.length > 0 || price.rules.length > 0) && <small>含分档 / 时段条件，实际费用按请求计算</small>}<PriceObservation provider={provider} model={model} observations={priceObservations} />{!chatDeclaration && <small>token参考配置，是否适用于此类型计价尚未核验</small>}</> : <span className="missing">未配置价格；费用未知</span>}</td>
               <td>{contextKnown ? `${chatDeclaration ? "" : "旧窗口配置："}${model.context_window.toLocaleString()} tokens` : "上下文未声明，不代表0"}<small>{{ chat: "聊天", embedding: "Embedding", image: "图像生成", speech: "语音合成" }[model.model_type] ?? "类型未确认"}</small><small>{chatDeclaration ? "配置值，未自动探测" : "本类型端点未按聊天窗口验证"}</small></td>
               <td><ModelCapabilityDeclaration model={model} declaration={provider.capability_declarations?.[model.alias]} /></td>
-              <td>{!chatDeclaration && <strong style={{ display: "block", marginBottom: 4 }}>专用质量口径未定义</strong>}{ledger === null ? <span className="missing">质量来源尚未读取</span> : <><span>{chatDeclaration ? `${covered} / 4 质量维度有来源` : `原通用资料：${covered} / 4 维度有有效分值`}</span><small>{covered > 0 ? rows.filter(row => DIMENSION_LABEL[row.dimension]).map(row => DIMENSION_LABEL[row.dimension]).join("、") : configuredQuality.length > 0 ? `${configuredQuality.length} / 4 维度有配置分值，无多来源账本` : chatDeclaration ? `供应商默认回退 ${provider.intelligence}/100，非质量实测` : "不以缺少聊天质量分推断本类型能力低"}</small></>}{model.capabilities?.updated_at && <small>{chatDeclaration ? "质量记录时间" : "通用质量记录时间"}：{model.capabilities.updated_at}</small>}{ledger !== null && <CapabilityEvidence rows={rows} />}<small>延迟 / 任务匹配 / 效率：持续补充使用样本</small></td>
+              <td>{!chatDeclaration && <strong style={{ display: "block", marginBottom: 4 }}>专用质量口径未定义</strong>}{ledger === null ? <span className="missing">质量来源尚未读取</span> : discardedKeys.has(`${provider.id}/${model.alias}`) ? <span className="missing">账本已损坏，未纳入质量覆盖；覆盖未知</span> : <><span>{rows.some(row => row.uncertain) ? (chatDeclaration ? `已确认至少 ${covered} / 4 质量维度有来源；其余待核对` : `原通用资料：已确认至少 ${covered} / 4 维度有有效分值；其余待核对`) : (chatDeclaration ? `${covered} / 4 质量维度有来源` : `原通用资料：${covered} / 4 维度有有效分值`)}</span><small>{covered > 0 ? rows.filter(row => row.items.length > 0 && Object.prototype.hasOwnProperty.call(DIMENSION_LABEL, row.dimension)).map(row => safeLabel(DIMENSION_LABEL, row.dimension)).join("、") : rows.some(row => row.uncertain) ? "来源或数据待核对，覆盖未知" : configuredQuality.length > 0 ? `${configuredQuality.length} / 4 维度有配置分值，无多来源账本` : chatDeclaration ? `供应商默认回退 ${provider.intelligence}/100，非质量实测` : "不以缺少聊天质量分推断本类型能力低"}</small></>}{model.capabilities?.updated_at && <small>{chatDeclaration ? "质量记录时间" : "通用质量记录时间"}：{model.capabilities.updated_at}</small>}{ledger !== null && rows.some(row => row.uncertain) && <small>部分来源或数据待核对；覆盖仅计有效0..1数值及已知来源，缺失或无效不补0。</small>}{ledger !== null && !discardedKeys.has(`${provider.id}/${model.alias}`) && <CapabilityEvidence rows={rows} />}<small>延迟 / 任务匹配 / 效率：持续补充使用样本</small></td>
             </tr>;
           })}</tbody>
         </table></div>
@@ -244,7 +289,7 @@ export default function CapabilitiesPage() {
                 <tbody>
                   {item.breakdown.factors.map((f) => (
                     <tr key={f.name}>
-                      <td>{FACTOR_LABEL[f.name] ?? f.name}</td>
+                      <td>{safeLabel(FACTOR_LABEL, f.name)}</td>
                       <td>{f.raw === null ? <span className="missing">{f.weight === 0 ? "未参与评分" : f.name === "cost" ? "无可比价格" : "缺少本项样本"}</span> : f.raw.toFixed(3)}</td>
                       <td>{f.weight.toFixed(2)}</td>
                       <td>{f.contribution.toFixed(4)}</td>
@@ -321,7 +366,7 @@ export default function CapabilitiesPage() {
         </section>
       )}
 
-      {ledger !== null && withData.length === 0 && !error && (
+      {ledger !== null && ledgerSnapshot?.discarded.length === 0 && !entries.some(entry => entry.rows.some(row => row.items.length > 0)) && !error && (
         <div className="capability-empty">
           <strong>尚无有效质量来源分值</strong>
           <p>
@@ -337,8 +382,10 @@ export default function CapabilitiesPage() {
 
       {ledger !== null && withData.length > 0 && (
         <div className="capability-summary">
-          共 {withData.length} 个模型有能力数据：<strong>{conflicting.length} 个存在冲突</strong>
-          {agreeing > 0 && `，${agreeing} 个各来源一致`}
+          共 {withData.length} 个模型的账本含条目或异常：{certain.length} 个模型的条目可解析；<strong>{conflicting.length} 个存在冲突</strong>
+          {multiLabel.length > 0 && `，${multiLabel.length} 个至少一维有多个来源标签且数值未冲突`}
+          {singleOnly.length > 0 && `，${singleOnly.length} 个各维度仅有单条来源记录`}
+          {uncertain.length > 0 && `，${uncertain.length} 个来源或数据待核对`}
         </div>
       )}
 
@@ -351,13 +398,13 @@ export default function CapabilitiesPage() {
           {entry.rows.filter((row) => row.conflict).map((row) => (
             <div className="capability-row" key={row.dimension}>
               <div className="capability-dimension">
-                {DIMENSION_LABEL[row.dimension] ?? row.dimension}
+                {safeLabel(DIMENSION_LABEL, row.dimension)}
               </div>
               <ul className="capability-values">
                 {row.items.map((item, index) => (
                   <li key={item.source} className={index === 0 ? "winner" : undefined}>
-                    <span className="capability-source">{SOURCE_LABEL[item.source] ?? item.source}</span>
-                    <span className="capability-value">{item.value.toFixed(2)}</span>
+                    <span className="capability-source">{safeLabel(SOURCE_LABEL, item.source)}</span>
+                    <span className="capability-value">{evidenceValue(row, item)}</span>
                     {index === 0 && <span className="capability-winner-tag">生效</span>}
                   </li>
                 ))}
@@ -371,21 +418,30 @@ export default function CapabilitiesPage() {
         </article>
       ))}
 
-      {agreeing > 0 && (
+      {uncertain.length > 0 && (
+        <details className="capability-uncertain">
+          <summary>{uncertain.length} 个模型来源或数据待核对</summary>
+          <p className="capability-hint">来源键与内部来源不一致、缺少内部来源、未知来源或数据无效时，无法确认该维度的来源顺序和比较结果；下列模型不计入已确认分类，也不标记生效来源。其他维度的有效记录仍可查看。</p>
+          <ul>{uncertain.map(entry => <li key={entry.key}>{entry.key}：{entry.rows.map(row =>
+            row.uncertain ? `${safeLabel(DIMENSION_LABEL, row.dimension)} 来源或数据待核对` :
+              `${safeLabel(DIMENSION_LABEL, row.dimension)} ${row.items.map(item => `${safeLabel(SOURCE_LABEL, item.source)} ${evidenceValue(row, item)}`).join(" / ")}${row.conflict ? "（数值冲突）" : ""}`).join("、")}</li>)}</ul>
+        </details>
+      )}
+
+      {multiLabel.length > 0 && (
         <details className="capability-agreeing">
-          <summary>{agreeing} 个模型各来源一致（无需处理）</summary>
-          <ul>
-            {withData
-              .filter((entry) => !entry.rows.some((row) => row.conflict))
-              .map((entry) => (
-                <li key={entry.key}>
-                  {entry.key}：
-                  {entry.rows
-                    .map((row) => `${DIMENSION_LABEL[row.dimension] ?? row.dimension} ${row.items[0].value.toFixed(2)}`)
-                    .join("、")}
-                </li>
-              ))}
-          </ul>
+          <summary>{multiLabel.length} 个模型至少一维有多个来源标签且数值未冲突</summary>
+          <p className="capability-hint">比较使用后端既有精度阈值；多个标签不证明来源独立、测量有效或结果已核验，其他维度仍可能只有单条记录。</p>
+          <ul>{multiLabel.map(entry => <li key={entry.key}>{entry.key}：{entry.rows.map(row =>
+            `${safeLabel(DIMENSION_LABEL, row.dimension)} ${row.items.map(item => `${safeLabel(SOURCE_LABEL, item.source)} ${evidenceValue(row, item)}`).join(" / ")}（${row.items.length} 个来源标签）`).join("、")}</li>)}</ul>
+        </details>
+      )}
+      {singleOnly.length > 0 && (
+        <details className="capability-single-source">
+          <summary>{singleOnly.length} 个模型各维度仅有单条来源记录</summary>
+          <p className="capability-hint">没有同维度的另一条来源记录可比较，不能据此称为多来源一致或验证。</p>
+          <ul>{singleOnly.map(entry => <li key={entry.key}>{entry.key}：{entry.rows.map(row =>
+            `${safeLabel(DIMENSION_LABEL, row.dimension)} ${row.items[0].value.toFixed(2)}（单条来源）`).join("、")}</li>)}</ul>
         </details>
       )}
     </div>
