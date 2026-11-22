@@ -829,6 +829,9 @@ impl UpstreamClient {
             let _free_permit=free_permit;
             let mut budget_report=crate::budget::holds::StreamReport::default();
             let mut buffer = Vec::new();
+            // Gemini emits whole calls without a stream index. Keep one sequence
+            // for this upstream attempt, including a final undelimited frame.
+            let mut next_gemini_tool_index = 0;
 
             while let Some(chunk) = bytes.next().await {
                 match chunk {
@@ -838,7 +841,7 @@ impl UpstreamClient {
                         buffer.extend_from_slice(&chunk);
                         let events = match dialect {
                             Dialect::Ollama => drain_ollama_lines(&mut buffer, generation.as_ref()),
-                            _ => drain_sse_blocks(dialect, &mut buffer),
+                            _ => drain_sse_blocks(dialect, &mut buffer, &mut next_gemini_tool_index),
                         };
                         for event in events {
                             if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
@@ -863,7 +866,7 @@ impl UpstreamClient {
             if !buffer.is_empty() {
                 let events = match dialect {
                     Dialect::Ollama => parse_ollama_line(&buffer, generation.as_ref()),
-                    _ => parse_sse_block(dialect, &buffer),
+                    _ => parse_sse_block_with_index(dialect, &buffer, &mut next_gemini_tool_index),
                 };
                 for event in events {
                     if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
@@ -937,12 +940,20 @@ pub enum UpstreamEvent {
 }
 
 /// 从跨网络分块的缓存中取出所有完整 SSE 事件，残留半包继续留给下一次读取。
-fn drain_sse_blocks(dialect: Dialect, buffer: &mut Vec<u8>) -> Vec<Result<UpstreamEvent>> {
+fn drain_sse_blocks(
+    dialect: Dialect,
+    buffer: &mut Vec<u8>,
+    next_gemini_tool_index: &mut usize,
+) -> Vec<Result<UpstreamEvent>> {
     let mut out = Vec::new();
 
     while let Some((end, delimiter_len)) = find_sse_delimiter(buffer) {
         let event: Vec<u8> = buffer.drain(..end + delimiter_len).collect();
-        out.extend(parse_sse_block(dialect, &event[..end]));
+        out.extend(parse_sse_block_with_index(
+            dialect,
+            &event[..end],
+            next_gemini_tool_index,
+        ));
     }
     out
 }
@@ -974,6 +985,14 @@ fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
 
 /// 解析一段完整 SSE 事件。JSON 解码失败时不 panic；上游偶发的非 JSON 心跳直接忽略。
 pub fn parse_sse_block(dialect: Dialect, bytes: &[u8]) -> Vec<Result<UpstreamEvent>> {
+    parse_sse_block_with_index(dialect, bytes, &mut 0)
+}
+
+fn parse_sse_block_with_index(
+    dialect: Dialect,
+    bytes: &[u8],
+    next_gemini_tool_index: &mut usize,
+) -> Vec<Result<UpstreamEvent>> {
     let text = String::from_utf8_lossy(bytes);
     let mut event_name: Option<&str> = None;
     let mut data = String::new();
@@ -1003,7 +1022,7 @@ pub fn parse_sse_block(dialect: Dialect, bytes: &[u8]) -> Vec<Result<UpstreamEve
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    parse_event_value(dialect, event_name, v)
+    parse_event_value(dialect, event_name, v, next_gemini_tool_index)
 }
 
 fn parse_ollama_line(
@@ -1020,7 +1039,7 @@ fn parse_ollama_line(
             if let Some(generation) = generation {
                 generation.observe(&v);
             }
-            parse_event_value(Dialect::Ollama, None, v)
+            parse_event_value(Dialect::Ollama, None, v, &mut 0)
         }
         // 截断或厂商自定义诊断行不应导致代理 panic；后续完整行仍可继续输出。
         Err(_) => Vec::new(),
@@ -1031,6 +1050,7 @@ fn parse_event_value(
     dialect: Dialect,
     event_name: Option<&str>,
     v: serde_json::Value,
+    next_gemini_tool_index: &mut usize,
 ) -> Vec<Result<UpstreamEvent>> {
     // A successful HTTP header is not a successful model result. Native
     // error envelopes must not disappear behind a later DONE/stop/done:true.
@@ -1060,7 +1080,7 @@ fn parse_event_value(
         Dialect::OpenAI => parse_openai_chunk(v, &mut out),
         Dialect::Responses => parse_responses_chunk(event_name, v, &mut out),
         Dialect::Anthropic => parse_anthropic_chunk(event_name, v, &mut out),
-        Dialect::Gemini => parse_gemini_chunk(v, &mut out),
+        Dialect::Gemini => parse_gemini_chunk(v, &mut out, next_gemini_tool_index),
         Dialect::Ollama => parse_ollama_chunk(v, &mut out),
     }
     out
@@ -1448,12 +1468,16 @@ fn anthropic_usage(usage: Option<&serde_json::Value>) -> Option<Usage> {
     Some(Usage::from_anthropic(usage))
 }
 
-fn parse_gemini_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) {
+fn parse_gemini_chunk(
+    v: serde_json::Value,
+    out: &mut Vec<Result<UpstreamEvent>>,
+    next_tool_index: &mut usize,
+) {
     let text = crate::protocol::gemini::extract_stream_text(&v);
     if !text.is_empty() {
         out.push(Ok(UpstreamEvent::Delta(text)));
     }
-    let has_tool_calls = push_gemini_tool_calls(&v, out);
+    let has_tool_calls = push_gemini_tool_calls(&v, out, next_tool_index);
     let usage = gemini_usage(&v);
     let finish_reason = v
         .get("candidates")
@@ -1605,7 +1629,11 @@ fn normalize_ollama_finish_reason(reason: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn push_gemini_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) -> bool {
+fn push_gemini_tool_calls(
+    v: &serde_json::Value,
+    out: &mut Vec<Result<UpstreamEvent>>,
+    next_tool_index: &mut usize,
+) -> bool {
     let Some(parts) = v
         .get("candidates")
         .and_then(|candidates| candidates.get(0))
@@ -1626,8 +1654,9 @@ fn push_gemini_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEv
             let name = call.get("name").and_then(|name| name.as_str())?;
             Some((name, call))
         })
-        .enumerate()
-        .map(|(index, (name, call))| {
+        .map(|(name, call)| {
+            let index = *next_tool_index;
+            *next_tool_index += 1;
             let id = call
                 .get("id")
                 .and_then(|id| id.as_str())
