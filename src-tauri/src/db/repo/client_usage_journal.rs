@@ -134,6 +134,39 @@ pub async fn mark_agent_gate(
     finish(transaction, result).await
 }
 
+/// Join the exact request's intent without committing the caller's audit transaction.
+pub(super) async fn link_native_audit_in_conn(
+    connection: &mut SqliteConnection,
+    scope_id: &str,
+    attempt_id: &str,
+    request_id: i64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        valid_uuid(scope_id) && valid_uuid(attempt_id) && request_id > 0,
+        "client_usage_journal_invalid_link"
+    );
+    contract(connection).await?;
+    let changed = sqlx::query(
+        r#"UPDATE usage_attempt_journal_v2 SET audit_request_id=?
+           WHERE attempt_id=? AND scope_id=? AND kind='native_exact'
+           AND audit_request_id IS NULL AND background_scope_id IS NULL
+           AND known_not_sent=0 AND reviewed_at IS NULL
+           AND EXISTS(SELECT 1 FROM requests WHERE id=?)"#,
+    )
+    .bind(request_id)
+    .bind(attempt_id)
+    .bind(scope_id)
+    .bind(request_id)
+    .execute(connection)
+    .await
+    .map_err(unavailable)?;
+    anyhow::ensure!(
+        changed.rows_affected() == 1,
+        "client_usage_journal_state_conflict"
+    );
+    Ok(())
+}
+
 /// Links one intent to an existing audit row without dropping its evidence.
 pub async fn link_audit(db: &Db, attempt_id: &str, request_id: i64) -> anyhow::Result<()> {
     anyhow::ensure!(

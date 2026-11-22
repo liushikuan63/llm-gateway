@@ -2189,7 +2189,25 @@ pub async fn log_request_with_usage(
     log: RequestLog<'_>,
     usage: &[UsageEntry],
 ) -> Result<()> {
-    log_request_internal(pool, Utc::now().timestamp(), log, Some(usage)).await
+    log_request_internal(pool, Utc::now().timestamp(), log, Some(usage), None).await
+}
+
+/// Persist the native audit, daily usage, and dispatch link in one transaction.
+pub(crate) async fn log_native_request_with_journal(
+    pool: &SqlitePool,
+    log: RequestLog<'_>,
+    usage: &[UsageEntry],
+    scope_id: &str,
+    attempt_id: &str,
+) -> Result<()> {
+    log_request_internal(
+        pool,
+        Utc::now().timestamp(),
+        log,
+        Some(usage),
+        Some((scope_id, attempt_id)),
+    )
+    .await
 }
 
 /// 与 [`log_request`] 相同，但**时间戳由调用方给**。
@@ -2199,7 +2217,7 @@ pub async fn log_request_with_usage(
 /// 那既慢又不稳（CLAUDE.md 第 11 条的同款教训：时间夹具不能靠等）。
 /// 生产路径仍然走 [`log_request`]。
 pub async fn log_request_at(pool: &SqlitePool, ts: i64, log: RequestLog<'_>) -> Result<()> {
-    log_request_internal(pool, ts, log, None).await
+    log_request_internal(pool, ts, log, None, None).await
 }
 
 async fn log_request_internal(
@@ -2207,6 +2225,7 @@ async fn log_request_internal(
     ts: i64,
     log: RequestLog<'_>,
     usage: Option<&[UsageEntry]>,
+    native_link: Option<(&str, &str)>,
 ) -> Result<()> {
     let mut log = log;
     if log.route.budget_admission.is_none() {
@@ -2344,6 +2363,19 @@ async fn log_request_internal(
     .bind(entry.cost.unwrap_or(0.0))
     .execute(&mut *tx)
     .await?;
+    }
+    if let Some((scope_id, attempt_id)) = native_link {
+        if let Err(error) = client_usage_journal::link_native_audit_in_conn(
+            &mut tx,
+            scope_id,
+            attempt_id,
+            inserted_request.last_insert_rowid(),
+        )
+        .await
+        {
+            tx.rollback().await?;
+            return Err(error.into());
+        }
     }
     tx.commit().await?;
     Ok(())

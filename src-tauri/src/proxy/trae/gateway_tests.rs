@@ -8,8 +8,12 @@ use crate::proxy::trae::{
 use axum::extract::Request;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize};
 
+#[path = "gateway_v2_exit_tests.rs"]
+mod v2_exit_tests;
+
 type CapturedRequest = (String, String, HeaderMap, Value);
 struct Fixture {
+    v2_intent_observer: parking_lot::Mutex<Option<v2_exit_tests::PostIntentObserver>>,
     packets: parking_lot::Mutex<VecDeque<String>>,
     status: parking_lot::Mutex<StatusCode>,
     requests: parking_lot::Mutex<Vec<CapturedRequest>>,
@@ -56,6 +60,12 @@ async fn upstream(State(f): State<Arc<Fixture>>, request: Request) -> Response {
     let method = request.method().to_string();
     let path = request.uri().to_string();
     let headers = request.headers().clone();
+    if method == "POST" && path == MODEL_PATH {
+        let observer = f.v2_intent_observer.lock().clone();
+        if let Some(observer) = observer {
+            observer.observe().await;
+        }
+    }
     let bytes = axum::body::to_bytes(request.into_body(), 8 * 1024 * 1024)
         .await
         .unwrap();
@@ -124,6 +134,7 @@ async fn setup_with_database(images: bool, path: &std::path::Path) -> Setup {
         base64::engine::general_purpose::STANDARD.encode([73; 32]),
     );
     let fixture = Arc::new(Fixture {
+        v2_intent_observer: parking_lot::Mutex::new(None),
         packets: parking_lot::Mutex::new(VecDeque::new()),
         status: parking_lot::Mutex::new(StatusCode::OK),
         requests: parking_lot::Mutex::new(Vec::new()),
@@ -1962,6 +1973,126 @@ async fn auth_gate_wait_counts_toward_deadline_and_disable_before_send_has_zero_
     }
 }
 #[tokio::test]
+async fn native_intent_commit_failure_and_policy_change_prevent_post() {
+    use sqlx::sqlite::SqliteOperation;
+
+    for permit_commit in [false, true] {
+        let t = setup(false).await;
+        let pool = t.state.db.pool();
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(parking_lot::Mutex::new(Some(entered)));
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Arc::new(parking_lot::Mutex::new(wait));
+        let mut connections = Vec::new();
+        // Hooks are per connection. Cover every possible writer of this fixture.
+        for _ in 0..pool.options().get_max_connections() {
+            connections.push(pool.acquire().await.unwrap());
+        }
+        for connection in &mut connections {
+            let inserted = Arc::new(AtomicBool::new(false));
+            let updated = inserted.clone();
+            let rolled_back = inserted.clone();
+            let entered = entered.clone();
+            let wait = wait.clone();
+            let mut handle = connection.lock_handle().await.unwrap();
+            handle.set_update_hook(move |update| {
+                if update.database == "main"
+                    && update.table == "usage_attempt_journal_v2"
+                    && update.operation == SqliteOperation::Insert
+                {
+                    updated.store(true, Ordering::SeqCst);
+                }
+            });
+            handle.set_rollback_hook(move || rolled_back.store(false, Ordering::SeqCst));
+            handle.set_commit_hook(move || {
+                if inserted.swap(false, Ordering::SeqCst) {
+                    let Some(sender) = entered.lock().take() else {
+                        return false;
+                    };
+                    // Returning false rejects a real SQLite COMMIT. Bound the
+                    // wait even if the HTTP task fails before releasing it.
+                    return sender.send(()).is_ok()
+                        && wait.lock().recv_timeout(Duration::from_secs(10)) == Ok(true);
+                }
+                true
+            });
+        }
+        drop(connections);
+
+        let body = request();
+        let fixture = &t.fixture;
+        let state = &t.state;
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(post(&t, "/v1/chat/completions", &body), async move {
+                observed.await.unwrap();
+                assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+                if permit_commit {
+                    let mut cfg = state.cfg_snapshot();
+                    cfg.free_routing.enabled = true;
+                    state.update_cfg(cfg);
+                }
+                release.send(permit_commit).unwrap();
+            })
+        })
+        .await
+        .expect("owned request never finished its journal commit");
+
+        let (status, error) = if permit_commit {
+            (
+                StatusCode::BAD_REQUEST,
+                "free_policy_account_hard_stop_unverified",
+            )
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "client_usage_journal_unavailable",
+            )
+        };
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            error
+        );
+        assert_eq!(t.fixture.calls.load(Ordering::SeqCst), 0);
+        assert!(!audit(&t).await[0]["native_exact"]["upstream_post_started"]
+            .as_bool()
+            .unwrap());
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM requests),
+                    (SELECT COUNT(*) FROM usage_attempt_journal_v2),
+                    (SELECT COUNT(*) FROM usage_attempt_versions_v2)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let intents = i64::from(permit_commit);
+        assert_eq!(counts, (1, intents, intents));
+        if permit_commit {
+            let linked: (String, i64, Option<String>, i64, i64, String) = sqlx::query_as(
+                "SELECT j.kind, j.known_not_sent, j.agent_gate_reason, v.revision, r.status, r.error
+                 FROM usage_attempt_journal_v2 j
+                 JOIN usage_attempt_versions_v2 v ON v.attempt_id=j.attempt_id
+                 JOIN requests r ON r.id=j.audit_request_id",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                linked,
+                (
+                    "native_exact".into(),
+                    0,
+                    None,
+                    2,
+                    i64::from(status.as_u16()),
+                    error.into()
+                ),
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn failed_same_chunk_usage_keeps_last_committed_partial_counts_in_audit() {
     let t = setup(false).await;
     for invalid in [
@@ -2408,6 +2539,7 @@ fn finalfix_audit_shutdown_does_not_recursively_spawn() {
         error: None,
         recorded: false,
         evidence: Arc::new(parking_lot::Mutex::new(TraeUsageReport::default())),
+        journal: Arc::new(NativeJournal::new()),
     };
     runtime.spawn(async move {
         let _audit = audit;

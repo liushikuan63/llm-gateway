@@ -7,6 +7,8 @@ use crate::proxy::trae::{
 };
 use serde_json::{json, Value};
 
+const CLIENT_JOURNAL_UNAVAILABLE: &str = "client_usage_journal_unavailable";
+
 #[derive(Clone)]
 pub(super) struct NativeSelection {
     provider: Provider,
@@ -24,7 +26,9 @@ pub(super) fn caller_error(error: &str) -> Response {
         .into_response()
 }
 fn execution_status(error: &str) -> StatusCode {
-    if error == "native_entitlement_operation_unconfirmed" {
+    if error == CLIENT_JOURNAL_UNAVAILABLE {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if error == "native_entitlement_operation_unconfirmed" {
         StatusCode::CONFLICT
     } else if error.contains("deadline") {
         StatusCode::GATEWAY_TIMEOUT
@@ -314,6 +318,20 @@ fn audit_marker(
     }
     json!([record])
 }
+struct NativeJournal {
+    scope_id: String,
+    attempt_id: parking_lot::Mutex<Option<String>>,
+}
+
+impl NativeJournal {
+    fn new() -> Self {
+        Self {
+            scope_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
 struct Audit {
     decision: crate::audit::route_decision::Snapshot,
     state: Arc<GatewayState>,
@@ -329,6 +347,7 @@ struct Audit {
     error: Option<String>,
     recorded: bool,
     evidence: Arc<parking_lot::Mutex<TraeUsageReport>>,
+    journal: Arc<NativeJournal>,
 }
 impl Audit {
     async fn record(&mut self) -> std::result::Result<(), String> {
@@ -355,37 +374,46 @@ impl Audit {
             currency: None,
             errors: i64::from(self.status != 200),
         }];
-        let result = repo::log_request_with_usage(
-            self.state.db.pool(),
-            repo::RequestLog {
-                session_id: Some(&self.session),
-                client: self.client.as_deref(),
-                requested_model: &self.selection.requested,
-                routed_provider: Some(&self.selection.provider.id),
-                routed_model: Some(&self.selection.selected.config_name),
-                status: Some(self.status),
-                latency_ms: self.started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-                prompt_tokens: prompt,
-                completion_tokens: completion,
-                fallback_attempts: 0,
-                error: self.error.as_deref(),
-                cost: None,
-                currency: None,
-                rate_label: None,
-                estimated_prompt_tokens: None,
-                attempts_json: Some(&marker),
-                route: repo::RouteTrace {
-                    decision: Some(self.decision.clone()),
-                    intent: Some("native_exact".into()),
-                    ..Default::default()
-                },
-                access_key_id: crate::budget::access_key_id_of(self.client.as_deref()),
-                refined_prompt: None,
-                trace_id: &self.trace,
+        let log = repo::RequestLog {
+            session_id: Some(&self.session),
+            client: self.client.as_deref(),
+            requested_model: &self.selection.requested,
+            routed_provider: Some(&self.selection.provider.id),
+            routed_model: Some(&self.selection.selected.config_name),
+            status: Some(self.status),
+            latency_ms: self.started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            fallback_attempts: 0,
+            error: self.error.as_deref(),
+            cost: None,
+            currency: None,
+            rate_label: None,
+            estimated_prompt_tokens: None,
+            attempts_json: Some(&marker),
+            route: repo::RouteTrace {
+                decision: Some(self.decision.clone()),
+                intent: Some("native_exact".into()),
+                ..Default::default()
             },
-            &usage,
-        )
-        .await;
+            access_key_id: crate::budget::access_key_id_of(self.client.as_deref()),
+            refined_prompt: None,
+            trace_id: &self.trace,
+        };
+        let attempt_id = self.journal.attempt_id.lock().clone();
+        let result = match attempt_id {
+            Some(attempt_id) => {
+                repo::log_native_request_with_journal(
+                    self.state.db.pool(),
+                    log,
+                    &usage,
+                    &self.journal.scope_id,
+                    &attempt_id,
+                )
+                .await
+            }
+            None => repo::log_request_with_usage(self.state.db.pool(), log, &usage).await,
+        };
         // A failed audit is reported to the caller, not quietly retried into a duplicate.
         self.recorded = true;
         if result.is_err() {
@@ -420,6 +448,7 @@ impl Drop for Audit {
             // still performs the one write; this flag only suppresses Drop work.
             recorded: true,
             evidence: self.evidence.clone(),
+            journal: self.journal.clone(),
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let audit_tasks = abandoned.state.audit_tasks();
@@ -577,6 +606,7 @@ pub(super) async fn dispatch_native_exact(
         error: None,
         recorded: false,
         evidence: evidence.clone(),
+        journal: Arc::new(NativeJournal::new()),
     };
     let native = match &state.trae {
         Ok(v) => v.clone(),
@@ -605,6 +635,7 @@ pub(super) async fn dispatch_native_exact(
     let reserved_entitlement = entitlement.is_some();
     let validate_state = state.clone();
     let validate_selection = selection.clone();
+    let journal = audit.journal.clone();
     let proxy = cfg.http_proxy.clone();
     let stream = native
         .model_stream(
@@ -613,6 +644,25 @@ pub(super) async fn dispatch_native_exact(
             &request,
             deadline.saturating_duration_since(tokio::time::Instant::now()),
             || async {
+                current_until(
+                    &validate_state,
+                    &validate_selection,
+                    proxy.as_deref(),
+                    deadline,
+                    reserved_entitlement,
+                )
+                .await?;
+                // The journal commit is inside the native deadline and before
+                // the first POST poll. Capture its ID for the cancellation audit.
+                let attempt_id = repo::client_usage_journal::record_intent(
+                    &validate_state.db,
+                    &journal.scope_id,
+                    repo::client_usage_journal::AttemptKind::NativeExact,
+                )
+                .await
+                .map_err(|_| CLIENT_JOURNAL_UNAVAILABLE.to_string())?;
+                *journal.attempt_id.lock() = Some(attempt_id);
+                // Config and policy can change while waiting for SQLite.
                 current_until(
                     &validate_state,
                     &validate_selection,
@@ -649,8 +699,10 @@ pub(super) async fn dispatch_native_exact(
             }
             audit.status = i64::from(execution_status(&error).as_u16());
             audit.error = Some(error.clone());
-            if let Err(error) = audit.record().await {
-                return execution_error(&error);
+            if let Err(audit_error) = audit.record().await {
+                if error != CLIENT_JOURNAL_UNAVAILABLE {
+                    return execution_error(&audit_error);
+                }
             }
             return execution_error(&error);
         }
