@@ -17,6 +17,7 @@
 | 第二CN账号的来源隔离、本地保护与ready边界 | [同类型多账号](multi-account-acceptance.md) |
 | 逐跳响应头、首段内容和结束时间的观测与未知边界 | [请求耗时](request-timing.md) |
 | 单请求人工反馈、版本冲突与保留期 | [任务反馈](request-feedback.md) |
+| 客户端 V2 意向账本、SQLite 启动检查及存储边界 | [客户端 V2 意向账本](client-usage-journal.md) |
 | 如何扩展、复用验证和更新本 Wiki | [维护与扩展](maintenance.md) |
 
 ## 当前证据锚点

@@ -239,6 +239,8 @@ CREATE TABLE IF NOT EXISTS app_secrets (
 ];
 
 pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
+    // Reject an invalid V2 contract before starting any legacy schema writes.
+    super::client_usage_journal_schema::preflight(pool).await?;
     super::budget_archive_schema::preflight(pool).await?;
     for (name, sql) in SCHEMA
         .iter()
@@ -397,6 +399,7 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     super::catalog_schema::finish(pool).await?;
     super::budget_archive_schema::migrate(pool).await?;
     super::capability_declaration_schema::migrate(pool).await?;
+    super::client_usage_journal_schema::migrate(pool).await?;
     Ok(())
 }
 

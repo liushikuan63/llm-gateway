@@ -7,6 +7,7 @@ pub(crate) mod budget_archive_schema;
 mod budget_schema;
 mod capability_declaration_schema;
 mod catalog_schema;
+pub mod client_usage_journal_schema;
 mod entitlement_schema;
 pub mod migrations;
 pub mod repo;
@@ -21,6 +22,8 @@ use crate::config;
 #[derive(Clone)]
 pub struct Db {
     pool: SqlitePool,
+    // Clones share the review binding; opening a pool creates a new binding.
+    client_usage_binding: std::sync::Arc<uuid::Uuid>,
 }
 
 impl Db {
@@ -75,7 +78,10 @@ impl Db {
             .await?;
 
         migrations::run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            client_usage_binding: std::sync::Arc::new(uuid::Uuid::new_v4()),
+        })
     }
 
     pub fn pool(&self) -> &SqlitePool {

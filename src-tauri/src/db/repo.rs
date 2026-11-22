@@ -1,5 +1,6 @@
 //! 数据访问。所有 SQL 集中在此，便于后续替换存储后端。
 pub mod catalog;
+pub mod client_usage_journal;
 pub mod conversation_feedback;
 pub(crate) mod native_usage;
 pub mod price_observation;
