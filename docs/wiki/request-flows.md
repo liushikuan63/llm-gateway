@@ -565,6 +565,8 @@ Responses 的 `response.failed`／`error` 也沿用同一已派发未知保护�
 
 仅在流式解析事件层，主用量字段缺失、NULL、部分缺失、溢出或 total 自相矛盾时保留 `usage: None`，不把它们补为已知零；完整已知零仍为 `Some(0)`，输入／输出已知且缺 total 时沿既有和数。非流式转换器和普通线协议的既有标量兼容格式保持原字节，不能据此宣称安装版用量 UI 已验或任意供应商的结算可信。16 种畸形包络分别经正文前／后真实自有 Gateway 读回审计／尝试／无重放；内部变体不累加顶层数量。更深的工具／输出语义、其他网络与版本及实装仍保留。
 
+[Gemini → Responses 双工具调用回归](../../src-tauri/tests/protocol_stream_boundaries.rs) 通过实际网关发送 `POST /v1/responses`，由本机夹具在一条 Gemini SSE 帧内发送两个带显式 ID 的完整 `functionCall`。客户端读到 `response.created`、索引 0／1 各自的 item 与参数增量后，才允许上游发送独立的 `STOP`。正常结束检查对应的两对 done 事件和唯一的 `response.completed`，其中输出保留两项原工具调用和 3／2 用量。同一前缀提前 EOF 时仅返回 `error`，保留输入与已发出的两项工具调用，审计为 502。两条路径各派发一次上游 POST。覆盖范围限于单个 Gemini SSE 帧内的完整调用及后续终止帧，跨帧调用序号、真实供应商和安装版待验。
+
 
 
 

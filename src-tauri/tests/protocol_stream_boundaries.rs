@@ -15,7 +15,12 @@ use llm_gateway_lib::{
 };
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::sync::{Arc, Mutex};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::watch;
 
 #[derive(Clone, Copy, Debug)]
 enum Ending {
@@ -31,6 +36,7 @@ struct Scenario {
     dialect: &'static str,
     ending: Ending,
     reason: &'static str,
+    gemini_tools_gate: Option<watch::Receiver<bool>>,
     calls: Mutex<Vec<(String, String, Value)>>,
 }
 fn event(name: &str, data: Value) -> String {
@@ -124,6 +130,28 @@ fn malformed_terminal(reason: &str) -> String {
     }
     event(v["type"].as_str().unwrap(), v.clone())
 }
+const GEMINI_CALLS: [(&str, &str, &str); 2] = [
+    ("owned-weather", "lookup_weather", r#"{"city":"Paris"}"#),
+    ("owned-clock", "lookup_clock", r#"{"utc_offset":2}"#),
+];
+
+fn gemini_calls_wire() -> String {
+    let parts = GEMINI_CALLS.map(|(id, name, args)| {
+        json!({"functionCall": {"id": id, "name": name, "args": serde_json::from_str::<Value>(args).unwrap()}})
+    });
+    format!(
+        "data: {}\n\n",
+        json!({"candidates": [{"content": {"role": "model", "parts": parts}}]})
+    )
+}
+
+fn gemini_stop_wire() -> String {
+    format!(
+        "data: {}\n\n",
+        json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}})
+    )
+}
+
 fn wire(s: &Scenario) -> String {
     if matches!(s.ending, Ending::MalformedBeforeContent) {
         return malformed_terminal(s.reason);
@@ -183,10 +211,7 @@ fn wire(s: &Scenario) -> String {
                 value += &error_wire(s.dialect);
             }
             if matches!(s.ending, Ending::Complete | Ending::ErrorThenTerminal) {
-                value += &format!(
-                    "data: {}\n\n",
-                    json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}})
-                );
+                value += &gemini_stop_wire();
             }
             value
         }
@@ -260,6 +285,19 @@ async fn respond(State(s): State<Arc<Scenario>>, request: Request) -> Response {
         path,
         serde_json::from_slice(&data).unwrap_or(Value::Null),
     ));
+    let body = if let Some(mut gate) = s.gemini_tools_gate.clone() {
+        let complete = matches!(s.ending, Ending::Complete);
+        Body::from_stream(async_stream::stream! {
+            // Both cases send the same two calls in one Gemini frame, then wait
+            // until the downstream client has checked the corresponding SSE events.
+            yield Ok::<_, Infallible>(gemini_calls_wire());
+            if gate.wait_for(|released| *released).await.is_ok() && complete {
+                yield Ok(gemini_stop_wire());
+            }
+        })
+    } else {
+        Body::from(wire(&s))
+    };
     Response::builder()
         .status(200)
         .header(
@@ -270,7 +308,7 @@ async fn respond(State(s): State<Arc<Scenario>>, request: Request) -> Response {
                 "text/event-stream"
             },
         )
-        .body(Body::from(wire(&s)))
+        .body(body)
         .unwrap()
 }
 struct Owned {
@@ -287,10 +325,21 @@ impl Drop for Owned {
 }
 impl Owned {
     async fn new(dialect: &'static str, ending: Ending, reason: &'static str) -> Self {
+        Self::start(dialect, ending, reason, None).await
+    }
+
+    async fn start(
+        dialect: &'static str,
+        ending: Ending,
+        reason: &'static str,
+        gemini_tools_gate: Option<watch::Receiver<bool>>,
+    ) -> Self {
+        let supports_tools = gemini_tools_gate.is_some();
         let scenario = Arc::new(Scenario {
             dialect,
             ending,
             reason,
+            gemini_tools_gate,
             calls: Mutex::new(Vec::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -311,7 +360,7 @@ impl Owned {
             } else {
                 "backup-physical"
             };
-            let p:Provider=serde_json::from_value(json!({"id":id,"name":id,"base_url":format!("{origin}{suffix}"),"api_key_enc":"","dialect":dialect,"enabled":true,"priority":priority,"rpm_limit":0,"intelligence":50,"runtime_id":null,"created_at":"2026-10-20T00:00:00Z","updated_at":"2026-10-20T00:00:00Z","models":[{"alias":"owned-model","upstream":physical,"enabled":true,"context_window":32768,"supports_tools":false,"supports_vision":false,"supports_audio":false,"supports_video":false,"supports_thinking":false,"supports_stream":true,"model_type":"chat","price":null}]})).unwrap();
+            let p:Provider=serde_json::from_value(json!({"id":id,"name":id,"base_url":format!("{origin}{suffix}"),"api_key_enc":"","dialect":dialect,"enabled":true,"priority":priority,"rpm_limit":0,"intelligence":50,"runtime_id":null,"created_at":"2026-10-20T00:00:00Z","updated_at":"2026-10-20T00:00:00Z","models":[{"alias":"owned-model","upstream":physical,"enabled":true,"context_window":32768,"supports_tools":supports_tools,"supports_vision":false,"supports_audio":false,"supports_video":false,"supports_thinking":false,"supports_stream":true,"model_type":"chat","price":null}]})).unwrap();
             repo::upsert_provider(db.pool(), &p).await.unwrap();
         }
         let mut cfg = AppConfig {
@@ -559,6 +608,236 @@ async fn responses_bad_envelope_after_content_never_turns_partial_output_into_su
         let result = std::panic::AssertUnwindSafe(f.verify())
             .catch_unwind()
             .await;
+        f.finish(result).await;
+    }
+}
+
+async fn next_responses_event(
+    response: &mut reqwest::Response,
+    pending: &mut Vec<u8>,
+) -> Option<Value> {
+    loop {
+        if let Some(end) = pending.windows(2).position(|pair| pair == b"\n\n") {
+            let frame = std::str::from_utf8(&pending[..end]).unwrap();
+            let kind = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))
+                .expect("Responses SSE event name");
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("Responses SSE event data");
+            let payload: Value = serde_json::from_str(data).expect("Responses SSE JSON");
+            assert_eq!(payload["type"], kind);
+            pending.drain(..end + 2);
+            return Some(payload);
+        }
+        let Some(chunk) = response.chunk().await.expect("read Responses SSE chunk") else {
+            assert!(pending.is_empty(), "truncated downstream SSE frame");
+            return None;
+        };
+        pending.extend_from_slice(&chunk);
+    }
+}
+
+async fn verify_gemini_tool_responses(f: &Owned, release: watch::Sender<bool>, complete: bool) {
+    const SESSION: &str = "owned-n4-gemini-tools";
+    const INPUT: &str = "owned tool request";
+    let tools = GEMINI_CALLS.map(
+        |(_, name, _)| json!({"type": "function", "name": name, "parameters": {"type": "object"}}),
+    );
+    let mut response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+        .post(format!("{}/v1/responses", f.base))
+        .bearer_auth("owned-n4-key")
+        .header("x-session-id", SESSION)
+        .json(&json!({"model": "owned-model", "input": INPUT, "stream": true, "tools": tools}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let trace = response.headers()["x-trace-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let mut pending = Vec::new();
+    let created = next_responses_event(&mut response, &mut pending)
+        .await
+        .unwrap();
+    assert_eq!(created["type"], "response.created");
+    assert_eq!(created["response"]["status"], "in_progress");
+    assert_eq!(created["response"]["output"], json!([]));
+    let response_id = created["response"]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .unwrap();
+
+    let mut expected_output = Vec::new();
+    for (index, (call_id, name, arguments)) in GEMINI_CALLS.into_iter().enumerate() {
+        let added = next_responses_event(&mut response, &mut pending)
+            .await
+            .unwrap();
+        assert_eq!(added["type"], "response.output_item.added");
+        assert_eq!(added["output_index"], index);
+        let item_id = added["item"]["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .unwrap();
+        assert_eq!(
+            added["item"],
+            json!({
+                "id": item_id, "type": "function_call", "status": "in_progress",
+                "call_id": call_id, "name": name, "arguments": ""
+            })
+        );
+
+        let delta = next_responses_event(&mut response, &mut pending)
+            .await
+            .unwrap();
+        assert_eq!(delta["type"], "response.function_call_arguments.delta");
+        assert_eq!(delta["output_index"], index);
+        assert_eq!(delta["item_id"], item_id);
+        assert_eq!(delta["delta"], arguments);
+        expected_output.push(json!({
+            "id": item_id, "type": "function_call", "status": "completed",
+            "call_id": call_id, "name": name, "arguments": arguments
+        }));
+    }
+    assert_ne!(expected_output[0]["id"], expected_output[1]["id"]);
+    release.send(true).unwrap();
+
+    if complete {
+        for (index, item) in expected_output.iter().enumerate() {
+            let arguments_done = next_responses_event(&mut response, &mut pending)
+                .await
+                .unwrap();
+            assert_eq!(
+                arguments_done["type"],
+                "response.function_call_arguments.done"
+            );
+            assert_eq!(arguments_done["output_index"], index);
+            assert_eq!(arguments_done["item_id"], item["id"]);
+            for key in ["call_id", "name", "arguments"] {
+                assert_eq!(arguments_done[key], item[key]);
+            }
+            let item_done = next_responses_event(&mut response, &mut pending)
+                .await
+                .unwrap();
+            assert_eq!(item_done["type"], "response.output_item.done");
+            assert_eq!(item_done["output_index"], index);
+            assert_eq!(&item_done["item"], item);
+        }
+        let completed = next_responses_event(&mut response, &mut pending)
+            .await
+            .unwrap();
+        assert_eq!(completed["type"], "response.completed");
+        assert_eq!(completed["response"]["id"], response_id);
+        assert_eq!(completed["response"]["status"], "completed");
+        assert_eq!(completed["response"]["output"], json!(expected_output));
+        assert_eq!(
+            completed["response"]["usage"],
+            json!({
+                "input_tokens": 3, "output_tokens": 2, "total_tokens": 5
+            })
+        );
+    } else {
+        let error = next_responses_event(&mut response, &mut pending)
+            .await
+            .unwrap();
+        assert_eq!(error["type"], "error");
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()));
+    }
+    assert!(next_responses_event(&mut response, &mut pending)
+        .await
+        .is_none());
+
+    f.service.set_enabled(false).await.unwrap();
+    {
+        let calls = f.scenario.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no replay or backup POST");
+        let (method, path, request) = &calls[0];
+        assert_eq!(method, "POST");
+        assert_eq!(
+            path,
+            "/v1beta/models/owned-physical:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(request["contents"][0]["parts"][0]["text"], INPUT);
+        let declarations = request["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(declarations.len(), GEMINI_CALLS.len());
+        for (declaration, (_, name, _)) in declarations.iter().zip(GEMINI_CALLS) {
+            assert_eq!(declaration["name"], name);
+        }
+    }
+
+    let rows = sqlx::query(
+        "SELECT status, prompt_tokens, completion_tokens, fallback_attempts, attempts_json, error FROM requests WHERE trace_id = ?",
+    )
+    .bind(&trace)
+    .fetch_all(f.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(
+        row.get::<i64, _>("status"),
+        if complete { 200 } else { 502 }
+    );
+    assert_eq!(row.get::<i64, _>("fallback_attempts"), 0);
+    let attempts: Value = serde_json::from_str(&row.get::<String, _>("attempts_json")).unwrap();
+    assert_eq!(attempts.as_array().unwrap().len(), 1);
+    assert_eq!(row.get::<Option<String>, _>("error").is_none(), complete);
+    if complete {
+        assert_eq!(row.get::<i64, _>("prompt_tokens"), 3);
+        assert_eq!(row.get::<i64, _>("completion_tokens"), 2);
+    }
+    let sticky: Option<String> =
+        sqlx::query_scalar("SELECT sticky_provider_id FROM sessions WHERE id = ?")
+            .bind(SESSION)
+            .fetch_one(f.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        sticky.as_deref(),
+        if complete { Some("primary") } else { None }
+    );
+
+    let stored = repo::recent_messages(f.state.db.pool(), SESSION, 10)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].role, "user");
+    assert_eq!(stored[0].content, INPUT);
+    assert_eq!(stored[1].role, "assistant");
+    assert!(stored[1].content.is_empty());
+    let stored_calls: Value =
+        serde_json::from_str(stored[1].tool_calls.as_deref().unwrap()).unwrap();
+    let expected_calls = GEMINI_CALLS.map(|(id, name, arguments)| {
+        json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments}})
+    });
+    assert_eq!(stored_calls, json!(expected_calls));
+}
+
+#[tokio::test]
+async fn gemini_tool_calls_stream_to_responses_before_terminal_and_survive_eof() {
+    for (ending, complete) in [(Ending::Complete, true), (Ending::MissingTerminal, false)] {
+        let (release, gate) = watch::channel(false);
+        let f = Owned::start("gemini", ending, "stop", Some(gate)).await;
+        let result =
+            std::panic::AssertUnwindSafe(verify_gemini_tool_responses(&f, release, complete))
+                .catch_unwind()
+                .await;
         f.finish(result).await;
     }
 }
