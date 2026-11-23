@@ -234,6 +234,82 @@ async fn sources_keep_unknown_json_fields_and_corrupt_json_keeps_existing_read_f
     assert_eq!(broken.as_deref(), Some("{ invalid JSON"));
 }
 
+/// The coverage export must report malformed rows while preserving the old
+/// bare-map behavior for existing callers.
+#[tokio::test]
+async fn capability_snapshot_reports_discarded_rows_without_changing_the_old_map() {
+    let db = Db::connect_in_memory().await.unwrap();
+    let p = seed(&db).await;
+    sqlx::query(
+        "UPDATE models SET capability_sources_json='{ invalid JSON with https://leak.invalid/secret' WHERE provider_id=? AND alias='second'",
+    )
+    .bind(&p.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let checked = repo::read_capability_ledgers_snapshot_checked(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(checked.observed, 2);
+    assert_eq!(checked.ledgers.len(), 1);
+    assert!(checked.ledgers.contains_key(&format!("{}/first", p.id)));
+    assert_eq!(checked.discarded.len(), 1);
+    let dropped = &checked.discarded[0];
+    assert_eq!(dropped.key, format!("{}/second", p.id));
+    assert!(!dropped.reason.contains("leak.invalid"));
+    assert!(!dropped.reason.contains("invalid JSON"));
+    assert!(dropped.reason.starts_with("syntax at line "));
+
+    let legacy = repo::read_capability_ledgers_snapshot(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(legacy, checked.ledgers);
+}
+
+#[tokio::test]
+async fn capability_snapshot_reports_null_rows_as_discarded() {
+    let db = Db::connect_in_memory().await.unwrap();
+    let p = seed(&db).await;
+    sqlx::query(
+        "UPDATE models SET capability_sources_json=NULL WHERE provider_id=? AND alias='second'",
+    )
+    .bind(&p.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let checked = repo::read_capability_ledgers_snapshot_checked(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(checked.observed, 2);
+    assert_eq!(checked.ledgers.len(), 1);
+    assert_eq!(checked.discarded.len(), 1);
+    assert_eq!(checked.discarded[0].key, format!("{}/second", p.id));
+    assert_eq!(checked.discarded[0].reason, "null_ledger");
+
+    let legacy = repo::read_capability_ledgers_snapshot(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(legacy, checked.ledgers);
+}
+
+#[tokio::test]
+async fn capability_snapshot_reports_full_coverage_when_nothing_is_dropped() {
+    let db = Db::connect_in_memory().await.unwrap();
+    let p = seed(&db).await;
+    let checked = repo::read_capability_ledgers_snapshot_checked(db.pool())
+        .await
+        .unwrap();
+    assert!(checked.discarded.is_empty());
+    assert_eq!(checked.observed, 2);
+    assert_eq!(checked.ledgers.len(), 2);
+    assert_eq!(
+        checked.ledgers.get(&format!("{}/first", p.id)),
+        Some(&ledger(0.9))
+    );
+}
+
 #[tokio::test]
 async fn failed_model_replacement_rolls_back_provider_sources_and_resolved_values() {
     let db = Db::connect_in_memory().await.unwrap();

@@ -831,28 +831,76 @@ pub async fn write_model_capabilities(
     Ok(result.rows_affected() > 0)
 }
 
+/// A ledger row that could not be exported, and why.
+///
+/// Keep parser details out of the response: stored JSON can contain source
+/// URLs or other sensitive payload, so only the error class and position are
+/// returned.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DiscardedLedger {
+    pub key: String,
+    pub reason: String,
+}
+
+/// One read snapshot plus rows that were discarded while parsing.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CapabilityLedgerSnapshot {
+    pub ledgers: std::collections::BTreeMap<String, crate::capability::CapabilitySet>,
+    pub observed: usize,
+    pub discarded: Vec<DiscardedLedger>,
+}
+
+fn ledger_parse_reason(error: &serde_json::Error) -> String {
+    let class = match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "shape",
+        serde_json::error::Category::Eof => "truncated",
+    };
+    format!("{class} at line {} column {}", error.line(), error.column())
+}
+
 /// Export the known providers' ledgers in one SQLite read statement. Separate
 /// model-by-model reads can straddle an atomic import and export a mixed file.
 /// Keep the existing malformed/null-ledger omission and sorted JSON contract.
 pub async fn read_capability_ledgers_snapshot(
     pool: &SqlitePool,
 ) -> Result<std::collections::BTreeMap<String, crate::capability::CapabilitySet>> {
-    let rows = sqlx::query("SELECT m.provider_id,m.alias,m.capability_sources_json FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.capability_sources_json IS NOT NULL ORDER BY p.priority ASC,p.name ASC,m.alias ASC")
+    Ok(read_capability_ledgers_snapshot_checked(pool)
+        .await?
+        .ledgers)
+}
+
+/// Same snapshot as [`read_capability_ledgers_snapshot`], while reporting rows
+/// that could not be represented in the legacy bare map.
+pub async fn read_capability_ledgers_snapshot_checked(
+    pool: &SqlitePool,
+) -> Result<CapabilityLedgerSnapshot> {
+    let rows = sqlx::query("SELECT m.provider_id,m.alias,m.capability_sources_json FROM models m JOIN providers p ON p.id=m.provider_id ORDER BY p.priority ASC,p.name ASC,m.alias ASC")
         .fetch_all(pool).await?;
-    let mut out = std::collections::BTreeMap::new();
+    let mut out = CapabilityLedgerSnapshot::default();
     for row in rows {
-        if let Some(ledger) = row
-            .get::<Option<String>, _>("capability_sources_json")
-            .and_then(|raw| serde_json::from_str::<crate::capability::CapabilitySet>(&raw).ok())
-        {
-            out.insert(
-                format!(
-                    "{}/{}",
-                    row.get::<String, _>("provider_id"),
-                    row.get::<String, _>("alias")
-                ),
-                ledger,
-            );
+        out.observed += 1;
+        let key = format!(
+            "{}/{}",
+            row.get::<String, _>("provider_id"),
+            row.get::<String, _>("alias")
+        );
+        let Some(raw) = row.get::<Option<String>, _>("capability_sources_json") else {
+            out.discarded.push(DiscardedLedger {
+                key,
+                reason: "null_ledger".to_string(),
+            });
+            continue;
+        };
+        match serde_json::from_str::<crate::capability::CapabilitySet>(&raw) {
+            Ok(ledger) => {
+                out.ledgers.insert(key, ledger);
+            }
+            Err(error) => out.discarded.push(DiscardedLedger {
+                key,
+                reason: ledger_parse_reason(&error),
+            }),
         }
     }
     Ok(out)

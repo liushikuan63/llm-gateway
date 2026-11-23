@@ -530,6 +530,7 @@ pub fn run() {
             commands::set_request_feedback,
             commands::export_requests,
             commands::export_capabilities,
+            commands::export_capabilities_with_coverage,
             commands::capability_pareto,
             commands::explain_routing,
             commands::preview_routing_request,

@@ -283,6 +283,7 @@ impl OwnedIpc {
                 get_remote_key_budget_snapshot,
                 import_capabilities,
                 export_capabilities,
+                export_capabilities_with_coverage,
                 price_observations,
                 list_sessions_page,
             ])
@@ -905,6 +906,30 @@ fn seed_capability_transfer(h: &OwnedIpc) {
             .await
             .unwrap();
     });
+}
+
+#[test]
+fn capability_transfer_coverage_command_reports_malformed_rows() {
+    let h = OwnedIpc::new();
+    seed_capability_transfer(&h);
+    tauri::async_runtime::block_on(
+        sqlx::query(
+            "UPDATE models SET capability_sources_json='{ invalid JSON with https://leak.invalid/secret' WHERE provider_id='owned-cap' AND alias='b'",
+        )
+        .execute(h.db.pool()),
+    )
+    .unwrap();
+
+    let snapshot = h
+        .invoke("export_capabilities_with_coverage", json!({}))
+        .unwrap();
+    assert_eq!(snapshot["observed"], 2);
+    assert_eq!(snapshot["ledgers"].as_object().unwrap().len(), 1);
+    assert_eq!(snapshot["discarded"].as_array().unwrap().len(), 1);
+    let reason = snapshot["discarded"][0]["reason"].as_str().unwrap();
+    assert!(reason.starts_with("syntax at line "));
+    assert!(!reason.contains("leak.invalid"));
+    assert!(!reason.contains("invalid JSON"));
 }
 
 #[test]

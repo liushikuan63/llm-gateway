@@ -4036,6 +4036,16 @@ pub async fn export_capabilities(state: State<'_, AppState>) -> Result<String, S
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
+/// Export capability ledgers together with rows discarded during parsing.
+#[tauri::command]
+pub async fn export_capabilities_with_coverage(
+    state: State<'_, AppState>,
+) -> Result<crate::db::repo::CapabilityLedgerSnapshot, String> {
+    repo::read_capability_ledgers_snapshot_checked(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 导入结果。**把跳过的东西回给用户看** ——
 /// 静默跳过会让他以为数据齐了。
 #[derive(Debug, Serialize)]
