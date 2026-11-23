@@ -461,6 +461,13 @@ mod tests {
     async fn fixture(
         database: db::Db,
     ) -> (Arc<GatewayState>, Provider, RemoteAccessKey, Arc<AtomicU32>) {
+        fixture_at(database, Utc::now()).await
+    }
+
+    async fn fixture_at(
+        database: db::Db,
+        now: chrono::DateTime<Utc>,
+    ) -> (Arc<GatewayState>, Provider, RemoteAccessKey, Arc<AtomicU32>) {
         let count = Arc::new(AtomicU32::new(0));
         let observed = count.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -469,7 +476,6 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let now = Utc::now();
         let p:Provider=serde_json::from_value(serde_json::json!({"id":"owned","name":"owned","dialect":"openai","base_url":format!("http://{addr}"),"api_key_enc":"","enabled":true,"priority":0,"models":[{"enabled":true,"alias":"owned","upstream":"owned","context_window":100,"supports_tools":false,"supports_vision":false,"supports_audio":false,"supports_video":false,"supports_thinking":false,"supports_stream":true,"model_type":"chat","price":{"prompt":0.0,"completion":1.0,"currency":"usd"}}],"rpm_limit":0,"intelligence":50,"created_at":now,"updated_at":now})).unwrap();
         repo::upsert_provider(database.pool(), &p).await.unwrap();
         let k = RemoteAccessKey {
@@ -550,9 +556,14 @@ mod tests {
         let path = dir.join("owned-budget.sqlite");
         eprintln!("owned durable budget fixture: {}", path.display());
         let database = db::Db::connect_path(&path).await.unwrap();
-        let (state, p, k, count) = fixture(database).await;
-        let mut ctx = request(&state, k.clone());
         let month = super::super::month_start_secs(1_791_000_000);
+        // Key creation seeds the first month of budget history.
+        let (state, p, k, count) = fixture_at(
+            database,
+            chrono::DateTime::from_timestamp(month, 0).unwrap(),
+        )
+        .await;
+        let mut ctx = request(&state, k.clone());
         Arc::get_mut(&mut ctx).unwrap().month = month;
         let body = serde_json::json!({"max_tokens":2});
         let permit = scope(ctx, before_http(&p, "owned", &body))
