@@ -1519,6 +1519,34 @@ fn gemini_usage(v: &serde_json::Value) -> Option<Usage> {
     Some(Usage::from_gemini(usage))
 }
 
+/// Ollama's terminal counters for the desktop display. Legacy normalized
+/// usage is computed separately; it cannot prove that either field was sent.
+fn desktop_ollama_usage(raw: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let count = |name| {
+        raw.get(name)
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let prompt = count("prompt_eval_count");
+    let completion = count("eval_count");
+    let mut usage = Map::new();
+    if let Some(tokens) = prompt {
+        usage.insert("prompt_tokens".into(), tokens.into());
+    }
+    if let Some(tokens) = completion {
+        usage.insert("completion_tokens".into(), tokens.into());
+    }
+    if let Some(total) = prompt.zip(completion).and_then(|(a, b)| a.checked_add(b)) {
+        usage.insert("total_tokens".into(), total.into());
+    }
+    if usage.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(usage)
+    }
+}
+
 fn parse_ollama_chunk(
     v: serde_json::Value,
     out: &mut Vec<Result<UpstreamEvent>>,
@@ -1553,6 +1581,11 @@ fn parse_ollama_chunk(
             total_tokens: prompt_tokens + completion_tokens,
             ..Default::default()
         });
+        // An explicit null also prevents the desktop observer from falling
+        // back to compatibility counters when neither source count is useful.
+        out.push(Ok(UpstreamEvent::UsageObservation(desktop_ollama_usage(
+            &v,
+        ))));
         out.push(Ok(UpstreamEvent::Done {
             finish_reason: if has_tool_calls {
                 Some("tool_calls".into())

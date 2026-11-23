@@ -3,6 +3,7 @@ use axum::{body::Body, response::IntoResponse, routing::post, Json, Router};
 use llm_gateway_lib::{
     config::AppConfig,
     db::{repo, Db},
+    desktop_chat::{self, ChatInput, ChatMessage},
     domain::Provider,
     proxy::server::GatewayState,
     proxy_control::gateway::GatewayService,
@@ -34,7 +35,16 @@ impl Drop for Owned {
     }
 }
 impl Owned {
-    async fn new(report: Value, ending: &'static str, cache: bool) -> Self {
+    async fn new(mut report: Value, ending: &'static str, cache: bool) -> Self {
+        report
+            .as_object_mut()
+            .unwrap()
+            .entry("prompt_eval_count")
+            .or_insert(json!(3));
+        Self::with_terminal_report(report, ending, cache).await
+    }
+
+    async fn with_terminal_report(report: Value, ending: &'static str, cache: bool) -> Self {
         let calls = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(std::sync::Mutex::new(vec![]));
         let hold_first = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -52,11 +62,11 @@ impl Owned {
                 axum::serve(listener,Router::new().route("/api/chat",post(move |Json(request):Json<Value>|{let calls=calls.clone();let requests=requests.clone();let hold_first=hold_first.clone();let first_started=first_started.clone();let release_first=release_first.clone();let report=report.clone();async move {
    requests.lock().unwrap().push(request.clone());
    if hold_first.swap(false,Ordering::SeqCst) { first_started.notify_one();release_first.notified().await; }
-   calls.fetch_add(1,Ordering::SeqCst);let mut final_report=json!({"model":"owned-physical","message":{"role":"assistant","content":"owned"},"done":true,"done_reason":"stop","prompt_eval_count":3});
+   calls.fetch_add(1,Ordering::SeqCst);let mut final_report=json!({"model":"owned-physical","message":{"role":"assistant","content":"owned"},"done":true,"done_reason":"stop"});
    for (k,v) in report.as_object().unwrap(){final_report[k]=v.clone();}
    if request["stream"]==true {
     let first=json!({"model":"owned-physical","message":{"role":"assistant","content":"owned"},"done":false});
-    let last=match ending {"missing"=>String::new(),"error"=>format!("{}\n",json!({"error":"owned-private-inline-marker","done":true,"eval_count":18,"eval_duration":2000000000u64})),_=>format!("{final_report}\n")};
+    let last=match ending {"missing"=>String::new(),"eof"=>final_report.to_string(),"truncated"=>final_report.to_string().strip_suffix('}').unwrap().to_owned(),"error"=>format!("{}\n",json!({"error":"owned-private-inline-marker","done":true,"eval_count":18,"eval_duration":2000000000u64})),_=>format!("{final_report}\n")};
     return ([("content-type","application/x-ndjson")],Body::from(format!("{first}\r\n{last}"))).into_response();
    }
    Json(final_report).into_response()
@@ -95,7 +105,24 @@ impl Owned {
         }
     }
     async fn send(&self, stream: bool) -> (String, String) {
-        let response=reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build().unwrap().post(format!("{}/v1/chat/completions",self.base)).bearer_auth("owned-generation-key").json(&json!({"model":"owned-generation","messages":[{"role":"user","content":"owned"}],"stream":stream,"max_tokens":32})).send().await.unwrap();
+        self.send_chat(stream, false).await
+    }
+
+    async fn send_chat(&self, stream: bool, desktop_observation: bool) -> (String, String) {
+        let request = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap()
+            .post(format!("{}/v1/chat/completions", self.base))
+            .bearer_auth("owned-generation-key")
+            .json(&json!({"model":"owned-generation","messages":[{"role":"user","content":"owned"}],"stream":stream,"max_tokens":32}));
+        let request = if desktop_observation {
+            request.header("x-llmgw-desktop-observation", "1")
+        } else {
+            request
+        };
+        let response = request.send().await.unwrap();
         assert_eq!(response.status().as_u16(), 200);
         let trace = response
             .headers()
@@ -375,4 +402,186 @@ async fn final_send_observation_context_changes_with_actual_bound_config_not_mod
         assert_eq!(aa[0]["generation"]["rate_tokens_per_second"], 9.0);
         assert_eq!(bb[0]["generation"]["rate_tokens_per_second"], 9.0);
     }
+}
+
+fn sse_frames(body: &str) -> Vec<(Option<&str>, Value)> {
+    body.split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .map(|frame| {
+            let event = frame.lines().find_map(|line| line.strip_prefix("event: "));
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            if data == "[DONE]" {
+                return (event, json!("[DONE]"));
+            }
+            let mut value: Value = serde_json::from_str(data).unwrap();
+            if let Some(object) = value.as_object_mut() {
+                // The public request identifiers and wall time vary with each request.
+                object.remove("id");
+                object.remove("created");
+            }
+            (event, value)
+        })
+        .collect()
+}
+
+async fn assert_ollama_desktop_usage(report: Value, ending: &'static str, expected: Value) {
+    let h = Owned::with_terminal_report(report, ending, false).await;
+    let (_, ordinary) = h.send_chat(true, false).await;
+    assert_eq!(
+        h.calls.load(Ordering::SeqCst),
+        1,
+        "ordinary stream dispatch"
+    );
+    let (_, desktop) = h.send_chat(true, true).await;
+    assert_eq!(h.calls.load(Ordering::SeqCst), 2, "desktop stream dispatch");
+    let ordinary = sse_frames(&ordinary);
+    let mut desktop = sse_frames(&desktop);
+    h.stop().await;
+    const PRIVATE: Option<&str> = Some("llmgw_reply_observation");
+    assert!(!ordinary.iter().any(|f| f.0 == PRIVATE));
+    assert_eq!(ordinary.last(), Some(&(None, json!("[DONE]"))));
+    let observations: Vec<_> = desktop
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.0 == PRIVATE)
+        .collect();
+    assert_eq!(observations.len(), 1);
+    let (i, frame) = observations[0];
+    assert_eq!(
+        i + 3,
+        desktop.len(),
+        "private frame before public finish and [DONE]"
+    );
+    assert_eq!(desktop[i + 1].1["choices"][0]["finish_reason"], "stop");
+    let present = !expected.is_null();
+    assert_eq!(
+        frame.1,
+        json!({"version":1,"finish_reason":"stop","usage_present":present,
+            "usage":expected,"usage_evidence":if present {"unknown"} else {"unobserved"}}),
+        "Ollama private frame must preserve reported counters without compatibility defaults"
+    );
+    desktop.remove(i);
+    assert_eq!(desktop, ordinary, "opt-in does not change public SSE");
+}
+
+#[tokio::test]
+async fn ollama_desktop_usage_keeps_explicit_zero_at_eof() {
+    assert_ollama_desktop_usage(
+        json!({"prompt_eval_count":0,"eval_count":0}),
+        "eof",
+        json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ollama_desktop_usage_keeps_partial_counts_without_defaults() {
+    assert_ollama_desktop_usage(
+        json!({"prompt_eval_count":0}),
+        "complete",
+        json!({"prompt_tokens":0}),
+    )
+    .await;
+    assert_ollama_desktop_usage(
+        json!({"eval_count":7}),
+        "complete",
+        json!({"completion_tokens":7}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ollama_desktop_usage_omits_invalid_and_wide_counts() {
+    assert_ollama_desktop_usage(
+        json!({"prompt_eval_count": u64::from(u32::MAX) + 2,"eval_count":5}),
+        "complete",
+        json!({"completion_tokens":5}),
+    )
+    .await;
+    assert_ollama_desktop_usage(
+        json!({"prompt_eval_count": 0,"eval_count":"5"}),
+        "complete",
+        json!({"prompt_tokens":0}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ollama_desktop_usage_preserves_missing_and_complete_controls() {
+    assert_ollama_desktop_usage(json!({}), "complete", Value::Null).await;
+    assert_ollama_desktop_usage(
+        json!({"prompt_eval_count":3,"eval_count":7}),
+        "complete",
+        json!({"prompt_tokens":3,"completion_tokens":7,"total_tokens":10}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ollama_desktop_usage_reaches_the_desktop_stream_reader() {
+    let h = Owned::with_terminal_report(json!({"prompt_eval_count":0}), "complete", false).await;
+    let mut events = Vec::new();
+    let result = desktop_chat::stream::send(
+        &h.state.cfg_snapshot(),
+        h.state.listener_snapshot().unwrap().bound_addr,
+        ChatInput {
+            personal_test: false,
+            model: "owned-generation".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "owned".into(),
+                reasoning_content: None,
+            }],
+            session_id: uuid::Uuid::new_v4().to_string(),
+            max_tokens: 32,
+        },
+        uuid::Uuid::new_v4(),
+        |event| {
+            events.push(event);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    h.stop().await;
+    assert_eq!(h.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.content, "ownedowned");
+    assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.text.as_str())
+            .collect::<String>(),
+        result.content
+    );
+    assert_eq!(result.usage, Some(json!({"prompt_tokens":0})));
+    assert_eq!(
+        serde_json::to_value(result.response_metadata.unwrap()).unwrap(),
+        json!({"finish_reason":"reported","usage":"reported","usage_evidence":"unknown"}),
+    );
+}
+
+#[tokio::test]
+async fn ollama_desktop_usage_does_not_claim_success_on_truncated_eof() {
+    let h = Owned::with_terminal_report(
+        json!({"prompt_eval_count":0,"eval_count":0}),
+        "truncated",
+        false,
+    )
+    .await;
+    let (trace, body) = h.send_chat(true, true).await;
+    let (status, _) = h.audit(&trace).await;
+    h.stop().await;
+    assert_eq!(status, 502);
+    assert_eq!(h.calls.load(Ordering::SeqCst), 1);
+    let frames = sse_frames(&body);
+    assert!(frames
+        .iter()
+        .any(|(_, v)| v["choices"][0]["delta"]["content"] == "owned"));
+    assert!(!frames
+        .iter()
+        .any(|(event, v)| *event == Some("llmgw_reply_observation") || *v == "[DONE]"));
 }

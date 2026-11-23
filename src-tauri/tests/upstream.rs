@@ -243,7 +243,7 @@ async fn ollama_ndjson_emits_incremental_tool_calls_and_completion_events() {
     }
     server.abort();
 
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
     match &events[0] {
         UpstreamEvent::Delta(content) => assert_eq!(content, "Hel"),
         event => panic!("expected first Ollama increment, got {event:?}"),
@@ -267,7 +267,15 @@ async fn ollama_ndjson_emits_incremental_tool_calls_and_completion_events() {
         ),
         event => panic!("expected Ollama tool-call event, got {event:?}"),
     }
-    match &events[3] {
+    assert!(
+        matches!(
+            &events[3],
+            UpstreamEvent::UsageObservation(serde_json::Value::Null)
+        ),
+        "expected private observation of missing counters, got {:?}",
+        events[3]
+    );
+    match &events[4] {
         UpstreamEvent::Done {
             finish_reason,
             usage,
@@ -973,9 +981,17 @@ fn transport_terminal_does_not_fabricate_a_reported_finish_reason() {
         (Dialect::Ollama, "data: {\"done\":true}\n\n"),
     ] {
         let events = parse_sse_block(dialect, wire.as_bytes());
+        let terminal = match (dialect, events.as_slice()) {
+            (
+                Dialect::Ollama,
+                [Ok(UpstreamEvent::UsageObservation(serde_json::Value::Null)), done],
+            ) => done,
+            (Dialect::OpenAI | Dialect::Anthropic, [done]) => done,
+            _ => panic!("unexpected {dialect:?} terminal events: {events:?}"),
+        };
         assert!(
             matches!(
-                &events[0],
+                terminal,
                 Ok(UpstreamEvent::Done {
                     finish_reason: None,
                     usage: None
