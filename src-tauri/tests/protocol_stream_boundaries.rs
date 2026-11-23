@@ -36,7 +36,7 @@ struct Scenario {
     dialect: &'static str,
     ending: Ending,
     reason: &'static str,
-    gemini_tools: Option<(GeminiToolFrames, watch::Receiver<bool>)>,
+    tool_frames: Option<(ToolFrames, watch::Receiver<u8>)>,
     calls: Mutex<Vec<(String, String, Value)>>,
 }
 fn event(name: &str, data: Value) -> String {
@@ -131,34 +131,37 @@ fn malformed_terminal(reason: &str) -> String {
     event(v["type"].as_str().unwrap(), v.clone())
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GeminiToolFrames {
+enum ToolFrames {
     SameFrame,
     Split,
     SplitWithoutIds,
     SplitWithUndelimitedTail,
+    SplitWithTruncatedRecord,
 }
 
-type GeminiCall = (&'static str, &'static str, &'static str);
+type ToolCall = (&'static str, &'static str, &'static str);
 
-const GEMINI_CALLS: [GeminiCall; 2] = [
+const TOOL_CALLS: [ToolCall; 2] = [
     ("owned-weather", "lookup_weather", r#"{"city":"Paris"}"#),
     ("owned-clock", "lookup_clock", r#"{"utc_offset":2}"#),
 ];
 
-impl GeminiToolFrames {
-    fn expected_calls(self) -> [GeminiCall; 2] {
+impl ToolFrames {
+    fn expected_calls(self) -> Vec<ToolCall> {
         if self == Self::SplitWithoutIds {
-            [
-                ("call_0", GEMINI_CALLS[0].1, GEMINI_CALLS[0].2),
-                ("call_1", GEMINI_CALLS[1].1, GEMINI_CALLS[1].2),
+            vec![
+                ("call_0", TOOL_CALLS[0].1, TOOL_CALLS[0].2),
+                ("call_1", TOOL_CALLS[1].1, TOOL_CALLS[1].2),
             ]
+        } else if self == Self::SplitWithTruncatedRecord {
+            TOOL_CALLS[..1].to_vec()
         } else {
-            GEMINI_CALLS
+            TOOL_CALLS.to_vec()
         }
     }
 }
 
-fn gemini_calls_wire(calls: &[GeminiCall], include_ids: bool) -> String {
+fn gemini_calls_wire(calls: &[ToolCall], include_ids: bool) -> String {
     let parts: Vec<_> = calls
         .iter()
         .map(|(id, name, args)| {
@@ -180,6 +183,30 @@ fn gemini_stop_wire() -> String {
     format!(
         "data: {}\n\n",
         json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}})
+    )
+}
+
+fn ollama_calls_wire(calls: &[ToolCall], include_ids: bool) -> String {
+    let calls: Vec<_> = calls
+        .iter()
+        .map(|(id, name, args)| {
+            let mut call = json!({
+                "function": {"name": name, "arguments": serde_json::from_str::<Value>(args).unwrap()}
+            });
+            if include_ids {
+                call["id"] = json!(id);
+            }
+            call
+        })
+        .collect();
+    json!({"model":"owned-physical","message":{"role":"assistant","content":"","tool_calls":calls},"done":false})
+        .to_string()
+}
+
+fn ollama_done_wire() -> String {
+    format!(
+        "{}\n",
+        json!({"model":"owned-physical","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":2})
     )
 }
 
@@ -255,10 +282,7 @@ fn wire(s: &Scenario) -> String {
                 value += &error_wire(s.dialect);
             }
             if matches!(s.ending, Ending::Complete | Ending::ErrorThenTerminal) {
-                value += &format!(
-                    "{}\n",
-                    json!({"model":"owned-physical","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":2})
-                );
+                value += &ollama_done_wire();
             }
             value
         }
@@ -316,27 +340,50 @@ async fn respond(State(s): State<Arc<Scenario>>, request: Request) -> Response {
         path,
         serde_json::from_slice(&data).unwrap_or(Value::Null),
     ));
-    let body = if let Some((frames, mut gate)) = s.gemini_tools.clone() {
+    let body = if let Some((frames, mut gate)) = s.tool_frames.clone() {
         let complete = matches!(s.ending, Ending::Complete);
+        let ollama = s.dialect == "ollama";
+        let (frame, delimiter, terminal) = if ollama {
+            (
+                ollama_calls_wire as fn(&[ToolCall], bool) -> String,
+                "\n",
+                ollama_done_wire as fn() -> String,
+            )
+        } else {
+            (
+                gemini_calls_wire as fn(&[ToolCall], bool) -> String,
+                "\n\n",
+                gemini_stop_wire as fn() -> String,
+            )
+        };
         Body::from_stream(async_stream::stream! {
-            let include_ids = frames != GeminiToolFrames::SplitWithoutIds;
-            if frames == GeminiToolFrames::SameFrame {
-                yield Ok::<_, Infallible>(gemini_calls_wire(&GEMINI_CALLS, include_ids) + "\n\n");
+            let include_ids = frames != ToolFrames::SplitWithoutIds;
+            if frames == ToolFrames::SameFrame {
+                yield Ok::<_, Infallible>(frame(&TOOL_CALLS, include_ids) + delimiter);
             } else {
-                yield Ok(gemini_calls_wire(&GEMINI_CALLS[..1], include_ids) + "\n\n");
-                let second = gemini_calls_wire(&GEMINI_CALLS[1..], include_ids);
-                if frames == GeminiToolFrames::SplitWithUndelimitedTail {
-                    // No delimiter or protocol terminal. Only HTTP EOF exposes this complete JSON.
-                    if gate.wait_for(|released| *released).await.is_ok() {
-                        yield Ok(second);
-                    }
+                yield Ok(frame(&TOOL_CALLS[..1], include_ids) + delimiter);
+                // Make the two tool messages reach the client in separate HTTP reads.
+                if gate.wait_for(|phase| *phase >= 1).await.is_err() {
                     return;
                 }
-                yield Ok(second + "\n\n");
+                let mut second = frame(&TOOL_CALLS[1..], include_ids);
+                match frames {
+                    ToolFrames::SplitWithUndelimitedTail => {
+                        // HTTP EOF exposes the complete JSON without a protocol terminal.
+                        yield Ok(second);
+                        return;
+                    }
+                    ToolFrames::SplitWithTruncatedRecord => {
+                        second.pop().unwrap();
+                        yield Ok(second);
+                        return;
+                    }
+                    _ => yield Ok(second + delimiter),
+                }
             }
             // Release the terminal (or EOF) only after the client saw both calls.
-            if gate.wait_for(|released| *released).await.is_ok() && complete {
-                yield Ok(gemini_stop_wire());
+            if gate.wait_for(|phase| *phase >= 2).await.is_ok() && complete {
+                yield Ok(terminal());
             }
         })
     } else {
@@ -376,14 +423,14 @@ impl Owned {
         dialect: &'static str,
         ending: Ending,
         reason: &'static str,
-        gemini_tools: Option<(GeminiToolFrames, watch::Receiver<bool>)>,
+        tool_frames: Option<(ToolFrames, watch::Receiver<u8>)>,
     ) -> Self {
-        let supports_tools = gemini_tools.is_some();
+        let supports_tools = tool_frames.is_some();
         let scenario = Arc::new(Scenario {
             dialect,
             ending,
             reason,
-            gemini_tools,
+            tool_frames,
             calls: Mutex::new(Vec::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -684,16 +731,16 @@ async fn next_responses_event(
     }
 }
 
-async fn verify_gemini_tool_responses(
+async fn verify_tool_responses(
     f: &Owned,
-    release: watch::Sender<bool>,
-    frames: GeminiToolFrames,
+    release: watch::Sender<u8>,
+    frames: ToolFrames,
     complete: bool,
 ) {
-    const SESSION: &str = "owned-n4-gemini-tools";
+    const SESSION: &str = "owned-n4-upstream-tools";
     const INPUT: &str = "owned tool request";
     let calls = frames.expected_calls();
-    let tools = calls.map(
+    let tools = TOOL_CALLS.map(
         |(_, name, _)| json!({"type": "function", "name": name, "parameters": {"type": "object"}}),
     );
     let mut response = reqwest::Client::builder()
@@ -731,13 +778,14 @@ async fn verify_gemini_tool_responses(
         .unwrap();
 
     let mut expected_output = Vec::new();
-    for (index, (call_id, name, arguments)) in calls.into_iter().enumerate() {
+    for (index, (call_id, name, arguments)) in calls.iter().copied().enumerate() {
         let added = next_responses_event(&mut response, &mut pending)
             .await
             .unwrap();
         assert_eq!(
             added["type"], "response.output_item.added",
-            "{frames:?} call {index} must open a separate Responses item"
+            "{} {frames:?} call {index} must open a separate Responses item",
+            f.scenario.dialect
         );
         assert_eq!(added["output_index"], index);
         let item_id = added["item"]["id"]
@@ -763,14 +811,19 @@ async fn verify_gemini_tool_responses(
             "id": item_id, "type": "function_call", "status": "completed",
             "call_id": call_id, "name": name, "arguments": arguments
         }));
-        if index == 0 && frames == GeminiToolFrames::SplitWithUndelimitedTail {
-            release.send(true).unwrap();
+        if index == 0 && frames != ToolFrames::SameFrame {
+            release.send(1).unwrap();
         }
     }
-    assert_ne!(expected_output[0]["id"], expected_output[1]["id"]);
-    assert_ne!(expected_output[0]["call_id"], expected_output[1]["call_id"]);
-    if frames != GeminiToolFrames::SplitWithUndelimitedTail {
-        release.send(true).unwrap();
+    if expected_output.len() == 2 {
+        assert_ne!(expected_output[0]["id"], expected_output[1]["id"]);
+        assert_ne!(expected_output[0]["call_id"], expected_output[1]["call_id"]);
+    }
+    if !matches!(
+        frames,
+        ToolFrames::SplitWithUndelimitedTail | ToolFrames::SplitWithTruncatedRecord
+    ) {
+        release.send(2).unwrap();
     }
 
     if complete {
@@ -826,17 +879,29 @@ async fn verify_gemini_tool_responses(
         assert_eq!(upstream_requests.len(), 1, "no replay or backup POST");
         let (method, path, request) = &upstream_requests[0];
         assert_eq!(method, "POST");
-        assert_eq!(
-            path,
-            "/v1beta/models/owned-physical:streamGenerateContent?alt=sse"
-        );
-        assert_eq!(request["contents"][0]["parts"][0]["text"], INPUT);
-        let declarations = request["tools"][0]["functionDeclarations"]
-            .as_array()
-            .unwrap();
-        assert_eq!(declarations.len(), calls.len());
-        for (declaration, (_, name, _)) in declarations.iter().zip(calls) {
-            assert_eq!(declaration["name"], name);
+        if f.scenario.dialect == "ollama" {
+            assert_eq!(path, "/api/chat");
+            assert_eq!(request["model"], "owned-physical");
+            assert_eq!(request["stream"], true);
+            assert_eq!(request["messages"][0]["content"], INPUT);
+            let declarations = request["tools"].as_array().unwrap();
+            assert_eq!(declarations.len(), TOOL_CALLS.len());
+            for (declaration, (_, name, _)) in declarations.iter().zip(TOOL_CALLS) {
+                assert_eq!(declaration["function"]["name"], name);
+            }
+        } else {
+            assert_eq!(
+                path,
+                "/v1beta/models/owned-physical:streamGenerateContent?alt=sse"
+            );
+            assert_eq!(request["contents"][0]["parts"][0]["text"], INPUT);
+            let declarations = request["tools"][0]["functionDeclarations"]
+                .as_array()
+                .unwrap();
+            assert_eq!(declarations.len(), TOOL_CALLS.len());
+            for (declaration, (_, name, _)) in declarations.iter().zip(TOOL_CALLS) {
+                assert_eq!(declaration["name"], name);
+            }
         }
     }
 
@@ -882,40 +947,67 @@ async fn verify_gemini_tool_responses(
     assert!(stored[1].content.is_empty());
     let stored_calls: Value =
         serde_json::from_str(stored[1].tool_calls.as_deref().unwrap()).unwrap();
-    let expected_calls = calls.map(|(id, name, arguments)| {
-        json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments}})
-    });
+    let expected_calls: Vec<_> = calls
+        .into_iter()
+        .map(|(id, name, arguments)| {
+            json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments}})
+        })
+        .collect();
     assert_eq!(stored_calls, json!(expected_calls));
 }
 
-async fn check_gemini_tool_frames(frames: GeminiToolFrames, ending: Ending) {
-    let (release, gate) = watch::channel(false);
-    let f = Owned::start("gemini", ending, "stop", Some((frames, gate))).await;
+async fn check_tool_frames(dialect: &'static str, frames: ToolFrames, ending: Ending) {
+    let (release, gate) = watch::channel(0);
+    let f = Owned::start(dialect, ending, "stop", Some((frames, gate))).await;
     let complete = matches!(ending, Ending::Complete);
-    let result =
-        std::panic::AssertUnwindSafe(verify_gemini_tool_responses(&f, release, frames, complete))
-            .catch_unwind()
-            .await;
+    let result = std::panic::AssertUnwindSafe(verify_tool_responses(&f, release, frames, complete))
+        .catch_unwind()
+        .await;
     f.finish(result).await;
 }
 
 #[tokio::test]
 async fn gemini_tool_calls_stream_to_responses_before_terminal_and_survive_eof() {
     for ending in [Ending::Complete, Ending::MissingTerminal] {
-        check_gemini_tool_frames(GeminiToolFrames::SameFrame, ending).await;
+        check_tool_frames("gemini", ToolFrames::SameFrame, ending).await;
     }
 }
 
 #[tokio::test]
 async fn gemini_tool_calls_keep_distinct_identity_across_sse_frames() {
     for (frames, ending) in [
-        (GeminiToolFrames::Split, Ending::Complete),
-        (GeminiToolFrames::SplitWithoutIds, Ending::MissingTerminal),
+        (ToolFrames::Split, Ending::Complete),
+        (ToolFrames::SplitWithoutIds, Ending::MissingTerminal),
         (
-            GeminiToolFrames::SplitWithUndelimitedTail,
+            ToolFrames::SplitWithUndelimitedTail,
             Ending::MissingTerminal,
         ),
     ] {
-        check_gemini_tool_frames(frames, ending).await;
+        check_tool_frames("gemini", frames, ending).await;
     }
+}
+
+#[tokio::test]
+async fn ollama_tool_calls_keep_distinct_identity_across_ndjson_records() {
+    check_tool_frames("ollama", ToolFrames::SplitWithoutIds, Ending::Complete).await;
+}
+
+#[tokio::test]
+async fn ollama_tool_calls_keep_identity_in_a_complete_undelimited_record_at_eof() {
+    check_tool_frames(
+        "ollama",
+        ToolFrames::SplitWithUndelimitedTail,
+        Ending::MissingTerminal,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ollama_truncated_tool_record_does_not_invent_a_second_call_or_completion() {
+    check_tool_frames(
+        "ollama",
+        ToolFrames::SplitWithTruncatedRecord,
+        Ending::MissingTerminal,
+    )
+    .await;
 }

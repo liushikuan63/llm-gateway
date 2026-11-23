@@ -569,6 +569,8 @@ Responses 的 `response.failed`／`error` 也沿用同一已派发未知保护�
 
 Gemini 的完整 `functionCall` 在每次上游派发内按出现顺序编号。常规 SSE 帧与 EOF 时可解析的最后一帧共用这套编号。保留上游显式 ID，缺失时使用对应的 `call_{index}`。Responses 流里的工具项及本地持久化各自保留原调用的 ID、名称和参数。跨帧回归覆盖两帧后收到 `STOP`、缺少 ID 时提前 EOF，以及末帧没有空行时提前 EOF。后两种只发出错误终态，审计为 502。本地夹具验证范围为完整调用，真实供应商、Gemini 参数增量和安装版另验。
 
+[Ollama → Responses 跨记录回归](../../src-tauri/tests/protocol_stream_boundaries.rs) 使用自有 `/api/chat` 夹具。每次派发内，完整的 `tool_calls` 按出现顺序编号，NDJSON 行与 EOF 时可解析的无换行尾行共用编号。保留显式 ID，缺失时使用 `call_{index}`。收到 `done:true` 才成功完成；如果只有 EOF，保留已读完整调用并返回错误。截断的尾行不新增调用，也不产生成功终态。回归核对每个可见工具项的 ID、名称和参数，以及 SQLite 持久化和单次上游派发。真实 Ollama 和安装版仍需单独验证。
+
 
 
 

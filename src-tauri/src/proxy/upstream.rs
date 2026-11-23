@@ -829,9 +829,9 @@ impl UpstreamClient {
             let _free_permit=free_permit;
             let mut budget_report=crate::budget::holds::StreamReport::default();
             let mut buffer = Vec::new();
-            // Gemini emits whole calls without a stream index. Keep one sequence
-            // for this upstream attempt, including a final undelimited frame.
-            let mut next_gemini_tool_index = 0;
+            // Gemini and Ollama emit whole calls without a stream index. Keep
+            // one sequence per attempt, including the final undelimited record.
+            let mut next_tool_index = 0;
 
             while let Some(chunk) = bytes.next().await {
                 match chunk {
@@ -840,8 +840,8 @@ impl UpstreamClient {
                         if let Some(observer) = &byte_observer { observer.received(chunk.len()); }
                         buffer.extend_from_slice(&chunk);
                         let events = match dialect {
-                            Dialect::Ollama => drain_ollama_lines(&mut buffer, generation.as_ref()),
-                            _ => drain_sse_blocks(dialect, &mut buffer, &mut next_gemini_tool_index),
+                            Dialect::Ollama => drain_ollama_lines(&mut buffer, generation.as_ref(), &mut next_tool_index),
+                            _ => drain_sse_blocks(dialect, &mut buffer, &mut next_tool_index),
                         };
                         for event in events {
                             if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
@@ -862,11 +862,11 @@ impl UpstreamClient {
                 }
             }
 
-            // 有些实现不会在最后一个 SSE 事件后补空行；EOF 时仍需消费完整残留。
+            // EOF 时仍需消费缺少 SSE 或 NDJSON 分隔符的完整残留。
             if !buffer.is_empty() {
                 let events = match dialect {
-                    Dialect::Ollama => parse_ollama_line(&buffer, generation.as_ref()),
-                    _ => parse_sse_block_with_index(dialect, &buffer, &mut next_gemini_tool_index),
+                    Dialect::Ollama => parse_ollama_line(&buffer, generation.as_ref(), &mut next_tool_index),
+                    _ => parse_sse_block_with_index(dialect, &buffer, &mut next_tool_index),
                 };
                 for event in events {
                     if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
@@ -943,7 +943,7 @@ pub enum UpstreamEvent {
 fn drain_sse_blocks(
     dialect: Dialect,
     buffer: &mut Vec<u8>,
-    next_gemini_tool_index: &mut usize,
+    next_tool_index: &mut usize,
 ) -> Vec<Result<UpstreamEvent>> {
     let mut out = Vec::new();
 
@@ -952,7 +952,7 @@ fn drain_sse_blocks(
         out.extend(parse_sse_block_with_index(
             dialect,
             &event[..end],
-            next_gemini_tool_index,
+            next_tool_index,
         ));
     }
     out
@@ -962,11 +962,12 @@ fn drain_sse_blocks(
 fn drain_ollama_lines(
     buffer: &mut Vec<u8>,
     generation: Option<&super::generation::SharedGeneration>,
+    next_tool_index: &mut usize,
 ) -> Vec<Result<UpstreamEvent>> {
     let mut out = Vec::new();
     while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
         let line: Vec<u8> = buffer.drain(..=end).collect();
-        out.extend(parse_ollama_line(&line, generation));
+        out.extend(parse_ollama_line(&line, generation, next_tool_index));
     }
     out
 }
@@ -991,7 +992,7 @@ pub fn parse_sse_block(dialect: Dialect, bytes: &[u8]) -> Vec<Result<UpstreamEve
 fn parse_sse_block_with_index(
     dialect: Dialect,
     bytes: &[u8],
-    next_gemini_tool_index: &mut usize,
+    next_tool_index: &mut usize,
 ) -> Vec<Result<UpstreamEvent>> {
     let text = String::from_utf8_lossy(bytes);
     let mut event_name: Option<&str> = None;
@@ -1022,12 +1023,13 @@ fn parse_sse_block_with_index(
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    parse_event_value(dialect, event_name, v, next_gemini_tool_index)
+    parse_event_value(dialect, event_name, v, next_tool_index)
 }
 
 fn parse_ollama_line(
     bytes: &[u8],
     generation: Option<&super::generation::SharedGeneration>,
+    next_tool_index: &mut usize,
 ) -> Vec<Result<UpstreamEvent>> {
     let text = String::from_utf8_lossy(bytes);
     let line = text.trim();
@@ -1039,7 +1041,7 @@ fn parse_ollama_line(
             if let Some(generation) = generation {
                 generation.observe(&v);
             }
-            parse_event_value(Dialect::Ollama, None, v, &mut 0)
+            parse_event_value(Dialect::Ollama, None, v, next_tool_index)
         }
         // 截断或厂商自定义诊断行不应导致代理 panic；后续完整行仍可继续输出。
         Err(_) => Vec::new(),
@@ -1050,7 +1052,7 @@ fn parse_event_value(
     dialect: Dialect,
     event_name: Option<&str>,
     v: serde_json::Value,
-    next_gemini_tool_index: &mut usize,
+    next_tool_index: &mut usize,
 ) -> Vec<Result<UpstreamEvent>> {
     // A successful HTTP header is not a successful model result. Native
     // error envelopes must not disappear behind a later DONE/stop/done:true.
@@ -1080,8 +1082,8 @@ fn parse_event_value(
         Dialect::OpenAI => parse_openai_chunk(v, &mut out),
         Dialect::Responses => parse_responses_chunk(event_name, v, &mut out),
         Dialect::Anthropic => parse_anthropic_chunk(event_name, v, &mut out),
-        Dialect::Gemini => parse_gemini_chunk(v, &mut out, next_gemini_tool_index),
-        Dialect::Ollama => parse_ollama_chunk(v, &mut out),
+        Dialect::Gemini => parse_gemini_chunk(v, &mut out, next_tool_index),
+        Dialect::Ollama => parse_ollama_chunk(v, &mut out, next_tool_index),
     }
     out
 }
@@ -1517,7 +1519,11 @@ fn gemini_usage(v: &serde_json::Value) -> Option<Usage> {
     Some(Usage::from_gemini(usage))
 }
 
-fn parse_ollama_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) {
+fn parse_ollama_chunk(
+    v: serde_json::Value,
+    out: &mut Vec<Result<UpstreamEvent>>,
+    next_tool_index: &mut usize,
+) {
     if let Some(t) = v
         .get("message")
         .and_then(|m| m.get("content"))
@@ -1529,7 +1535,7 @@ fn parse_ollama_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
         }
     }
     let done = v.get("done").and_then(|x| x.as_bool()).unwrap_or(false);
-    let has_tool_calls = push_ollama_tool_calls(&v, out);
+    let has_tool_calls = push_ollama_tool_calls(&v, out, next_tool_index);
     if has_tool_calls && !done {
         out.push(Ok(UpstreamEvent::Finish {
             finish_reason: Some("tool_calls".into()),
@@ -1681,7 +1687,11 @@ fn push_gemini_tool_calls(
     }
 }
 
-fn push_ollama_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) -> bool {
+fn push_ollama_tool_calls(
+    v: &serde_json::Value,
+    out: &mut Vec<Result<UpstreamEvent>>,
+    next_tool_index: &mut usize,
+) -> bool {
     let Some(calls) = v
         .get("message")
         .and_then(|message| message.get("tool_calls"))
@@ -1701,8 +1711,9 @@ fn push_ollama_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEv
                 .and_then(|name| name.as_str())?;
             Some((call, function, name))
         })
-        .enumerate()
-        .map(|(index, (call, function, name))| {
+        .map(|(call, function, name)| {
+            let index = *next_tool_index;
+            *next_tool_index += 1;
             let id = call
                 .get("id")
                 .or_else(|| function.get("id"))
