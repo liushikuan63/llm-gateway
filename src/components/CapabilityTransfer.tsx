@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type ImportCapabilitiesResult, type CapabilityLedgerSnapshot } from "../api";
+import { api, summarizeCapabilityLedgerCoverage, type ImportCapabilitiesResult, type CapabilityLedgerSnapshot } from "../api";
 import "./capability-transfer.css";
 
 function resultOf(value: unknown): ImportCapabilitiesResult {
@@ -12,6 +12,7 @@ export default function CapabilityTransfer({ disabled, onImported }: { disabled:
   const [draft, setDraft] = useState("");
   const [lastExport, setLastExport] = useState<{ text: string; snapshot: CapabilityLedgerSnapshot } | null>(null);
   const exported = lastExport?.text ?? "";
+  const coverage = lastExport ? summarizeCapabilityLedgerCoverage(lastExport.snapshot) : null;
   const [pending, setPending] = useState<"file" | "import" | "export" | null>(null);
   const [result, setResult] = useState<ImportCapabilitiesResult | null>(null);
   const [error, setError] = useState<string | null>(null), [notice, setNotice] = useState("");
@@ -58,7 +59,11 @@ export default function CapabilityTransfer({ disabled, onImported }: { disabled:
         const a = document.createElement("a"); a.href = url; a.download = "llm-gateway-capabilities.json"; a.click();
         setTimeout(() => URL.revokeObjectURL(url), 0);
       }
-    } catch (e) { if (mounted.current) setError(`导出未确认：${String(e)}。下方若有文本，是上次成功读取的版本。`); }
+    } catch (e) {
+      if (mounted.current) {
+        setError(`导出未确认：${e instanceof Error ? e.message : String(e)}。${lastExport ? "已保留上次成功读取的 JSON。" : ""}`);
+      }
+    }
     finally { end("export"); }
   };
   return <details className="card capability-transfer" data-testid="capability-transfer">
@@ -71,7 +76,7 @@ export default function CapabilityTransfer({ disabled, onImported }: { disabled:
       {exported && <><label htmlFor="capability-export-json">最近一次成功读取的导出 JSON</label><textarea ref={output} id="capability-export-json" rows={6} readOnly value={exported}/></>}
     </fieldset>
     {pending && <p role="status">{pending === "file" ? "正在读入文件，尚未导入…" : pending === "import" ? "正在导入，等待后端确认…" : "正在读取导出账本…"}</p>}
-    {lastExport && <p data-testid="capability-export-coverage" role="status">最近成功导出：读取 {lastExport.snapshot.observed} 条账本记录，JSON 包含 {Object.keys(lastExport.snapshot.ledgers).length} 个模型账本；损坏未包含 {lastExport.snapshot.discarded.length} 条。覆盖信息只在此处说明，文件仍为原账本格式。</p>}
+    {coverage && <p data-testid="capability-export-coverage" role="status">最近成功导出：读取 {coverage.observed} 条模型记录，JSON 包含 {coverage.retained} 个模型账本；缺失 {coverage.missing} 条；损坏 {coverage.damaged} 条。{coverage.unclassified > 0 && `另有 ${coverage.unclassified} 条覆盖待核对。`}文件仍可按原格式导入。</p>}
     {error && <p className="msg error breakable" role="alert">{error}</p>}
     {!pending && notice && <p role="status">{notice}</p>}
     {result && <section aria-label="能力导入结果" data-testid="capability-import-result"><p>已写入模型：{result.written}；未知模型：{result.skipped.length}；跳过维度：{result.skipped_dimensions.length}；跳过来源：{result.skipped_sources.length}。</p>{([["未知模型", result.skipped], ["跳过维度", result.skipped_dimensions], ["跳过来源", result.skipped_sources]] as const).map(([label, values]) => values.length > 0 && <div key={label}><strong>{label}</strong><ul>{values.map((v, i) => <li className="breakable" key={`${v}-${i}`}>{v}</li>)}</ul></div>)}</section>}

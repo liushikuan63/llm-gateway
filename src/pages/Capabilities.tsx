@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, CandidateExplanation, CapabilitySet, CapabilityLedgerSnapshot, PriceObservationView, TpsReference, formatPricePerMillion, ParetoView, ProviderView } from "../api";
+import { api, CandidateExplanation, CapabilitySet, CapabilityLedgerSnapshot, PriceObservationView, TpsReference, formatPricePerMillion, ParetoView, ProviderView, summarizeCapabilityLedgerCoverage } from "../api";
 import { errorText } from "./providerPresets";
 import "./capabilities.css";
 import CapabilityTransfer from "../components/CapabilityTransfer";
@@ -119,7 +119,8 @@ export default function CapabilitiesPage() {
   const [priceObservations, setPriceObservations] = useState<PriceObservationView[] | null>(null);
   const [ledgerSnapshot, setLedgerSnapshot] = useState<CapabilityLedgerSnapshot | null>(null);
   const ledger = ledgerSnapshot?.ledgers ?? null;
-  const discardedKeys = new Set(ledgerSnapshot?.discarded.map(row => row.key) ?? []);
+  const discardReasons = new Map(ledgerSnapshot?.discarded.map(row => [row.key, row.reason]));
+  const coverage = ledgerSnapshot ? summarizeCapabilityLedgerCoverage(ledgerSnapshot) : null;
   const [pareto, setPareto] = useState<ParetoView | null>(null);
   const [explain, setExplain] = useState<CandidateExplanation[] | null>(null);
   const [explainModel, setExplainModel] = useState("");
@@ -205,13 +206,13 @@ export default function CapabilitiesPage() {
 
       {error && <div className="capability-error" role="alert">部分数据读取失败：{error}</div>}
 
-      {ledgerSnapshot && <section className="card" data-testid="ledger-coverage" aria-labelledby="ledger-coverage-title">
+      {ledgerSnapshot && coverage && <section className="card" data-testid="ledger-coverage" aria-labelledby="ledger-coverage-title">
         <h3 id="ledger-coverage-title">能力账本读取覆盖</h3>
-        <p>最近成功读取：{ledgerSnapshot.observed} 条账本记录；保留 {Object.keys(ledgerSnapshot.ledgers).length} 个模型账本；损坏未纳入 {ledgerSnapshot.discarded.length} 条。</p>
+        <p>最近成功读取：{coverage.observed} 条模型记录；保留 {coverage.retained} 个模型账本；缺失 {coverage.missing} 条；损坏 {coverage.damaged} 条。{coverage.unclassified > 0 && `另有 ${coverage.unclassified} 条覆盖待核对。`}</p>
         {ledgerSnapshot.discarded.length > 0 && <>
-          <p role="status">损坏账本未纳入当前质量来源，覆盖未知；其他有效账本仍可查看。</p>
-          <ul data-testid="ledger-discarded">{ledgerSnapshot.discarded.map((row, index) =>
-            <li className="breakable" key={`${row.key}-${index}`}>{row.key}：{row.reason}</li>)}</ul>
+          <p role="status">缺失或损坏账本的质量覆盖未知；其他有效账本仍可查看。</p>
+          <ul data-testid="ledger-discarded">{ledgerSnapshot.discarded.map(row =>
+            <li className="breakable" key={row.key}>{row.key}：{row.reason === "null_ledger" ? "账本缺失" : `账本已损坏（${row.reason}）`}</li>)}</ul>
         </>}
       </section>}
 
@@ -225,6 +226,7 @@ export default function CapabilitiesPage() {
           <thead><tr><th>模型 / 供应商</th><th>价格与来源</th><th>上下文 / 用途</th><th>声明 / 适用范围</th><th>质量覆盖</th></tr></thead>
           <tbody>{visibleFacts.map(({ provider, model, rows }) => {
             const chatDeclaration = usesChatDeclaration(model);
+            const discardReason = discardReasons.get(`${provider.id}/${model.alias}`);
             const contextKnown = Number.isSafeInteger(model.context_window) && model.context_window > 0;
             const covered = rows.filter(row => row.items.length > 0 && Object.prototype.hasOwnProperty.call(DIMENSION_LABEL, row.dimension)).length;
             const configuredQuality = Object.keys(DIMENSION_LABEL).filter(dimension => {
@@ -237,7 +239,19 @@ export default function CapabilitiesPage() {
               <td>{price ? <><span>{formatPricePerMillion(price)}</span><small>{price.currency.toUpperCase()} · {price.source === "manual" ? "手工配置" : price.source === "catalog" ? "目录参考价" : "价格来源未知"}</small><small data-testid="configured-cache-price">缓存读取：{configuredCacheUnit(price.cache_read)}；缓存写入：{configuredCacheUnit(price.cache_creation)}（每 100 万 token）</small>{(price.tiers.length > 0 || price.rules.length > 0) && <small>含分档 / 时段条件，实际费用按请求计算</small>}<PriceObservation provider={provider} model={model} observations={priceObservations} />{!chatDeclaration && <small>token参考配置，是否适用于此类型计价尚未核验</small>}</> : <span className="missing">未配置价格；费用未知</span>}</td>
               <td>{contextKnown ? `${chatDeclaration ? "" : "旧窗口配置："}${model.context_window.toLocaleString()} tokens` : "上下文未声明，不代表0"}<small>{{ chat: "聊天", embedding: "Embedding", image: "图像生成", speech: "语音合成" }[model.model_type] ?? "类型未确认"}</small><small>{chatDeclaration ? "配置值，未自动探测" : "本类型端点未按聊天窗口验证"}</small></td>
               <td><ModelCapabilityDeclaration model={model} declaration={provider.capability_declarations?.[model.alias]} /></td>
-              <td>{!chatDeclaration && <strong style={{ display: "block", marginBottom: 4 }}>专用质量口径未定义</strong>}{ledger === null ? <span className="missing">质量来源尚未读取</span> : discardedKeys.has(`${provider.id}/${model.alias}`) ? <span className="missing">账本已损坏，未纳入质量覆盖；覆盖未知</span> : <><span>{rows.some(row => row.uncertain) ? (chatDeclaration ? `已确认至少 ${covered} / 4 质量维度有来源；其余待核对` : `原通用资料：已确认至少 ${covered} / 4 维度有有效分值；其余待核对`) : (chatDeclaration ? `${covered} / 4 质量维度有来源` : `原通用资料：${covered} / 4 维度有有效分值`)}</span><small>{covered > 0 ? rows.filter(row => row.items.length > 0 && Object.prototype.hasOwnProperty.call(DIMENSION_LABEL, row.dimension)).map(row => safeLabel(DIMENSION_LABEL, row.dimension)).join("、") : rows.some(row => row.uncertain) ? "来源或数据待核对，覆盖未知" : configuredQuality.length > 0 ? `${configuredQuality.length} / 4 维度有配置分值，无多来源账本` : chatDeclaration ? `供应商默认回退 ${provider.intelligence}/100，非质量实测` : "不以缺少聊天质量分推断本类型能力低"}</small></>}{model.capabilities?.updated_at && <small>{chatDeclaration ? "质量记录时间" : "通用质量记录时间"}：{model.capabilities.updated_at}</small>}{ledger !== null && rows.some(row => row.uncertain) && <small>部分来源或数据待核对；覆盖仅计有效0..1数值及已知来源，缺失或无效不补0。</small>}{ledger !== null && !discardedKeys.has(`${provider.id}/${model.alias}`) && <CapabilityEvidence rows={rows} />}<small>延迟 / 任务匹配 / 效率：持续补充使用样本</small></td>
+              <td>
+                {!chatDeclaration && <strong style={{ display: "block", marginBottom: 4 }}>专用质量口径未定义</strong>}
+                {ledger === null ? <span className="missing">质量来源尚未读取</span> : discardReason ? (
+                  <span className="missing">{discardReason === "null_ledger" ? "账本缺失" : "账本已损坏"}；质量覆盖未知</span>
+                ) : <>
+                  <span>{rows.some(row => row.uncertain) ? (chatDeclaration ? `已确认至少 ${covered} / 4 质量维度有来源；其余待核对` : `原通用资料：已确认至少 ${covered} / 4 维度有有效分值；其余待核对`) : (chatDeclaration ? `${covered} / 4 质量维度有来源` : `原通用资料：${covered} / 4 维度有有效分值`)}</span>
+                  <small>{covered > 0 ? rows.filter(row => row.items.length > 0 && Object.prototype.hasOwnProperty.call(DIMENSION_LABEL, row.dimension)).map(row => safeLabel(DIMENSION_LABEL, row.dimension)).join("、") : rows.some(row => row.uncertain) ? "来源或数据待核对，覆盖未知" : configuredQuality.length > 0 ? `${configuredQuality.length} / 4 维度有配置分值，无多来源账本` : chatDeclaration ? `供应商默认回退 ${provider.intelligence}/100，非质量实测` : "不以缺少聊天质量分推断本类型能力低"}</small>
+                </>}
+                {model.capabilities?.updated_at && <small>{chatDeclaration ? "质量记录时间" : "通用质量记录时间"}：{model.capabilities.updated_at}</small>}
+                {ledger !== null && rows.some(row => row.uncertain) && <small>部分来源或数据待核对；覆盖仅计有效0..1数值及已知来源，缺失或无效不补0。</small>}
+                {ledger !== null && !discardReason && <CapabilityEvidence rows={rows} />}
+                <small>延迟 / 任务匹配 / 效率：持续补充使用样本</small>
+              </td>
             </tr>;
           })}</tbody>
         </table></div>

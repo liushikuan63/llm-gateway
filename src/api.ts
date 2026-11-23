@@ -1711,16 +1711,36 @@ export interface CapabilityLedgerSnapshot {
 export function capabilityLedgerSnapshotOf(value: unknown): CapabilityLedgerSnapshot {
   const object = (entry: unknown): entry is Record<string, unknown> =>
     entry !== null && typeof entry === "object" && !Array.isArray(entry);
+  const discard = (row: unknown): row is CapabilityLedgerSnapshot["discarded"][number] =>
+    object(row) && typeof row.key === "string" && typeof row.reason === "string" &&
+    /^(?:null_ledger|(?:io|syntax|shape|truncated) at line \d+ column \d+)$/.test(row.reason);
+  const invalid = () => new Error("能力账本覆盖返回无法确认，请重新读取");
   if (!object(value) || !object(value.ledgers) || !Number.isSafeInteger(value.observed) ||
       typeof value.observed !== "number" || value.observed < 0 || !Array.isArray(value.discarded) ||
       !Object.values(value.ledgers).every(ledger => object(ledger) && object(ledger.values)) ||
-      !value.discarded.every(row => object(row) && typeof row.key === "string" &&
-        typeof row.reason === "string" && /^(?:null_ledger|(?:io|syntax|shape|truncated) at line \d+ column \d+)$/.test(row.reason)) ||
-      value.observed < Object.keys(value.ledgers).length || value.observed < value.discarded.length) {
-    throw new Error("能力账本覆盖返回无法确认；未将损坏或缺失账本视为零。");
+      !value.discarded.every(discard)) {
+    throw invalid();
   }
-  // observed counts physical records, while ledgers is a key map: no equality assumption.
+  const keys = new Set(Object.keys(value.ledgers));
+  for (const row of value.discarded) {
+    if (keys.has(row.key)) throw invalid();
+    keys.add(row.key);
+  }
+  // The physical row count cannot be smaller than the combined number of distinct keys.
+  if (value.observed < keys.size) throw invalid();
   return value as unknown as CapabilityLedgerSnapshot;
+}
+
+export function summarizeCapabilityLedgerCoverage(snapshot: CapabilityLedgerSnapshot) {
+  const retained = Object.keys(snapshot.ledgers).length;
+  const missing = snapshot.discarded.filter(row => row.reason === "null_ledger").length;
+  return {
+    observed: snapshot.observed,
+    retained,
+    missing,
+    damaged: snapshot.discarded.length - missing,
+    unclassified: snapshot.observed - retained - snapshot.discarded.length,
+  };
 }
 
 /**
