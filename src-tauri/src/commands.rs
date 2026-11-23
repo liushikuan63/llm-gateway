@@ -3395,6 +3395,10 @@ pub async fn apply_snapshot(
 #[path = "commands/native_usage_tests.rs"]
 mod native_usage_tests;
 
+#[cfg(test)]
+#[path = "commands/audit_v2_tests.rs"]
+mod audit_v2_tests;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderUsage {
     pub provider_id: Option<String>,
@@ -3433,6 +3437,34 @@ pub struct StatsOverview {
     pub native_usage: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_usage_by_model: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderCallCounts {
+    provider_id: Option<String>,
+    provider: String,
+    requests: i64,
+    successful_requests: i64,
+    fallback_attempts: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsOverviewMetadata {
+    window: String,
+    total_requests: i64,
+    today_requests: i64,
+    success_rate: f64,
+    avg_latency_ms: i64,
+    latency_sample_count: i64,
+    latency_p50_ms: Option<i64>,
+    latency_p95_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_timings: Option<serde_json::Value>,
+    total_fallbacks: i64,
+    fallback_request_count: i64,
+    fallback_rate: f64,
+    provider_distribution: Vec<ProviderCallCounts>,
+    spend: SpendOverview,
 }
 
 /// 本地花费估算。数据来自 `usage_daily`（按 UTC 自然日聚合），只统计配置了价格的
@@ -3528,6 +3560,54 @@ async fn stats_overview_from_pool(
     pool: &sqlx::SqlitePool,
     since: i64,
 ) -> Result<StatsOverview, String> {
+    let overview = stats_overview_metadata(pool, since).await?;
+    let usage = repo::native_usage::rolling_usage(pool, since)
+        .await
+        .map_err(|e| e.to_string())?;
+    let empty = repo::native_usage::UsageTotals::default();
+    let provider_distribution = overview
+        .provider_distribution
+        .into_iter()
+        .map(|counts| {
+            let totals = usage.providers.get(&counts.provider_id).unwrap_or(&empty);
+            ProviderUsage {
+                provider_id: counts.provider_id,
+                provider: counts.provider,
+                requests: counts.requests,
+                successful_requests: counts.successful_requests,
+                prompt_tokens: totals.prompt,
+                completion_tokens: totals.completion,
+                fallback_attempts: counts.fallback_attempts,
+                native_usage: totals.native_json(),
+            }
+        })
+        .collect();
+    Ok(StatsOverview {
+        window: overview.window,
+        total_requests: overview.total_requests,
+        today_requests: overview.today_requests,
+        success_rate: overview.success_rate,
+        avg_latency_ms: overview.avg_latency_ms,
+        latency_sample_count: overview.latency_sample_count,
+        latency_p50_ms: overview.latency_p50_ms,
+        latency_p95_ms: overview.latency_p95_ms,
+        request_timings: overview.request_timings,
+        total_fallbacks: overview.total_fallbacks,
+        fallback_request_count: overview.fallback_request_count,
+        fallback_rate: overview.fallback_rate,
+        total_prompt_tokens: usage.totals.prompt,
+        total_completion_tokens: usage.totals.completion,
+        provider_distribution,
+        spend: overview.spend,
+        native_usage: usage.totals.native_json(),
+        native_usage_by_model: usage.models_json(),
+    })
+}
+
+async fn stats_overview_metadata(
+    pool: &sqlx::SqlitePool,
+    since: i64,
+) -> Result<StatsOverviewMetadata, String> {
     let total_row = sqlx::query("SELECT COUNT(*) AS total_requests FROM requests")
         .fetch_one(pool)
         .await
@@ -3584,31 +3664,20 @@ async fn stats_overview_from_pool(
     .await
     .map_err(|e| e.to_string())?;
 
-    let usage = repo::native_usage::rolling_usage(pool, since)
-        .await
-        .map_err(|e| e.to_string())?;
     let provider_distribution = distribution_rows
         .iter()
-        .map(|row| {
-            let provider_id: Option<String> = row.get("provider_id");
-            let empty = repo::native_usage::UsageTotals::default();
-            let totals = usage.providers.get(&provider_id).unwrap_or(&empty);
-            ProviderUsage {
-                provider_id: row.get("provider_id"),
-                provider: row.get("provider"),
-                requests: row.get("requests"),
-                successful_requests: row
-                    .get::<Option<i64>, _>("successful_requests")
-                    .unwrap_or(0),
-                prompt_tokens: totals.prompt,
-                completion_tokens: totals.completion,
-                fallback_attempts: row.get::<Option<i64>, _>("fallback_attempts").unwrap_or(0),
-                native_usage: totals.native_json(),
-            }
+        .map(|row| ProviderCallCounts {
+            provider_id: row.get("provider_id"),
+            provider: row.get("provider"),
+            requests: row.get("requests"),
+            successful_requests: row
+                .get::<Option<i64>, _>("successful_requests")
+                .unwrap_or(0),
+            fallback_attempts: row.get::<Option<i64>, _>("fallback_attempts").unwrap_or(0),
         })
         .collect();
 
-    Ok(StatsOverview {
+    Ok(StatsOverviewMetadata {
         window: "24h".into(),
         total_requests: total_row.get("total_requests"),
         today_requests,
@@ -3638,13 +3707,55 @@ async fn stats_overview_from_pool(
         } else {
             fallback_request_count as f64 / today_requests as f64
         },
-        total_prompt_tokens: usage.totals.prompt,
-        total_completion_tokens: usage.totals.completion,
-        native_usage: usage.totals.native_json(),
-        native_usage_by_model: usage.models_json(),
         provider_distribution,
         spend: spend_overview(pool).await?,
     })
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatsOverviewV2 {
+    schema_version: u8,
+    #[serde(flatten)]
+    overview: StatsOverviewMetadata,
+    usage_stats: crate::audit::v2::UsageStatsV2,
+}
+
+#[tauri::command]
+pub async fn stats_overview_v2(state: State<'_, AppState>) -> Result<StatsOverviewV2, String> {
+    stats_overview_v2_from_pool(
+        state.db.pool(),
+        chrono::Utc::now().timestamp() - 24 * 60 * 60,
+    )
+    .await
+}
+
+async fn stats_overview_v2_from_pool(
+    pool: &sqlx::SqlitePool,
+    since: i64,
+) -> Result<StatsOverviewV2, String> {
+    let overview = stats_overview_metadata(pool, since).await?;
+    let filter = crate::audit::RequestFilter {
+        from_ts: Some(since),
+        ..Default::default()
+    };
+    let usage_stats = repo::audit_v2::usage_stats(pool, &filter)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(StatsOverviewV2 {
+        schema_version: 2,
+        overview,
+        usage_stats,
+    })
+}
+
+#[tauri::command]
+pub async fn usage_stats_v2(
+    state: State<'_, AppState>,
+    filter: crate::audit::RequestFilter,
+) -> Result<crate::audit::v2::UsageStatsV2, String> {
+    repo::audit_v2::usage_stats(state.db.pool(), &filter)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Nearest-rank percentile over an already sorted, validated latency list.
@@ -3712,6 +3823,16 @@ pub async fn get_request_feedback(
 }
 
 #[tauri::command]
+pub async fn query_requests_v2(
+    state: State<'_, AppState>,
+    filter: crate::audit::RequestFilter,
+) -> Result<crate::audit::v2::AuditPageV2, String> {
+    repo::audit_v2::query_page(state.db.pool(), &filter)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn get_feedback_coverage(
     state: State<'_, AppState>,
     filter: crate::audit::RequestFilter,
@@ -3765,6 +3886,35 @@ pub async fn export_requests(
     format: String,
     dest_path: String,
 ) -> Result<AuditExportResult, String> {
+    export_audit(state.db.pool(), filter, format, dest_path, false).await
+}
+
+#[tauri::command]
+pub async fn export_requests_v2(
+    state: State<'_, AppState>,
+    filter: crate::audit::RequestFilter,
+    format: String,
+    dest_path: String,
+) -> Result<AuditExportResult, String> {
+    export_requests_v2_from_pool(state.db.pool(), filter, format, dest_path).await
+}
+
+async fn export_requests_v2_from_pool(
+    pool: &sqlx::SqlitePool,
+    filter: crate::audit::RequestFilter,
+    format: String,
+    dest_path: String,
+) -> Result<AuditExportResult, String> {
+    export_audit(pool, filter, format, dest_path, true).await
+}
+
+async fn export_audit(
+    pool: &sqlx::SqlitePool,
+    filter: crate::audit::RequestFilter,
+    format: String,
+    dest_path: String,
+    bounded: bool,
+) -> Result<AuditExportResult, String> {
     let fmt = format.trim().to_ascii_lowercase();
     if fmt != "jsonl" && fmt != "csv" {
         return Err(format!("不支持的导出格式 {format:?}，只支持 jsonl 与 csv"));
@@ -3774,9 +3924,12 @@ pub async fn export_requests(
         return Err("导出路径不能为空".into());
     }
 
-    let rows = repo::query_requests_for_export(state.db.pool(), &filter)
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = if bounded {
+        repo::audit_v2::query_requests_for_export(pool, &filter).await
+    } else {
+        repo::query_requests_for_export(pool, &filter).await
+    }
+    .map_err(|e| e.to_string())?;
 
     let (content, columns_doc_path) = if fmt == "jsonl" {
         (crate::audit::to_jsonl(&rows), None)

@@ -271,6 +271,10 @@ impl OwnedIpc {
                 get_conversation_feedback,
                 get_conversation_requests,
                 query_requests,
+                query_requests_v2,
+                usage_stats_v2,
+                stats_overview_v2,
+                export_requests_v2,
                 preview_routing_request,
                 create_snapshot,
                 apply_snapshot,
@@ -327,6 +331,62 @@ impl Drop for OwnedIpc {
         tauri::async_runtime::block_on(self.db.pool().close());
         eprintln!("OWNED_FEEDBACK_IPC_ROOT={}", self.root.display());
     }
+}
+
+#[test]
+fn audit_v2_production_ipc_distinguishes_unreadable_bodies_and_preserves_exports() {
+    let h = OwnedIpc::new();
+    let now = chrono::Utc::now().timestamp();
+    tauri::async_runtime::block_on(async {
+        for (model, body) in [("good", "[]"), ("damaged", "{broken")] {
+            sqlx::query("INSERT INTO requests(ts,requested_model,routed_provider,routed_model,status,prompt_tokens,completion_tokens,attempts_json) VALUES(?,'owned','owned',?,200,13,5,?)")
+                .bind(now).bind(model).bind(body).execute(h.db.pool()).await.unwrap();
+        }
+    });
+
+    let overview = h.invoke("stats_overview_v2", json!({})).unwrap();
+    assert_eq!(overview["schema_version"], 2);
+    assert_eq!(overview["today_requests"], 2);
+    assert!(overview.get("total_prompt_tokens").is_none());
+    assert!(overview["usage_stats"]["usage_coverage"]["prompt_tokens"]["reliable_total"].is_null());
+
+    let filter = json!({"filter": {"provider": "owned", "offset": 0, "limit": 1}});
+    let page = h.invoke("query_requests_v2", filter.clone()).unwrap();
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(page["rows"][0]["attempts_body"]["reason"], "json_invalid");
+    assert_eq!(page["rows"][0]["usage_evidence"]["kind"], "unavailable");
+    assert!(page["rows"][0]["prompt_tokens"].is_null());
+    let stats = h.invoke("usage_stats_v2", filter).unwrap();
+    assert_eq!(stats["request_count"], 2);
+    assert_eq!(stats["usage_coverage"]["legacy_unverified_requests"], 1);
+    assert_eq!(stats["usage_coverage"]["unavailable_requests"], 1);
+
+    let output = h.root.join("audit.csv");
+    let columns = h.root.join("audit_columns.md");
+    std::fs::write(&output, b"prior main").unwrap();
+    std::fs::write(&columns, b"prior columns").unwrap();
+    let args = |filter: Value| json!({"filter": filter, "format": "csv", "destPath": output});
+    let error = h
+        .invoke("export_requests_v2", args(json!({"provider": "owned"})))
+        .unwrap_err();
+    assert_eq!(error, repo::audit_v2::RAW_EXPORT_UNAVAILABLE);
+    assert_eq!(std::fs::read(&output).unwrap(), b"prior main");
+    assert_eq!(std::fs::read(&columns).unwrap(), b"prior columns");
+    let result = h
+        .invoke(
+            "export_requests_v2",
+            args(json!({"model": "good", "offset": 120})),
+        )
+        .unwrap();
+    assert_eq!(result["written"], 1);
+    assert_eq!(result["path"].as_str(), output.to_str());
+    assert_eq!(result["columns_doc"].as_str(), columns.to_str());
+    assert!(std::fs::read_to_string(output).unwrap().contains("good"));
+    assert_eq!(
+        std::fs::read_to_string(columns).unwrap(),
+        crate::audit::columns_doc(0)
+    );
 }
 
 #[test]

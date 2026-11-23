@@ -1547,7 +1547,12 @@ export interface UsageStatsV2 {
     known_not_sent_entries: number; unreviewed_known_not_sent_entries: number; linked_body_missing_entries: number;
   };
 }
-export type StatsOverviewV2 = StatsOverview & {usage_stats: UsageStatsV2};
+export type StatsOverviewV2 = Omit<StatsOverview, "total_prompt_tokens" | "total_completion_tokens" |
+  "provider_distribution" | "native_usage" | "native_usage_by_model"> & {
+  schema_version: 2;
+  provider_distribution: Omit<ProviderUsage, "prompt_tokens" | "completion_tokens" | "native_usage">[];
+  usage_stats: UsageStatsV2;
+};
 
 export interface ClientUsageReviewItem {
   attempt_id: string; scope_id: string; created_at: number; gate_reason: "quota" | "concurrency";

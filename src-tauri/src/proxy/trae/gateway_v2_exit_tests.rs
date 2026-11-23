@@ -323,7 +323,7 @@ async fn run_child(role: &str) {
         observations: observations.clone(),
     });
     let (entered, release) = gate_commit(t.state.db.pool()).await;
-    let sentinel = format!("s2-v2-owned-visible-{trace}");
+    let sentinel = native_exit_sentinel("s2-v2-owned-visible", &trace);
     t.fixture.stall.store(true, Ordering::SeqCst);
     // Usage is decoded before the distinct visible line. There is no terminal
     // frame, so the resulting audit must originate from the downstream drop.
@@ -488,7 +488,10 @@ async fn owned_native_cancel_exit_preserves_atomic_v2_audit() {
         assert_eq!(ready["nonce"], nonce);
         assert_eq!(ready["trace"], trace);
         assert_eq!(ready["pid"], child.0.id());
-        assert_eq!(ready["sentinel"], format!("s2-v2-owned-visible-{trace}"));
+        assert_eq!(
+            ready["sentinel"],
+            native_exit_sentinel("s2-v2-owned-visible", &trace)
+        );
         let initial: Intent = serde_json::from_value(ready["initial"].clone()).unwrap();
         let writes: CommitWrites = serde_json::from_value(ready["writes"].clone()).unwrap();
         let rowid = writes.request.unwrap();

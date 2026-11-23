@@ -1282,6 +1282,12 @@ const NATIVE_EXIT_TEST: &str =
     "proxy::server::native_exact::tests::owned_native_cancel_exit_preserves_atomic_v1_audit";
 const NATIVE_EXIT_PROMPT_TOKENS: i64 = 37;
 
+fn native_exit_sentinel(prefix: &str, trace: &str) -> String {
+    // A bare trailing 7 is retained as a possible fixture device ID prefix.
+    // Include it to exercise that case, then resolve the prefix with punctuation.
+    format!("{prefix}-{trace}7!")
+}
+
 fn native_exit_root(nonce: &str) -> std::path::PathBuf {
     let id = uuid::Uuid::parse_str(nonce).expect("owned exit fixture nonce must be a UUID");
     assert_eq!(nonce, id.simple().to_string());
@@ -1485,7 +1491,7 @@ async fn run_native_cancel_exit_child(role: &str) {
     let t = setup_with_database(false, &path).await;
     check_native_exit_wal(&path, &trace, None).await;
     let (commit_entered, release_commit) = native_exit_commit_gate(t.state.db.pool()).await;
-    let sentinel = format!("s2-owned-visible-{trace}");
+    let sentinel = native_exit_sentinel("s2-owned-visible", &trace);
     t.fixture.stall.store(true, Ordering::SeqCst);
     t.fixture.packets.lock().push_back(
         // Usage has to cross the parser before the client can observe the
@@ -1644,7 +1650,10 @@ async fn owned_native_cancel_exit_preserves_atomic_v1_audit() {
         assert_eq!(ready["nonce"], nonce);
         assert_eq!(ready["pid"], child.0.id());
         assert_eq!(ready["trace"], trace);
-        assert_eq!(ready["sentinel"], format!("s2-owned-visible-{trace}"));
+        assert_eq!(
+            ready["sentinel"],
+            native_exit_sentinel("s2-owned-visible", &trace)
+        );
         assert_eq!(ready["commit_hook_staged_usage"], true);
         let rowid = ready["commit_hook_rowid"].as_i64().unwrap();
         assert!(rowid > 0);

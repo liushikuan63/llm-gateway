@@ -4,7 +4,7 @@ use crate::domain::{Currency, ModelPrice};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-const MAX_JSON_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_JSON_BYTES: usize = 256 * 1024;
 const MAX_ATTEMPTS: usize = 64;
 const MAX_DEPTH: usize = 16;
 const MAX_NODES: usize = 4096;

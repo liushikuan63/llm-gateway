@@ -6,12 +6,13 @@ import RequestObservationContext from "./RequestObservationContext";
 import RequestTimingDetails, { projectRequestTiming } from "./RequestTiming";
 import RequestControlModes from "./RequestControlModes";
 import RequestGeneration from "./RequestGeneration";
-import NativeUsagePanel, { isUnverifiedPersonalUsage, NativeRequestUsage, NativeScalarCoverage } from "./NativeUsagePanel";
+import NativeUsagePanel, { isUnverifiedPersonalUsage, NativeRequestUsage } from "./NativeUsagePanel";
+import AuditUsageV2, { AuditBodyStatus, V2Count } from "./AuditUsageV2";
 import RequestFeedback from "./RequestFeedback";
 import RequestDecision from "./RequestDecision";
 import FeedbackCoverage from "./FeedbackCoverage";
 import ConversationFeedback from "./ConversationFeedback";
-import { api, AttemptRecord, AuditFilter, AuditRow, FeedbackCoverage as Coverage, formatMoney, SpendBucket, SpendByDimension, SpendDaily, StatsOverview, TokenCalibration } from "../api";
+import { api, AuditFilter, AuditPageV2, FeedbackCoverage as Coverage, formatMoney, SpendBucket, SpendByDimension, SpendDaily, StatsOverviewV2, TokenCalibration, UsageStatsV2 } from "../api";
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error);
@@ -53,12 +54,33 @@ function dimensionRows(rows: SpendByDimension[], showModel: boolean) {
   ));
 }
 
-function attemptStatus(record: AttemptRecord) {
+function projectAttempt(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.provider !== "string" || typeof raw.model !== "string") return null;
+  const unsigned = (candidate: unknown) => typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate >= 0 ? candidate : null;
+  return {
+    provider_id: typeof raw.provider_id === "string" ? raw.provider_id : "",
+    provider: raw.provider,
+    model: raw.model,
+    status: unsigned(raw.status),
+    latency_ms: unsigned(raw.latency_ms),
+    reason: typeof raw.reason === "string" ? raw.reason : null,
+    ok: typeof raw.ok === "boolean" ? raw.ok : null,
+    retryable: typeof raw.retryable === "boolean" ? raw.retryable : null,
+    timing: raw.timing,
+    generation: raw.generation,
+    wire_modes: raw.wire_modes,
+    observation_context: raw.observation_context,
+  };
+}
+
+function attemptStatus(record: NonNullable<ReturnType<typeof projectAttempt>>) {
   const timing = projectRequestTiming(record.timing);
   if (timing) {
     if (timing.terminal === "completed") {
       // An observed HTTP completion does not override a failed outer attempt.
-      if (!record.ok) return <span className="tag err">{record.status == null ? "失败" : `${record.status} · 失败`}</span>;
+      if (record.ok === false) return <span className="tag err">{record.status == null ? "失败" : `${record.status} · 失败`}</span>;
       return <span className="tag ok">完成</span>;
     }
     if (timing.terminal === "failed") return <span className="tag err">失败</span>;
@@ -67,26 +89,28 @@ function attemptStatus(record: AttemptRecord) {
     return <span className="tag warn">观察未结束</span>;
   }
   if (record.ok) return <span className="tag ok">选路成功</span>;
+  if (record.ok === null) return <span className="tag warn">结果未知</span>;
   if (record.status === null) return <span className="tag err">失败</span>;
   return <span className="tag err">{record.status}</span>;
 }
 
-function attemptList(attempts: AttemptRecord[] | null) {
-  if (!attempts || attempts.length === 0) {
+function attemptList(attempts: unknown) {
+  const records = Array.isArray(attempts) ? attempts.map(projectAttempt).filter(record => record !== null) : [];
+  if (records.length === 0) {
     return <div className="empty attempt-empty">该请求没有尝试明细（可能是旧版本记录）。</div>;
   }
   return (
     <ol className="attempt-chain">
-      {attempts.map((record, index) => (
+      {records.map((record, index) => (
         <li key={`${record.provider_id}-${record.model}-${index}`}>
           <span className="attempt-index">{index + 1}</span>
           <span className="attempt-target mono breakable">{record.provider} · {record.model}</span>
           {attemptStatus(record)}
-          <span className="muted">记录耗时 {record.latency_ms}ms</span>
+          <span className="muted">记录耗时 {record.latency_ms == null ? "未知" : `${record.latency_ms}ms`}</span>
           {record.reason && <span className="muted breakable attempt-reason">{record.reason}</span>}
-          {!record.ok && !record.retryable && <span className="tag warn">已停止降级</span>}
+          {record.ok === false && record.retryable === false && <span className="tag warn">已停止降级</span>}
           <RequestTimingDetails value={record.timing}/>
-          <RequestGeneration value={record.generation} attemptOk={record.ok} completed={projectRequestTiming(record.timing)?.terminal === "completed"} mode={projectRequestTiming(record.timing)?.mode ?? null}/>
+          <RequestGeneration value={record.generation} attemptOk={record.ok === true} completed={projectRequestTiming(record.timing)?.terminal === "completed"} mode={projectRequestTiming(record.timing)?.mode ?? null}/>
           <RequestControlModes value={record.wire_modes}/>
           <RequestObservationContext value={record.observation_context} providerId={record.provider_id}/>
         </li>
@@ -96,8 +120,7 @@ function attemptList(attempts: AttemptRecord[] | null) {
 }
 
 export default function StatsPage() {
-  const [stats, setStats] = useState<StatsOverview | null>(null);
-  const [rows, setRows] = useState<AuditRow[]>([]);
+  const [stats, setStats] = useState<StatsOverviewV2 | null>(null);
   const [calibrations, setCalibrations] = useState<TokenCalibration[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: "err" | "ok"; text: string } | null>(null);
@@ -111,18 +134,21 @@ export default function StatsPage() {
   // ---------- B3 审计筛选 ----------
   //
   // 筛选条件与「本页条数 / 命中总数 / 还有更多」都放在这里。
-  // 用 `queryRequests` 而不是 `recentRequests`：后者是固定窗口，
-  // 加不了条件也拿不到总数。
   const [filter, setFilter] = useState<AuditFilter>({});
-  const [coverage, setCoverage] = useState<{value: Coverage | null; scope: string; error: string | null}>({value:null,scope:"",error:null});
-  const coverageScope = JSON.stringify({...filter,limit:undefined,offset:undefined});
-  const [total, setTotal] = useState(0);
-  const [truncated, setTruncated] = useState(false);
+  const [coverage, setCoverage] = useState<{value: Coverage | null; filter: AuditFilter; error: string | null} | null>(null);
+  const [auditRead, setAuditRead] = useState<{filter: AuditFilter; page: AuditPageV2 | null; failed: boolean} | null>(null);
+  const [usageRead, setUsageRead] = useState<{filter: AuditFilter; value: UsageStatsV2 | null} | null>(null);
   const [exporting, setExporting] = useState(false);
   const [fromTime, setFromTime] = useState("");
   const [toTime, setToTime] = useState("");
   const [timeError, setTimeError] = useState<string | null>(null);
   const pageOffset = filter.offset ?? 0;
+  // Object identity distinguishes a new A in an A → B → A filter change.
+  const currentAudit = auditRead?.filter === filter ? auditRead : null;
+  const rows = currentAudit?.page?.rows ?? [];
+  const total = currentAudit?.page?.total;
+  const truncated = currentAudit?.page?.truncated ?? false;
+  const canExport = !exporting && !currentAudit?.failed && (total ?? 0) > 0 && !timeError;
 
   const patchFilter = (next: Partial<AuditFilter>) =>
     // 换条件时**必须回到第一页**：留在第 3 页而结果只剩 5 条，
@@ -135,7 +161,7 @@ export default function StatsPage() {
     const end = to ? new Date(to).getTime() / 1000 : null;
     if ((start !== null && !Number.isFinite(start)) || (end !== null && !Number.isFinite(end)) ||
         (start !== null && end !== null && start > end)) {
-      setTimeError("开始时间不能晚于结束时间；列表仍显示上次有效筛选结果。"); return;
+      setTimeError("时间范围无效或开始时间晚于结束时间；列表仍显示上次有效筛选结果。"); return;
     }
     setTimeError(null);
     patchFilter({ from_ts: start, to_ts: end });
@@ -162,27 +188,27 @@ export default function StatsPage() {
       setRefreshing(true);
       const revision = calibrationRevision.current;
       try {
-        const requests = [
-          api.statsOverview(),
-          api.queryRequests({ ...filter, limit: 120 }),
+        const [overview, audit, calibration, feedback, usage] = await Promise.allSettled([
+          api.statsOverviewV2(),
+          api.queryRequestsV2({ ...filter, limit: 120 }),
           api.listTokenCalibrations(),
-        ] as const;
-        // A rejected summary must not release the polling guard while audit IPC is pending.
-        const feedbackRequest = api.feedbackCoverage(filter);
-        const settled = await Promise.allSettled([...requests, feedbackRequest] as const);
+          api.feedbackCoverage(filter),
+          api.usageStatsV2(filter),
+        ] as const);
         if (!active) return;
-        // Coverage owns its scoped success/error; unrelated panel rejection
-        // must not discard this settled result or leave stale success visible.
-        const result = settled[3];
-        setCoverage({value:result.status === "fulfilled" ? result.value : null,scope:coverageScope,error:result.status === "rejected" ? "人工反馈覆盖读取失败；未显示为零。" : null});
-        const [overview, page, calibrationRows] = await Promise.all(requests);
-        if (!active) return;
-        setStats(overview);
-        setRows(page.rows);
-        setTotal(page.total);
-        setTruncated(page.truncated);
-        if (revision === calibrationRevision.current) setCalibrations(calibrationRows);
-        setLoadError(null);
+        setCoverage({filter,value:feedback.status === "fulfilled" ? feedback.value : null,error:feedback.status === "rejected" ? "人工反馈覆盖读取失败；未显示为零。" : null});
+        setAuditRead(previous => audit.status === "fulfilled"
+          ? {filter, page:audit.value, failed:false}
+          : {filter, page:previous?.filter === filter ? previous.page : null, failed:true});
+        setUsageRead({filter, value:usage.status === "fulfilled" ? usage.value : null});
+        if (overview.status === "fulfilled" && audit.status === "fulfilled" && calibration.status === "fulfilled" && usage.status === "fulfilled") {
+          setStats(overview.value);
+          if (revision === calibrationRevision.current) setCalibrations(calibration.value);
+          setLoadError(null);
+        } else {
+          const failed = [overview, audit, calibration, usage].find(result => result.status === "rejected");
+          if (failed?.status === "rejected") setLoadError(`加载统计失败：${errorText(failed.reason)}`);
+        }
       } catch (error) {
         if (active) setLoadError(`加载统计失败：${errorText(error)}`);
       } finally {
@@ -210,6 +236,8 @@ export default function StatsPage() {
    * 桌面应用里用户对「文件去哪了」的预期只有他自己知道。
    */
   const exportAudit = async (format: "jsonl" | "csv") => {
+    if (!canExport) return;
+    const exportFilter = { ...filter, offset: 0, limit: null };
     const version = lifecycle.current;
     const isCurrent = () => mounted.current && lifecycle.current === version;
     setExporting(true);
@@ -224,7 +252,7 @@ export default function StatsPage() {
       });
       // 用户取消 → 什么都不做，也不报错（取消不是失败）
       if (!dest || !isCurrent()) return;
-      const result = await api.exportRequests({ ...filter, offset: 0, limit: null }, format, dest);
+      const result = await api.exportRequestsV2(exportFilter, format, dest);
       if (!isCurrent()) return;
       setMsg({
         kind: "ok",
@@ -241,6 +269,8 @@ export default function StatsPage() {
 
   const spend = stats?.spend;
   const daily: SpendDaily[] = spend?.daily ?? [];
+  const usage = stats?.usage_stats;
+  const providerLabels = new Map(stats?.provider_distribution.map(provider => [provider.provider_id, provider.provider]));
 
   return (
     <div>
@@ -253,19 +283,23 @@ export default function StatsPage() {
       </div>
 
       {loadError && <div role="alert" className="msg err">{loadError}</div>}
+      {loadError && stats && <p role="status" className="muted">概览仍显示上次成功读取的结果，可能已过期。</p>}
       {msg && <div role={msg.kind === "err" ? "alert" : "status"} className={`msg ${msg.kind}`}>{msg.text}</div>}
 
       <ClientUsagePanel/>
-      <NativeUsagePanel usage={stats?.native_usage} byModel={stats?.native_usage_by_model}/>
+      <NativeUsagePanel usage={usage?.usage_coverage.native_usage} byModel={usage?.by_model.map(item => ({
+        provider_id:item.provider_id, provider:providerLabels.get(item.provider_id) ?? item.provider_id ?? "未记录供应商",
+        model:item.model, usage:item.usage_coverage.native_usage,
+      }))}/>
       <RequestTimingSummary value={stats?.request_timings}/>
       <RequestGenerationSummary value={stats?.request_timings}/>
-      <FeedbackCoverage value={coverage.scope === coverageScope ? coverage.value : null} loading={refreshing} error={coverage.scope === coverageScope ? coverage.error : null}/>
+      <FeedbackCoverage value={coverage?.filter === filter ? coverage.value : null} loading={refreshing} error={coverage?.filter === filter ? coverage.error : null}/>
       <ConversationFeedback filter={filter}/>
       <div className="grid4" style={{ marginBottom: 14 }}>
         <div className="stat">
           <div className="k">近 24 小时请求</div>
-          <div className="v">{formatNumber(stats?.today_requests ?? 0)}</div>
-          <div className="muted stat-detail">累计 {formatNumber(stats?.total_requests ?? 0)}</div>
+          <div className="v">{formatNumber(stats?.today_requests)}</div>
+          <div className="muted stat-detail">累计 {formatNumber(stats?.total_requests)}</div>
         </div>
         <div className="stat">
           <div className="k">成功率</div>
@@ -275,12 +309,12 @@ export default function StatsPage() {
         <div className="stat">
           <div className="k">平均延迟</div>
           <div className="v">{stats ? `${formatNumber(stats.avg_latency_ms)}ms` : "-"}</div>
-          <div className="muted stat-detail">均值 · 有效样本 {formatNumber(stats?.latency_sample_count ?? 0)}</div>
+          <div className="muted stat-detail">均值 · 有效样本 {formatNumber(stats?.latency_sample_count)}</div>
           <div className="muted stat-detail">P50 {stats?.latency_p50_ms == null ? "未知" : `${formatNumber(stats.latency_p50_ms)}ms`} · P95 {stats?.latency_p95_ms == null ? "未知" : `${formatNumber(stats.latency_p95_ms)}ms`}</div>
         </div>
         <div className="stat">
           <div className="k">故障转移</div>
-          <div className="v">{formatNumber(stats?.total_fallbacks ?? 0)}</div>
+          <div className="v">{formatNumber(stats?.total_fallbacks)}</div>
           <div className="muted stat-detail">
             {stats ? `${stats.fallback_request_count} 个请求，${(stats.fallback_rate * 100).toFixed(1)}%` : "-"}
           </div>
@@ -290,17 +324,18 @@ export default function StatsPage() {
       <div className="grid2" style={{ marginBottom: 14 }}>
         <div className="stat">
           <div className="k">输入 token</div>
-          <div className="v"><NativeScalarCoverage value={stats?.total_prompt_tokens ?? 0} coverage={stats?.native_usage?.prompt_tokens} legacyRequests={stats?.native_usage?.legacy_requests}/></div>
+          <div className="v"><V2Count coverage={usage?.usage_coverage.prompt_tokens}/></div>
           <div className="muted stat-detail">近 24 小时 prompt tokens</div>
         </div>
         <div className="stat">
           <div className="k">输出 token</div>
-          <div className="v"><NativeScalarCoverage value={stats?.total_completion_tokens ?? 0} coverage={stats?.native_usage?.completion_tokens} legacyRequests={stats?.native_usage?.legacy_requests}/></div>
+          <div className="v"><V2Count coverage={usage?.usage_coverage.completion_tokens}/></div>
           <div className="muted stat-detail">近 24 小时 completion tokens</div>
         </div>
       </div>
 
-      {(stats?.native_usage?.native_requests ?? 0) > 0 && <p className="sub">下方花费沿用本地日聚合口径，不代表平台完整账单；独立调用的已知 API 参考费用及未知覆盖见上方最近 24 小时专节。</p>}
+      <AuditUsageV2 stats={usage} scope="最近 24 小时"/>
+      {(usage?.usage_coverage.native_usage.native_requests ?? 0) > 0 && <p className="sub">下方花费沿用本地日聚合口径，不代表平台完整账单；独立调用的 API 参考费用及覆盖见上方最近 24 小时专节。</p>}
       <div className="grid3 spend-cards">
         <div className="stat">
           <div className="k">今日花费</div>
@@ -381,8 +416,8 @@ export default function StatsPage() {
                   <td>{provider.provider}</td>
                   <td>{formatNumber(provider.requests)}</td>
                   <td>{formatNumber(provider.successful_requests)}</td>
-                  <td><NativeScalarCoverage value={provider.prompt_tokens} coverage={provider.native_usage?.prompt_tokens} legacyRequests={provider.native_usage?.legacy_requests}/></td>
-                  <td><NativeScalarCoverage value={provider.completion_tokens} coverage={provider.native_usage?.completion_tokens} legacyRequests={provider.native_usage?.legacy_requests}/></td>
+                  <td><V2Count coverage={usage?.by_provider.find(item => item.provider_id === provider.provider_id)?.usage_coverage.prompt_tokens}/></td>
+                  <td><V2Count coverage={usage?.by_provider.find(item => item.provider_id === provider.provider_id)?.usage_coverage.completion_tokens}/></td>
                   <td>{formatNumber(provider.fallback_attempts)}</td>
                 </tr>
               ))}
@@ -601,14 +636,14 @@ export default function StatsPage() {
             </button>
             <button
               id="audit-export-jsonl"
-              disabled={exporting || rows.length === 0 || !!timeError}
+              disabled={!canExport}
               onClick={() => void exportAudit("jsonl")}
             >
               导出 JSONL
             </button>
             <button
               id="audit-export-csv"
-              disabled={exporting || rows.length === 0 || !!timeError}
+              disabled={!canExport}
               onClick={() => void exportAudit("csv")}
             >
               导出 CSV
@@ -618,17 +653,19 @@ export default function StatsPage() {
           <div className="row" style={{ marginTop: 10 }}>
             <button id="audit-prev" disabled={refreshing || pageOffset === 0 || !!timeError} onClick={() => setFilter(prev => ({ ...prev, offset: Math.max(0, pageOffset - 120) }))}>上一页</button>
             <button id="audit-next" disabled={refreshing || !truncated || !!timeError} onClick={() => setFilter(prev => ({ ...prev, offset: pageOffset + 120 }))}>下一页</button>
-            <span role="status">当前 {rows.length ? `${formatNumber(pageOffset + 1)}–${formatNumber(pageOffset + rows.length)}` : "0"} 条 / 共 {formatNumber(total)} 条</span>
+            <span role="status">{total === undefined ? (currentAudit?.failed ? "审计列表读取失败" : "正在读取当前筛选") : <>当前 {rows.length ? `${formatNumber(pageOffset + 1)}–${formatNumber(pageOffset + rows.length)}` : "0"} / 共 {formatNumber(total)} 条</>}</span>
           </div>
           <div className="sub" style={{ marginTop: 6, marginBottom: 0 }}>
             {/* 命中总数必须露出来：只看当前 120 条会让人以为「一共就这么点」。 */}
             命中 <strong>{formatNumber(total)}</strong> 条
             {truncated && <>（每页最多 120 条，可继续翻页）</>}
-            。导出会按当前筛选条件写出**全部**命中记录（上限 100000 条）。
+            。原始导出涵盖完整筛选范围；存在超限或无法读取的正文时不会写入文件。
           </div>
         </div>
+        {currentAudit?.failed && currentAudit.page && <p className="muted">审计列表仍显示上次读取的结果。</p>}
+        <AuditUsageV2 stats={usageRead?.filter === filter ? usageRead.value : null} scope="当前筛选"/>
         <div style={{ marginTop: 10 }}>
-          {rows.length === 0 ? (
+          {!currentAudit?.page ? null : rows.length === 0 ? (
             <div className="empty">暂无记录</div>
           ) : (
             <table className="requests-table">
@@ -652,8 +689,9 @@ export default function StatsPage() {
                   const validId = Number.isSafeInteger(request.id) && request.id > 0;
                   const rowKey = validId ? `audit-${request.id}` : `legacy-${request.ts}-${index}`;
                   const isExpanded = expanded === rowKey;
-                  const hasAttempts = (request.attempts?.length ?? 0) > 0;
-                  const personalUnverified = isUnverifiedPersonalUsage(request.native_usage);
+                  const hasAttempts = Array.isArray(request.attempts) && request.attempts.length > 0;
+                  const nativeUsage = request.usage_evidence.kind === "native" ? request.usage_evidence.native : undefined;
+                  const personalUnverified = isUnverifiedPersonalUsage(nativeUsage);
                   return (
                     <Fragment key={rowKey}>
                       <tr
@@ -675,20 +713,19 @@ export default function StatsPage() {
                         </td>
                         <td>{request.latency_ms === null ? "-" : `${request.latency_ms}ms`}</td>
                         <td>
-                          {formatNumber(personalUnverified ? null : request.native_usage ? request.native_usage.prompt_tokens : request.prompt_tokens)} / {formatNumber(personalUnverified ? null : request.native_usage ? request.native_usage.completion_tokens : request.completion_tokens)}
+                          {formatNumber(personalUnverified ? null : nativeUsage?.prompt_tokens)} / {formatNumber(personalUnverified ? null : nativeUsage?.completion_tokens)}
+                          <div><AuditBodyStatus body={request.attempts_body} kind={request.usage_evidence.kind}/></div>
                           {request.estimated_prompt_tokens !== null && (
                             <span className="muted" style={{ fontSize: 10 }} title="本地估算值；与左侧实际值对比即可看出估算偏差">
                               {" "}（估 {formatNumber(request.estimated_prompt_tokens)}）
                             </span>
                           )}
-                          {request.native_usage && <NativeRequestUsage usage={request.native_usage}/>}
+                          {nativeUsage && <NativeRequestUsage usage={nativeUsage}/>}
                         </td>
                         <td>
-                          {personalUnverified ? <span className="muted">用量／费用未核验</span> : request.native_usage ? <span className="muted">API 参考费用见用量明细</span> : request.cost === null || request.currency === null
-                            ? <span className="muted">未计价</span>
-                            : formatMoney(request.cost, request.currency)}
+                          {nativeUsage && !personalUnverified ? <span className="muted">API 参考费用见用量明细</span> : <span className="muted">用量／费用未核验</span>}
                         </td>
-                        <td className="muted breakable" style={{ fontSize: 11 }}>{personalUnverified ? "无可信用量或费用收据" : request.native_usage ? "请求时参考单价" : request.rate_label ?? "基础价"}</td>
+                        <td className="muted breakable" style={{ fontSize: 11 }}>{personalUnverified ? "无可信用量或费用收据" : nativeUsage ? "请求时参考单价" : "未知"}</td>
                         <td>
                           {hasAttempts || validId ? (
                             <button type="button" className="ghost attempt-toggle" aria-expanded={isExpanded} aria-label={validId ? `任务反馈与请求明细 ${request.id}` : undefined}>

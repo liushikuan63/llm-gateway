@@ -12,6 +12,7 @@
 pub(crate) mod auxiliary;
 pub(crate) mod native_usage;
 pub mod route_decision;
+pub mod v2;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
