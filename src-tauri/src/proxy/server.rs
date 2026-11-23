@@ -5165,17 +5165,12 @@ async fn dispatch_context_inner(
         let fixed_reserve = fixed_context_reserve(&req, &candidates);
         if let Some(max_message_budget) = max_message_budget(&candidates, fixed_reserve) {
             let conservative_ratio = conservative_ratio(&candidates, &calibration);
-            let scaled_budget = (max_message_budget as f64 / conservative_ratio).floor() as u32;
-            if scaled(estimate_message_tokens(&req.messages), conservative_ratio)
-                > max_message_budget
-            {
+            let required_before_compaction =
+                scaled(estimate_message_tokens(&req.messages), conservative_ratio);
+            if required_before_compaction > max_message_budget {
                 if request_context.strict() {
                     return error_response(&GatewayError::ContextLengthExceeded {
-                        required: scaled(
-                            estimate_message_tokens(&req.messages),
-                            conservative_ratio,
-                        )
-                        .saturating_add(fixed_reserve),
+                        required: required_before_compaction.saturating_add(fixed_reserve),
                         available: max_message_budget.saturating_add(fixed_reserve),
                     });
                 }
@@ -5208,17 +5203,16 @@ async fn dispatch_context_inner(
                 }
             }
 
-            let before_trim = estimate_message_tokens(&req.messages);
-            if scaled(before_trim, conservative_ratio) > max_message_budget {
-                req.messages = trim_to_budget(req.messages, scaled_budget);
-                let after_trim = estimate_message_tokens(&req.messages);
-                if scaled(after_trim, conservative_ratio) > max_message_budget {
-                    return error_response(&GatewayError::ContextLengthExceeded {
-                        required: scaled(before_trim, conservative_ratio)
-                            .saturating_add(fixed_reserve),
-                        available: max_message_budget.saturating_add(fixed_reserve),
-                    });
-                }
+            let (before_trim, after_trim) = match trim_chat_context_to_window(
+                &mut req.messages,
+                max_message_budget,
+                conservative_ratio,
+                fixed_reserve,
+            ) {
+                Ok(tokens) => tokens,
+                Err(error) => return error_response(&error),
+            };
+            if after_trim < before_trim {
                 tracing::warn!(
                     "会话 {} 在所有候选窗口内无法完整容纳，已从 {} tokens 裁剪至 {} tokens",
                     session_id,
@@ -5724,6 +5718,31 @@ fn max_message_budget(
         })
         .map(|window| window.saturating_sub(fixed_reserve))
         .max()
+}
+
+/// Common Chat's local capacity gate, independent of any remote compaction.
+fn trim_chat_context_to_window(
+    messages: &mut Vec<Message>,
+    max_message_budget: u32,
+    conservative_ratio: f64,
+    fixed_reserve: u32,
+) -> Result<(u32, u32)> {
+    let before_trim = estimate_message_tokens(messages);
+    let required = scaled(before_trim, conservative_ratio);
+    if required <= max_message_budget {
+        return Ok((before_trim, before_trim));
+    }
+    let scaled_budget = (max_message_budget as f64 / conservative_ratio).floor() as u32;
+    *messages = trim_to_budget(std::mem::take(messages), scaled_budget);
+    let after_trim = estimate_message_tokens(messages);
+    // Local trimming preserves the latest complete unit, which may still be too large.
+    if scaled(after_trim, conservative_ratio) > max_message_budget {
+        return Err(GatewayError::ContextLengthExceeded {
+            required: required.saturating_add(fixed_reserve),
+            available: max_message_budget.saturating_add(fixed_reserve),
+        });
+    }
+    Ok((before_trim, after_trim))
 }
 
 fn candidate_supports_context(

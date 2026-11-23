@@ -230,6 +230,7 @@ impl GatewayState {
             }
         }
         let mut supported = Vec::new();
+        let mut buffered_sizing_only = Vec::new();
         for c in candidates {
             // Same local runtime configuration resolver as actual dispatch.
             // It does not prepare auth, launch a CLI or prove account readiness.
@@ -261,20 +262,30 @@ impl GatewayState {
             };
             if let Some(reason) = reason {
                 reasons.insert(key(&c), reason);
+                if !req.stream {
+                    buffered_sizing_only.push(c);
+                }
             } else {
                 supported.push(c);
             }
         }
+        // Buffered Chat sizes the cost-approved pool before runtime resolution.
+        // Streaming Chat sizes only the transport-supported candidates.
+        let supported_count = supported.len();
+        supported.append(&mut buffered_sizing_only);
         candidates = supported;
         let calibration = self.calibration_snapshot().await;
         let fixed_reserve = fixed_context_reserve(&req, &candidates);
         let before = req.messages.len();
-        if let Some(max) = max_message_budget(&candidates, fixed_reserve) {
-            let ratio = conservative_ratio(&candidates, &calibration);
-            if scaled(estimate_message_tokens(&req.messages), ratio) > max {
-                req.messages = trim_to_budget(req.messages, (max as f64 / ratio).floor() as u32);
-            }
+        let context_window_insufficient = max_message_budget(&candidates, fixed_reserve)
+            .is_some_and(|max| {
+                let ratio = conservative_ratio(&candidates, &calibration);
+                trim_chat_context_to_window(&mut req.messages, max, ratio, fixed_reserve).is_err()
+            });
+        if context_window_insufficient {
+            gate_issue = Some("context_window_insufficient");
         }
+        candidates.truncate(supported_count);
         let message_tokens = estimate_message_tokens(&req.messages);
         let media = crate::media::Media::of(&req);
         let required = required_capabilities(&req);
@@ -283,7 +294,9 @@ impl GatewayState {
                 Some("protocol_media_unsupported")
             } else if !crate::router::score::satisfies_hard_constraints(c, &required) {
                 Some("model_capability_missing")
-            } else if !candidate_supports_context(c, message_tokens, fixed_reserve, &calibration) {
+            } else if context_window_insufficient
+                || !candidate_supports_context(c, message_tokens, fixed_reserve, &calibration)
+            {
                 Some("context_window_insufficient")
             } else {
                 None
