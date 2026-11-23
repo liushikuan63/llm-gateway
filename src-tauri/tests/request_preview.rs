@@ -615,3 +615,262 @@ async fn n2ctx_classification_precedes_local_trimming_like_actual_dispatch() {
     }).catch_unwind().await;
     f.finish(result).await;
 }
+
+async fn configure_local_windows(f: &Owned, include_known: bool) {
+    for mut provider in repo::list_providers(f.state.db.pool()).await.unwrap() {
+        provider.enabled = provider.id == "vision" || (include_known && provider.id == "text");
+        if provider.enabled {
+            for model in &mut provider.models {
+                model.context_window = if provider.id == "text" { 1024 } else { 0 };
+                model.supports_tools = false;
+                model.supports_vision = false;
+                model.supports_audio = false;
+                model.supports_video = false;
+            }
+        }
+        repo::upsert_provider(f.state.db.pool(), &provider)
+            .await
+            .unwrap();
+    }
+    f.state.reload_providers().await.unwrap();
+    let mut cfg = f.state.cfg.write();
+    cfg.smart_routing.enabled = false;
+    cfg.compact_threshold_tokens = u32::MAX;
+    // There is no older persisted history for either normal or forced compaction.
+    cfg.compact_keep_recent = 1_000;
+}
+
+fn indivisible_window_request() -> Value {
+    let mut body = text();
+    body["messages"][0]["content"] = json!("x".repeat(8192));
+    body
+}
+
+#[tokio::test]
+async fn n2_window_indivisible_overflow_refuses_before_ranking_unknown_candidate() {
+    let f = Owned::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        configure_local_windows(&f, true).await;
+        let body = indivisible_window_request();
+        let before = f.counts().await;
+        deny_preview_writes(&f, true).await;
+        let preview = f
+            .state
+            .preview_routing_request(input(body.clone(), None, None))
+            .await
+            .unwrap();
+        assert_eq!(f.counts().await, before);
+        assert!(f.calls.lock().unwrap().is_empty());
+        deny_preview_writes(&f, false).await;
+
+        let response = f.send(body).await;
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let error: Value = response.json().await.unwrap();
+        assert_eq!(error["error"]["type"], "context_length_exceeded");
+        assert!(f.calls.lock().unwrap().is_empty());
+        eprintln!("owned actual status=400 error.type=context_length_exceeded physical_posts=0");
+
+        assert_eq!(preview.trimmed_messages, 0);
+        assert_eq!(preview.rows.len(), 2);
+        assert_eq!(
+            preview.gate_issue,
+            Some("context_window_insufficient"),
+            "offline preview contradicted the actual local refusal: {:?}",
+            preview.rows
+        );
+        for provider in ["text", "vision"] {
+            let row = preview
+                .rows
+                .iter()
+                .find(|row| row.provider_id == provider)
+                .unwrap();
+            assert_eq!(row.exclusion_reason, Some("context_window_insufficient"));
+            assert!(!row.eligible);
+            assert!(row.ordinal.is_none());
+            assert!(row.score.is_none());
+            assert!(row.breakdown.is_none());
+        }
+    })
+    .catch_unwind()
+    .await;
+    f.finish(result).await;
+}
+
+#[tokio::test]
+async fn n2_window_short_trimmed_and_unknown_only_requests_still_dispatch() {
+    let f = Owned::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        configure_local_windows(&f, true).await;
+        let short = text();
+        let mut trimmable = text();
+        trimmable["messages"] = json!([
+            {"role":"user","content":"owned old ".repeat(1024)},
+            {"role":"assistant","content":"owned previous exchange"},
+            {"role":"user","content":"owned recent turn"}
+        ]);
+        for (at, body, expected_trim) in [(0, short, 0), (1, trimmable, 1)] {
+            let preview = f
+                .state
+                .preview_routing_request(input(body.clone(), None, None))
+                .await
+                .unwrap();
+            assert_eq!(preview.gate_issue, None);
+            assert_eq!(preview.trimmed_messages, expected_trim);
+            assert_eq!(preview.rows.iter().filter(|row| row.eligible).count(), 2);
+            assert_eq!(f.calls.lock().unwrap().len(), at);
+            let response = f.send(body.clone()).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert!(response
+                .text()
+                .await
+                .unwrap()
+                .contains("owned preview reply"));
+            let calls = f.calls.lock().unwrap();
+            assert_eq!(calls.len(), at + 1);
+            assert_eq!(
+                calls[at].0,
+                preview
+                    .rows
+                    .iter()
+                    .find(|r| r.ordinal == Some(1))
+                    .unwrap()
+                    .provider_id
+            );
+            let supplied = body["messages"].as_array().unwrap();
+            assert_eq!(
+                calls[at].1["messages"].as_array().unwrap(),
+                &supplied[expected_trim..]
+            );
+        }
+
+        configure_local_windows(&f, false).await;
+        let long = indivisible_window_request();
+        let preview = f
+            .state
+            .preview_routing_request(input(long.clone(), None, None))
+            .await
+            .unwrap();
+        assert_eq!(preview.gate_issue, None);
+        assert_eq!(preview.trimmed_messages, 0);
+        assert_eq!(preview.rows.len(), 1);
+        assert_eq!(preview.rows[0].provider_id, "vision");
+        assert_eq!(preview.rows[0].ordinal, Some(1));
+        assert_eq!(f.calls.lock().unwrap().len(), 2);
+        let response = f.send(long.clone()).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("owned preview reply"));
+        let calls = f.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].0, "vision");
+        assert_eq!(calls[2].1["messages"], long["messages"]);
+    })
+    .catch_unwind()
+    .await;
+    f.finish(result).await;
+}
+
+#[tokio::test]
+async fn n2_window_runtime_candidates_follow_buffered_and_stream_sizing() {
+    let f = Owned::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        configure_local_windows(&f, true).await;
+        let mut disabled = llm_gateway_lib::domain::AgentRuntime::new(
+            "owned-window-disabled-runtime",
+            "codex",
+            "Owned disabled large-window runtime",
+        );
+        disabled.enabled = false;
+        repo::upsert_agent_runtime(f.state.db.pool(), &disabled)
+            .await
+            .unwrap();
+        let mut runtime = repo::list_providers(f.state.db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == "small")
+            .unwrap();
+        runtime.enabled = true;
+        runtime.priority = 90;
+        runtime.runtime_id = Some(disabled.id);
+        for model in &mut runtime.models {
+            model.context_window = 16_384;
+            model.supports_stream = true;
+        }
+        repo::upsert_provider(f.state.db.pool(), &runtime)
+            .await
+            .unwrap();
+        f.state.reload_providers().await.unwrap();
+
+        // The disabled runtime has the only known window large enough for this request.
+        // Ordinary Chat still includes it when sizing, then sends to the pure HTTP candidate.
+        // Streaming drops that runtime before sizing and rejects the intact recent message.
+        for stream in [true, false] {
+            let mut body = indivisible_window_request();
+            body["stream"] = json!(stream);
+            let before = f.counts().await;
+            deny_preview_writes(&f, true).await;
+            let preview = f
+                .state
+                .preview_routing_request(input(body.clone(), None, None))
+                .await
+                .unwrap();
+            assert_eq!(f.counts().await, before);
+            assert!(f.calls.lock().unwrap().is_empty());
+            deny_preview_writes(&f, false).await;
+
+            let response = f.send(body.clone()).await;
+            let status = response.status();
+            let response: Value = response.json().await.unwrap();
+            if stream {
+                assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+                assert_eq!(response["error"]["type"], "context_length_exceeded");
+                assert!(f.calls.lock().unwrap().is_empty());
+                eprintln!(
+                    "owned runtime-window stream=true status=400 error.type=context_length_exceeded physical_posts=0"
+                );
+            } else {
+                assert_eq!(status, reqwest::StatusCode::OK);
+                assert_eq!(
+                    response["choices"][0]["message"]["content"],
+                    "owned preview reply"
+                );
+                let calls = f.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].0, "vision");
+                assert_eq!(calls[0].1["messages"], body["messages"]);
+                eprintln!("owned runtime-window stream=false status=200 physical_posts=1 provider=vision");
+            }
+
+            let rows = &preview.rows;
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                preview.gate_issue,
+                stream.then_some("context_window_insufficient"),
+                "preview window sizing disagreed with actual Chat for stream={stream}: {rows:?}"
+            );
+            assert_eq!(preview.trimmed_messages, 0);
+            for (provider, expected_reason) in [
+                ("small", Some("runtime_unavailable")),
+                ("text", Some("context_window_insufficient")),
+                ("vision", stream.then_some("context_window_insufficient")),
+            ] {
+                let row = rows.iter().find(|row| row.provider_id == provider).unwrap();
+                assert_eq!(row.exclusion_reason, expected_reason);
+                assert_eq!(row.eligible, expected_reason.is_none());
+                if expected_reason.is_some() {
+                    assert!(row.ordinal.is_none() && row.score.is_none() && row.breakdown.is_none());
+                } else {
+                    assert_eq!(row.ordinal, Some(1));
+                    assert!(row.score.is_some() && row.breakdown.is_some());
+                }
+            }
+        }
+    })
+    .catch_unwind()
+    .await;
+    f.finish(result).await;
+}
