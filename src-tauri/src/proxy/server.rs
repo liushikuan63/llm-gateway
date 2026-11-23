@@ -42,6 +42,7 @@ use crate::domain::{
     RemoteAccessKey, Role, ToolCall, Usage,
 };
 use crate::error::{GatewayError, Result};
+use crate::protocol::openai::AccountIngressShape;
 use crate::proxy::dedup::{DedupDecision, DedupOutcome, DedupRegistry, Verdict};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::upstream::{PassthroughResponse, UpstreamClient, UpstreamEvent};
@@ -661,6 +662,9 @@ impl GatewayState {
                     "account_hard_stop_and_reservation_unverified",
                 ));
             }
+            if let Some(reason) = account_ingress_rejection(&runtime, options.account_ingress) {
+                return Err(GatewayError::RequestControlUnavailable { reason });
+            }
             match runtime {
                 crate::agent_upstream::runtime::ChatRuntime::WorkBuddy {
                     region,
@@ -826,6 +830,9 @@ impl GatewayState {
                 return Err(crate::cost_policy::rejected(
                     "account_hard_stop_and_reservation_unverified",
                 ));
+            }
+            if let Some(reason) = account_ingress_rejection(&runtime, options.account_ingress) {
+                return Err(GatewayError::RequestControlUnavailable { reason });
             }
             match runtime {
                 crate::agent_upstream::runtime::ChatRuntime::WorkBuddy {
@@ -2076,12 +2083,28 @@ async fn chat_completions(
         Ok(None) => (),
     }
     let caller = super::control_modes::CallerControls::capture(&body, Dialect::OpenAI);
-    match serde_json::from_value::<crate::protocol::openai::OaChatRequest>(body) {
-        Ok(r) => match r.to_internal() {
-            Ok(req) => dispatch(state, req, &headers, auth.client, Exit::OpenAI, caller).await,
-            Err(e) => error_response(&e),
-        },
-        Err(e) => error_response(&GatewayError::Protocol(format!("请求体解析失败: {e}"))),
+    let request = match serde_json::from_value::<crate::protocol::openai::OaChatRequest>(body) {
+        Ok(request) => request,
+        Err(e) => return error_response(&GatewayError::Protocol(format!("请求体解析失败: {e}"))),
+    };
+    let account_ingress = request.account_ingress_shape();
+    match request.to_internal() {
+        Ok(req) => {
+            dispatch_with_context(
+                state,
+                req,
+                &headers,
+                auth.client,
+                Exit::OpenAI,
+                ResponseRequestContext {
+                    caller: Some(caller),
+                    account_ingress,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+        Err(e) => error_response(&e),
     }
 }
 
@@ -2191,6 +2214,7 @@ struct ResponseRequestContext {
     cost_policy: RequestCostPolicy,
     normalized_ingress: Option<super::control_modes::ControlSet>,
     caller: Option<super::control_modes::CallerControls>,
+    account_ingress: AccountIngressShape,
 }
 
 impl ResponseRequestContext {
@@ -2217,6 +2241,7 @@ impl ResponseRequestContext {
                 body,
                 Dialect::Responses,
             )),
+            account_ingress: AccountIngressShape::default(),
         })
     }
 
@@ -2237,6 +2262,7 @@ impl ResponseRequestContext {
             cost_policy: self.cost_policy,
             normalized_ingress: self.normalized_ingress,
             caller: self.caller,
+            account_ingress: self.account_ingress,
         }
     }
 }
@@ -3603,6 +3629,68 @@ enum Exit {
     Gemini,
 }
 
+fn account_ingress_rejection(
+    runtime: &crate::agent_upstream::runtime::ChatRuntime,
+    shape: AccountIngressShape,
+) -> Option<&'static str> {
+    use crate::agent_upstream::runtime::ChatRuntime;
+    match runtime {
+        ChatRuntime::Qoder { .. } => shape.rejection(true),
+        ChatRuntime::WorkBuddy { .. } => shape.rejection(false),
+        ChatRuntime::Trae { .. } | ChatRuntime::Agent(_) => None,
+    }
+}
+
+async fn candidate_ingress_rejection(
+    state: &GatewayState,
+    candidate: Option<&crate::router::score::Candidate>,
+    shape: AccountIngressShape,
+) -> Option<&'static str> {
+    if !shape.needs_check() {
+        return None;
+    }
+    let runtime = crate::agent_upstream::runtime::resolve_chat_runtime(
+        state.db.pool(),
+        &state.adapters,
+        candidate?.provider.runtime_id.as_deref()?,
+    )
+    .await
+    .ok()?;
+    account_ingress_rejection(&runtime, shape)
+}
+
+// Existing durable budget and FreeOnly checks still own their errors.
+fn can_reject_account_ingress(state: &GatewayState, policy: RequestCostPolicy) -> bool {
+    !crate::budget::holds::active() && !state.cost_gate.effective(policy).is_free()
+}
+
+async fn all_chat_routes_reject_ingress(
+    state: &GatewayState,
+    req: &ChatRequest,
+    cfg: &AppConfig,
+    shape: AccountIngressShape,
+) -> Option<&'static str> {
+    let candidates = state
+        .router
+        .resolve_typed_with(
+            &req.model,
+            &state.legacy_providers(),
+            ModelType::Chat,
+            smart_mode_enabled(cfg),
+        )
+        .ok()?;
+    let mut reason = None;
+    for candidate in &candidates {
+        if req.stream && !candidate.model.supports_stream {
+            return None;
+        }
+        // Unknown/disabled runtimes and mixed pools must go through normal
+        // route selection rather than treating the eligible set as closed.
+        reason = Some(candidate_ingress_rejection(state, Some(candidate), shape).await?);
+    }
+    reason
+}
+
 /// Match the existing call_chat_upstream account/HTTP branch: every runtime_id
 /// is resolved by an account/agent adapter, never this HTTP serializer. Only the
 /// actual first route is checked; an unused conflicting fallback is not rejected.
@@ -3686,6 +3774,8 @@ struct DispatchInput {
     // Request-scoped opt-in, never forwarded to an upstream or persisted.
     desktop_observation: bool,
     wire_options: super::upstream::RequestWireOptions,
+    // Prepared before dedup only when loss on account ingress is possible.
+    buffered_cascade: Option<BufferedCascade>,
     req: ChatRequest,
     new_messages: Vec<Message>,
     /// 客户端可见的逻辑会话 ID。远程模式下不能回显内部隔离后的存储键。
@@ -4950,6 +5040,17 @@ async fn dispatch_context_inner(
         return response;
     }
 
+    // If every known route rejects the original shape, avoid reconstructing
+    // the session or running request preflight for a request we cannot send.
+    if request_context.account_ingress.needs_check() && can_reject_account_ingress(&state, policy) {
+        if let Some(reason) =
+            all_chat_routes_reject_ingress(&state, &req, &cfg, request_context.account_ingress)
+                .await
+        {
+            return error_response(&GatewayError::RequestControlUnavailable { reason });
+        }
+    }
+
     // 1) 会话定位
     let header_sid = headers
         .get("x-session-id")
@@ -5325,12 +5426,21 @@ async fn dispatch_context_inner(
         //
         // 指纹由「请求内容 + 会话 + 客户端」派生，不依赖调用方回传任何 id ——
         // 主流 SDK 客户端不保证回传幂等键，而网关侧派生键对它们一律有效。
-        let fingerprint = dedup_fingerprint(
-            &state,
-            client.as_deref(),
-            &req,
-            request_context.wire_options(),
-        );
+        let wire_options = request_context.wire_options();
+        let buffered_cascade = (!req.stream && wire_options.account_ingress.needs_check())
+            .then(|| order_buffered_cascade(&state, &cfg, &req, &mut ranked));
+        // The original shape can disappear from the dedup fingerprint. Only
+        // the selected incompatible route skips dedup; a mixed pool whose
+        // selected route is ordinary HTTP still uses the normal fingerprint.
+        let fingerprint =
+            if candidate_ingress_rejection(&state, ranked.first(), wire_options.account_ingress)
+                .await
+                .is_some()
+            {
+                None
+            } else {
+                dedup_fingerprint(&state, client.as_deref(), &req, wire_options)
+            };
         let permit = match state.dedup.begin(fingerprint.as_deref()).await {
             DedupDecision::Off => None,
             DedupDecision::Take(permit) => Some(permit),
@@ -5346,7 +5456,8 @@ async fn dispatch_context_inner(
             desktop_observation: headers
                 .get("x-llmgw-desktop-observation")
                 .is_some_and(|v| v == "1"),
-            wire_options: request_context.wire_options(),
+            wire_options,
+            buffered_cascade,
             req,
             new_messages,
             response_session_id,
@@ -5966,6 +6077,33 @@ async fn persist_completed_exchange(
     Ok(())
 }
 
+struct BufferedCascade {
+    enabled: bool,
+    ordered_by_cost: bool,
+}
+
+fn order_buffered_cascade(
+    state: &GatewayState,
+    cfg: &AppConfig,
+    req: &ChatRequest,
+    ranked: &mut [crate::router::score::Candidate],
+) -> BufferedCascade {
+    // Only buffered Cascade changes execution order. The router owns the
+    // downgrade rule; incomparable currencies or no price keep the rank.
+    let (strategy, _) = state.router.effective_strategy(ranked, cfg);
+    let enabled = matches!(strategy, RoutingStrategy::Cascade) && cfg.cascade.enabled();
+    let ordered_by_cost = enabled
+        && crate::router::order_by_cost(
+            ranked,
+            estimate_message_tokens(&req.messages) as i64,
+            utc_minute_of_day(),
+        );
+    BufferedCascade {
+        enabled,
+        ordered_by_cost,
+    }
+}
+
 /// 非流式请求执行与缓存。
 async fn normal_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Response {
     let started = Instant::now();
@@ -6010,6 +6148,7 @@ async fn normal_dispatch_inner(
         decision: _,
         desktop_observation,
         wire_options,
+        buffered_cascade,
         cache_session,
         cache_generation,
         trace_id,
@@ -6033,34 +6172,11 @@ async fn normal_dispatch_inner(
         1
     };
 
-    // ===== D4：级联档的执行层 =====
-    //
-    // 这是 `RoutingStrategy::Cascade` 唯一的生产消费点。判定用
-    // [`Router::effective_strategy`] 而不是在本地重写一遍降级口径 ——
-    // 两处各判一次的话，表现会是「界面上设了 cascade、实际却没级联」，
-    // 而那种错误不报错，只是行为不对。
-    //
-    // **只在非流式路径上**（这里就是）：流式的换家在 `stream_dispatch` 里
-    // 由「首个字节之后不换家」那条铁律挡着，级联压根不参与。
-    let (strategy, _) = state.router.effective_strategy(&ranked, &cfg);
-    let cascade_on = matches!(strategy, RoutingStrategy::Cascade) && cfg.cascade.enabled();
-    // 级联档的**执行顺序**是「便宜优先」，与 `Weights` 排序刻意分开
-    // （级联档的权重与 Balanced 逐位相同，见 tests/cascade.rs）。
-    //
-    // 【模式隔离】重排只发生在真的走级联时 —— 其余七档的候选顺序
-    // 必须逐位不变。判断因此放在重排**之前**。
-    //
-    // `order_by_cost` 返回 false = 币种不可比或一个价格都没有，
-    // 此时保持原顺序：那不算错误，只是「便宜优先」这个前提本轮不成立。
-    let cascade_ordered = if cascade_on {
-        crate::router::order_by_cost(
-            &mut ranked,
-            estimate_message_tokens(&req.messages) as i64,
-            utc_minute_of_day(),
-        )
-    } else {
-        false
-    };
+    // Lossy input already used the actual buffered order before dedup.
+    let BufferedCascade {
+        enabled: cascade_on,
+        ordered_by_cost: cascade_ordered,
+    } = buffered_cascade.unwrap_or_else(|| order_buffered_cascade(&state, &cfg, &req, &mut ranked));
     if cascade_on {
         if let Some(decision) = route.decision.as_mut() {
             decision.cascade_order(&ranked, cascade_ordered);
@@ -6077,6 +6193,14 @@ async fn normal_dispatch_inner(
         return error_response(&error);
     }
 
+    let account_rejection =
+        candidate_ingress_rejection(&state, ranked.first(), wire_options.account_ingress).await;
+    if let Some(reason) =
+        account_rejection.filter(|_| can_reject_account_ingress(&state, wire_options.cost_policy))
+    {
+        return error_response(&GatewayError::RequestControlUnavailable { reason });
+    }
+
     // 缓存键的 provider/model 用**本轮路由的首选**（ranked[0]）。
     //
     // 为什么不用实际命中的那家：查表必须发生在跑上游**之前**，那时还不知道
@@ -6087,10 +6211,11 @@ async fn normal_dispatch_inner(
         .first()
         .map(|c| (c.provider.id.clone(), c.model.upstream.clone()));
     let mut cache_cfg = cfg.cache.clone();
-    if state
-        .cost_gate
-        .effective(wire_options.cost_policy)
-        .is_free()
+    if account_rejection.is_some()
+        || state
+            .cost_gate
+            .effective(wire_options.cost_policy)
+            .is_free()
     {
         cache_cfg.enabled = false;
     }
@@ -6822,6 +6947,7 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
         decision: _,
         desktop_observation,
         wire_options,
+        buffered_cascade: _,
         // 流式一律 BYPASS，用不到缓存键里的会话 id。
         cache_session: _cache_session,
         cache_generation: _cache_generation,
@@ -6845,6 +6971,16 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 
     if let Err(error) = validate_first_http_instruction_override(&ranked, wire_options) {
         return error_response(&error);
+    }
+
+    if wire_options.account_ingress.needs_check()
+        && can_reject_account_ingress(&state, wire_options.cost_policy)
+    {
+        if let Some(reason) =
+            candidate_ingress_rejection(&state, ranked.first(), wire_options.account_ingress).await
+        {
+            return error_response(&GatewayError::RequestControlUnavailable { reason });
+        }
     }
 
     let req_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());

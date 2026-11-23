@@ -39,7 +39,70 @@ pub struct OaMessage {
     pub tool_call_id: Option<String>,
 }
 
+/// Facts the compatibility conversion would otherwise erase. Never forwarded,
+/// serialized into a request, or derived from its flattened extras.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AccountIngressShape {
+    unsupported_part: bool,
+    incomplete_call: bool,
+}
+
+impl AccountIngressShape {
+    pub(crate) fn needs_check(self) -> bool {
+        self.unsupported_part || self.incomplete_call
+    }
+
+    pub(crate) fn rejection(self, qoder: bool) -> Option<&'static str> {
+        if self.unsupported_part {
+            Some("unsupported_account_content_part")
+        } else if qoder && self.incomplete_call {
+            Some("invalid_account_tool_history")
+        } else {
+            None
+        }
+    }
+}
+
 impl OaChatRequest {
+    pub(crate) fn account_ingress_shape(&self) -> AccountIngressShape {
+        use serde_json::Value;
+
+        let mut shape = AccountIngressShape::default();
+        for message in &self.messages {
+            if let Some(Value::Array(parts)) = &message.content {
+                shape.unsupported_part |=
+                    parts
+                        .iter()
+                        .any(|part| match part.get("type").and_then(Value::as_str) {
+                            Some("text") => !part.get("text").is_some_and(Value::is_string),
+                            Some(kind @ ("image_url" | "video_url")) => {
+                                !part.get(kind).is_some_and(|media| {
+                                    media.get("url").is_some_and(Value::is_string)
+                                        && matches!(
+                                            media.get("detail"),
+                                            None | Some(Value::Null | Value::String(_))
+                                        )
+                                })
+                            }
+                            Some("input_audio") => {
+                                !part.get("input_audio").is_some_and(Value::is_object)
+                            }
+                            _ => true,
+                        });
+            }
+            if let Some(calls) = &message.tool_calls {
+                shape.incomplete_call |= calls.iter().any(|call| {
+                    !call.get("id").is_some_and(Value::is_string)
+                        || !call
+                            .get("function")
+                            .and_then(|function| function.get("name"))
+                            .is_some_and(Value::is_string)
+                });
+            }
+        }
+        shape
+    }
+
     pub fn to_internal(self) -> Result<ChatRequest, crate::error::GatewayError> {
         let mut msgs = Vec::with_capacity(self.messages.len());
         for m in self.messages {
@@ -311,3 +374,42 @@ pub fn anthropic_sse(event: &str, data: &serde_json::Value) -> String {
 }
 
 pub const SSE_DONE: &str = "data: [DONE]\n\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_ingress_rejects_media_that_conversion_would_reset() {
+        for kind in ["image_url", "video_url"] {
+            for (detail, expected) in [
+                (serde_json::Value::Null, None),
+                (json!("high"), None),
+                (json!(1), Some("unsupported_account_content_part")),
+            ] {
+                let url = "https://owned.invalid/media";
+                let body = json!({
+                    "model": "owned",
+                    "messages": [{"role": "user", "content": [
+                        {"type":kind, (kind):{"url":url, "detail":detail}}
+                    ]}]
+                });
+                let req: OaChatRequest = serde_json::from_value(body).unwrap();
+                let ingress = req.account_ingress_shape();
+                assert_eq!(ingress.rejection(false), expected);
+                assert_eq!(ingress.rejection(true), expected);
+                let normalized = req.to_internal().unwrap();
+                let Content::Parts(parts) = &normalized.messages[0].content else {
+                    panic!("expected media part");
+                };
+                let retained = match &parts[0] {
+                    Part::ImageUrl { image_url } => &image_url.url,
+                    Part::VideoUrl { video_url } => &video_url.url,
+                    part => panic!("unexpected part {part:?}"),
+                };
+                let expected_url = if expected.is_some() { "" } else { url };
+                assert_eq!(retained, expected_url);
+            }
+        }
+    }
+}

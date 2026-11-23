@@ -503,6 +503,14 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 
 
 
+### R5-P 普通 OpenAI Chat 的账号入站形状
+
+普通 OpenAI Chat 在转换成统一消息前，暂存内容项是否会被转换丢弃或补默认值，以及工具调用是否缺少字符串 ID 或函数名。这两个标志只供本次路由检查，不参与请求序列化、缓存键或去重指纹。
+
+已选 Qoder 或 WorkBuddy 路线遇到不支持的内容项，返回 HTTP 400，原因 `unsupported_account_content_part`；仅 Qoder 另外拒绝不完整的工具调用历史（`invalid_account_tool_history`）。明确只有不兼容账号候选时可在会话预处理前拒绝；混合候选沿既有顺序选择，非流式按实际级联顺序检查后才可读缓存或去重。每次账号派发按解析出的运行时再核验，包括故障转移；拒绝不会读取该账号的供应商目录或向其发送模型请求。现有预算和 FreeOnly 拒绝仍由原判定处理。
+
+普通 HTTP 路线和原生原样透传保持现有入口。自有回环用例覆盖 Qoder／WorkBuddy 各两区的流式和非流式请求、预热缓存及重复请求；不涉及真实账号、其他协议入口或远程压缩。
+
 ### N4 原生上游的流终态
 
 

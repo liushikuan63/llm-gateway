@@ -786,6 +786,94 @@ async fn gateway_both_regions_preserve_stream_nonstream_history_usage_and_audit(
     }
 }
 #[tokio::test]
+async fn gateway_qoder_rejects_lossy_openai_ingress_in_both_regions() {
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [(Region::Global, "global"), (Region::Cn, "cn")] {
+        let f = setup().await;
+        *f.fixture.response.lock() = Some(normal_response_with_null_frames());
+        let g = gateway(&f, region, false).await;
+        for stream in [false, true] {
+            for (reason, messages) in [
+                (
+                    "unsupported_account_content_part",
+                    json!([{"role":"user","content":[
+                        {"type":"text","text":"owned question"},
+                        {"type":"input_file","file_id":"owned-file"}
+                    ]}]),
+                ),
+                (
+                    "invalid_account_tool_history",
+                    json!([
+                        {"role":"user","content":"prior question"},
+                        {"role":"assistant","content":"prior answer","tool_calls":[
+                            {"id":"owned-call","type":"function","function":{"arguments":"{}"}}
+                        ]},
+                        {"role":"user","content":"next question"}
+                    ]),
+                ),
+            ] {
+                let before = (
+                    f.fixture.posts.load(Ordering::SeqCst),
+                    f.fixture.catalogs.load(Ordering::SeqCst),
+                );
+                let response = http
+                    .post(format!("{}/v1/chat/completions", g.url))
+                    .bearer_auth("synthetic-gateway-key")
+                    .json(&json!({"model":"public","stream":stream,"messages":messages}))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let wire = response.text().await.unwrap();
+                let error = serde_json::from_str::<Value>(&wire).unwrap_or(Value::Null);
+                let after = (
+                    f.fixture.posts.load(Ordering::SeqCst),
+                    f.fixture.catalogs.load(Ordering::SeqCst),
+                );
+                if status != StatusCode::BAD_REQUEST
+                    || !error["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(reason))
+                    || after != before
+                {
+                    failures.push(format!("{label} stream={stream} {reason}: status={status}, counts={before:?}->{after:?}"));
+                }
+            }
+        }
+        let control = http
+            .post(format!("{}/v1/chat/completions", g.url))
+            .bearer_auth("synthetic-gateway-key")
+            .json(&json!({"model":"public","messages":[
+                {"role":"user","content":"prior question"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"id":"owned-call","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"kept\"}"}}
+                ]},
+                {"role":"tool","tool_call_id":"owned-call","content":"owned result"},
+                {"role":"user","content":"next question"}
+            ]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(control.status(), StatusCode::OK, "{label}");
+        let body: Value = control.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "OK");
+        let requests = f.fixture.requests.lock();
+        let (_, request) = requests.last().unwrap();
+        assert_eq!(
+            request["messages"][1]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            request["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            "{\"q\":\"kept\"}"
+        );
+        assert_eq!(request["messages"][2]["tool_call_id"], "owned-call");
+    }
+    assert!(failures.is_empty(), "lossy Qoder ingress: {failures:?}");
+}
+
+#[tokio::test]
 async fn gateway_five_protocols_preserve_complete_tool_name_and_json_arguments() {
     let f = setup().await;
     let gateway = gateway(&f, Region::Global, false).await;

@@ -90,6 +90,7 @@ pub(crate) struct RequestWireOptions {
     pub cost_policy: crate::cost_policy::RequestCostPolicy,
     pub normalized_ingress: Option<super::control_modes::ControlSet>,
     pub caller: Option<super::control_modes::CallerControls>,
+    pub account_ingress: crate::protocol::openai::AccountIngressShape,
 }
 
 /// Response decoding and inherited cost policy stay together at passthrough's
