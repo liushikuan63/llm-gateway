@@ -1,5 +1,118 @@
 // Source browser and synthetic IPC only; production command/SQLite tested separately.
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
+
+async function verifyLedgerCoverage(page, panel, exportButton, output, proof, shot) {
+  const refresh = page.getByRole('button', { name: '重新读取', exact: true });
+  const coverage = page.getByTestId('ledger-coverage');
+  const exportedCoverage = panel.getByTestId('capability-export-coverage');
+  const exportedText = panel.getByRole('textbox', { name: '最近一次成功读取的导出 JSON', exact: true });
+  const pageError = page.locator('.capabilities-page > [role="alert"]');
+  const fact = alias => page.getByTestId('capability-facts').getByRole('row')
+    .filter({ has: page.getByText(alias, { exact: true }) });
+  const seed = {
+    observed: 3,
+    ledgers: { 'openrouter/my-chat': { values: { coding: { manual: { source: 'manual', value: 0.75 } } } } },
+    discarded: [
+      { key: 'openrouter/coverage-missing', reason: 'null_ledger' },
+      { key: 'openrouter/coverage-damaged', reason: 'syntax at line 1 column 2' },
+    ],
+  };
+  await page.evaluate(snapshot => {
+    const provider = window.__fixtureProviders.find(row => row.id === 'openrouter');
+    const model = provider.models.find(row => row.alias === 'my-chat');
+    provider.models = [model, ...['coverage-missing', 'coverage-damaged'].map(alias => ({ ...model, alias, upstream: alias }))];
+    window.__fixtureProviders = [provider];
+    const original = window.__TAURI_INTERNALS__.invoke;
+    window.__coverageFixture = { snapshot, reads: 0, downloads: 0 };
+    window.__TAURI_INTERNALS__.invoke = (command, args) => {
+      if (command !== 'export_capabilities_with_coverage') return original(command, args);
+      ++window.__coverageFixture.reads;
+      return Promise.resolve(structuredClone(window.__coverageFixture.snapshot));
+    };
+    const click = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () {
+      if (this.download === 'llm-gateway-capabilities.json' && this.href.startsWith('blob:')) ++window.__coverageFixture.downloads;
+      return click.call(this);
+    };
+  }, seed);
+  const counts = () => page.evaluate(() => ({ reads: window.__coverageFixture.reads, downloads: window.__coverageFixture.downloads }));
+  const read = async button => {
+    const previous = await counts();
+    await button.click();
+    await page.waitForFunction(n => window.__coverageFixture.reads === n + 1, previous.reads);
+    await page.waitForFunction(label => Array.from(document.querySelectorAll('button')).some(
+      button => button.textContent === label && !button.matches(':disabled')), await button.textContent());
+  };
+
+  await read(refresh);
+  const downloadEvent = page.waitForEvent('download');
+  await read(exportButton);
+  const download = await downloadEvent;
+  const saved = path.join(output, 'owned-mixed-coverage-export.json');
+  await download.saveAs(saved);
+  const expectedFile = JSON.stringify(seed.ledgers, null, 2);
+  assert.equal(fs.readFileSync(saved, 'utf8'), expectedFile, 'coverage metadata must stay outside the import-compatible JSON');
+  proof.downloads.push({path:saved,sha256:crypto.createHash('sha256').update(fs.readFileSync(saved)).digest('hex')});
+  const positive = {
+    summary: await coverage.innerText(),
+    exportSummary: await exportedCoverage.innerText(),
+    valid: await fact('my-chat').innerText(),
+    missing: await fact('coverage-missing').innerText(),
+    damaged: await fact('coverage-damaged').innerText(),
+  };
+  const failures = [];
+  const check = (label, assertion) => {
+    try { assertion(); } catch (error) { failures.push({label, error: String(error)}); }
+  };
+  proof.ledgerCoverage = { positive, invalid: [], failures };
+  check('page separates coverage counts', () => assert.match(positive.summary, /3 条模型记录；保留 1 个模型账本；缺失 1 条；损坏 1 条/));
+  check('export separates coverage counts', () => assert.match(positive.exportSummary, /3 条模型记录.*1 个模型账本；缺失 1 条；损坏 1 条/));
+  check('healthy ledger stays usable', () => assert.match(positive.valid, /1 \/ 4 质量维度有来源/));
+  check('missing stays unknown without a damage label or default', () => {
+    assert.match(positive.missing, /账本缺失；质量覆盖未知/);
+    assert.doesNotMatch(positive.missing, /账本已损坏|供应商默认回退/);
+  });
+  check('damaged stays unknown without a default', () => {
+    assert.match(positive.damaged, /账本已损坏；质量覆盖未知/);
+    assert.doesNotMatch(positive.damaged, /账本缺失|供应商默认回退/);
+  });
+  if (failures.length === 0) await shot('ledger-coverage-mixed.png', coverage);
+
+  const changed = structuredClone(seed);
+  changed.ledgers['openrouter/my-chat'].values.coding.manual.value = 0.12;
+  const bad = [
+    ['undercounted', { ...changed, observed: 2 }],
+    ['retained-and-discarded', { ...changed, discarded: [{ ...seed.discarded[0], key: 'openrouter/my-chat' }, seed.discarded[1]] }],
+    ['duplicate-discard', { ...changed, discarded: [seed.discarded[0], seed.discarded[0]] }],
+  ];
+  for (const [label, snapshot] of bad) {
+    await page.evaluate(next => { window.__coverageFixture.snapshot = next; }, snapshot);
+    const before = await counts();
+    await read(refresh);
+    const afterPage = {
+      rejected: (await pageError.filter({hasText:'能力账本覆盖返回无法确认'}).count()) === 1,
+      keepsLastSuccess: (await coverage.innerText()) === positive.summary,
+    };
+    await read(exportButton);
+    const afterExport = {
+      rejected: (await panel.getByRole('alert').filter({hasText:'能力账本覆盖返回无法确认'}).count()) === 1,
+      keepsLastSuccess: (await exportedCoverage.innerText()) === positive.exportSummary && (await exportedText.inputValue()) === expectedFile,
+      newDownload: (await counts()).downloads !== before.downloads,
+    };
+    proof.ledgerCoverage.invalid.push({label, afterPage, afterExport});
+    check(label, () => {
+      assert.deepEqual(afterPage, {rejected:true, keepsLastSuccess:true});
+      assert.deepEqual(afterExport, {rejected:true, keepsLastSuccess:true, newDownload:false});
+    });
+  }
+  assert.deepEqual(failures, [], 'invalid coverage must not replace a confirmed read or produce a file');
+  await page.setViewportSize({ width: 390, height: 1000 });
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'coverage summary must wrap at 390px');
+  await shot('ledger-coverage-mixed-mobile.png', coverage);
+  await shot('ledger-export-rejected-mobile.png', panel);
+  proof.checks.push('missing and damaged stay distinct; inconsistent snapshots keep the last confirmed read and cannot download');
+}
+
 async function verifyCapabilityTransfer(browser,baseUrl,output,errors,fixture){
  const context=await browser.newContext({viewport:{width:1320,height:1080},acceptDownloads:true,reducedMotion:'reduce'});await context.addInitScript(fixture);
  await context.addInitScript(()=>{
@@ -34,6 +147,7 @@ async function verifyCapabilityTransfer(browser,baseUrl,output,errors,fixture){
   const count=(await calls('import_capabilities')).length;await draft().fill('{invalid');await send().click();assert.match(await panel().getByRole('alert').innerText(),/JSON 未提交/);assert.equal((await calls('import_capabilities')).length,count);await draft().fill(payload);await page.evaluate(()=>window.__transferPlan.push({error:'owned command failure'}));await send().click();await panel().getByRole('alert').filter({hasText:'导入未确认'}).waitFor();assert.equal(await draft().inputValue(),payload);assert.equal((await calls('import_capabilities')).length,count+1);assert.equal(await panel().getByTestId('capability-import-result').count(),0);proof.checks.push('invalid JSON invokes0; backend error preserves draft, claims no false rollback or success and never auto-retries');
   await page.evaluate(()=>window.__transferPlan.push({bad:true}));await send().click();await panel().getByRole('alert').filter({hasText:'返回无法确认'}).waitFor();assert.equal(await panel().getByTestId('capability-import-result').count(),0);await page.evaluate(()=>window.__transferExportFailure=true);await exports().click();await panel().getByRole('alert').filter({hasText:'上次成功读取'}).waitFor();assert.equal(await panel().getByRole('textbox',{name:'最近一次成功读取的导出 JSON'}).inputValue(),before);await page.evaluate(()=>window.__transferExportFailure=false);proof.checks.push('malformed command DTO is not acceptance; export failure preserves and labels prior export text');
   await page.evaluate(()=>window.__transferPlan.push({hold:true}));const exportsBefore=(await calls('export_capabilities_with_coverage')).length;await send().click();await page.waitForFunction(()=>typeof window.__releaseCapabilityTransfer==='function');await page.getByRole('navigation',{name:'主导航'}).getByRole('button',{name:'用量与审计',exact:true}).click();await page.evaluate(()=>window.__releaseCapabilityTransfer());await page.waitForFunction(()=>!document.querySelector('[data-testid="capability-transfer"]'));assert.equal((await calls('export_capabilities_with_coverage')).length,exportsBefore);await navigate();await panel().locator('summary').click();assert.equal(await draft().inputValue(),'');proof.checks.push('completion after unmount cannot refresh old page or replay an import; new page starts with a new empty draft');
+  await verifyLedgerCoverage(page, panel(), exports(), output, proof, shot);
   await draft().fill(payload);await page.setViewportSize({width:390,height:1000});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth));await shot('capability-transfer-mobile-source.png',panel());proof.commands=await page.evaluate(()=>window.__transferCalls.map(x=>x.command));assert(!proof.commands.some(c=>/^(desktop_chat|test_provider|discover_|login_|refresh_pricing|prepare_|claim_)/.test(c)));assert.equal(proof.foreign_requests,0);assert.deepEqual(errors,[]);proof.checks.push('390px labelled controls and wrapping, no foreign/model/account request or console errors');proof.passed=true;
  }catch(e){proof.failure=String(e?.stack||e);if(page)try{await shot('capability-transfer-failure-source.png',page);}catch(x){proof.screenshot_error=String(x);}throw e;}
  finally{fs.writeFileSync(path.join(output,'capability-transfer-proof.json'),JSON.stringify(proof,null,2));await context.close();}
