@@ -511,6 +511,12 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 
 普通 HTTP 路线和原生原样透传保持现有入口。自有回环用例覆盖 Qoder／WorkBuddy 各两区的流式和非流式请求、预热缓存及重复请求；不涉及真实账号、其他协议入口或远程压缩。
 
+### R5-P 普通 Responses 的账号入站形状
+
+普通 /v1/responses 在保持兼容转换的同时，记录消息 content 与 function_call_output 的 output 中不能可靠转成内部内容的项。Qoder 和 WorkBuddy 复用账号路线检查，对带此标记的请求返回 HTTP 400（unsupported_account_content_part），并在读取账号模型目录或发送模型请求前停止。普通 HTTP 仍保留原有转换，例如未知文件项转成 JSON 文本；合法工具调用和结果保留标识及内容。
+
+标记只给普通 Responses 的路由使用。显式 compaction_trigger 仍进入原来的远程压缩入口；工具标识校验、其他协议和原生原样透传沿用既有规则。这里的自有回环用例覆盖 Qoder 和 WorkBuddy 两区的流式与非流式模式，不代表真实账号验收。
+
 ### N4 原生上游的流终态
 
 

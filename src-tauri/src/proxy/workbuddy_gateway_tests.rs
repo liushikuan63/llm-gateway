@@ -1382,3 +1382,106 @@ async fn effort_gateway_valid_controls_preserve_exact_wire_finish_and_usage() {
 }
 
 mod subject_receipt_tests;
+
+#[tokio::test]
+async fn ordinary_responses_account_ingress_rejects_lossy_workbuddy() {
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let file_input = json!([{"role":"user","content":[
+        {"type":"input_text","text":"owned question"},
+        {"type":"input_file","file_id":"owned-file"}
+    ]}]);
+    let mut failures = Vec::new();
+    for (region, label) in [
+        (WorkBuddyRegion::Global, "global"),
+        (WorkBuddyRegion::Cn, "cn"),
+    ] {
+        let s = setup_region(region).await;
+        let counts = || {
+            (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+            )
+        };
+        let send = |model: &str, input: Value, stream| {
+            http.post(format!("{}/v1/responses", s.url))
+                .bearer_auth("offline-gateway-key")
+                .json(&json!({"model":model,"input":input,"stream":stream}))
+                .send()
+        };
+        for stream in [false, true] {
+            let before = counts();
+            let response = send("public", file_input.clone(), stream).await.unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            let error = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            let expected_error = error["error"]["type"] == "invalid_request_error"
+                && error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.ends_with("unsupported_account_content_part"));
+            let after = counts();
+            if status != reqwest::StatusCode::BAD_REQUEST || !expected_error || before != after {
+                failures.push(format!(
+                    "{label} stream={stream} input_file: status={}, counts={before:?}->{after:?}, expected_error={expected_error}",
+                    status.as_u16()
+                ));
+            }
+        }
+
+        for stream in [false, true] {
+            let before = counts();
+            let response = send("public", json!("owned supported question"), stream)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::OK,
+                "{label} legal stream={stream}"
+            );
+            let body = response.text().await.unwrap();
+            assert!(body.contains("answer"), "{label} legal stream={stream}");
+            if stream {
+                assert!(body.contains("response.completed"), "{label} legal stream");
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap()["status"],
+                    "completed"
+                );
+            }
+            assert_eq!(counts(), (before.0 + 1, 1), "{label} legal stream={stream}");
+        }
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 0);
+
+        let mut ordinary = s.gateway.providers.read()[0].clone();
+        ordinary.id = "owned-responses-ordinary".into();
+        ordinary.runtime_id = None;
+        ordinary.base_url = format!("{}/v1", s.origin);
+        ordinary.models[0].alias = "owned-responses-ordinary".into();
+        repo::upsert_provider(s.gateway.db.pool(), &ordinary)
+            .await
+            .unwrap();
+        s.gateway.reload_providers().await.unwrap();
+        let before = counts();
+        let response = send("owned-responses-ordinary", file_input.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "{label} ordinary HTTP"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["status"], "completed");
+        assert!(body.to_string().contains("backup answer"));
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counts(),
+            before,
+            "{label} ordinary HTTP never reaches the account"
+        );
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        failures.is_empty(),
+        "ordinary Responses WorkBuddy ingress: {failures:?}"
+    );
+}

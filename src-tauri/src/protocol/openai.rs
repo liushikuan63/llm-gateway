@@ -48,6 +48,10 @@ pub(crate) struct AccountIngressShape {
 }
 
 impl AccountIngressShape {
+    pub(crate) fn note_unsupported_part(&mut self) {
+        self.unsupported_part = true;
+    }
+
     pub(crate) fn needs_check(self) -> bool {
         self.unsupported_part || self.incomplete_call
     }

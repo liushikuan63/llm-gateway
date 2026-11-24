@@ -2304,7 +2304,8 @@ async fn responses(
     // `input` 既可能是纯字符串，也可能是 Responses 原生 item 数组。后者与
     // Chat Completions 的 content 类型不同（input_text/function_call_output 等），
     // 不能先强转成 OaMessage，否则会把真实文本和工具续轮静默清空。
-    let messages = match responses_input_messages(body.get("input")) {
+    let mut account_ingress = AccountIngressShape::default();
+    let messages = match responses_input_messages(body.get("input"), &mut account_ingress) {
         Ok(messages) => messages,
         Err(error) => return error_response(&error),
     };
@@ -2363,6 +2364,9 @@ async fn responses(
         .await;
     }
 
+    // Remote Compaction owns a separate dispatch path. Only ordinary Responses
+    // uses this private marker with the account ingress checks.
+    request_context.account_ingress = account_ingress;
     dispatch_with_context(
         state,
         req,
@@ -3228,6 +3232,7 @@ async fn dispatch_remote_compaction(
 
 fn responses_input_messages(
     input: Option<&serde_json::Value>,
+    account_ingress: &mut AccountIngressShape,
 ) -> std::result::Result<Vec<Message>, GatewayError> {
     match input {
         None => Ok(Vec::new()),
@@ -3240,7 +3245,7 @@ fn responses_input_messages(
                     // Remote Compaction V2 的请求控制项不是消息，不能送给上游。
                     continue;
                 }
-                messages.push(response_input_item(item)?);
+                messages.push(response_input_item(item, account_ingress)?);
             }
             Ok(messages)
         }
@@ -3250,7 +3255,10 @@ fn responses_input_messages(
     }
 }
 
-fn response_input_item(item: &serde_json::Value) -> std::result::Result<Message, GatewayError> {
+fn response_input_item(
+    item: &serde_json::Value,
+    account_ingress: &mut AccountIngressShape,
+) -> std::result::Result<Message, GatewayError> {
     let kind = item.get("type").and_then(|value| value.as_str());
     match kind {
         Some("function_call") => {
@@ -3274,7 +3282,7 @@ fn response_input_item(item: &serde_json::Value) -> std::result::Result<Message,
         }
         Some("function_call_output") => Ok(Message {
             role: Role::Tool,
-            content: responses_content(item.get("output")),
+            content: responses_content(item.get("output"), account_ingress),
             tool_calls: None,
             tool_call_id: Some(response_required_string(item, "call_id")?),
             name: None,
@@ -3297,7 +3305,7 @@ fn response_input_item(item: &serde_json::Value) -> std::result::Result<Message,
             };
             Ok(Message {
                 role,
-                content: responses_content(item.get("content")),
+                content: responses_content(item.get("content"), account_ingress),
                 tool_calls: None,
                 tool_call_id: item
                     .get("call_id")
@@ -3327,75 +3335,75 @@ fn response_required_string(
         .ok_or_else(|| GatewayError::Protocol(format!("Responses {key} 不能为空")))
 }
 
-fn responses_content(value: Option<&serde_json::Value>) -> Content {
+fn responses_content(
+    value: Option<&serde_json::Value>,
+    account_ingress: &mut AccountIngressShape,
+) -> Content {
+    use serde_json::Value;
+
     match value {
-        None | Some(serde_json::Value::Null) => Content::Text(String::new()),
-        Some(serde_json::Value::String(text)) => Content::Text(text.clone()),
-        Some(serde_json::Value::Array(parts)) => {
+        None | Some(Value::Null) => Content::Text(String::new()),
+        Some(Value::String(text)) => Content::Text(text.clone()),
+        Some(Value::Array(parts)) => {
             let mut content_parts = Vec::new();
             for part in parts {
-                match part.get("type").and_then(|value| value.as_str()) {
-                    Some("input_text") | Some("output_text") | Some("text") => {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("input_text" | "output_text" | "text") => {
+                        let text = part.get("text").and_then(Value::as_str);
+                        if text.is_none() {
+                            account_ingress.note_unsupported_part();
+                        }
                         content_parts.push(Part::Text {
-                            text: part
-                                .get("text")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or_default()
-                                .to_owned(),
+                            text: text.unwrap_or_default().to_owned(),
                         });
                     }
-                    Some("input_image") | Some("image_url") => {
-                        let image_url = part.get("image_url");
-                        let url = image_url
-                            .and_then(|value| value.as_str())
-                            .or_else(|| {
-                                image_url
-                                    .and_then(|value| value.get("url"))
-                                    .and_then(|value| value.as_str())
-                            })
-                            .unwrap_or_default()
-                            .to_owned();
+                    Some(kind @ ("input_image" | "image_url" | "input_video" | "video_url")) => {
+                        let video = matches!(kind, "input_video" | "video_url");
+                        let source = part.get(if video { "video_url" } else { "image_url" });
+                        let url = source.and_then(Value::as_str).or_else(|| {
+                            source
+                                .and_then(|media| media.get("url"))
+                                .and_then(Value::as_str)
+                        });
+                        let url = if video {
+                            url.or_else(|| part.get("url").and_then(Value::as_str))
+                        } else {
+                            url
+                        };
                         let detail = part
                             .get("detail")
-                            .or_else(|| image_url.and_then(|value| value.get("detail")))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_owned);
-                        content_parts.push(Part::ImageUrl {
-                            image_url: ImageUrl { url, detail },
+                            .or_else(|| source.and_then(|media| media.get("detail")));
+                        if url.is_none()
+                            || !matches!(detail, None | Some(Value::Null | Value::String(_)))
+                        {
+                            account_ingress.note_unsupported_part();
+                        }
+                        let media = ImageUrl {
+                            url: url.unwrap_or_default().to_owned(),
+                            detail: detail.and_then(Value::as_str).map(str::to_owned),
+                        };
+                        content_parts.push(if video {
+                            Part::VideoUrl { video_url: media }
+                        } else {
+                            Part::ImageUrl { image_url: media }
                         });
                     }
-                    Some("input_audio") => content_parts.push(Part::InputAudio {
-                        input_audio: part
-                            .get("input_audio")
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!({})),
-                    }),
-                    Some("input_video") | Some("video_url") => {
-                        let video_url = part.get("video_url");
-                        let url = video_url
-                            .and_then(|value| value.as_str())
-                            .or_else(|| {
-                                video_url
-                                    .and_then(|value| value.get("url"))
-                                    .and_then(|value| value.as_str())
-                            })
-                            .or_else(|| part.get("url").and_then(|value| value.as_str()))
-                            .unwrap_or_default()
-                            .to_owned();
-                        let detail = part
-                            .get("detail")
-                            .or_else(|| video_url.and_then(|value| value.get("detail")))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_owned);
-                        content_parts.push(Part::VideoUrl {
-                            video_url: ImageUrl { url, detail },
+                    Some("input_audio") => {
+                        let audio = part.get("input_audio");
+                        if !audio.is_some_and(Value::is_object) {
+                            account_ingress.note_unsupported_part();
+                        }
+                        content_parts.push(Part::InputAudio {
+                            input_audio: audio.cloned().unwrap_or_else(|| serde_json::json!({})),
                         });
                     }
-                    // 未知 block 不应被静默丢弃；保留 JSON 文本至少让上游和日志
-                    // 能看到内容，而不是错误地发送空消息。
-                    Some(_) | None => content_parts.push(Part::Text {
-                        text: part.to_string(),
-                    }),
+                    // 普通 HTTP 保留原有兼容文本；账号路线不能把未知块当成用户文本发送。
+                    Some(_) | None => {
+                        account_ingress.note_unsupported_part();
+                        content_parts.push(Part::Text {
+                            text: part.to_string(),
+                        });
+                    }
                 }
             }
             if content_parts
@@ -3417,6 +3425,74 @@ fn responses_content(value: Option<&serde_json::Value>) -> Content {
             }
         }
         Some(other) => Content::Text(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn responses_account_ingress_keeps_the_compatibility_projection() {
+    use serde_json::json;
+
+    let file = json!({"type":"input_file","file_id":"owned-file"});
+    let input = json!([
+        {"role":"user","content":[{"type":"input_text","text":"before"},file]},
+        {"type":"function_call_output","call_id":"owned-call","output":[
+            {"type":"output_text","text":"kept"},{"type":"output_text","text":17}
+        ]}
+    ]);
+    let mut shape = AccountIngressShape::default();
+    let messages = responses_input_messages(Some(&input), &mut shape).unwrap();
+    assert_eq!(
+        shape.rejection(false),
+        Some("unsupported_account_content_part")
+    );
+    assert!(
+        matches!(&messages[0].content, Content::Text(text) if text == &format!("before{file}"))
+    );
+    assert!(matches!(&messages[1].content, Content::Text(text) if text == "kept"));
+    assert_eq!(messages[1].tool_call_id.as_deref(), Some("owned-call"));
+
+    for (part, lossy, expected) in [
+        (
+            json!({"type":"input_image","image_url":"owned-image","detail":null}),
+            false,
+            json!({"type":"image_url","image_url":{"url":"owned-image"}}),
+        ),
+        (
+            json!({"type":"image_url","image_url":{"url":"owned-image","detail":"low"}}),
+            false,
+            json!({"type":"image_url","image_url":{"url":"owned-image","detail":"low"}}),
+        ),
+        (
+            json!({"type":"input_video","url":"owned-video","detail":"high"}),
+            false,
+            json!({"type":"video_url","video_url":{"url":"owned-video","detail":"high"}}),
+        ),
+        (
+            json!({"type":"image_url","image_url":{"url":"owned-image","detail":17}}),
+            true,
+            json!({"type":"image_url","image_url":{"url":"owned-image"}}),
+        ),
+        (
+            json!({"type":"input_video","video_url":{"detail":null}}),
+            true,
+            json!({"type":"video_url","video_url":{"url":""}}),
+        ),
+        (
+            json!({"type":"input_audio","input_audio":{"data":"owned","format":"wav"}}),
+            false,
+            json!({"type":"input_audio","input_audio":{"data":"owned","format":"wav"}}),
+        ),
+        (
+            json!({"type":"input_audio"}),
+            true,
+            json!({"type":"input_audio","input_audio":{}}),
+        ),
+    ] {
+        let mut shape = AccountIngressShape::default();
+        let content = responses_content(Some(&json!([part])), &mut shape);
+        assert_eq!(shape.needs_check(), lossy);
+        assert_eq!(serde_json::to_value(content).unwrap(), json!([expected]));
     }
 }
 
