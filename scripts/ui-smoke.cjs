@@ -1201,6 +1201,15 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         request.completed = true;
         return response.page;
       }
+      case "get_request_feedback": {
+        const requestId = args.requestId;
+        if (!Number.isSafeInteger(requestId) || requestId <= 0) throw new Error("feedback_invalid_input");
+        const row = makeAuditV2(window.__fixtureRequests).rows.find(r => r.id === requestId);
+        if (!row) throw new Error("feedback_request_not_found");
+        const { ts, requested_model, routed_provider, routed_model, status, route_intent, route_classifier } = row;
+        return { request_id: requestId, ts, requested_model, routed_provider, routed_model, status,
+          route_intent, route_classifier, confirmed_class: null, outcome: null, revision: 0, source: null, created_at: null, updated_at: null };
+      }
       case "usage_stats_v2": {
         const f = args.filter || {};
         const request = {command: "usage_stats_v2", filter: structuredClone(f), completed: false};
@@ -1707,6 +1716,14 @@ async function verifyAsyncPages(browser, errors) {
 async function verifyChatPage(browser, errors) {
   const context = await browser.newContext({ viewport: { width: 1180, height: 900 } });
   await context.addInitScript(fixture);
+  const fixtureOrigin = new URL(baseUrl).origin;
+  let foreignRequests = 0;
+  const guardFixtureOrigin = async route => {
+    if (new URL(route.request().url()).origin === fixtureOrigin) return route.fallback();
+    foreignRequests++;
+    await route.abort();
+  };
+  await context.route("**/*", guardFixtureOrigin);
   const page = await context.newPage();
   page.on("pageerror", e => errors.push(`chat: ${e.message}`));
   page.on("console", m => { if (m.type() === "error") errors.push(`chat: ${m.text()}`); });
@@ -1749,7 +1766,9 @@ async function verifyChatPage(browser, errors) {
   assert.equal(inputs[0].model, "auto"); assert.equal(inputs[1].model, explicit);
   assert.equal(inputs[1].messages.length, 3); assert.equal(inputs[1].session_id, inputs[0].session_id);
   await chat.getByRole("button", { name: "新建对话", exact: true }).click();
-  await page.evaluate(() => { window.__fixtureChatFailure = true; window.__fixtureChatHold = true; });
+  await page.evaluate(() => {
+    window.__fixtureChatFailure = true; window.__fixtureChatHold = true; window.__fixtureChatRelease = null;
+  });
   await chat.locator("#chat-prompt").fill("失败时保留输入");
   await chat.getByRole("button", { name: "发送消息", exact: true }).click();
   await page.waitForFunction(() => Boolean(window.__fixtureChatRelease));
@@ -1768,33 +1787,106 @@ async function verifyChatPage(browser, errors) {
     "a delayed successful score refresh must not erase the failed chat request");
   assert.equal(await chat.locator("#chat-prompt").inputValue(), "失败时保留输入");
   assert.equal(await chat.locator(".chat-turn").count(), 0);
-  const third = await page.evaluate(() => window.__fixtureChatInputs[2]);
+  const recorded = () => page.evaluate(() => window.__fixtureChatInputs);
+  const ipcCount = () => page.evaluate(() => window.__fixtureCalls.length);
+  const prompt = chat.locator("#chat-prompt");
+  const send = chat.getByRole("button", { name: "发送消息", exact: true });
+  const isolate = chat.getByRole("button", { name: "保留草稿并建立隔离会话", exact: true });
+  const traceHint = chat.getByTestId("chat-error-context");
+  const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const third = (await recorded())[2];
   assert.notEqual(third.session_id, inputs[0].session_id);
+  assert.equal((await recorded()).length, 3);
+  await isolate.waitFor({ state: "visible" });
+  assert.match(await traceHint.innerText(), /未取得本次请求的就绪追踪标识.*无法确认是否存在审计记录/);
+  assert(await send.isDisabled(), "the send button stays locked after a no-ready failure");
+  assert(await chat.getByRole("button", { name: "新建对话", exact: true }).isDisabled(), "generic reset cannot bypass isolation");
+  assert(await chat.getByRole("button", { name: "打开对话 JSON 副本", exact: true }).isDisabled(), "opening a copy cannot bypass isolation");
+  assert(await chat.locator('input[type="file"]').isDisabled(), "the import input is also disabled");
+  assert(!(await prompt.isDisabled()), "the user can still edit the preserved draft");
   await page.screenshot({ path: path.join(output, "chat-error.png"), fullPage: true });
   await page.evaluate(() => { window.__fixtureChatFailure = false; });
-  const isolate = chat.getByRole("button", { name: "保留草稿并建立隔离会话", exact: true });
-  await isolate.waitFor();
-  await isolate.click();
-  assert.equal(await chat.locator("#chat-prompt").inputValue(), "失败时保留输入", "isolation must preserve the retry draft");
-  await page.waitForFunction(() => { const button = document.querySelector('[data-testid="chat-page"] button[type=submit]'); return Boolean(button && !button.disabled); });
-  await chat.getByRole("button", { name: "发送消息", exact: true }).click();
+  const blockedIpcCount = await ipcCount();
+  await prompt.press("Control+Enter");
+  assert.equal(await ipcCount(), blockedIpcCount, "the keyboard shortcut must not dispatch on the blocked session");
+  await chat.locator("form.chat-compose").evaluate(form => {
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  });
+  assert.equal(await ipcCount(), blockedIpcCount, "form submit must not dispatch on the blocked session");
+  assert.equal((await recorded()).length, 3, "the failed request has not been replayed");
+  assert(await send.isDisabled());
+  assert.equal(await prompt.inputValue(), "失败时保留输入");
+  assert.equal(await chat.locator(".chat-turn").count(), 0);
+
+  const isolateWithoutDispatch = async (draft, count) => {
+    const calls = await ipcCount();
+    const diagnostic = await traceHint.innerText();
+    await isolate.click();
+    assert.equal(await ipcCount(), calls, "isolation is local and must not call any IPC");
+    assert.equal((await recorded()).length, count, "isolation must not send or retry");
+    assert.equal(await prompt.inputValue(), draft, "isolation must preserve the retry draft");
+    assert(await prompt.evaluate(el => el === document.activeElement), "isolation returns focus to the draft");
+    assert.equal(await traceHint.innerText(), diagnostic, "isolation must retain the old request's audit hint");
+    await page.waitForFunction(() => !document.querySelector('[data-testid="chat-page"] button[type=submit]').disabled);
+  };
+  await isolateWithoutDispatch("失败时保留输入", 3);
+  await send.click();
   await chat.getByText("收到，模型已接入。", { exact: true }).waitFor();
-  const retry = await page.evaluate(() => window.__fixtureChatInputs[3]);
+  const afterRetry = await recorded();
+  assert.equal(afterRetry.length, 4, "the explicit retry sends exactly once");
+  const retry = afterRetry[3];
+  assert.match(retry.session_id, uuidV4);
   assert.notEqual(retry.session_id, third.session_id, "retry after unknown must use an isolated session");
   assert.equal(retry.messages.at(-1).content, "失败时保留输入", "isolated retry must retain the draft");
   await page.screenshot({ path: path.join(output, "chat-desktop.png"), fullPage: true });
+
+  const turns = chat.locator(".chat-history .chat-text");
+  const confirmed = ["失败时保留输入", "收到，模型已接入。"];
+  assert.deepEqual(await turns.allTextContents(), confirmed);
+  const followup = "已有确认历史时保留后续草稿";
+  await page.evaluate(() => { window.__fixtureChatFailure = true; });
+  await prompt.fill(followup);
+  await send.click();
+  await chat.getByRole("alert").filter({ hasText: "HTTP 503" }).waitFor();
+  await chat.locator("#chat-model:not(:disabled)").waitFor();
+  const afterFollowupFailure = await recorded();
+  assert.equal(afterFollowupFailure.length, 5);
+  const failedFollowup = afterFollowupFailure[4];
+  assert.equal(failedFollowup.session_id, retry.session_id, "the follow-up starts from the confirmed session");
+  assert.deepEqual(await turns.allTextContents(), confirmed, "uncertain turns never become confirmed history");
+  await page.evaluate(() => { window.__fixtureChatFailure = false; });
+  await isolateWithoutDispatch(followup, 5);
+  assert.deepEqual(await turns.allTextContents(), confirmed, "local isolation keeps the confirmed history visible");
+  await prompt.press("Control+Enter");
+  await page.waitForFunction(() => document.querySelectorAll('[data-testid="chat-page"] .chat-history .chat-turn').length === 4);
+  const finalInputs = await recorded();
+  assert.equal(finalInputs.length, 6, "one manual follow-up sends once, including the known history");
+  const recovered = finalInputs[5];
+  assert.match(recovered.session_id, uuidV4);
+  assert.notEqual(recovered.session_id, failedFollowup.session_id);
+  assert.deepEqual(recovered.messages, [
+    {role: "user", content: confirmed[0]},
+    {role: "assistant", content: confirmed[1]},
+    {role: "user", content: followup},
+  ]);
+  assert.deepEqual(await turns.allTextContents(), [...confirmed, followup, confirmed[1]]);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: path.join(output, "chat-narrow.png"), fullPage: true });
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 2), "chat must fit narrow layouts");
   await context.close();
   const empty = await browser.newContext(); await empty.addInitScript(fixture, { empty: true });
-  const emptyPage = await empty.newPage(); await emptyPage.goto(baseUrl);
+  await empty.route("**/*", guardFixtureOrigin);
+  const emptyPage = await empty.newPage();
+  emptyPage.on("pageerror", e => errors.push(`chat empty: ${e.message}`));
+  emptyPage.on("console", m => { if (m.type() === "error") errors.push(`chat empty: ${m.text()}`); });
+  await emptyPage.goto(baseUrl);
   await emptyPage.getByRole("button", { name: "跳过引导", exact: true }).click();
   await emptyPage.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "聊天测试", exact: true }).click();
   await emptyPage.getByText("没有已启用的聊天模型", { exact: false }).waitFor();
   assert(await emptyPage.getByRole("button", { name: "发送消息", exact: true }).isDisabled());
   await emptyPage.screenshot({ path: path.join(output, "chat-empty.png"), fullPage: true });
   await empty.close();
+  assert.equal(foreignRequests, 0, "chat fixture must not contact a real origin");
 }
 
 async function verifyUsageEnhancements(browser, errors) {
@@ -3038,6 +3130,7 @@ if (require.main === module) (async () => {
       if(focus==='capability-evidence') {await require('./capability-evidence-ui.cjs').verifyCapabilityEvidence(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: capability-evidence');return;}
       if(focus==='provider-health-result') {await require('./provider-health-result-ui.cjs').verifyProviderHealthResult(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: provider-health-result');return;}
       if(focus==='providers-read-state') {await require('./providers-read-state-ui.cjs').verifyProvidersReadState(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: providers-read-state');return;}
+      if(focus==='chat-session-isolation') {await verifyChatPage(browser,errors);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-session-isolation; screenshots=${output}`);return;}
       if(focus==='chat-error-trace') {await require('./chat-error-trace-ui.cjs').verifyChatErrorTrace(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-error-trace; screenshots=${output}`);return;}
       if(focus==='observation-context') {await require('./observation-context-ui.cjs').verifyObservationContext(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: observation-context');return;}
       if(focus==='generation-readback') {await require('./request-generation-readback-ui.cjs').verifyGenerationReadback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: generation-readback');return;}
@@ -4066,7 +4159,11 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
     assert.equal(await page.evaluate(() => window.__fixtureCalibrationsCleared === true), true);
     // 降级链展开：第一跳 429 失败、第二跳成功。
     await page.locator(".attempt-toggle").first().click();
-    const chain = await page.locator(".attempt-row").first().innerText();
+    const retryableDetails = page.locator(".attempt-row").first();
+    const chain = await retryableDetails.innerText();
+    assert.equal(await retryableDetails.locator(".attempt-chain > li").count(), 2);
+    assert.equal(await retryableDetails.locator(".attempt-chain").getByText("已停止降级", {exact: true}).count(), 0,
+      "a retryable 429 followed by a success must not be shown as a stopped fallback");
     assert(chain.includes("限流服务"), `降级链应显示第一跳：${chain}`);
     assert(chain.includes("429"));
     assert(chain.includes("OpenRouter"));
@@ -4139,14 +4236,22 @@ for (const net of [1080, 1000, 900, 820, 780, 700, 660, 620, 580, 520, 460, 420,
       `导出必须带上当前筛选条件：${JSON.stringify(filteredExport.filter)}`);
     await page.locator("#audit-reset").click();
     await page.waitForTimeout(400);
-    // 非重试401应只展示一次失败尝试；不要求产品伪造“停止降级”文案。
-    await page.locator(".attempt-toggle").nth(1).click();
+    // 401 无重试：核对同一条尝试的真实状态和停止标记。
+    const feedbackWritesBefore = await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "set_request_feedback").length);
+    await page.getByRole("button", {name: "任务反馈与请求明细 2", exact: true}).click();
     const blockedDetails = page.locator(".attempt-row").last();
-    const blocked = await blockedDetails.innerText();
-    assert.equal(await blockedDetails.locator(".attempt-chain > li").count(), 1, "401 must not produce a fallback attempt");
-    assert(blocked.includes("记录状态 401"), `401 status must be visible: ${blocked}`);
-    assert(blocked.includes("记录的重试标记：否"), `non-retryable marker must be visible: ${blocked}`);
-    assert(blocked.includes("invalid api key"));
+    const blockedAttempt = blockedDetails.locator(".attempt-chain > li");
+    assert.equal(await blockedAttempt.count(), 1, "401 must not produce a fallback attempt");
+    assert.equal(await blockedAttempt.locator(".attempt-target").innerText(), "失效密钥服务 · vendor/chat:free");
+    assert.equal(await blockedAttempt.locator(".tag.err").innerText(), "401", "401 status must be visible");
+    assert.equal(await blockedAttempt.locator(".tag.warn").innerText(), "已停止降级", "non-retryable marker must be visible");
+    assert.equal(await blockedAttempt.locator(".attempt-reason").innerText(), "上游返回 HTTP 401: invalid api key");
+    const feedback = blockedDetails.getByTestId("request-feedback");
+    await feedback.getByText("服务器已保存：未确认 / 未评价 · 修订 0", {exact: true}).waitFor();
+    assert.match(await feedback.innerText(), /请求编号 2 /);
+    assert.equal(await feedback.getByRole("alert").count(), 0);
+    assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(cmd => cmd === "set_request_feedback").length), feedbackWritesBefore,
+      "opening audit details must not write feedback");
     await page.screenshot({ path: path.join(output, "stats-spend-desktop.png"), fullPage: true });
     for (const width of [900, 390]) {
       await page.setViewportSize({ width, height: 844 });

@@ -47,7 +47,7 @@ async function verifyRequestTiming(browser,baseUrl,output,errors=[],fixture){
    window.__fixtureRequests[1].attempts[0].wire_modes={...modes,schema_version:99,private_body:'PRIVATE-CONTROL-DO-NOT-DISPLAY'};
    window.__fixtureRequests[2].attempts[0].wire_modes={...modes,caller:null,normalized_ingress:null};
    const invoke=window.__TAURI_INTERNALS__.invoke;window.__fixtureTimingFail=false;
-   window.__TAURI_INTERNALS__.invoke=async(command,args)=>{if(command==='query_requests'&&window.__fixtureTimingFail)throw Error('Synthetic audit read failure');return invoke(command,args);};
+   window.__TAURI_INTERNALS__.invoke=async(command,args)=>{if(command==='query_requests_v2'&&window.__fixtureTimingFail)throw Error('Synthetic audit read failure');return invoke(command,args);};
   });
   await context.route('**/*',async route=>{if(new URL(route.request().url()).origin===new URL(baseUrl).origin)return route.fallback();proof.foreign_network_requests++;await route.abort();});
   page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));page.on('console',m=>{if(m.type()==='error')proof.console_errors.push(m.text());});

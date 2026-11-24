@@ -214,6 +214,7 @@ impl OwnedIpc {
             desktop_chat_controls: Arc::new(crate::desktop_chat::RequestControls::default()),
             manual_search_controls: Arc::new(crate::desktop_chat::RequestControls::default()),
             client_usage_jobs: Err("unused in owned IPC test".into()),
+            client_usage_review_controls: crate::client_usage_review::Controls::default(),
             gateway_service: Arc::new(GatewayService::new(gateway.clone())),
             system_proxy: crate::proxy_control::system::SystemProxyManager::default(),
             proxy_commands: tokio::sync::Mutex::new(()),
@@ -290,6 +291,7 @@ impl OwnedIpc {
                 export_capabilities_with_coverage,
                 price_observations,
                 list_sessions_page,
+                list_client_usage_reviewable,
             ])
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -331,6 +333,54 @@ impl Drop for OwnedIpc {
         tauri::async_runtime::block_on(self.db.pool().close());
         eprintln!("OWNED_FEEDBACK_IPC_ROOT={}", self.root.display());
     }
+}
+
+#[test]
+fn client_usage_review_list_production_ipc_projects_only_pending_fields() {
+    use crate::db::repo::client_usage_journal::{self as journal, AgentGateReason, AttemptKind};
+
+    let h = OwnedIpc::new();
+    let scope = uuid::Uuid::new_v4().to_string();
+    let (attempt, created_at) = tauri::async_runtime::block_on(async {
+        let attempt = journal::record_intent(&h.db, &scope, AttemptKind::AgentIntent)
+            .await
+            .unwrap();
+        journal::mark_agent_gate(&h.db, &attempt, AgentGateReason::Quota)
+            .await
+            .unwrap();
+        journal::record_intent(&h.db, &scope, AttemptKind::AgentIntent)
+            .await
+            .unwrap();
+        let created_at: i64 = sqlx::query_scalar(
+            "SELECT created_at FROM usage_attempt_journal_v2 WHERE attempt_id=?",
+        )
+        .bind(&attempt)
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap();
+        (attempt, created_at)
+    });
+    let expected = json!({
+        "schema_version": 2,
+        "items": [{
+            "attempt_id": attempt,
+            "scope_id": scope,
+            "created_at": created_at,
+            "gate_reason": "quota",
+        }],
+        "next_after": null,
+    });
+    let command = "list_client_usage_reviewable";
+    assert_eq!(h.invoke(command, json!({})).unwrap(), expected);
+    assert_eq!(
+        h.invoke(command, json!({"after": &attempt})).unwrap(),
+        json!({"schema_version": 2, "items": [], "next_after": null})
+    );
+    assert_eq!(
+        h.invoke(command, json!({"after": "invalid"})).unwrap_err(),
+        json!("client_usage_journal_invalid_cursor")
+    );
+    assert_eq!(h.invoke(command, json!({})).unwrap(), expected);
 }
 
 #[test]

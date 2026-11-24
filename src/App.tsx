@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
@@ -106,7 +106,20 @@ async function copyText(value: string) {
 }
 
 export default function App({ bootWarning = null }: { bootWarning?: string | null }) {
-  const [tab, setTab] = useState<TabId>(readTab);
+  const [navigation, setNavigation] = useState(() => ({tab: readTab(), reviewEpoch: 0}));
+  const navigationIntent = useRef(navigation);
+  const {tab, reviewEpoch} = navigation;
+  const navigate = useCallback((target: TabId) => {
+    const previous = navigationIntent.current;
+    if (target === previous.tab) return;
+    // A review callback may run before React commits the tab change.
+    const reviewEpoch = previous.reviewEpoch + (previous.tab === "stats" || target === "stats" ? 1 : 0);
+    const next = {tab: target, reviewEpoch};
+    navigationIntent.current = next;
+    setNavigation(next);
+  }, []);
+  const isStatsActive = useCallback(() => navigationIntent.current.tab === "stats", []);
+  const getReviewNavigationIntent = useCallback(() => navigationIntent.current.reviewEpoch, []);
   const [theme, setTheme] = useState<Theme>(readTheme);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [configState, setConfigState] = useState<"loading" | "ready" | "unavailable" | "preview">("loading");
@@ -210,7 +223,7 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
     let unlisten: (() => void) | undefined;
     let disposed = false;
     void listen<string>("llm-gateway-navigate", (event) => {
-      if (isTabId(event.payload)) setTab(event.payload);
+      if (isTabId(event.payload)) navigate(event.payload);
     }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;
@@ -219,7 +232,7 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
       disposed = true;
       unlisten?.();
     };
-  }, [desktopRuntime]);
+  }, [desktopRuntime, navigate]);
 
   useEffect(() => {
     if (!desktopRuntime) {
@@ -318,7 +331,7 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
   };
 
   const navigateFromHelp = (target: TabId) => {
-    setTab(target);
+    navigate(target);
     // 前往实际页面表示用户暂时离开引导；仍可随时从帮助入口重新打开。
     saveOnboardingStatus("skipped");
     setOnboardingOpen(false);
@@ -344,7 +357,7 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
           {NAVIGATION.map((item) => {
             const active = tab === item.id;
             return (
-              <button type="button" key={item.id} className={`nav ${active ? "active" : ""}`} aria-current={active ? "page" : undefined} onClick={() => setTab(item.id)}>
+              <button type="button" key={item.id} className={`nav ${active ? "active" : ""}`} aria-current={active ? "page" : undefined} onClick={() => navigate(item.id)}>
                 <Icon name={item.icon as IconName} size={17} />
                 <span>{item.label}</span>
               </button>
@@ -529,7 +542,7 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
               {tab === "local" && <LocalModelsPage />}
               {tab === "capabilities" && <CapabilitiesPage />}
               {tab === "sessions" && <SessionsPage />}
-              {tab === "stats" && <StatsPage />}
+              <StatsPage active={tab === "stats"} isActive={isStatsActive} navigationEpoch={reviewEpoch} getNavigationIntent={getReviewNavigationIntent} />
               {tab === "vpn" && <VpnPage />}
               {tab === "clients" && <ClientsPage />}
           {tab === "diagnostics" && <DiagnosticsPage />}

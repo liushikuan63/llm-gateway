@@ -1,5 +1,6 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import ClientUsagePanel from "./ClientUsagePanel";
+import { useClientUsageReview, type ClientUsageReviewNavigation } from "./ClientUsageReview";
 import RequestTimingSummary from "./RequestTimingSummary";
 import RequestGenerationSummary from "./RequestGenerationSummary";
 import RequestObservationContext from "./RequestObservationContext";
@@ -119,7 +120,14 @@ function attemptList(attempts: unknown) {
   );
 }
 
-export default function StatsPage() {
+export default function StatsPage(navigation: ClientUsageReviewNavigation) {
+  // A pending native review owns its lease until it settles, even across navigation.
+  // Unmount the rest of Stats on departure so polling and exports keep their lifecycle.
+  const review = useClientUsageReview(navigation);
+  return navigation.active ? <StatsContent review={review}/> : null;
+}
+
+function StatsContent({review}: {review: ReactNode}) {
   const [stats, setStats] = useState<StatsOverviewV2 | null>(null);
   const [calibrations, setCalibrations] = useState<TokenCalibration[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -287,6 +295,7 @@ export default function StatsPage() {
       {msg && <div role={msg.kind === "err" ? "alert" : "status"} className={`msg ${msg.kind}`}>{msg.text}</div>}
 
       <ClientUsagePanel/>
+      {review}
       <NativeUsagePanel usage={usage?.usage_coverage.native_usage} byModel={usage?.by_model.map(item => ({
         provider_id:item.provider_id, provider:providerLabels.get(item.provider_id) ?? item.provider_id ?? "未记录供应商",
         model:item.model, usage:item.usage_coverage.native_usage,

@@ -8,7 +8,11 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
   const context = await browser.newContext({viewport:{width:1180,height:900}});
   await context.addInitScript(fixture);
   const page = await context.newPage();
-  const proof = {scope:'Source browser with isolated IPC fixture; not installed/native acceptance',checks:[],passed:false};
+  const proof = {scope:'Source browser with isolated IPC fixture; not installed/native acceptance',checks:[],foreign_requests:0,passed:false};
+  await context.route('**/*',async route=>{
+    if(new URL(route.request().url()).origin===new URL(baseUrl).origin)return route.fallback();
+    proof.foreign_requests++;await route.abort();
+  });
   page.on('pageerror',error=>errors.push(error.message));
   page.on('console',message=>{if(message.type()==='error')errors.push(message.text());});
   try {
@@ -28,9 +32,10 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
         if(command==='desktop_chat') {
           if(window.__fixtureCancelClosedOnce) {
             window.__fixtureCancelClosedOnce=false;
+            window.__fixtureCancelClosedSession=args.input.session_id;
             const channel=args.onReady;
             if(channel&&Number.isInteger(channel.id))window[`_${channel.id}`]({index:0,end:true});
-            throw Error('LLM 网关服务未开启');
+            throw 'LLM 网关服务未开启，请在设置页或托盘开启后发送';
           }
           const id=args.requestId??'legacy-no-control';
           window.__fixtureCancelInputs.push({id,input:structuredClone(args.input)});
@@ -57,15 +62,21 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
     await page.getByRole('navigation',{name:'主导航'}).getByRole('button',{name:'聊天测试',exact:true}).click();
     const chat=page.getByTestId('chat-page'),prompt=chat.locator('#chat-prompt');
     await chat.locator('#chat-model:not(:disabled)').waitFor();
+    const send=chat.getByRole('button',{name:'发送消息',exact:true});
+    const isolate=chat.getByRole('button',{name:'保留草稿并建立隔离会话',exact:true});
     await prompt.fill('owned draft must survive cancellation');
-    await chat.getByRole('button',{name:'发送消息',exact:true}).click();
-    await chat.getByRole('alert').filter({hasText:'LLM 网关服务未开启'}).waitFor();
+    await send.click();
+    await chat.getByRole('alert').getByText('LLM 网关服务未开启，请在设置页或托盘开启后发送',{exact:true}).waitFor();
     assert.equal(await prompt.inputValue(),'owned draft must survive cancellation');
     assert(!(await prompt.isDisabled()));assert.equal(await chat.getByTestId('chat-cancel').count(),0);
+    await page.waitForFunction(()=>!document.querySelector('[data-testid="chat-page"] button[type=submit]').disabled);
+    assert.equal(await isolate.count(),0,'ordinary exact closed-gateway rejection does not require isolation');
     assert.deepEqual(await page.evaluate(()=>({cleanup:window.__fixtureCancelCleanup,requests:window.__fixtureCancelInputs.length,cancels:window.__fixtureCancelCalls.length})),{cleanup:1,requests:0,cancels:0});
     proof.checks.push('closed gateway fixture ends channel without ready, retains draft and permits explicit retry');
     await chat.getByRole('button',{name:'发送消息',exact:true}).click();
     await page.waitForFunction(()=>window.__fixtureCancelJobs.size===1);
+    const firstSession=await page.evaluate(()=>window.__fixtureCancelInputs[0].input.session_id);
+    assert.equal(firstSession,await page.evaluate(()=>window.__fixtureCancelClosedSession),'explicit retry after pre-dispatch closed gateway keeps its session');
     const cancel=chat.getByTestId('chat-cancel');
     await cancel.waitFor({state:'visible',timeout:2000});
     assert(await cancel.isDisabled(),'cancel waits for actual registration readiness');
@@ -83,8 +94,9 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
     assert.equal(await chat.locator('.chat-turn').count(),0);
     assert.equal(await page.evaluate(()=>window.__fixtureCancelInputs.length),1,'no automatic resend');
     assert.equal(await page.evaluate(()=>window.__fixtureCancelCalls.length),1);
+    assert.equal(await isolate.count(),0,'confirmed cancellation rotates the session without requiring another click');
     assert(await prompt.evaluate(e=>e===document.activeElement),'cancel returns keyboard focus to preserved draft');
-    proof.checks.push('registered request keyboard cancellation preserves draft and releases busy without replay');
+    proof.checks.push('registered request keyboard cancellation preserves draft and releases busy without replay; next manual send uses a new session');
 
     await page.evaluate(()=>{window.__fixtureCancelReadyHold=false;window.__fixtureCancelFailOnce=true;});
     await chat.getByRole('button',{name:'发送消息',exact:true}).click();
@@ -94,6 +106,8 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
     await chat.getByRole('alert').filter({hasText:'取消未确认'}).waitFor();
     assert(await prompt.isDisabled(),'failed cancel does not pretend the request ended');
     assert.equal(await page.evaluate(()=>window.__fixtureCancelInputs.length),2);
+    const secondSession=await page.evaluate(()=>window.__fixtureCancelInputs[1].input.session_id);
+    assert.notEqual(secondSession,firstSession,'first manual send after cancellation never reuses the uncertain session');
     await cancel.click();
     await chat.getByRole('status').filter({hasText:'已取消当前请求'}).waitFor();
     assert.equal(await prompt.inputValue(),'owned draft must survive cancellation');
@@ -111,6 +125,8 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
     assert.equal(await prompt.inputValue(),'');assert.equal(await chat.locator('.chat-turn').count(),2);
     const ids=await page.evaluate(()=>window.__fixtureCancelInputs.map(row=>row.id));
     assert.equal(new Set(ids).size,3);assert(ids.every(id=>/^[0-9a-f-]{36}$/.test(id)));
+    const confirmedSession=await page.evaluate(()=>window.__fixtureCancelInputs[2].input.session_id);
+    assert.notEqual(confirmedSession,secondSession,'manual send after the completed cancel again uses a new session');
     proof.checks.push('completed result wins late cancellation and each manual send has a new operation identity');
 
     await page.evaluate(()=>{window.__fixtureCancelAcceptedButCompleted=true;});
@@ -127,6 +143,10 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
     assert.equal(await chat.getByRole('status').filter({hasText:/等待.*确认|已取消当前请求/}).count(),0,'known success clears cancellation pending notice and is never called cancelled');
     proof.checks.push('accepted cancellation followed by known success clears pending notice without claiming cancellation');
     assert.deepEqual(errors,[]);
+    assert.equal(proof.foreign_requests,0);
+    proof.sessions=await page.evaluate(()=>({closed:window.__fixtureCancelClosedSession,sends:window.__fixtureCancelInputs.map(row=>row.input.session_id)}));
+    assert.equal(proof.sessions.sends.length,4);
+    assert.equal(proof.sessions.sends[3],confirmedSession,'known success keeps the session for the next manual turn');
     const file=path.join(output,'chat-cancel-ui.png');await page.screenshot({path:file,fullPage:true});
     proof.screenshot={path:file,sha256:crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')};proof.passed=true;
   } catch(error) {

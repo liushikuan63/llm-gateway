@@ -19,6 +19,7 @@ pub mod cli_tools;
 pub mod client_bridges;
 pub mod client_session;
 pub mod client_usage;
+pub mod client_usage_review;
 mod commands;
 pub mod config;
 pub mod context;
@@ -76,6 +77,7 @@ pub struct AppState {
     pub desktop_chat_controls: Arc<crate::desktop_chat::RequestControls>,
     pub manual_search_controls: Arc<crate::desktop_chat::RequestControls>,
     pub client_usage_jobs: Result<Arc<crate::client_usage::jobs::UsageJobs>, String>,
+    pub client_usage_review_controls: crate::client_usage_review::Controls,
     pub gateway_service: Arc<proxy_control::gateway::GatewayService>,
     pub system_proxy: proxy_control::system::SystemProxyManager,
     pub proxy_commands: tokio::sync::Mutex<()>,
@@ -222,6 +224,7 @@ async fn initialize_backend(app: tauri::AppHandle, boot: boot::BootState) {
         desktop_chat_controls: Arc::new(crate::desktop_chat::RequestControls::default()),
         manual_search_controls: Arc::new(crate::desktop_chat::RequestControls::default()),
         client_usage_jobs,
+        client_usage_review_controls: crate::client_usage_review::Controls::default(),
         gateway_service: gateway_service.clone(),
         system_proxy,
         proxy_commands: tokio::sync::Mutex::new(()),
@@ -504,6 +507,9 @@ pub fn run() {
             commands::get_current_client_usage_job,
             commands::cancel_client_usage_job,
             commands::resume_client_usage_job,
+            commands::list_client_usage_reviewable,
+            commands::review_client_usage_journal,
+            commands::cancel_client_usage_review,
             commands::get_unified_key,
             commands::rotate_unified_key,
             commands::list_remote_access_keys,
@@ -597,6 +603,24 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            if let tauri::RunEvent::WindowEvent { label, event, .. } = &event {
+                if matches!(
+                    event,
+                    tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+                ) {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        state.client_usage_review_controls.cancel_owner(Some(label));
+                    }
+                }
+            }
+            if matches!(
+                &event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.client_usage_review_controls.cancel_owner(None);
+                }
+            }
             if matches!(&event, tauri::RunEvent::Exit) {
                 if let Some(state) = app.try_state::<AppState>() {
                     if let Ok(jobs) = &state.client_usage_jobs {

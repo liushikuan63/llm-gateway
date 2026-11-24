@@ -262,6 +262,21 @@ impl PendingReview {
             .map(|snapshot| snapshot.item.clone())
             .collect()
     }
+
+    /// Native display is generated from the exact private snapshot, never a
+    /// second read or frontend-supplied version. This is presentation only.
+    pub fn native_confirmation_details(&self) -> String {
+        let mut text = format!(
+            "运行时：{}\n数据库 generation：{}\n数据库启用时间：{}\n",
+            self.runtime, self.meta.db_generation, self.meta.activated_at
+        );
+        for snapshot in &self.snapshots {
+            let item = &snapshot.item;
+            text.push_str(&format!("attempt：{}\nscope：{}\n创建时间（Unix 秒）：{}\n未发送原因：{}\n条目 generation：{}；revision：{}\n", item.attempt_id, item.scope_id, item.created_at, item.gate_reason.as_str(), snapshot.generation, snapshot.revision));
+        }
+        text.push_str("状态：AgentIntent，已知未发送；未核阅、未关联审计、无后台 scope。\n本次只核阅这1条门禁记录；不证明发送、用量或费用，不删除记录。\n确认后任一版本变化都会拒绝；失败时请重新读取并确认。");
+        text
+    }
 }
 
 /// Captures only explicitly selected IDs in a single read snapshot. No write

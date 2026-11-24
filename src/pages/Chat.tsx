@@ -55,6 +55,7 @@ export default function ChatPage({ active }: { active: boolean }) {
   const [maxTokens, setMaxTokens] = useState(1024);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [busy, setBusy] = useState(false);
+  const [sessionBlocked, setSessionBlocked] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [preview, setPreview] = useState<StreamPreview | null>(null);
   const [canCancel, setCanCancel] = useState(false);
@@ -86,6 +87,7 @@ export default function ChatPage({ active }: { active: boolean }) {
   const copyReturnFocus = useRef(false);
   const copyBusy = readingCopy || pendingCopy !== null;
   const session = useRef<string>(crypto.randomUUID());
+  const blockedSession = useRef<string | null>(null);
   const sending = useRef(false);
   const composing = useRef(false);
   const exportInFlight = useRef(false);
@@ -147,7 +149,7 @@ export default function ChatPage({ active }: { active: boolean }) {
   }, [active, readingCopy, pendingCopy, copyFocusVersion, loading, exporting, changingPersonal, busy, personal.enabled]);
 
   const openTextCopy = async (file?: File) => {
-    if (!file || sending.current || exportInFlight.current || copyInFlight.current || personalChange.current || personal.enabled) return;
+    if (!file || sending.current || blockedSession.current || exportInFlight.current || copyInFlight.current || personalChange.current || personal.enabled) return;
     const operation = new AbortController(); copyRead.current = operation;
     copyInFlight.current = true; setReadingCopy(true); setCopyError(null); setNotice(null);
     try {
@@ -176,7 +178,7 @@ export default function ChatPage({ active }: { active: boolean }) {
     setPendingCopy(null); copyInFlight.current = false;
   };
   const acceptTextCopy = () => {
-    if (!pendingCopy || sending.current || personal.enabled) return;
+    if (!pendingCopy || sending.current || blockedSession.current || personal.enabled) return;
     // A copy never reattaches a former account, sticky route or native session.
     session.current = crypto.randomUUID(); setTurns(pendingCopy.turns.map(turn => ({ ...turn, copied: true as const }))); setPrompt("");
     setError(null); setExportMessage(null); setCopyError(null);
@@ -188,7 +190,7 @@ export default function ChatPage({ active }: { active: boolean }) {
   // The backend owns ordering and the session. The UI never persists opt-in or
   // substitutes a balance/login/runtime label for a trusted principal source.
   const configurePersonal = async (enabled: boolean, target = model) => {
-    if (personalChange.current || sending.current || copyInFlight.current) return;
+    if (personalChange.current || sending.current || blockedSession.current || copyInFlight.current) return;
     personalChange.current = true; personalRevision.current++; setChangingPersonal(true); setError(null);
     try {
       const status = await api.setPersonalTest(enabled, enabled ? target : null);
@@ -198,7 +200,7 @@ export default function ChatPage({ active }: { active: boolean }) {
   };
 
   const send = async () => {
-    if (sending.current || copyInFlight.current || personalChange.current || composing.current || loading || !prompt.trim() || !choices.length) return;
+    if (sending.current || blockedSession.current || sessionBlocked || copyInFlight.current || personalChange.current || composing.current || loading || !prompt.trim() || !choices.length) return;
     if (personal.enabled && (personal.target !== model || !choices.some(c => c.id === model && c.personal))) { setError("个人测试只能发送到本窗口明确选择的单个 Codex CLI 目标。"); return; }
     if (model !== "auto" && !choices.some(c => c.id === model)) {
       setError("所选供应商模型已停用或移除，请刷新并重新选择。"); return;
@@ -218,7 +220,7 @@ export default function ChatPage({ active }: { active: boolean }) {
     pending.current = current;
     sending.current = true; setBusy(true); setError(null); setNotice(null); setCanCancel(false); setCancelling(false);
     try {
-      const result = await api.desktopChat({ model, messages, session_id: session.current, max_tokens: maxTokens, ...(personal.enabled ? { personal_test: true } : {}) }, {
+      const result = await api.desktopChat({ model, messages, session_id: current.sessionId, max_tokens: maxTokens, ...(personal.enabled ? { personal_test: true } : {}) }, {
         requestId: current.id,
         ...(current.streaming ? { onEvent: (event: import("../api").DesktopChatStreamEvent) => {
           if (!mounted.current || pending.current !== current || current.cancelAccepted || session.current !== current.sessionId) return;
@@ -241,15 +243,23 @@ export default function ChatPage({ active }: { active: boolean }) {
       void refresh();
     } catch (e) {
       if (mounted.current && pending.current === current) {
-        // Keep partial Gateway history in its old session for audit, never
-        // replay it as a completed answer on a later manual send.
-        const isolated = current.streaming;
+        const failure = personalFailure(e);
+        const cancelled = (failure?.message ?? errorText(e)) === "desktop_chat_cancelled";
+        const bufferedOrdinary = !current.streaming && !personal.enabled;
+        // This exact desktop command error is produced before gateway dispatch.
+        // A missing ready callback on its own doesn't establish that boundary.
+        const gatewayClosed = !current.ready && e === "LLM 网关服务未开启，请在设置页或托盘开启后发送";
+        const isolated = current.streaming || (bufferedOrdinary && cancelled);
         if (isolated) {
           session.current = crypto.randomUUID();
-          setNotice("本次未确认完成的会话已隔离。保留完整对话和草稿；下次手动发送使用新会话，不会自动重发。请核对原请求审计及用量。");
+          if (!cancelled) setNotice("本次未确认完成的会话已隔离。保留完整对话和草稿；下次手动发送使用新会话，不会自动重发。请核对原请求审计及用量。");
+        } else if (bufferedOrdinary && !gatewayClosed) {
+          // The gateway may already have applied the request. Keep the draft
+          // and confirmed turns, and require an explicit new local session.
+          blockedSession.current = current.sessionId;
+          setSessionBlocked(true);
         }
-        const failure = personalFailure(e);
-        if ((failure?.message ?? String(e)) === "desktop_chat_cancelled") {
+        if (cancelled) {
           setError(null);
           setNotice(`已取消当前请求，输入已保留。${isolated ? "未确认完成的旧会话已隔离；下次手动发送使用新会话。" : ""}${failure ? personalOutcome[failure.outcome] : "已发出的请求可能仍有用量，请在用量与审计中核对。"}${current.trace ? ` 追踪：${current.trace}` : ""}`);
         } else { setError(failure ? `${personalOutcome[failure.outcome]}：${failure.message}` : errorText(e), current); void refresh(); }
@@ -261,6 +271,15 @@ export default function ChatPage({ active }: { active: boolean }) {
         if (mounted.current) { setBusy(false); setCanCancel(false); setCancelling(false); setPreview(null); }
       }
     }
+  };
+
+  const isolateUnknownSession = () => {
+    if (sending.current || copyInFlight.current || personalChange.current || blockedSession.current !== session.current) return;
+    session.current = crypto.randomUUID();
+    blockedSession.current = null;
+    setSessionBlocked(false);
+    setNotice("已建立新会话，原请求仍未确认。草稿和已确认历史已保留；此操作未发送新请求，也未取消原请求。");
+    if (active) promptInput.current?.focus();
   };
 
   const cancelCurrent = async () => {
@@ -304,10 +323,10 @@ export default function ChatPage({ active }: { active: boolean }) {
   return <div className="page chat-page" data-testid="chat-page" hidden={!active}>
     <div className="page-head"><h2>聊天测试</h2><div className="row">
       <button disabled={busy || loading || copyBusy} onClick={() => void refresh()}>刷新模型与评分</button>
-      <button ref={copyButton} type="button" disabled={busy || loading || exporting || copyBusy || changingPersonal || personal.enabled} onClick={() => copyInput.current?.click()}>打开对话 JSON 副本</button>
-      <input ref={copyInput} type="file" accept=".json,application/json" aria-label="选择对话 JSON 文件" hidden disabled={busy || copyBusy || exporting || changingPersonal || personal.enabled} onChange={event => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; void openTextCopy(file); }} />
+      <button ref={copyButton} type="button" disabled={busy || sessionBlocked || loading || exporting || copyBusy || changingPersonal || personal.enabled} onClick={() => copyInput.current?.click()}>打开对话 JSON 副本</button>
+      <input ref={copyInput} type="file" accept=".json,application/json" aria-label="选择对话 JSON 文件" hidden disabled={busy || sessionBlocked || copyBusy || exporting || changingPersonal || personal.enabled} onChange={event => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; void openTextCopy(file); }} />
       <button disabled={busy || copyBusy || exporting || !turns.length} onClick={() => void exportConversation()}>{exporting ? "导出中…" : "导出对话 JSON"}</button>
-      <button disabled={busy || copyBusy} onClick={() => { setTurns([]); setPrompt(""); setError(null); setNotice(null); setCopyError(null); setExportMessage(null); session.current = crypto.randomUUID(); }}>新建对话</button>
+      <button disabled={busy || copyBusy || sessionBlocked} onClick={() => { if (sending.current || copyInFlight.current || blockedSession.current) return; setTurns([]); setPrompt(""); setError(null); setNotice(null); setCopyError(null); setExportMessage(null); session.current = crypto.randomUUID(); }}>新建对话</button>
     </div></div>
     <p className="sub">测试所有已加入的聊天模型，包括 Qoder、Trae 和 WorkBuddy。自动路由遵循供应商页的当前策略、健康、额度与能力约束；多轮对话可保持会话路由。发送会使用真实账号额度，并记录到会话上下文和用量与审计。</p>
     <p className="sub">发送前请在设置页或托盘开启「LLM 网关服务」。系统网络代理可单独选择，不影响网关服务开关。</p>
@@ -317,6 +336,11 @@ export default function ChatPage({ active }: { active: boolean }) {
           : <>{error.request.ready ? "就绪通知未提供可用追踪标识" : "未取得本次请求的就绪追踪标识"}，无法确认是否存在审计记录；可按本次时间在“用量与审计”中核对。</>}
       </p>}
     </div>}
+    {sessionBlocked && <section className="card" aria-labelledby="chat-isolation-heading">
+      <h3 id="chat-isolation-heading">原会话结果未确认</h3>
+      <p>原请求可能已派发或产生用量，请核对用量与审计。再次手动发送会使用新会话，并发送草稿和已确认历史，可能产生用量。</p>
+      <button type="button" disabled={busy || copyBusy || changingPersonal} onClick={isolateUnknownSession}>保留草稿并建立隔离会话</button>
+    </section>}
     {notice && <p role="status" className="msg">{notice}</p>}
     {readingCopy && <p role="status" className="msg">正在本窗口读取所选对话文件，尚未发送。 <button type="button" onClick={() => copyRead.current?.abort()}>取消读取对话文件</button></p>}
     {copyError && <p role="alert" className="msg err">打开副本失败：{copyError}</p>}
@@ -376,7 +400,7 @@ export default function ChatPage({ active }: { active: boolean }) {
       <ChatModelReference automatic={model === "auto"} selected={selectedChoice} stale={Boolean(loadError) || loading} />
     </div>
     <div className="card">
-      <label><input type="checkbox" data-testid="personal-test-toggle" checked={personal.enabled} disabled={busy || copyBusy || loading || changingPersonal || (!personal.enabled && !choices.some(c => c.id === model && c.personal))} onChange={e => void configurePersonal(e.target.checked)} /> 个人测试</label>
+      <label><input type="checkbox" data-testid="personal-test-toggle" checked={personal.enabled} disabled={busy || sessionBlocked || copyBusy || loading || changingPersonal || (!personal.enabled && !choices.some(c => c.id === model && c.personal))} onChange={e => void configurePersonal(e.target.checked)} /> 个人测试</label>
       <p className="sub">默认关闭，重启后关闭。先明确选择一个已配置的 Codex CLI 运行时和模型；启用会通过所选 CLI 读取账号元数据，仅本窗口会话生效。</p>
       {personal.enabled && <div role="note" aria-label="个人测试说明"><strong>个人测试 · 免费资格／费用未核验</strong>
         <p>每次发送只允许一次请求 CLI 启动，不自动重试、切换备用或远程压缩；账号元数据辅助进程另行受控。严格免费限制仍然有效，CLI 内部真实供应商请求及重试次数未核验。</p>
@@ -424,7 +448,7 @@ export default function ChatPage({ active }: { active: boolean }) {
         onKeyDown={e => { if (!composing.current && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229 && (e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); void send(); } }}/>
       <div className="row"><span className="sub">Ctrl + Enter 发送。失败后保留输入；不自动重试。</span>
         {busy && <button type="button" data-testid="chat-cancel" aria-label="取消当前请求" disabled={!canCancel || cancelling} onClick={() => void cancelCurrent()}>{cancelling ? "正在取消…" : "取消当前请求"}</button>}
-        <button type="submit" className="primary" disabled={busy || copyBusy || loading || changingPersonal || !choices.length || !prompt.trim()}>{busy ? "生成中…" : "发送消息"}</button></div>
+        <button type="submit" className="primary" disabled={busy || sessionBlocked || copyBusy || loading || changingPersonal || !choices.length || !prompt.trim()}>{busy ? "生成中…" : "发送消息"}</button></div>
     </form>
   </div>;
 }

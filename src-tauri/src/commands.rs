@@ -1213,6 +1213,46 @@ pub async fn resume_client_usage_job(
     client_usage_jobs(&state)?.resume(&job_id).await
 }
 
+#[tauri::command]
+pub async fn list_client_usage_reviewable(
+    state: State<'_, AppState>,
+    after: Option<String>,
+) -> Result<repo::client_usage_journal::ReviewPage, String> {
+    repo::client_usage_journal::list_reviewable(&state.db, after.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn review_client_usage_journal(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request_id: String,
+    attempt_id: String,
+    on_ready: tauri::ipc::Channel<crate::client_usage_review::ReviewReady>,
+) -> Result<crate::client_usage_review::ReviewResult, String> {
+    crate::client_usage_review::review(
+        window,
+        &state.db,
+        &state.client_usage_review_controls,
+        request_id,
+        attempt_id,
+        on_ready,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn cancel_client_usage_review(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<bool, String> {
+    Ok(state
+        .client_usage_review_controls
+        .cancel(window.label(), &request_id))
+}
+
 /// 显式绑定或解除账号上游；普通供应商保存继续保留已有绑定。
 #[tauri::command]
 pub async fn set_provider_runtime(
