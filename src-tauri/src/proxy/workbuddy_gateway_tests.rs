@@ -35,6 +35,7 @@ struct Fixture {
     model_release: Arc<tokio::sync::Notify>,
     backup_posts: Arc<AtomicUsize>,
     retryable_primary_posts: Arc<AtomicUsize>,
+    usage_frames: Arc<parking_lot::Mutex<Option<Vec<Value>>>>,
     unexpected: Arc<AtomicUsize>,
     region: WorkBuddyRegion,
 }
@@ -89,6 +90,26 @@ async fn completion(
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error":{"code":"owned_unknown_delivery"}})),
+        )
+            .into_response();
+    }
+    let usage_frames = f.usage_frames.lock().clone();
+    if let Some(usage_frames) = usage_frames {
+        let frames =
+            [json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]})]
+                .into_iter()
+                .chain(
+                    usage_frames
+                        .into_iter()
+                        .map(|usage| json!({"choices":[],"usage":usage})),
+                );
+        let mut text = frames
+            .map(|value| format!("data: {value}\n\n"))
+            .collect::<String>();
+        text.push_str("data: [DONE]\n\n");
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            text,
         )
             .into_response();
     }
@@ -1589,5 +1610,181 @@ async fn ordinary_responses_account_ingress_rejects_lossy_workbuddy() {
     assert!(
         failures.is_empty(),
         "ordinary Responses WorkBuddy ingress: {failures:?}"
+    );
+}
+
+#[tokio::test]
+async fn desktop_usage_retains_only_reported_workbuddy_fields_in_both_regions() {
+    use crate::desktop_chat::{self, ChatInput, ChatMessage, ReplyFieldState, ReplyUsageEvidence};
+
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut mismatches = Vec::new();
+    for region in [WorkBuddyRegion::Global, WorkBuddyRegion::Cn] {
+        let s = setup_region(region).await;
+        let mut cfg = s.gateway.cfg_snapshot();
+        let listener = s.gateway.listener_snapshot().unwrap().bound_addr;
+        let url = format!("{}/v1/chat/completions", s.url);
+        let mut posts = 0;
+        for (case, frames, expected) in [
+            (
+                "partial",
+                vec![
+                    json!({"prompt_tokens":12,"prompt_tokens_details":{"cached_tokens":0,"unknown":"fixture-private-usage"}}),
+                    json!(null),
+                    json!({"credit":0,"completion_tokens":-1,"total_tokens":"fixture-private-usage"}),
+                ],
+                Some(
+                    json!({"prompt_tokens":12,"prompt_tokens_details":{"cached_tokens":0},"credit":0}),
+                ),
+            ),
+            (
+                "zero",
+                vec![json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0})],
+                Some(json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0})),
+            ),
+            (
+                "invalid",
+                vec![
+                    json!({"prompt_tokens":4294967296u64,"completion_tokens":-1,"credit":"fixture-private-usage"}),
+                ],
+                None,
+            ),
+            ("missing", vec![], None),
+        ] {
+            *s.fixture.usage_frames.lock() = Some(frames);
+            for stream in [false, true] {
+                let input = ChatInput {
+                    personal_test: false,
+                    model: "public".into(),
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: "owned desktop usage probe".into(),
+                        reasoning_content: None,
+                    }],
+                    session_id: uuid::Uuid::new_v4().to_string(),
+                    max_tokens: 32,
+                };
+                let result = if stream {
+                    desktop_chat::stream::send(&cfg, listener, input, uuid::Uuid::new_v4(), |_| {
+                        Ok(())
+                    })
+                    .await
+                } else {
+                    desktop_chat::send(&cfg, listener, input).await
+                }
+                .unwrap();
+                posts += 1;
+                assert_eq!(s.fixture.posts.load(Ordering::SeqCst), posts);
+                assert_eq!(result.content, "answer");
+                assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+                let meta = result.response_metadata.unwrap();
+                let evidence_matches = matches!(
+                    (&expected, &meta.usage, &meta.usage_evidence),
+                    (
+                        Some(_),
+                        ReplyFieldState::Reported,
+                        Some(ReplyUsageEvidence::Unknown)
+                    ) | (
+                        None,
+                        ReplyFieldState::Unavailable,
+                        Some(ReplyUsageEvidence::Unobserved)
+                    )
+                );
+                if result.usage != expected || !evidence_matches {
+                    mismatches.push(format!(
+                        "{region:?}/{case}/stream={stream}: usage={:?}, state={:?}, evidence={:?}",
+                        result.usage, meta.usage, meta.usage_evidence
+                    ));
+                }
+            }
+            if case == "partial" {
+                for stream in [false, true] {
+                    let response = http
+                        .post(&url)
+                        .bearer_auth(&cfg.unified_key)
+                        .json(&json!({"model":"public","stream":stream,
+                            "messages":[{"role":"user","content":"ordinary compatibility control"}]}))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), 200);
+                    let body = response.text().await.unwrap();
+                    posts += 1;
+                    assert_eq!(s.fixture.posts.load(Ordering::SeqCst), posts);
+                    assert!(!body.contains("llmgw_reply_observation"));
+                    assert!(!body.contains("fixture-private-usage"));
+                    let expected = json!({"prompt_tokens":12,"completion_tokens":0,"total_tokens":12,"credit":0.0});
+                    if stream {
+                        let frames: Vec<_> = body
+                            .lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .collect();
+                        assert_eq!(frames.last().copied(), Some("[DONE]"));
+                        assert_eq!(frames.iter().filter(|frame| **frame == "[DONE]").count(), 1);
+                        let usage: Vec<_> = frames[..frames.len() - 1]
+                            .iter()
+                            .map(|frame| serde_json::from_str::<Value>(frame).unwrap())
+                            .filter_map(|value| value.get("usage").cloned())
+                            .collect();
+                        assert_eq!(usage, vec![expected]);
+                    } else {
+                        let body: Value = serde_json::from_str(&body).unwrap();
+                        assert_eq!(body["usage"], expected);
+                    }
+                }
+            }
+        }
+        assert_eq!(posts, 10);
+
+        cfg.cache.enabled = true;
+        s.gateway.update_cfg(cfg.clone());
+        *s.fixture.usage_frames.lock() = Some(vec![json!({"prompt_tokens":12})]);
+        let request = json!({"model":"public","stream":false,
+            "messages":[{"role":"user","content":"owned cached usage probe"}]});
+        for (cache, new_posts, private_usage, evidence) in [
+            ("MISS", 1, json!({"prompt_tokens":12}), "unknown"),
+            ("HIT", 0, Value::Null, "unobserved"),
+        ] {
+            let response = http
+                .post(&url)
+                .bearer_auth(&cfg.unified_key)
+                .header("x-llmgw-desktop-observation", "1")
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["x-cache"], cache);
+            let body: Value = response.json().await.unwrap();
+            posts += new_posts;
+            assert_eq!(s.fixture.posts.load(Ordering::SeqCst), posts);
+            assert_eq!(
+                body["usage"],
+                json!({"prompt_tokens":12,"completion_tokens":0,"total_tokens":12})
+            );
+            let observed = &body["llmgw_reply_observation"];
+            assert_eq!(observed["version"], 1);
+            assert_eq!(observed["finish_reason"], "stop");
+            if observed.get("usage") != Some(&private_usage)
+                || observed.get("usage_present").and_then(Value::as_bool)
+                    != Some(!private_usage.is_null())
+                || observed["usage_evidence"] != evidence
+            {
+                mismatches.push(format!("{region:?}/cache={cache}: {observed}"));
+            }
+        }
+        assert_eq!(posts, 11);
+        assert_eq!(s.fixture.catalog_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.retryable_primary_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        mismatches.is_empty(),
+        "desktop WorkBuddy usage must preserve upstream field presence: {mismatches:?}"
     );
 }

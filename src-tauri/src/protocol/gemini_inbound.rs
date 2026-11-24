@@ -813,6 +813,7 @@ mod tests {
     fn response(content: &str) -> ChatResponse {
         ChatResponse {
             reported_usage_evidence: Default::default(),
+            desktop_usage_observation: None,
             // 普通 API 上游没有「传输」这个概念（A6 判据 1 只对账号型上游有意义）。
             transport: None,
             id: "id-1".into(),

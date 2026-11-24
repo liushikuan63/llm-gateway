@@ -219,6 +219,18 @@ pub(crate) fn attach_gateway_observation(
     if !requested {
         return;
     }
+    if !personal && response.transport.as_deref() == Some(crate::proxy::workbuddy::HTTP_TRANSPORT) {
+        let usage = response
+            .desktop_usage_observation
+            .as_ref()
+            .filter(|value| !value.is_null());
+        body["llmgw_reply_observation"] = serde_json::json!({
+            "version": 1, "finish_reason": response.finish_reason,
+            "usage_present": usage.is_some(), "usage": usage,
+            "usage_evidence": if usage.is_some() { "unknown" } else { "unobserved" },
+        });
+        return;
+    }
     let evidence = if personal {
         "unknown"
     } else {
@@ -244,6 +256,9 @@ fn reply_observations(body: &Value) -> (Option<String>, Option<Value>, ReplyMeta
                 finish = observed.finish_reason;
                 if !observed.usage_present {
                     usage = None;
+                } else if let Some(source) = value.get("usage") {
+                    // Presence in newer receipts wins over the public compatibility counters.
+                    usage = (!source.is_null()).then(|| source.clone());
                 }
                 Some(observed.usage_evidence)
             }

@@ -106,6 +106,7 @@ pub fn openai_response_to_internal(v: &serde_json::Value) -> crate::domain::Chat
 
     crate::domain::ChatResponse {
         reported_usage_evidence: Default::default(),
+        desktop_usage_observation: None,
         // 普通 API 上游没有「传输」这个概念（A6 判据 1 只对账号型上游有意义）。
         transport: None,
         id: v

@@ -169,6 +169,7 @@ pub fn from_ollama_response(v: &serde_json::Value) -> ChatResponse {
     let has_tool_calls = tool_calls.is_some();
     ChatResponse {
         reported_usage_evidence: Default::default(),
+        desktop_usage_observation: None,
         // 普通 API 上游没有「传输」这个概念（A6 判据 1 只对账号型上游有意义）。
         transport: None,
         id: uuid::Uuid::new_v4().to_string(),

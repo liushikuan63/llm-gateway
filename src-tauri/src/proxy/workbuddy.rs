@@ -1,6 +1,6 @@
 //! WorkBuddy's account-scoped model transport. The production origin is fixed;
 //! neither provider configuration nor request extras choose an authentication target.
-use super::upstream::UpstreamEvent;
+use super::upstream::{desktop_openai_usage, merge_desktop_usage_observation, UpstreamEvent};
 use crate::domain::{ChatRequest, ChatResponse, FunctionCall, ToolCall, Usage};
 use crate::error::{GatewayError, Result};
 use crate::model_catalog::{ContextSource, DiscoveredModel, DiscoveryResponse};
@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 
 #[cfg(test)]
 const DESKTOP_UA: &str = "WorkBuddy/5.7.6";
+pub(crate) const HTTP_TRANSPORT: &str = "workbuddy-http";
 const JSON_LIMIT: usize = 512 * 1024;
 const FRAME_LIMIT: usize = 1024 * 1024;
 // Local guards, not claims about the upstream service's limits.
@@ -385,11 +386,18 @@ impl WorkBuddyModelClient {
                     tokio::time::timeout_at(deadline, service.model_authorization_current(&account, &auth))
                         .await.map_err(|_| GatewayError::Timeout("WorkBuddy 响应超时".into()))?
                         .map_err(GatewayError::Unauthorized)?;
-                    if let (Some(permit), UpstreamEvent::Done { usage, .. }) = (&permit, &event) {
-                        tokio::time::timeout_at(deadline, async {
-                            permit.settle_usage(usage.as_ref()).await?;
-                            service.model_authorization_current(&account, &auth).await.map_err(GatewayError::Unauthorized)
-                        }).await.map_err(|_| GatewayError::Timeout("WorkBuddy 结算等待超时".into()))??;
+                    if let UpstreamEvent::Done { usage, .. } = &event {
+                        if let Some(permit) = &permit {
+                            tokio::time::timeout_at(deadline, async {
+                                permit.settle_usage(usage.as_ref()).await?;
+                                service.model_authorization_current(&account, &auth).await.map_err(GatewayError::Unauthorized)
+                            }).await.map_err(|_| GatewayError::Timeout("WorkBuddy 结算等待超时".into()))??;
+                        }
+                        // Publish display metadata alongside the checked terminal,
+                        // without another authorization lookup or settlement.
+                        yield UpstreamEvent::UsageObservation(
+                            parser.desktop_usage.take().unwrap_or(Value::Null),
+                        );
                     }
                     yield event;
                 }
@@ -1116,6 +1124,7 @@ struct SseParser {
     tools: ToolAssembler,
     finish: Option<String>,
     usage: Option<Usage>,
+    desktop_usage: Option<Value>,
     output_bytes: usize,
     output_limit: usize,
     has_output: bool,
@@ -1132,6 +1141,7 @@ impl SseParser {
             tools: ToolAssembler::default(),
             finish: None,
             usage: None,
+            desktop_usage: None,
             output_bytes: 0,
             output_limit,
             has_output: false,
@@ -1243,6 +1253,13 @@ impl SseParser {
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
             if !usage.is_object() {
                 return Err(protocol("usage 必须为对象"));
+            }
+            let observed = desktop_openai_usage(usage);
+            if observed
+                .as_object()
+                .is_some_and(|fields| !fields.is_empty())
+            {
+                merge_desktop_usage_observation(&mut self.desktop_usage, observed);
             }
             let incoming = Usage::from_openai(usage);
             merge_usage(&mut self.usage, incoming.clone());
@@ -1365,7 +1382,7 @@ async fn collect(mut stream: EventStream, model: &str) -> Result<ChatResponse> {
         reported_usage_evidence: Default::default(),
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         model: model.into(),
-        transport: Some("workbuddy-http".into()),
+        transport: Some(HTTP_TRANSPORT.into()),
         ..Default::default()
     };
     let mut tools = ToolAssembler::default();
@@ -1396,8 +1413,9 @@ async fn collect(mut stream: EventStream, model: &str) -> Result<ChatResponse> {
                 }
                 done = true;
             }
-            // Display-only evidence never changes this legacy collector/accounting.
-            UpstreamEvent::UsageObservation(_) => {}
+            UpstreamEvent::UsageObservation(value) => {
+                merge_desktop_usage_observation(&mut response.desktop_usage_observation, value);
+            }
             UpstreamEvent::Ping => {}
         }
     }

@@ -126,6 +126,7 @@ fn ollama_non_stream_response_preserves_tool_calls_and_usage() {
     let response = ollama::ollama_response(
         &ChatResponse {
             reported_usage_evidence: Default::default(),
+            desktop_usage_observation: None,
             id: "response-1".into(),
             model: "llama3.3".into(),
             content: internal.content,

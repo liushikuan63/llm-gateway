@@ -45,7 +45,9 @@ use crate::error::{GatewayError, Result};
 use crate::protocol::openai::AccountIngressShape;
 use crate::proxy::dedup::{DedupDecision, DedupOutcome, DedupRegistry, Verdict};
 use crate::proxy::health::HealthRegistry;
-use crate::proxy::upstream::{PassthroughResponse, UpstreamClient, UpstreamEvent};
+use crate::proxy::upstream::{
+    merge_desktop_usage_observation, PassthroughResponse, UpstreamClient, UpstreamEvent,
+};
 use crate::router::cascade::{CascadeRunRequest, CascadeStop, ConfidenceReading};
 use crate::router::failover::{classify, AtomicFlag, AttemptOutcome, AttemptRecord, FailoverChain};
 
@@ -7612,39 +7614,6 @@ async fn stream_dispatch(state: Arc<GatewayState>, input: DispatchInput) -> Resp
 /// 各方言会分段或在结尾重复报告用量；按维度取较完整的值，并保证 total
 /// 不会小于输入与输出之和。这样 Anthropic 的 input/output 分离事件和 OpenAI
 /// 的 usage-only chunk 都能落到同一条审计记录。
-/// A null usage frame is no new report and cannot erase prior known fields.
-/// Merge partial numeric declarations without manufacturing absent counters.
-fn merge_desktop_usage_observation(
-    current: &mut Option<serde_json::Value>,
-    next: serde_json::Value,
-) {
-    use serde_json::Value;
-    if next.is_null() {
-        if current.is_none() {
-            *current = Some(Value::Null);
-        }
-        return;
-    }
-    match (
-        current.as_mut().and_then(Value::as_object_mut),
-        next.as_object(),
-    ) {
-        (Some(current), Some(next)) => {
-            for (key, value) in next {
-                if let (Some(old), Some(new)) = (
-                    current.get_mut(key).and_then(Value::as_object_mut),
-                    value.as_object(),
-                ) {
-                    old.extend(new.iter().map(|(key, value)| (key.clone(), value.clone())));
-                } else {
-                    current.insert(key.clone(), value.clone());
-                }
-            }
-        }
-        _ => *current = Some(next),
-    }
-}
-
 fn merge_usage(current: &mut Option<Usage>, next: Usage) {
     let usage = current.get_or_insert_with(Usage::default);
     usage.prompt_tokens = usage.prompt_tokens.max(next.prompt_tokens);

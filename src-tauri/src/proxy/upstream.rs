@@ -1144,7 +1144,7 @@ fn parse_openai_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
 /// Optional display evidence, never a billing input. Only allowlisted numeric
 /// usage fields cross the desktop boundary; arbitrary upstream error/secret
 /// extensions are not reflected. Missing/invalid counters are not filled in.
-fn desktop_openai_usage(raw: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn desktop_openai_usage(raw: &serde_json::Value) -> serde_json::Value {
     use serde_json::{Map, Value};
     let Some(raw) = raw.as_object() else {
         return Value::Null;
@@ -1196,6 +1196,39 @@ fn desktop_openai_usage(raw: &serde_json::Value) -> serde_json::Value {
         }
     }
     Value::Object(output)
+}
+
+/// A null usage frame is no new report and cannot erase prior known fields.
+/// Merge partial numeric declarations without manufacturing absent counters.
+pub(crate) fn merge_desktop_usage_observation(
+    current: &mut Option<serde_json::Value>,
+    next: serde_json::Value,
+) {
+    use serde_json::Value;
+    if next.is_null() {
+        if current.is_none() {
+            *current = Some(Value::Null);
+        }
+        return;
+    }
+    match (
+        current.as_mut().and_then(Value::as_object_mut),
+        next.as_object(),
+    ) {
+        (Some(current), Some(next)) => {
+            for (key, value) in next {
+                if let (Some(old), Some(new)) = (
+                    current.get_mut(key).and_then(Value::as_object_mut),
+                    value.as_object(),
+                ) {
+                    old.extend(new.iter().map(|(key, value)| (key.clone(), value.clone())));
+                } else {
+                    current.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        _ => *current = Some(next),
+    }
 }
 
 fn openai_usage(v: &serde_json::Value) -> Option<Usage> {
