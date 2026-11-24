@@ -1932,3 +1932,344 @@ async fn ollama_account_images_ingress_rejects_workbuddy() {
         "Ollama WorkBuddy account images ingress: {failures:?}"
     );
 }
+
+fn owned_anthropic_document_block() -> Value {
+    json!({"type":"document","source":{
+        "type":"text","media_type":"text/plain","data":"owned document"
+    }})
+}
+
+fn owned_anthropic_document_messages(tool_result: bool, with_document: bool) -> Value {
+    let mut blocks = vec![json!({
+        "type":"text",
+        "text":if tool_result { "owned lookup result" } else { "owned direct question" }
+    })];
+    if with_document {
+        blocks.push(owned_anthropic_document_block());
+    }
+    if tool_result {
+        json!([
+            {"role":"user","content":"owned lookup question"},
+            {"role":"assistant","content":[{
+                "type":"tool_use","id":"toolu_owned_doc","name":"lookup","input":{"q":"owned"}
+            }]},
+            {"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"toolu_owned_doc","content":blocks
+            }]}
+        ])
+    } else {
+        json!([{"role":"user","content":blocks}])
+    }
+}
+
+async fn post_owned_anthropic_document_case(
+    (http, gateway, key): (&reqwest::Client, &str, &str),
+    model: &str,
+    messages: &Value,
+    stream: bool,
+    shape: &str,
+) -> reqwest::Response {
+    http.post(format!("{gateway}/v1/messages"))
+        .bearer_auth(key)
+        .header(
+            "x-session-id",
+            format!("owned-r138-{model}-{shape}-{stream}"),
+        )
+        .json(&json!({"model":model,"stream":stream,"max_tokens":32,"messages":messages}))
+        .send()
+        .await
+        .unwrap()
+}
+
+pub(super) fn assert_owned_anthropic_document_projection(
+    request: &Value,
+    tool_result: bool,
+    case: &str,
+) {
+    let messages = request["messages"].as_array().unwrap();
+    if tool_result {
+        let assistant = messages
+            .iter()
+            .find(|row| row["role"] == "assistant")
+            .unwrap();
+        let calls = assistant["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{case}");
+        let call = &calls[0];
+        assert_eq!(call["id"], "toolu_owned_doc", "{case}");
+        assert_eq!(call["function"]["name"], "lookup", "{case}");
+        let args: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({"q":"owned"}), "{case}");
+        let results = messages
+            .iter()
+            .filter(|row| row["role"] == "tool")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1, "{case}");
+        assert_eq!(results[0]["tool_call_id"], "toolu_owned_doc", "{case}");
+        assert_eq!(results[0]["content"], "owned lookup result", "{case}");
+    } else {
+        assert!(
+            messages
+                .iter()
+                .any(|row| row["role"] == "user" && row["content"] == "owned direct question"),
+            "{case}"
+        );
+    }
+}
+
+async fn assert_owned_anthropic_document_reply(
+    response: reqwest::Response,
+    stream: bool,
+    answer: &str,
+    case: &str,
+) {
+    let status = response.status();
+    let mime = response.headers()[reqwest::header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{case}: {body}");
+    if stream {
+        assert!(mime.starts_with("text/event-stream"), "{case}: {mime}");
+        let mut events = Vec::new();
+        for frame in body.split("\n\n").filter(|frame| !frame.trim().is_empty()) {
+            let mut lines = frame.lines();
+            let Some(event) = lines.next().and_then(|line| line.strip_prefix("event: ")) else {
+                assert!(frame.starts_with(':'), "{case}: unexpected frame {frame:?}");
+                continue;
+            };
+            let data = lines
+                .next()
+                .and_then(|line| line.strip_prefix("data: "))
+                .unwrap();
+            let data: Value = serde_json::from_str(data).unwrap();
+            assert_eq!(data["type"], event, "{case}: {frame}");
+            assert_ne!(event, "error", "{case}: {frame}");
+            events.push((event, data));
+        }
+        assert_eq!(
+            events.first().map(|event| event.0),
+            Some("message_start"),
+            "{case}"
+        );
+        assert_eq!(
+            events.last().map(|event| event.0),
+            Some("message_stop"),
+            "{case}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.0 == "message_stop")
+                .count(),
+            1,
+            "{case}"
+        );
+        let text = events
+            .iter()
+            .filter(|(event, data)| {
+                *event == "content_block_delta" && data["delta"]["type"] == "text_delta"
+            })
+            .map(|(_, data)| data["delta"]["text"].as_str().unwrap())
+            .collect::<String>();
+        assert_eq!(text, answer, "{case}");
+    } else {
+        assert!(mime.starts_with("application/json"), "{case}: {mime}");
+        let message: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(message["type"], "message", "{case}");
+        assert_eq!(message["role"], "assistant", "{case}");
+        assert!(message.get("error").is_none(), "{case}");
+        let text = message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .map(|block| block["text"].as_str().unwrap())
+            .collect::<String>();
+        assert_eq!(text, answer, "{case}");
+    }
+}
+
+pub(super) async fn check_owned_anthropic_document_ingress(
+    endpoint: (&reqwest::Client, &str, &str),
+    adapter: &str,
+    answer: &str,
+    counts: impl Fn() -> (usize, usize, Option<usize>),
+    assert_projection: impl Fn(bool, &str),
+    failures: &mut Vec<String>,
+) {
+    // Negative cases precede every good dispatch in each fresh region. The
+    // tuple records physical account POST / catalog GET / optional HTTP backup.
+    assert_eq!(counts().0, 0, "{adapter}");
+    assert_eq!(counts().1, 0, "{adapter}");
+    let direct = owned_anthropic_document_messages(false, true);
+    let tool_result = owned_anthropic_document_messages(true, true);
+    let mut sibling = owned_anthropic_document_messages(true, false);
+    sibling[2]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(owned_anthropic_document_block());
+    for stream in [false, true] {
+        for (shape, messages, expected_status, error_type, reason) in [
+            (
+                "direct-document",
+                &direct,
+                400,
+                "invalid_request_error",
+                "unsupported_account_content_part",
+            ),
+            (
+                "tool-result-document",
+                &tool_result,
+                400,
+                "invalid_request_error",
+                "unsupported_account_content_part",
+            ),
+            (
+                "sibling-document",
+                &sibling,
+                500,
+                "upstream_error",
+                "unsupported user content block `document` alongside tool_result",
+            ),
+        ] {
+            let before = counts();
+            let response =
+                post_owned_anthropic_document_case(endpoint, "public", messages, stream, shape)
+                    .await;
+            let status = response.status().as_u16();
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap();
+            let json_error = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            let json_header = headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json"));
+            let matches_error = json_header
+                && json_error["error"]["type"] == error_type
+                && json_error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.ends_with(reason))
+                && !headers.contains_key("x-routed-via")
+                && !headers.contains_key("x-cache");
+            let after = counts();
+            let witness = format!(
+                "R138 {adapter} {shape} stream={stream} status={status} physical(post,catalog,backup)={before:?}->{after:?} expected_json_error={matches_error}"
+            );
+            eprintln!("{witness}");
+            if status != expected_status || !matches_error || before != after {
+                failures.push(witness);
+            }
+        }
+    }
+
+    for stream in [false, true] {
+        for (tool_result, control) in [(false, "typed-text"), (true, "legal-tool-history")] {
+            let case = format!("{adapter}/{control} stream={stream}");
+            let before = counts();
+            let messages = owned_anthropic_document_messages(tool_result, false);
+            let response =
+                post_owned_anthropic_document_case(endpoint, "public", &messages, stream, control)
+                    .await;
+            assert_owned_anthropic_document_reply(response, stream, answer, &case).await;
+            assert_eq!(counts(), (before.0 + 1, 1, before.2), "{case}");
+            assert_projection(tool_result, &case);
+            eprintln!(
+                "R138 {case} passed; physical(post,catalog,backup)={before:?}->{:?}",
+                counts()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn anthropic_account_document_ingress_rejects_workbuddy() {
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [
+        (WorkBuddyRegion::Global, "global"),
+        (WorkBuddyRegion::Cn, "cn"),
+    ] {
+        let s = setup_region(region).await;
+        let mut backup = s.gateway.providers.read()[0].clone();
+        backup.id = "owned-anthropic-http".into();
+        backup.runtime_id = None;
+        backup.base_url = format!("{}/v1", s.origin);
+        backup.priority = 2;
+        let mut explicit_http_model = backup.models[0].clone();
+        explicit_http_model.alias = "owned-anthropic-http".into();
+        backup.models.push(explicit_http_model);
+        repo::upsert_provider(s.gateway.db.pool(), &backup)
+            .await
+            .unwrap();
+        s.gateway.reload_providers().await.unwrap();
+        let mut cfg = s.gateway.cfg_snapshot();
+        cfg.routing_strategy = crate::config::RoutingStrategy::Priority;
+        cfg.failover_enabled = true;
+        cfg.max_fallback_attempts = 2;
+        cfg.smart_routing.enabled = false;
+        cfg.search.enabled = false;
+        cfg.cache.enabled = false;
+        cfg.dedup.mode = crate::proxy::dedup::DedupMode::Off;
+        s.gateway.update_cfg(cfg);
+        s.gateway.set_active("wb-gateway-provider").unwrap();
+
+        let counts = || {
+            (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+                Some(s.fixture.backup_posts.load(Ordering::SeqCst)),
+            )
+        };
+        let endpoint = (&http, s.url.as_str(), "offline-gateway-key");
+        check_owned_anthropic_document_ingress(
+            endpoint,
+            &format!("WorkBuddy/{label}"),
+            "answer",
+            counts,
+            |tool_result, case| {
+                let requests = s.fixture.requests.lock();
+                assert_owned_anthropic_document_projection(
+                    requests.last().unwrap(),
+                    tool_result,
+                    case,
+                );
+            },
+            &mut failures,
+        )
+        .await;
+        assert_eq!(counts().2, Some(0), "no fallback for the account cases");
+        if region == WorkBuddyRegion::Global {
+            let before = counts();
+            let reply = post_owned_anthropic_document_case(
+                endpoint,
+                "owned-anthropic-http",
+                &owned_anthropic_document_messages(false, true),
+                false,
+                "direct-document",
+            )
+            .await;
+            assert_owned_anthropic_document_reply(
+                reply,
+                false,
+                "backup answer",
+                "ordinary HTTP exact body",
+            )
+            .await;
+            assert_eq!(counts(), (before.0, before.1, Some(1)));
+            eprintln!("R138 ordinary HTTP exact document passed; physical(post,catalog,backup)={before:?}->{:?}", counts());
+        }
+        assert_eq!(s.fixture.retryable_primary_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        failures.is_empty(),
+        "Anthropic WorkBuddy account document ingress:\n{}",
+        failures.join("\n")
+    );
+}

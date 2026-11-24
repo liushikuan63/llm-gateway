@@ -2128,12 +2128,29 @@ async fn anthropic_messages(
         return response;
     }
     let caller = super::control_modes::CallerControls::capture(&body, Dialect::Anthropic);
-    match serde_json::from_value::<crate::protocol::anthropic::AnthropicRequest>(body) {
-        Ok(r) => match r.to_internal() {
-            Ok(req) => dispatch(state, req, &headers, auth.client, Exit::Anthropic, caller).await,
-            Err(e) => error_response(&e),
-        },
-        Err(e) => error_response(&GatewayError::Protocol(format!("请求体解析失败: {e}"))),
+    let request = match serde_json::from_value::<crate::protocol::anthropic::AnthropicRequest>(body)
+    {
+        Ok(request) => request,
+        Err(e) => return error_response(&GatewayError::Protocol(format!("请求体解析失败: {e}"))),
+    };
+    let account_ingress = request.account_ingress_shape();
+    match request.to_internal() {
+        Ok(req) => {
+            dispatch_with_context(
+                state,
+                req,
+                &headers,
+                auth.client,
+                Exit::Anthropic,
+                ResponseRequestContext {
+                    caller: Some(caller),
+                    account_ingress,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+        Err(e) => error_response(&e),
     }
 }
 

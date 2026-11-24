@@ -1996,3 +1996,46 @@ async fn ollama_account_images_ingress_rejects_qoder() {
         "Ollama Qoder account images ingress: {failures:?}"
     );
 }
+
+#[tokio::test]
+async fn anthropic_account_document_ingress_rejects_qoder() {
+    use crate::proxy::workbuddy_gateway_tests::{
+        assert_owned_anthropic_document_projection, check_owned_anthropic_document_ingress,
+    };
+
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [(Region::Global, "global"), (Region::Cn, "cn")] {
+        let f = setup().await;
+        let g = gateway(&f, region, false).await;
+        check_owned_anthropic_document_ingress(
+            (&http, &g.url, "synthetic-gateway-key"),
+            &format!("Qoder/{label}"),
+            "OK",
+            || {
+                (
+                    f.fixture.posts.load(Ordering::SeqCst),
+                    f.fixture.catalogs.load(Ordering::SeqCst),
+                    None,
+                )
+            },
+            |tool_result, case| {
+                let requests = f.fixture.requests.lock();
+                let (target_region, request) = requests.last().unwrap();
+                assert_eq!(target_region, label, "{case}");
+                assert_owned_anthropic_document_projection(request, tool_result, case);
+            },
+            &mut failures,
+        )
+        .await;
+    }
+    assert!(
+        failures.is_empty(),
+        "Anthropic Qoder account document ingress:\n{}",
+        failures.join("\n")
+    );
+}

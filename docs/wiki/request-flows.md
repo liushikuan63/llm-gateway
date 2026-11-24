@@ -529,6 +529,12 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 
 自有回环验证了两种账号适配器各两区的流式与非流式拒绝、合法文本和空图片字段的成功对照，以及同一带图片字段的请求走普通 HTTP 路线时沿用原转换行为。流式成功仍输出 Ollama NDJSON 终态；NativeExact 的入口判定仍先执行。这里的保护不提供图片转发能力，也不代表真实账号验收。
 
+### R5-P 普通 Anthropic Messages 的文档入站形状
+
+普通 Anthropic `/v1/messages` 在兼容转换前识别消息内容中的 `document` 块，以及用户消息中 `tool_result.content` 数组第一层的文档块。兼容转换会丢弃这些块，因此选中的 Qoder 或 WorkBuddy 账号路线会返回 HTTP 400（unsupported_account_content_part），不读取该账号的模型目录，也不向该账号发送模型请求。此标记只供路由使用，不传给上游。
+
+NativeExact 仍先处理入口判定；普通 HTTP 沿用已有的内容转换。用户消息把文档和工具结果放在同级时，原解析错误仍优先返回。自有回环覆盖两个账号适配器各两区的流式和非流式请求，以及合法工具结果和普通 HTTP 的正对照。这里的保护不提供文档转发能力，也不代表真实账号验收。
+
 ### N4 原生上游的流终态
 
 
