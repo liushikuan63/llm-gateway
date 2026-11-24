@@ -59,7 +59,7 @@ async function verifyFeedbackCoveragePartial(browser,baseUrl,output,errors,fixtu
    if(scenario==='usage-rejects-coverage-succeeds'){
     const overview=page.getByRole('region',{name:'最近 24 小时用量核验覆盖',exact:true});
     const current=page.getByRole('region',{name:'当前筛选用量核验覆盖',exact:true});
-    const audit=page.locator('.card.table-card').filter({has:page.locator('#audit-provider')});
+    const audit=page.locator('.card').filter({has:page.locator('#audit-provider')});
     const unknown=audit.getByText('当前筛选用量核验覆盖未读取，未知量未显示为零。',{exact:true});
     const stale=page.getByText('概览仍显示上次成功读取的结果，可能已过期。',{exact:true});
     const currentRow=audit.locator('tbody tr').filter({hasText:'owned-current-row'});

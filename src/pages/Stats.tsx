@@ -539,7 +539,7 @@ function StatsContent({review}: {review: ReactNode}) {
         )}
       </div>
 
-      <div className="card table-card">
+      <div className="card audit-table-card">
         <strong>最近请求</strong>
         {/* B3 审计筛选。放在表格上方而不是折叠面板里：
             筛选条件看不见时，用户会以为「记录变少了」而不是「被筛掉了」。 */}
@@ -677,7 +677,7 @@ function StatsContent({review}: {review: ReactNode}) {
           {!currentAudit?.page ? null : rows.length === 0 ? (
             <div className="empty">暂无记录</div>
           ) : (
-            <table className="requests-table">
+            <div className="audit-table-scroll" role="region" aria-label="最近请求表格" tabIndex={0}><table className="requests-table">
               <thead>
                 <tr>
                   <th style={{ width: 76 }}>时间</th>
@@ -686,9 +686,9 @@ function StatsContent({review}: {review: ReactNode}) {
                   <th>实际路由</th>
                   <th style={{ width: 68 }}>状态</th>
                   <th style={{ width: 82 }}>延迟</th>
-                  <th>Token（输入 / 输出）</th>
-                  <th style={{ width: 96 }}>花费</th>
-                  <th style={{ width: 106 }}>计价档位</th>
+                  <th className="audit-reading-column">Token（输入 / 输出）</th>
+                  <th className="audit-reading-column">花费</th>
+                  <th className="audit-reading-column">计价档位</th>
                   <th style={{ width: 70 }}>降级</th>
                   <th>错误</th>
                 </tr>
@@ -708,10 +708,10 @@ function StatsContent({review}: {review: ReactNode}) {
                         onClick={() => (hasAttempts || validId) && setExpanded(isExpanded ? null : rowKey)}
                       >
                         <td className="muted" style={{ fontSize: 11 }}>{formatTime(request.ts)}</td>
-                        <td className="mono muted">{request.client ?? "-"}</td>
-                        <td className="mono">{request.requested_model}</td>
+                        <td className="mono muted"><span className="audit-identifier">{request.client ?? "-"}</span></td>
+                        <td className="mono"><span className="audit-identifier">{request.requested_model}</span></td>
                         <td className="mono muted">
-                          {request.routed_provider ? `${request.routed_provider}/${request.routed_model ?? "-"}` : "-"}
+                          <span className="audit-identifier">{request.routed_provider ? `${request.routed_provider}/${request.routed_model ?? "-"}` : "-"}</span>
                         </td>
                         <td>
                           {request.status === null ? (
@@ -760,7 +760,7 @@ function StatsContent({review}: {review: ReactNode}) {
                   );
                 })}
               </tbody>
-            </table>
+            </table></div>
           )}
         </div>
       </div>
