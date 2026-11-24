@@ -547,6 +547,12 @@ NativeExact 仍先判定，已有请求解析错误仍优先返回。普通 HTTP
 
 NativeExact、动作判定及原请求解析错误保留既有优先级；普通 HTTP 继续沿用原转换。自有回环覆盖两种账号适配器各两区的流式与非流式拒绝，以及合法账号工具历史、空值和普通 Gemini HTTP 的成功对照。此保护不提供代码部件转发能力，也不代表真实账号验收。
 
+### R5-P 普通 Gemini 的 thought signature 入站形状
+
+普通 Gemini 的 generateContent 和 streamGenerateContent 在兼容转换前检查 `contents[*].parts[*]` 直属的 `thoughtSignature` 和 `thought_signature`。缺省、显式 `null`、空字符串及工具结果业务 JSON 内的同名字段不触发拒绝；直属非空字符串或其他非 `null` 类型只记录为转换会丢失的形状，不保存签名值。选中的 Qoder 或 WorkBuddy 账号路线返回 HTTP 400（`unsupported_account_content_part`），不回显签名，不读取该账号的模型目录，也不发送模型请求。
+
+NativeExact、动作判定和请求解析仍沿用原来的顺序。普通 HTTP 继续使用原有转换；同一输入能够派发，并不表示签名被保真转发。自有回环覆盖两个账号适配器各两区的缓冲和流式拒绝，以及合法工具历史和普通 Gemini HTTP 对照；真实账号续接另行验收。
+
 ### N4 原生上游的流终态
 
 

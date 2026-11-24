@@ -40,8 +40,8 @@ pub fn strip_models_prefix(raw: &str) -> &str {
 }
 
 pub(crate) fn account_ingress_shape(body: &Value) -> super::openai::AccountIngressShape {
-    // GeminiPart does not keep these code parts. Preserve only the fact that
-    // conversion loses them so account routes can reject before dispatch.
+    // GeminiPart does not keep these code parts or opaque signatures.
+    // Record only the loss so account routes can reject before dispatch.
     let mut shape = super::openai::AccountIngressShape::default();
     if body
         .get("contents")
@@ -54,6 +54,12 @@ pub(crate) fn account_ingress_shape(body: &Value) -> super::openai::AccountIngre
             ["executableCode", "codeExecutionResult"]
                 .into_iter()
                 .any(|key| part.get(key).is_some_and(|value| !value.is_null()))
+                || ["thoughtSignature", "thought_signature"]
+                    .into_iter()
+                    .any(|key| {
+                        part.get(key)
+                            .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+                    })
         })
     {
         shape.note_unsupported_part();

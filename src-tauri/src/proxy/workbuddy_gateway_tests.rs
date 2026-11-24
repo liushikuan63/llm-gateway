@@ -2567,7 +2567,7 @@ pub(super) async fn check_owned_gemini_code_ingress(
         .unwrap()
         .push(json!({"functionCall":{"name":"lookup"}}));
     let with_null = json!({"contents":[{"role":"user","parts":[
-        {"text":"owned null controls","thoughtSignature":"owned opaque signature","ownedUnknown":{"keep":"compatibility"}},
+        {"text":"owned null controls","ownedUnknown":{"keep":"compatibility"}},
         {"executableCode":null},{"codeExecutionResult":null}
     ]}],"generationConfig":{"maxOutputTokens":32}});
     let history = json!({"contents":[
@@ -2860,5 +2860,235 @@ async fn anthropic_account_tool_result_error_ingress_rejects_workbuddy() {
     assert!(
         failures.is_empty(),
         "R141 WorkBuddy account cases: {failures:?}"
+    );
+}
+
+const OWNED_R142_GEMINI_SIGNATURE: &str = "cjE0Mi1vd25lZC1jb250aW51YXRpb24=";
+
+fn owned_gemini_signature_history() -> Value {
+    json!({"contents":[
+        {"role":"user","parts":[{"text":"look up owned data"}]},
+        {"role":"model","parts":[{"functionCall":{"id":"owned-gemini-call","name":"lookup","args":{"query":"owned"}}}]},
+        {"role":"user","parts":[{"functionResponse":{"id":"owned-gemini-call","name":"lookup","response":{"kept":"tool output"}}}]}
+    ]})
+}
+
+fn owned_gemini_signature_cases() -> [(&'static str, Value); 3] {
+    let mut camel_call = owned_gemini_signature_history();
+    camel_call["contents"][1]["parts"][0]["thoughtSignature"] = json!(OWNED_R142_GEMINI_SIGNATURE);
+    let mut proto_call = owned_gemini_signature_history();
+    proto_call["contents"][1]["parts"][0]["thought_signature"] = json!(OWNED_R142_GEMINI_SIGNATURE);
+    let mut thought_text = owned_gemini_signature_history();
+    thought_text["contents"][1]["parts"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            0,
+            json!({"text":"owned summary","thought":true,"thoughtSignature":OWNED_R142_GEMINI_SIGNATURE}),
+        );
+    [
+        ("call-camel", camel_call),
+        ("call-proto", proto_call),
+        ("thought-text", thought_text),
+    ]
+}
+
+fn owned_gemini_signature_controls() -> [(&'static str, Value); 4] {
+    let absent = owned_gemini_signature_history();
+    let mut empty = absent.clone();
+    let mut null = absent.clone();
+    for key in ["thoughtSignature", "thought_signature"] {
+        empty["contents"][1]["parts"][0][key] = json!("");
+        null["contents"][1]["parts"][0][key] = Value::Null;
+    }
+    let mut nested = absent.clone();
+    let result = &mut nested["contents"][2]["parts"][0]["functionResponse"]["response"];
+    result["thoughtSignature"] = json!("owned application field");
+    result["thought_signature"] = json!({"kept":"application object"});
+    [
+        ("absent", absent),
+        ("empty-present", empty),
+        ("null-present", null),
+        ("business-fields", nested),
+    ]
+}
+
+pub(super) fn assert_owned_gemini_signature_projection(
+    wire: &Value,
+    expected_result: &Value,
+    case: &str,
+) {
+    let messages = wire["messages"].as_array().unwrap();
+    let calls = messages
+        .iter()
+        .find_map(|m| m["tool_calls"].as_array())
+        .unwrap();
+    assert_eq!(calls.len(), 1, "{case}");
+    assert_eq!(calls[0]["id"], "owned-gemini-call", "{case}");
+    assert_eq!(calls[0]["function"]["name"], "lookup", "{case}");
+    assert_eq!(
+        serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap(),
+        json!({"query":"owned"}),
+        "{case}"
+    );
+    let result = messages.iter().find(|m| m["role"] == "tool").unwrap();
+    assert_eq!(result["tool_call_id"], "owned-gemini-call", "{case}");
+    assert_eq!(
+        &serde_json::from_str::<Value>(result["content"].as_str().unwrap()).unwrap(),
+        expected_result,
+        "{case}"
+    );
+}
+
+pub(super) async fn check_owned_gemini_signature_ingress(
+    endpoint: OwnedGeminiEndpoint<'_>,
+    adapter: &str,
+    account_answer: &str,
+    counts: impl Fn() -> (usize, usize, usize),
+    check_projection: impl Fn(&Value, &str),
+    failures: &mut Vec<String>,
+) {
+    assert_eq!(counts(), (0, 0, 0), "{adapter}: start with cold counters");
+    for stream in [false, true] {
+        for (shape, input) in owned_gemini_signature_cases() {
+            let before = counts();
+            let reply = post_owned_gemini(endpoint, "public", &input, stream, shape).await;
+            let status = reply.status().as_u16();
+            let headers = reply.headers().clone();
+            let body = reply.text().await.unwrap();
+            let error = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            let expected_error = headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json"))
+                && !headers.contains_key("x-routed-via")
+                && !headers.contains_key("x-cache")
+                && !body.lines().any(|line| line.starts_with("data:"))
+                && !body.contains("[DONE]")
+                && error["error"]["type"] == "invalid_request_error"
+                && error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.ends_with("unsupported_account_content_part"));
+            let signature = OWNED_R142_GEMINI_SIGNATURE.as_bytes();
+            let no_echo = !body.contains(OWNED_R142_GEMINI_SIGNATURE)
+                && headers.values().all(|value| {
+                    !value
+                        .as_bytes()
+                        .windows(signature.len())
+                        .any(|bytes| bytes == signature)
+                });
+            let after = counts();
+            let witness = format!(
+                "R142 {adapter} {shape} stream={stream} status={status} physical(post,catalog,http)={before:?}->{after:?} expected_json_error={expected_error} no_echo={no_echo}"
+            );
+            eprintln!("{witness}");
+            if status != 400 || before != after || !expected_error || !no_echo {
+                failures.push(witness);
+            }
+        }
+    }
+
+    for stream in [false, true] {
+        for (shape, input) in owned_gemini_signature_controls() {
+            let before = counts();
+            let case = format!("{adapter} {shape} stream={stream}");
+            let reply = post_owned_gemini(endpoint, "public", &input, stream, shape).await;
+            assert_owned_gemini_reply(reply, stream, account_answer, &case).await;
+            let after = counts();
+            assert_eq!(after, (before.0 + 1, 1, before.2), "{case}");
+            let expected = &input["contents"][2]["parts"][0]["functionResponse"]["response"];
+            check_projection(expected, &case);
+            eprintln!(
+                "R142 {case} status=200 physical(post,catalog,http)={before:?}->{after:?} control=ok"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_account_thought_signature_ingress_rejects_workbuddy() {
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [
+        (WorkBuddyRegion::Global, "global"),
+        (WorkBuddyRegion::Cn, "cn"),
+    ] {
+        let s = setup_region(region).await;
+        let ordinary = start_owned_gemini_http(&s.gateway, "wb-gateway-provider", true).await;
+        let counts = || {
+            (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+                ordinary.posts(),
+            )
+        };
+        let endpoint = (&http, s.url.as_str(), "offline-gateway-key");
+        check_owned_gemini_signature_ingress(
+            endpoint,
+            &format!("WorkBuddy/{label}"),
+            "answer",
+            counts,
+            |expected_result, case| {
+                let requests = s.fixture.requests.lock();
+                assert_owned_gemini_signature_projection(
+                    requests.last().unwrap(),
+                    expected_result,
+                    case,
+                );
+            },
+            &mut failures,
+        )
+        .await;
+
+        assert_eq!(ordinary.posts(), 0, "WorkBuddy/{label} same-alias fallback");
+        if region == WorkBuddyRegion::Global {
+            for stream in [false, true] {
+                for (shape, input) in owned_gemini_signature_cases() {
+                    let before = counts();
+                    let case = format!("HTTP/global {shape} stream={stream}");
+                    let reply =
+                        post_owned_gemini(endpoint, "owned-gemini-http", &input, stream, shape)
+                            .await;
+                    assert_owned_gemini_reply(reply, stream, "ordinary answer", &case).await;
+                    let after = counts();
+                    assert_eq!(after, (before.0, before.1, before.2 + 1), "{case}");
+                    let requests = ordinary.requests.lock();
+                    let (stream_on_wire, wire) = requests.last().unwrap();
+                    assert_eq!(*stream_on_wire, stream, "{case}");
+                    let parts = wire["contents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|entry| entry["parts"].as_array().unwrap())
+                        .collect::<Vec<_>>();
+                    let call = parts
+                        .iter()
+                        .find_map(|part| part.get("functionCall"))
+                        .unwrap();
+                    assert_eq!(call["name"], "lookup", "{case}");
+                    assert_eq!(call["args"], json!({"query":"owned"}), "{case}");
+                    let result = parts
+                        .iter()
+                        .find_map(|part| part.get("functionResponse"))
+                        .unwrap();
+                    assert_eq!(result["name"], "lookup", "{case}");
+                    assert_eq!(result["response"], json!({"kept":"tool output"}), "{case}");
+                    eprintln!(
+                        "R142 {case} status=200 physical(post,catalog,http)={before:?}->{after:?} control=ok"
+                    );
+                }
+            }
+        }
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.retryable_primary_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        failures.is_empty(),
+        "R142 WorkBuddy account cases: {failures:?}"
     );
 }

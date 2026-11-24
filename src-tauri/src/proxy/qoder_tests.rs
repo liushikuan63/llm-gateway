@@ -2129,3 +2129,48 @@ async fn anthropic_account_tool_result_error_ingress_rejects_qoder() {
         "R141 Qoder account cases: {failures:?}"
     );
 }
+
+#[tokio::test]
+async fn gemini_account_thought_signature_ingress_rejects_qoder() {
+    use crate::proxy::workbuddy_gateway_tests::{
+        assert_owned_gemini_signature_projection, check_owned_gemini_signature_ingress,
+        start_owned_gemini_http,
+    };
+
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [(Region::Global, "global"), (Region::Cn, "cn")] {
+        let f = setup().await;
+        let g = gateway(&f, region, false).await;
+        let ordinary = start_owned_gemini_http(&g.state, "qoder-fixture-provider", false).await;
+        check_owned_gemini_signature_ingress(
+            (&http, g.url.as_str(), "synthetic-gateway-key"),
+            &format!("Qoder/{label}"),
+            "OK",
+            || {
+                (
+                    f.fixture.posts.load(Ordering::SeqCst),
+                    f.fixture.catalogs.load(Ordering::SeqCst),
+                    ordinary.posts(),
+                )
+            },
+            |expected_result, case| {
+                let requests = f.fixture.requests.lock();
+                let (target, wire) = requests.last().unwrap();
+                assert_eq!(target, label, "{case}");
+                assert_owned_gemini_signature_projection(wire, expected_result, case);
+            },
+            &mut failures,
+        )
+        .await;
+        assert_eq!(ordinary.posts(), 0, "Qoder/{label} ordinary fixture");
+    }
+    assert!(
+        failures.is_empty(),
+        "R142 Qoder account cases: {failures:?}"
+    );
+}
