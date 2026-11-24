@@ -2039,3 +2039,48 @@ async fn anthropic_account_document_ingress_rejects_qoder() {
         failures.join("\n")
     );
 }
+
+#[tokio::test]
+async fn gemini_account_code_parts_ingress_rejects_qoder() {
+    use crate::proxy::workbuddy_gateway_tests::{
+        assert_owned_gemini_account_projection, check_owned_gemini_code_ingress,
+        start_owned_gemini_http,
+    };
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [(Region::Global, "global"), (Region::Cn, "cn")] {
+        let f = setup().await;
+        let g = gateway(&f, region, false).await;
+        let ordinary = start_owned_gemini_http(&g.state, "qoder-fixture-provider", false).await;
+        check_owned_gemini_code_ingress(
+            (&client, &g.url, "synthetic-gateway-key"),
+            &format!("Qoder/{label}"),
+            "OK",
+            || {
+                (
+                    f.fixture.posts.load(Ordering::SeqCst),
+                    f.fixture.catalogs.load(Ordering::SeqCst),
+                    ordinary.posts(),
+                )
+            },
+            |history, case| {
+                let requests = f.fixture.requests.lock();
+                let (target, wire) = requests.last().unwrap();
+                assert_eq!(target, label, "{case}");
+                assert_owned_gemini_account_projection(wire, history, case);
+            },
+            &mut failures,
+        )
+        .await;
+    }
+    assert!(
+        failures.is_empty(),
+        "R140 Qoder Gemini ingress:\n{}",
+        failures.join("\n")
+    );
+}

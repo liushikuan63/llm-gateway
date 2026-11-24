@@ -2273,3 +2273,416 @@ async fn anthropic_account_document_ingress_rejects_workbuddy() {
         failures.join("\n")
     );
 }
+
+type OwnedGeminiRequests = Arc<parking_lot::Mutex<Vec<(bool, Value)>>>;
+
+pub(super) struct OwnedGeminiHttp {
+    requests: OwnedGeminiRequests,
+    job: tokio::task::JoinHandle<()>,
+}
+
+impl OwnedGeminiHttp {
+    pub(super) fn posts(&self) -> usize {
+        self.requests.lock().len()
+    }
+}
+
+impl Drop for OwnedGeminiHttp {
+    fn drop(&mut self) {
+        self.job.abort();
+    }
+}
+
+async fn owned_gemini_http_reply(
+    State(requests): State<OwnedGeminiRequests>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let stream = uri.path().ends_with(":streamGenerateContent");
+    let wire = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    requests.lock().push((stream, wire));
+    assert_eq!(method, axum::http::Method::POST);
+    assert_eq!(
+        uri.path(),
+        if stream {
+            "/v1beta/models/owned-gemini-model:streamGenerateContent"
+        } else {
+            "/v1beta/models/owned-gemini-model:generateContent"
+        },
+    );
+    assert_eq!(uri.query(), if stream { Some("alt=sse") } else { None });
+
+    let text =
+        json!({"candidates":[{"content":{"role":"model","parts":[{"text":"ordinary answer"}]}}]});
+    let usage = json!({"promptTokenCount":4,"candidatesTokenCount":2,"totalTokenCount":6});
+    if stream {
+        let end = json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":usage});
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {text}\n\ndata: {end}\n\n"),
+        )
+            .into_response()
+    } else {
+        let mut reply = text;
+        reply["candidates"][0]["finishReason"] = json!("STOP");
+        reply["usageMetadata"] = usage;
+        Json(reply).into_response()
+    }
+}
+
+pub(super) async fn start_owned_gemini_http(
+    state: &GatewayState,
+    account_provider: &str,
+    same_alias_backup: bool,
+) -> OwnedGeminiHttp {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    let requests = OwnedGeminiRequests::default();
+    let router = Router::new()
+        .fallback(owned_gemini_http_reply)
+        .with_state(requests.clone());
+    let job = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = OwnedGeminiHttp { requests, job };
+
+    let mut provider = state
+        .providers
+        .read()
+        .iter()
+        .find(|provider| provider.id == account_provider)
+        .unwrap()
+        .clone();
+    provider.id = "owned-gemini-http".into();
+    provider.name = "Owned Gemini HTTP".into();
+    provider.runtime_id = None;
+    provider.dialect = Dialect::Gemini;
+    provider.base_url = format!("http://{origin}/v1beta");
+    provider.api_key_enc.clear();
+    provider.priority = 2;
+    provider.models[0].upstream = "owned-gemini-model".into();
+    let mut explicit = provider.models[0].clone();
+    explicit.alias = "owned-gemini-http".into();
+    if !same_alias_backup {
+        provider.models.clear();
+    }
+    provider.models.push(explicit);
+    repo::upsert_provider(state.db.pool(), &provider)
+        .await
+        .unwrap();
+    state.reload_providers().await.unwrap();
+    let mut cfg = state.cfg_snapshot();
+    cfg.routing_strategy = crate::config::RoutingStrategy::Priority;
+    cfg.failover_enabled = true;
+    cfg.max_fallback_attempts = 2;
+    cfg.smart_routing.enabled = false;
+    cfg.search.enabled = false;
+    cfg.cache.enabled = false;
+    cfg.dedup.mode = crate::proxy::dedup::DedupMode::Off;
+    state.update_cfg(cfg);
+    state.set_active(account_provider).unwrap();
+    fixture
+}
+
+fn owned_gemini_code_part_cases() -> [(&'static str, Value); 2] {
+    [
+        (
+            "executableCode",
+            json!({"contents":[{"role":"user","parts":[
+                {"text":"owned code history"},
+                {"executableCode":{"language":"PYTHON","code":"1 + 2"}}
+            ]}]}),
+        ),
+        (
+            "codeExecutionResult",
+            json!({"contents":[{"role":"user","parts":[
+                {"text":"owned code history"},
+                {"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"3"}}
+            ]}]}),
+        ),
+    ]
+}
+
+type OwnedGeminiEndpoint<'a> = (&'a reqwest::Client, &'a str, &'a str);
+
+async fn post_owned_gemini(
+    (client, endpoint, auth): OwnedGeminiEndpoint<'_>,
+    model: &str,
+    input: &Value,
+    stream: bool,
+    label: &str,
+) -> reqwest::Response {
+    let action = if stream {
+        "streamGenerateContent?alt=sse"
+    } else {
+        "generateContent"
+    };
+    client
+        .post(format!("{endpoint}/v1beta/models/{model}:{action}"))
+        .bearer_auth(auth)
+        .header(
+            "x-session-id",
+            format!("owned-r140-{model}-{label}-{stream}"),
+        )
+        .json(input)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn assert_owned_gemini_reply(
+    response: reqwest::Response,
+    stream: bool,
+    expected: &str,
+    case: &str,
+) {
+    assert_eq!(response.status(), reqwest::StatusCode::OK, "{case}");
+    let mime = response.headers()[reqwest::header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let wire = response.text().await.unwrap();
+    let frames = if stream {
+        assert!(mime.starts_with("text/event-stream"), "{case}: {mime}");
+        assert!(
+            !wire.contains("[DONE]"),
+            "{case}: Gemini does not use the OpenAI sentinel"
+        );
+        wire.lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|data| serde_json::from_str::<Value>(data.trim()).unwrap())
+            .collect::<Vec<_>>()
+    } else {
+        assert!(mime.starts_with("application/json"), "{case}: {mime}");
+        vec![serde_json::from_str::<Value>(&wire).unwrap()]
+    };
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame.get("error").is_none() && frame.get("choices").is_none()),
+        "{case}"
+    );
+    let candidates = frames
+        .iter()
+        .map(|frame| &frame["candidates"][0])
+        .collect::<Vec<_>>();
+    assert_eq!(candidates.last().unwrap()["finishReason"], "STOP", "{case}");
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|candidate| candidate.get("finishReason").is_some())
+            .count(),
+        1,
+        "{case}"
+    );
+    let visible = candidates
+        .iter()
+        .flat_map(|candidate| {
+            candidate["content"]["parts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter(|part| part["thought"] != true)
+        .filter_map(|part| part["text"].as_str())
+        .collect::<String>();
+    assert_eq!(visible, expected, "{case}");
+}
+
+pub(super) fn assert_owned_gemini_account_projection(wire: &Value, history: bool, case: &str) {
+    let messages = wire["messages"].as_array().unwrap();
+    if history {
+        let call = messages
+            .iter()
+            .find_map(|message| {
+                message["tool_calls"]
+                    .as_array()
+                    .and_then(|calls| calls.first())
+            })
+            .unwrap();
+        assert_eq!(call["id"], "owned-gemini-call", "{case}");
+        assert_eq!(call["function"]["name"], "lookup", "{case}");
+        assert_eq!(
+            serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap(),
+            json!({"query":"owned"}),
+            "{case}"
+        );
+        let result = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap();
+        assert_eq!(result["tool_call_id"], "owned-gemini-call", "{case}");
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"].as_str().unwrap()).unwrap(),
+            json!({"kept":"tool output"}),
+            "{case}"
+        );
+    } else {
+        let user = messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .unwrap();
+        assert_eq!(user["content"], "owned null controls", "{case}");
+    }
+}
+
+pub(super) async fn check_owned_gemini_code_ingress(
+    endpoint: OwnedGeminiEndpoint<'_>,
+    adapter: &str,
+    account_answer: &str,
+    counts: impl Fn() -> (usize, usize, usize),
+    assert_projection: impl Fn(bool, &str),
+    failures: &mut Vec<String>,
+) {
+    assert_eq!(counts(), (0, 0, 0), "{adapter}");
+    for stream in [false, true] {
+        for (shape, input) in owned_gemini_code_part_cases() {
+            let before = counts();
+            let reply = post_owned_gemini(endpoint, "public", &input, stream, shape).await;
+            let status = reply.status().as_u16();
+            let headers = reply.headers().clone();
+            let body = reply.text().await.unwrap();
+            let error = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            let expected_error = headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json"))
+                && !headers.contains_key("x-routed-via")
+                && !headers.contains_key("x-cache")
+                && error["error"]["type"] == "invalid_request_error"
+                && error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.ends_with("unsupported_account_content_part"));
+            let after = counts();
+            let witness = format!("R140 {adapter} {shape} stream={stream} status={status} physical(post,catalog,backup)={before:?}->{after:?} expected_json_error={expected_error}");
+            eprintln!("{witness}");
+            if status != 400 || !expected_error || before != after {
+                failures.push(witness);
+            }
+        }
+    }
+
+    let mut malformed = owned_gemini_code_part_cases()[0].1.clone();
+    malformed["contents"][0]["parts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"functionCall":{"name":"lookup"}}));
+    let with_null = json!({"contents":[{"role":"user","parts":[
+        {"text":"owned null controls","thoughtSignature":"owned opaque signature","ownedUnknown":{"keep":"compatibility"}},
+        {"executableCode":null},{"codeExecutionResult":null}
+    ]}],"generationConfig":{"maxOutputTokens":32}});
+    let history = json!({"contents":[
+        {"role":"user","parts":[{"text":"look up owned data"}]},
+        {"role":"model","parts":[{"functionCall":{"id":"owned-gemini-call","name":"lookup","args":{"query":"owned"}}}]},
+        {"role":"user","parts":[{"functionResponse":{"id":"owned-gemini-call","name":"lookup","response":{"kept":"tool output"}}}]}
+    ]});
+    for stream in [false, true] {
+        let before = counts();
+        let reply = post_owned_gemini(
+            endpoint,
+            "public",
+            &malformed,
+            stream,
+            "invalid-user-function-call",
+        )
+        .await;
+        assert_eq!(reply.status(), 500, "{adapter} stream={stream}");
+        let error: Value = serde_json::from_str(&reply.text().await.unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "upstream_error");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("functionCall") && message.contains("model"),
+            "{message}"
+        );
+        assert_eq!(counts(), before, "{adapter} stream={stream}");
+        eprintln!("R140 {adapter} invalid-user-function-call stream={stream} status=500 physical(post,catalog,backup)={before:?}->{:?}", counts());
+
+        for (is_history, label, input) in [
+            (false, "null-and-metadata", &with_null),
+            (true, "legal-tool-history", &history),
+        ] {
+            let before = counts();
+            let case = format!("{adapter}/{label} stream={stream}");
+            let reply = post_owned_gemini(endpoint, "public", input, stream, label).await;
+            assert_owned_gemini_reply(reply, stream, account_answer, &case).await;
+            assert_eq!(counts(), (before.0 + 1, 1, before.2), "{case}");
+            assert_projection(is_history, &case);
+            eprintln!(
+                "R140 {case} passed; physical(post,catalog,backup)={before:?}->{:?}",
+                counts()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_account_code_parts_ingress_rejects_workbuddy() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [
+        (WorkBuddyRegion::Global, "global"),
+        (WorkBuddyRegion::Cn, "cn"),
+    ] {
+        let s = setup_region(region).await;
+        let ordinary = start_owned_gemini_http(&s.gateway, "wb-gateway-provider", true).await;
+        let counts = || {
+            (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+                ordinary.posts(),
+            )
+        };
+        let endpoint = (&client, s.url.as_str(), "offline-gateway-key");
+        check_owned_gemini_code_ingress(
+            endpoint,
+            &format!("WorkBuddy/{label}"),
+            "answer",
+            counts,
+            |history, case| {
+                let requests = s.fixture.requests.lock();
+                assert_owned_gemini_account_projection(requests.last().unwrap(), history, case);
+            },
+            &mut failures,
+        )
+        .await;
+
+        assert_eq!(counts().2, 0);
+        if region == WorkBuddyRegion::Global {
+            for stream in [false, true] {
+                for (shape, input) in owned_gemini_code_part_cases() {
+                    let before = counts();
+                    let case = format!("ordinary HTTP {shape} stream={stream}");
+                    let reply =
+                        post_owned_gemini(endpoint, "owned-gemini-http", &input, stream, shape)
+                            .await;
+                    assert_owned_gemini_reply(reply, stream, "ordinary answer", &case).await;
+                    assert_eq!(counts(), (before.0, before.1, before.2 + 1), "{case}");
+                    let requests = ordinary.requests.lock();
+                    let (stream_on_wire, wire) = requests.last().unwrap();
+                    assert_eq!(*stream_on_wire, stream, "{case}");
+                    assert_eq!(
+                        wire["contents"][0]["parts"],
+                        json!([{"text":"owned code history"}]),
+                        "{case}"
+                    );
+                    drop(requests);
+                    eprintln!(
+                        "R140 {case} passed; physical(post,catalog,backup)={before:?}->{:?}",
+                        counts()
+                    );
+                }
+            }
+        }
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.retryable_primary_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        failures.is_empty(),
+        "R140 WorkBuddy Gemini ingress:\n{}",
+        failures.join("\n")
+    );
+}

@@ -39,6 +39,28 @@ pub fn strip_models_prefix(raw: &str) -> &str {
     raw.strip_prefix("models/").unwrap_or(raw)
 }
 
+pub(crate) fn account_ingress_shape(body: &Value) -> super::openai::AccountIngressShape {
+    // GeminiPart does not keep these code parts. Preserve only the fact that
+    // conversion loses them so account routes can reject before dispatch.
+    let mut shape = super::openai::AccountIngressShape::default();
+    if body
+        .get("contents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|content| content.get("parts").and_then(Value::as_array))
+        .flatten()
+        .any(|part| {
+            ["executableCode", "codeExecutionResult"]
+                .into_iter()
+                .any(|key| part.get(key).is_some_and(|value| !value.is_null()))
+        })
+    {
+        shape.note_unsupported_part();
+    }
+    shape
+}
+
 /// Gemini 入站请求体。
 #[derive(Debug, Clone, Deserialize)]
 pub struct GeminiInboundRequest {

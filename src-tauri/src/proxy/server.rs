@@ -2207,6 +2207,7 @@ async fn gemini_generate(
     let _ = query;
 
     let caller = super::control_modes::CallerControls::capture(&body, Dialect::Gemini);
+    let account_ingress = crate::protocol::gemini_inbound::account_ingress_shape(&body);
     let inbound: crate::protocol::gemini_inbound::GeminiInboundRequest =
         match serde_json::from_value(body) {
             Ok(v) => v,
@@ -2221,7 +2222,19 @@ async fn gemini_generate(
         Ok(req) => req,
         Err(error) => return error_response(&error),
     };
-    dispatch(state, req, &headers, auth.client, Exit::Gemini, caller).await
+    dispatch_with_context(
+        state,
+        req,
+        &headers,
+        auth.client,
+        Exit::Gemini,
+        ResponseRequestContext {
+            caller: Some(caller),
+            account_ingress,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// A per-request provenance boundary: original input alone reaches persistence;
@@ -5035,28 +5048,6 @@ fn model_allowlist_gate(
         )
             .into_response(),
     )
-}
-
-async fn dispatch(
-    state: Arc<GatewayState>,
-    req: ChatRequest,
-    headers: &HeaderMap,
-    client: Option<String>,
-    exit: Exit,
-    caller: super::control_modes::CallerControls,
-) -> Response {
-    dispatch_with_context(
-        state,
-        req,
-        headers,
-        client,
-        exit,
-        ResponseRequestContext {
-            caller: Some(caller),
-            ..Default::default()
-        },
-    )
-    .await
 }
 
 async fn dispatch_with_context(

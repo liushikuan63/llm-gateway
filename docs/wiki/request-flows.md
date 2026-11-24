@@ -535,6 +535,12 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 
 NativeExact 仍先处理入口判定；普通 HTTP 沿用已有的内容转换。用户消息把文档和工具结果放在同级时，原解析错误仍优先返回。自有回环覆盖两个账号适配器各两区的流式和非流式请求，以及合法工具结果和普通 HTTP 的正对照。这里的保护不提供文档转发能力，也不代表真实账号验收。
 
+### R5-P 普通 Gemini 的代码部件入站形状
+
+普通 Gemini 的 generateContent 和 streamGenerateContent 在兼容转换前检查 `contents[*].parts[*]` 直属的 `executableCode` 与 `codeExecutionResult`。字段缺失或显式 `null` 沿用原有行为，其他值会被记作转换时无法保留的内容。选中的 Qoder 或 WorkBuddy 账号路线返回 HTTP 400（`unsupported_account_content_part`），不读取该账号的模型目录，也不向该账号发送模型请求。标记只供路由检查使用，不传给上游。
+
+NativeExact、动作判定及原请求解析错误保留既有优先级；普通 HTTP 继续沿用原转换。自有回环覆盖两种账号适配器各两区的流式与非流式拒绝，以及合法账号工具历史、空值和普通 Gemini HTTP 的成功对照。此保护不提供代码部件转发能力，也不代表真实账号验收。
+
 ### N4 原生上游的流终态
 
 
