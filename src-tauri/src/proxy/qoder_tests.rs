@@ -2084,3 +2084,48 @@ async fn gemini_account_code_parts_ingress_rejects_qoder() {
         failures.join("\n")
     );
 }
+
+#[tokio::test]
+async fn anthropic_account_tool_result_error_ingress_rejects_qoder() {
+    use crate::proxy::workbuddy_gateway_tests::{
+        assert_owned_anthropic_document_projection,
+        check_owned_anthropic_tool_result_error_ingress,
+        configure_owned_anthropic_tool_result_error_routing,
+    };
+
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [(Region::Global, "global"), (Region::Cn, "cn")] {
+        let f = setup().await;
+        let g = gateway(&f, region, false).await;
+        configure_owned_anthropic_tool_result_error_routing(&g.state, "qoder-fixture-provider");
+        check_owned_anthropic_tool_result_error_ingress(
+            (&http, &g.url, "synthetic-gateway-key"),
+            &format!("Qoder/{label}"),
+            "OK",
+            || {
+                (
+                    f.fixture.posts.load(Ordering::SeqCst),
+                    f.fixture.catalogs.load(Ordering::SeqCst),
+                    None,
+                )
+            },
+            |case| {
+                let requests = f.fixture.requests.lock();
+                let (target_region, request) = requests.last().unwrap();
+                assert_eq!(target_region, label, "{case}");
+                assert_owned_anthropic_document_projection(request, true, case);
+            },
+            &mut failures,
+        )
+        .await;
+    }
+    assert!(
+        failures.is_empty(),
+        "R141 Qoder account cases: {failures:?}"
+    );
+}

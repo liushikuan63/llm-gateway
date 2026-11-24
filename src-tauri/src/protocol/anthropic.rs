@@ -42,10 +42,10 @@ impl AnthropicRequest {
     pub(crate) fn account_ingress_shape(&self) -> super::openai::AccountIngressShape {
         use serde_json::Value;
 
-        // The compatible conversion drops document blocks in message content and
-        // in user tool results. Account routes need to see that loss before dispatch.
+        // The compatible conversion drops documents and a failed tool result's
+        // error flag. Account routes must reject requests that would lose that meaning.
         let mut shape = super::openai::AccountIngressShape::default();
-        let has_document = self.messages.iter().any(|message| {
+        let has_unsupported_part = self.messages.iter().any(|message| {
             let Some(blocks) = message.content.as_array() else {
                 return false;
             };
@@ -53,18 +53,21 @@ impl AnthropicRequest {
                 .iter()
                 .any(|block| match block.get("type").and_then(Value::as_str) {
                     Some("document") => true,
-                    Some("tool_result") if message.role == "user" => block
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .is_some_and(|parts| {
-                            parts.iter().any(|part| {
-                                part.get("type").and_then(Value::as_str) == Some("document")
-                            })
-                        }),
+                    Some("tool_result") if message.role == "user" => {
+                        block.get("is_error").and_then(Value::as_bool) == Some(true)
+                            || block
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .is_some_and(|parts| {
+                                    parts.iter().any(|part| {
+                                        part.get("type").and_then(Value::as_str) == Some("document")
+                                    })
+                                })
+                    }
                     _ => false,
                 })
         });
-        if has_document {
+        if has_unsupported_part {
             shape.note_unsupported_part();
         }
         shape

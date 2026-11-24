@@ -535,6 +535,12 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 
 NativeExact 仍先处理入口判定；普通 HTTP 沿用已有的内容转换。用户消息把文档和工具结果放在同级时，原解析错误仍优先返回。自有回环覆盖两个账号适配器各两区的流式和非流式请求，以及合法工具结果和普通 HTTP 的正对照。这里的保护不提供文档转发能力，也不代表真实账号验收。
 
+### R5-P 普通 Anthropic Messages 的工具结果错误标记
+
+普通 Anthropic `/v1/messages` 在兼容转换前识别用户 `tool_result` 中明确的 JSON 布尔值 `is_error: true`。兼容转换只保留工具调用 ID 和结果内容，会丢掉错误标记。Qoder 和 WorkBuddy 账号路线因而返回 HTTP 400（`unsupported_account_content_part`），在读取账号模型目录或发送模型请求前停止；`false` 或缺省不触发这一条拒绝。
+
+NativeExact 仍先判定，已有请求解析错误仍优先返回。普通 HTTP 继续沿用原转换，不保证把 `is_error` 传给上游。自有回环用例覆盖两个账号适配器各两区的缓冲和流式拒绝、`false` 与缺省的成功请求，以及同一 `true` 请求走普通 HTTP 的成功对照；不代表真实账号验收。
+
 ### R5-P 普通 Gemini 的代码部件入站形状
 
 普通 Gemini 的 generateContent 和 streamGenerateContent 在兼容转换前检查 `contents[*].parts[*]` 直属的 `executableCode` 与 `codeExecutionResult`。字段缺失或显式 `null` 沿用原有行为，其他值会被记作转换时无法保留的内容。选中的 Qoder 或 WorkBuddy 账号路线返回 HTTP 400（`unsupported_account_content_part`），不读取该账号的模型目录，也不向该账号发送模型请求。标记只供路由检查使用，不传给上游。

@@ -2686,3 +2686,179 @@ async fn gemini_account_code_parts_ingress_rejects_workbuddy() {
         failures.join("\n")
     );
 }
+
+fn owned_anthropic_tool_result_error_messages(is_error: Option<bool>) -> Value {
+    let mut messages = owned_anthropic_document_messages(true, false);
+    if let Some(is_error) = is_error {
+        messages[2]["content"][0]["is_error"] = json!(is_error);
+    }
+    messages
+}
+
+pub(super) fn configure_owned_anthropic_tool_result_error_routing(
+    gateway: &GatewayState,
+    provider: &str,
+) {
+    // Explicit false and omission project to the same legal tool history.
+    // Each control has to reach the upstream even if these bodies are equivalent.
+    let mut cfg = gateway.cfg_snapshot();
+    cfg.routing_strategy = crate::config::RoutingStrategy::Priority;
+    cfg.failover_enabled = true;
+    cfg.max_fallback_attempts = 2;
+    cfg.smart_routing.enabled = false;
+    cfg.search.enabled = false;
+    cfg.cache.enabled = false;
+    cfg.dedup.mode = crate::proxy::dedup::DedupMode::Off;
+    gateway.update_cfg(cfg);
+    gateway.set_active(provider).unwrap();
+}
+
+pub(super) async fn check_owned_anthropic_tool_result_error_ingress(
+    endpoint: (&reqwest::Client, &str, &str),
+    adapter: &str,
+    answer: &str,
+    counts: impl Fn() -> (usize, usize, Option<usize>),
+    assert_projection: impl Fn(&str),
+    failures: &mut Vec<String>,
+) {
+    assert_eq!(counts().0, 0, "{adapter}");
+    assert_eq!(counts().1, 0, "{adapter}");
+    let messages = owned_anthropic_tool_result_error_messages(Some(true));
+    // Try the invalid shape on a cold fixture before proving that routing works.
+    for stream in [false, true] {
+        let case = format!("{adapter} flag=true stream={stream}");
+        let before = counts();
+        let response = post_owned_anthropic_document_case(
+            endpoint,
+            "public",
+            &messages,
+            stream,
+            "is-error-true",
+        )
+        .await;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap();
+        let error: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let expected_error = headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"))
+            && error["error"]["type"] == "invalid_request_error"
+            && error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.ends_with("unsupported_account_content_part"))
+            && !headers.contains_key("x-routed-via")
+            && !headers.contains_key("x-cache")
+            && !body.contains("event: message_stop");
+        let after = counts();
+        eprintln!(
+            "R141 {case} status={status} physical(post,catalog,backup)={before:?}->{after:?} expected_json_error={expected_error}"
+        );
+        if status != 400 || !expected_error || before != after {
+            failures.push(case);
+        }
+    }
+
+    for (label, flag, shape) in [
+        ("false", Some(false), "is-error-false"),
+        ("absent", None, "is-error-absent"),
+    ] {
+        let messages = owned_anthropic_tool_result_error_messages(flag);
+        for stream in [false, true] {
+            let case = format!("{adapter} flag={label} stream={stream}");
+            let before = counts();
+            let response =
+                post_owned_anthropic_document_case(endpoint, "public", &messages, stream, shape)
+                    .await;
+            assert_owned_anthropic_document_reply(response, stream, answer, &case).await;
+            let after = counts();
+            assert_eq!(after, (before.0 + 1, 1, before.2), "{case}");
+            assert_projection(&case);
+            eprintln!(
+                "R141 {case} status=200 physical(post,catalog,backup)={before:?}->{after:?} control=ok"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn anthropic_account_tool_result_error_ingress_rejects_workbuddy() {
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [
+        (WorkBuddyRegion::Global, "global"),
+        (WorkBuddyRegion::Cn, "cn"),
+    ] {
+        let s = setup_region(region).await;
+        let mut backup = s.gateway.providers.read()[0].clone();
+        backup.id = "owned-anthropic-error-http".into();
+        backup.runtime_id = None;
+        backup.base_url = format!("{}/v1", s.origin);
+        backup.priority = 2;
+        let mut ordinary_model = backup.models[0].clone();
+        ordinary_model.alias = backup.id.clone();
+        backup.models.push(ordinary_model);
+        repo::upsert_provider(s.gateway.db.pool(), &backup)
+            .await
+            .unwrap();
+        s.gateway.reload_providers().await.unwrap();
+        configure_owned_anthropic_tool_result_error_routing(&s.gateway, "wb-gateway-provider");
+
+        let counts = || {
+            (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+                Some(s.fixture.backup_posts.load(Ordering::SeqCst)),
+            )
+        };
+        let endpoint = (&http, s.url.as_str(), "offline-gateway-key");
+        check_owned_anthropic_tool_result_error_ingress(
+            endpoint,
+            &format!("WorkBuddy/{label}"),
+            "answer",
+            counts,
+            |case| {
+                let requests = s.fixture.requests.lock();
+                assert_owned_anthropic_document_projection(requests.last().unwrap(), true, case);
+            },
+            &mut failures,
+        )
+        .await;
+        assert_eq!(counts().2, Some(0), "no HTTP backup for account cases");
+
+        if region == WorkBuddyRegion::Global {
+            let before = counts();
+            let response = post_owned_anthropic_document_case(
+                endpoint,
+                &backup.id,
+                &owned_anthropic_tool_result_error_messages(Some(true)),
+                false,
+                "is-error-true",
+            )
+            .await;
+            assert_owned_anthropic_document_reply(
+                response,
+                false,
+                "backup answer",
+                "ordinary HTTP accepts the same tool result error flag",
+            )
+            .await;
+            let after = counts();
+            assert_eq!(after, (before.0, before.1, Some(1)));
+            eprintln!(
+                "R141 HTTP/global flag=true stream=false status=200 physical(post,catalog,backup)={before:?}->{after:?} control=ok"
+            );
+        }
+        assert_eq!(s.fixture.retryable_primary_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        failures.is_empty(),
+        "R141 WorkBuddy account cases: {failures:?}"
+    );
+}
