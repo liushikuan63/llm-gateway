@@ -1788,3 +1788,147 @@ async fn desktop_usage_retains_only_reported_workbuddy_fields_in_both_regions() 
         "desktop WorkBuddy usage must preserve upstream field presence: {mismatches:?}"
     );
 }
+
+pub(super) fn owned_ollama_image_messages() -> Value {
+    // Synthetic 1x1 PNG; a real nonempty Ollama image field, not a malformed payload.
+    const PNG: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+    json!([{"role":"user","content":"owned image question","images":[PNG]}])
+}
+
+pub(super) fn owned_ollama_text_cases() -> [(&'static str, Value); 3] {
+    [
+        (
+            "text",
+            json!([{"role":"user","content":"owned text question"}]),
+        ),
+        (
+            "null_images",
+            json!([{"role":"user","content":"owned text question","images":null}]),
+        ),
+        (
+            "empty_images",
+            json!([{"role":"user","content":"owned text question","images":[]}]),
+        ),
+    ]
+}
+
+pub(super) async fn assert_owned_ollama_reply(
+    response: reqwest::Response,
+    stream: bool,
+    answer: &str,
+    case: &str,
+) {
+    assert_eq!(response.status(), reqwest::StatusCode::OK, "{case}");
+    if stream {
+        assert!(
+            response.headers()[reqwest::header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/x-ndjson"),
+            "{case}"
+        );
+        let text = response.text().await.unwrap();
+        let chunks: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("owned Ollama NDJSON"))
+            .collect();
+        let (terminal, progress) = chunks.split_last().expect("native stream terminator");
+        assert_eq!(terminal["done"], true, "{case}");
+        assert!(
+            chunks.iter().all(|chunk| chunk.get("error").is_none()),
+            "{case}"
+        );
+        assert!(
+            progress.iter().all(|chunk| chunk["done"] == false),
+            "{case}"
+        );
+        let content = progress
+            .iter()
+            .map(|chunk| chunk["message"]["content"].as_str().unwrap_or_default())
+            .collect::<String>();
+        assert_eq!(content, answer, "{case}");
+    } else {
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["done"], true, "{case}");
+        assert_eq!(body["message"]["content"], answer, "{case}");
+        assert!(body.get("error").is_none(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn ollama_account_images_ingress_rejects_workbuddy() {
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let images = owned_ollama_image_messages();
+    let mut failures = Vec::new();
+    for (region, label) in [
+        (WorkBuddyRegion::Global, "global"),
+        (WorkBuddyRegion::Cn, "cn"),
+    ] {
+        let s = setup_region(region).await;
+        let counts = || {
+            (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+            )
+        };
+        let send = |model: &str, messages: &Value, stream| {
+            http.post(format!("{}/api/chat", s.url))
+                .bearer_auth("offline-gateway-key")
+                .json(&json!({"model":model,"messages":messages,"stream":stream}))
+                .send()
+        };
+        for stream in [false, true] {
+            let before = counts();
+            let response = send("public", &images, stream).await.unwrap();
+            let status = response.status();
+            let wire = response.text().await.unwrap();
+            let error = serde_json::from_str::<Value>(&wire).unwrap_or(Value::Null);
+            let expected_error = error["error"]["type"] == "invalid_request_error"
+                && error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.ends_with("unsupported_account_content_part"));
+            let after = counts();
+            if status != reqwest::StatusCode::BAD_REQUEST || !expected_error || before != after {
+                failures.push(format!(
+                    "{label} stream={stream} nonempty_images: status={}, counts={before:?}->{after:?}, expected_error={expected_error}",
+                    status.as_u16()
+                ));
+            }
+        }
+
+        for (shape, messages) in owned_ollama_text_cases() {
+            for stream in [false, true] {
+                let before = counts();
+                let response = send("public", &messages, stream).await.unwrap();
+                let case = format!("WorkBuddy {label} {shape} stream={stream}");
+                assert_owned_ollama_reply(response, stream, "answer", &case).await;
+                assert_eq!(counts(), (before.0 + 1, 1), "{case}");
+            }
+        }
+        // Keep the same image-bearing body on an ordinary, explicitly selected HTTP route.
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 0);
+        if region == WorkBuddyRegion::Global {
+            let mut ordinary = s.gateway.providers.read()[0].clone();
+            ordinary.id = "owned-ollama-ordinary".into();
+            ordinary.runtime_id = None;
+            ordinary.base_url = format!("{}/v1", s.origin);
+            ordinary.models[0].alias = "owned-ollama-ordinary".into();
+            repo::upsert_provider(s.gateway.db.pool(), &ordinary)
+                .await
+                .unwrap();
+            s.gateway.reload_providers().await.unwrap();
+            let before = counts();
+            let response = send("owned-ollama-ordinary", &images, false).await.unwrap();
+            assert_owned_ollama_reply(response, false, "backup answer", "ordinary HTTP").await;
+            assert_eq!(counts(), before, "ordinary HTTP never reaches the account");
+            assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(s.fixture.retryable_primary_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        failures.is_empty(),
+        "Ollama WorkBuddy account images ingress: {failures:?}"
+    );
+}

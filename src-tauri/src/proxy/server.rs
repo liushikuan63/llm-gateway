@@ -3642,8 +3642,23 @@ async fn ollama_chat(
         return response;
     }
     let caller = super::control_modes::CallerControls::capture(&body, Dialect::Ollama);
+    let account_ingress = crate::protocol::ollama::account_ingress_shape(&body);
     match crate::protocol::ollama::ollama_request_to_internal(&body) {
-        Ok(req) => dispatch(state, req, &headers, auth.client, Exit::Ollama, caller).await,
+        Ok(req) => {
+            dispatch_with_context(
+                state,
+                req,
+                &headers,
+                auth.client,
+                Exit::Ollama,
+                ResponseRequestContext {
+                    caller: Some(caller),
+                    account_ingress,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
         Err(error) => error_response(&error),
     }
 }

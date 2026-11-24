@@ -517,6 +517,12 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 
 标记只给普通 Responses 的路由使用。显式 compaction_trigger 仍进入原来的远程压缩入口；工具标识校验、其他协议和原生原样透传沿用既有规则。这里的自有回环用例覆盖 Qoder 和 WorkBuddy 两区的流式与非流式模式，不代表真实账号验收。
 
+### R5-P 普通 Ollama Chat 的图片入站形状
+
+普通 Ollama `/api/chat` 在兼容转换前检查 `messages[*].images`。字段缺失、显式 `null` 和空数组继续走原有路径；非空数组及其他非 `null` 的值会被记作转换时无法保留的内容。标记只供现有账号派发检查使用，不传给上游。选中的 Qoder 或 WorkBuddy 账号路线返回 HTTP 400，错误原因是 `unsupported_account_content_part`，不读取账号模型目录，也不向该账号发送模型请求。
+
+自有回环验证了两种账号适配器各两区的流式与非流式拒绝、合法文本和空图片字段的成功对照，以及同一带图片字段的请求走普通 HTTP 路线时沿用原转换行为。流式成功仍输出 Ollama NDJSON 终态；NativeExact 的入口判定仍先执行。这里的保护不提供图片转发能力，也不代表真实账号验收。
+
 ### N4 原生上游的流终态
 
 

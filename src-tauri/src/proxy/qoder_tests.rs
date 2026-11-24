@@ -1937,3 +1937,62 @@ async fn ordinary_responses_account_ingress_rejects_lossy_qoder() {
         "ordinary Responses Qoder ingress: {failures:?}"
     );
 }
+
+#[tokio::test]
+async fn ollama_account_images_ingress_rejects_qoder() {
+    use crate::proxy::workbuddy_gateway_tests::{
+        assert_owned_ollama_reply, owned_ollama_image_messages, owned_ollama_text_cases,
+    };
+
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let images = owned_ollama_image_messages();
+    let mut failures = Vec::new();
+    for (region, label) in [(Region::Global, "global"), (Region::Cn, "cn")] {
+        let f = setup().await;
+        let g = gateway(&f, region, false).await;
+        let counts = || {
+            (
+                f.fixture.posts.load(Ordering::SeqCst),
+                f.fixture.catalogs.load(Ordering::SeqCst),
+            )
+        };
+        let send = |messages: &Value, stream| {
+            http.post(format!("{}/api/chat", g.url))
+                .bearer_auth("synthetic-gateway-key")
+                .json(&json!({"model":"public","messages":messages,"stream":stream}))
+                .send()
+        };
+        for stream in [false, true] {
+            let before = counts();
+            let response = send(&images, stream).await.unwrap();
+            let status = response.status();
+            let wire = response.text().await.unwrap();
+            let error = serde_json::from_str::<Value>(&wire).unwrap_or(Value::Null);
+            let expected_error = error["error"]["type"] == "invalid_request_error"
+                && error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.ends_with("unsupported_account_content_part"));
+            let after = counts();
+            if status != StatusCode::BAD_REQUEST || !expected_error || before != after {
+                failures.push(format!(
+                    "{label} stream={stream} nonempty_images: status={}, counts={before:?}->{after:?}, expected_error={expected_error}",
+                    status.as_u16()
+                ));
+            }
+        }
+
+        for (shape, messages) in owned_ollama_text_cases() {
+            for stream in [false, true] {
+                let before = counts();
+                let response = send(&messages, stream).await.unwrap();
+                let case = format!("Qoder {label} {shape} stream={stream}");
+                assert_owned_ollama_reply(response, stream, "OK", &case).await;
+                assert_eq!(counts(), (before.0 + 1, 1), "{case}");
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Ollama Qoder account images ingress: {failures:?}"
+    );
+}

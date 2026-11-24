@@ -6,6 +6,30 @@ use crate::domain::{ChatRequest, ChatResponse, Content, FunctionCall, ToolCall, 
 use crate::error::GatewayError;
 use serde_json::json;
 
+pub(crate) fn account_ingress_shape(
+    body: &serde_json::Value,
+) -> super::openai::AccountIngressShape {
+    use serde_json::Value;
+
+    // The compatible conversion below does not carry Ollama's native images.
+    // Record the loss separately so only account routes reject the input.
+    let mut shape = super::openai::AccountIngressShape::default();
+    if body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|message| match message.get("images") {
+            None | Some(Value::Null) => false,
+            Some(Value::Array(images)) => !images.is_empty(),
+            Some(_) => true,
+        })
+    {
+        shape.note_unsupported_part();
+    }
+    shape
+}
+
 /// Ollama `/api/chat` 请求 -> 内部请求。
 ///
 /// Ollama 将生成参数放在 `options`，而工具定义在顶层。入口若只复用 messages
