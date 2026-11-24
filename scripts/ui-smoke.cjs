@@ -3176,6 +3176,12 @@ if (require.main === module) (async () => {
       if(focus==='chat-reply-observation') {await require('./chat-reply-observation-ui.cjs').verifyReplyObservation(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-reply-observation; screenshots=${output}`);return;}
       if(focus==='chat-stream') {await require('./chat-stream-ui.cjs').verifyChatStream(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-stream; screenshots=${output}`);return;}
       if(focus==='chat-cancel') {await require('./chat-cancel-ui.cjs').verifyChatCancellation(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-cancel; screenshots=${output}`);return;}
+      if (focus === "stats-model-spend") {
+        await require("./stats-model-spend-ui.cjs").verifyStatsModelSpend(browser, baseUrl, output, errors, fixture);
+        assert.deepEqual(errors, []);
+        console.log("UI_FOCUS_OK: stats-model-spend; screenshots=" + output);
+        return;
+      }
       if(focus==='request-timing-stats') {await require('./request-timing-stats-ui.cjs').verifyRequestTimingStats(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: request-timing-stats; screenshots=${output}`);return;}
       if(focus==='request-timing') {await require('./request-timing-ui.cjs').verifyRequestTiming(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: request-timing; screenshots=${output}`);return;}
       if(focus==='benefit-auto-claim') {await require('./benefit-auto-claim-ui.cjs').verifyBenefitAutoClaim(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: benefit-auto-claim; screenshots=${output}`);return;}
@@ -3260,6 +3266,9 @@ if (require.main === module) (async () => {
       "重试成功后应清除加载错误");
     await failedSettingsPage.screenshot({ path: path.join(output, "settings-load-recovered.png"), fullPage: true });
     await failedSettingsContext.close();
+    if (process.env.LLMGW_UI_ASSETS === "dist") {
+      await require("./stats-model-spend-ui.cjs").verifyStatsModelSpend(browser, baseUrl, path.join(output, "stats-model-spend"), errors, fixture);
+    }
     await verifyAsyncPages(browser, errors);
     await require('./settings-save-readback-ui.cjs').verifySettingsSaveReadback(browser,baseUrl,output,errors,fixture);
     await require('./settings-mutation-recovery-ui.cjs').verifySettingsMutationRecovery(browser,baseUrl,output,errors,fixture);

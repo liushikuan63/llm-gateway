@@ -493,6 +493,9 @@ tbody tr:hover { background: var(--accent-soft); }
 .spend-empty { font-size: 14px; }
 .spend-note { font-size: 11px; line-height: 1.7; margin: 0 0 14px; }
 .unpriced-hint { color: var(--warn); }
+.model-spend-scroll { max-inline-size: 100%; overflow-x: auto; scrollbar-color: var(--border-strong) transparent; }
+.model-spend-table :is(th, td):nth-child(-n + 2) { min-inline-size: 9rem; overflow-wrap: anywhere; }
+.model-spend-table :is(th, td):last-child { white-space: nowrap; }
 .audit-table-card { min-inline-size: 0; }
 .audit-table-scroll { overflow-x: auto; max-inline-size: 100%; scrollbar-color: var(--border-strong) transparent; }
 .audit-table-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

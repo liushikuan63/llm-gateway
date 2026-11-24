@@ -458,27 +458,29 @@ function StatsContent({review}: {review: ReactNode}) {
         )}
       </div>
 
-      <div className="card table-card">
+      <div className="card">
         <div className="spread" style={{ marginBottom: 10 }}>
-          <strong>近 30 天花费 · 按模型</strong>
+          <strong id="model-spend-title">近 30 天花费 · 按模型</strong>
           <span className="muted" style={{ fontSize: 12 }}>只统计配置了价格的模型</span>
         </div>
         {!spend || spend.by_model.length === 0 ? (
           <div className="empty">暂无计价请求。为模型填写价格后才会显示金额。</div>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>供应商</th>
-                <th>模型</th>
-                <th>币种</th>
-                <th>请求</th>
-                <th>Token（输入 / 输出）</th>
-                <th>花费</th>
-              </tr>
-            </thead>
-            <tbody>{dimensionRows(spend.by_model, true)}</tbody>
-          </table>
+          <div className="model-spend-scroll" role="region" aria-labelledby="model-spend-title" tabIndex={0}>
+            <table className="model-spend-table">
+              <thead>
+                <tr>
+                  <th>供应商</th>
+                  <th>模型</th>
+                  <th>币种</th>
+                  <th>请求</th>
+                  <th>Token（输入 / 输出）</th>
+                  <th>花费</th>
+                </tr>
+              </thead>
+              <tbody>{dimensionRows(spend.by_model, true)}</tbody>
+            </table>
+          </div>
         )}
       </div>
 
