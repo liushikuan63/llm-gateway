@@ -786,6 +786,94 @@ async fn gateway_both_regions_preserve_stream_nonstream_history_usage_and_audit(
     }
 }
 #[tokio::test]
+async fn gateway_qoder_rejects_lossy_openai_ingress_in_both_regions() {
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [(Region::Global, "global"), (Region::Cn, "cn")] {
+        let f = setup().await;
+        *f.fixture.response.lock() = Some(normal_response_with_null_frames());
+        let g = gateway(&f, region, false).await;
+        for stream in [false, true] {
+            for (reason, messages) in [
+                (
+                    "unsupported_account_content_part",
+                    json!([{"role":"user","content":[
+                        {"type":"text","text":"owned question"},
+                        {"type":"input_file","file_id":"owned-file"}
+                    ]}]),
+                ),
+                (
+                    "invalid_account_tool_history",
+                    json!([
+                        {"role":"user","content":"prior question"},
+                        {"role":"assistant","content":"prior answer","tool_calls":[
+                            {"id":"owned-call","type":"function","function":{"arguments":"{}"}}
+                        ]},
+                        {"role":"user","content":"next question"}
+                    ]),
+                ),
+            ] {
+                let before = (
+                    f.fixture.posts.load(Ordering::SeqCst),
+                    f.fixture.catalogs.load(Ordering::SeqCst),
+                );
+                let response = http
+                    .post(format!("{}/v1/chat/completions", g.url))
+                    .bearer_auth("synthetic-gateway-key")
+                    .json(&json!({"model":"public","stream":stream,"messages":messages}))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let wire = response.text().await.unwrap();
+                let error = serde_json::from_str::<Value>(&wire).unwrap_or(Value::Null);
+                let after = (
+                    f.fixture.posts.load(Ordering::SeqCst),
+                    f.fixture.catalogs.load(Ordering::SeqCst),
+                );
+                if status != StatusCode::BAD_REQUEST
+                    || !error["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(reason))
+                    || after != before
+                {
+                    failures.push(format!("{label} stream={stream} {reason}: status={status}, counts={before:?}->{after:?}"));
+                }
+            }
+        }
+        let control = http
+            .post(format!("{}/v1/chat/completions", g.url))
+            .bearer_auth("synthetic-gateway-key")
+            .json(&json!({"model":"public","messages":[
+                {"role":"user","content":"prior question"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"id":"owned-call","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"kept\"}"}}
+                ]},
+                {"role":"tool","tool_call_id":"owned-call","content":"owned result"},
+                {"role":"user","content":"next question"}
+            ]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(control.status(), StatusCode::OK, "{label}");
+        let body: Value = control.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "OK");
+        let requests = f.fixture.requests.lock();
+        let (_, request) = requests.last().unwrap();
+        assert_eq!(
+            request["messages"][1]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            request["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            "{\"q\":\"kept\"}"
+        );
+        assert_eq!(request["messages"][2]["tool_call_id"], "owned-call");
+    }
+    assert!(failures.is_empty(), "lossy Qoder ingress: {failures:?}");
+}
+
+#[tokio::test]
 async fn gateway_five_protocols_preserve_complete_tool_name_and_json_arguments() {
     let f = setup().await;
     let gateway = gateway(&f, Region::Global, false).await;
@@ -1748,3 +1836,104 @@ async fn entitlement_consumer_epoch_change_after_post_keeps_unknown_and_refunds_
 
 #[path = "qoder_tests/subject_receipt_tests.rs"]
 mod subject_receipt_tests;
+
+#[tokio::test]
+async fn ordinary_responses_account_ingress_rejects_lossy_qoder() {
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [(Region::Global, "global"), (Region::Cn, "cn")] {
+        let f = setup().await;
+        *f.fixture.response.lock() = Some(normal_response_with_null_frames());
+        let g = gateway(&f, region, false).await;
+        let counts = || {
+            (
+                f.fixture.posts.load(Ordering::SeqCst),
+                f.fixture.catalogs.load(Ordering::SeqCst),
+            )
+        };
+        let send = |input: Value, stream| {
+            http.post(format!("{}/v1/responses", g.url))
+                .bearer_auth("synthetic-gateway-key")
+                .json(&json!({"model":"public","input":input,"stream":stream}))
+                .send()
+        };
+        let tool_history = |output: Value| {
+            json!([
+                {"role":"user","content":[{"type":"input_text","text":"owned question"}]},
+                {"type":"function_call","call_id":"owned-call","name":"lookup","arguments":"{}"},
+                {"type":"function_call_output","call_id":"owned-call","output":output}
+            ])
+        };
+        for stream in [false, true] {
+            for (case, input) in [
+                (
+                    "input_file",
+                    json!([{"role":"user","content":[
+                        {"type":"input_text","text":"owned question"},
+                        {"type":"input_file","file_id":"owned-file"}
+                    ]}]),
+                ),
+                (
+                    "malformed_tool_output",
+                    tool_history(json!([
+                        {"type":"input_text","text":"kept prefix"},
+                        {"type":"input_text","text":17}
+                    ])),
+                ),
+            ] {
+                let before = counts();
+                let response = send(input, stream).await.unwrap();
+                let status = response.status();
+                let body = response.text().await.unwrap();
+                let error = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+                let expected_error = error["error"]["type"] == "invalid_request_error"
+                    && error["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.ends_with("unsupported_account_content_part"));
+                let after = counts();
+                if status != StatusCode::BAD_REQUEST || !expected_error || before != after {
+                    failures.push(format!(
+                        "{label} stream={stream} {case}: status={}, counts={before:?}->{after:?}, expected_error={expected_error}",
+                        status.as_u16()
+                    ));
+                }
+            }
+        }
+
+        for stream in [false, true] {
+            let before = counts();
+            let response = send(
+                tool_history(json!([{"type":"input_text","text":"kept output"}])),
+                stream,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{label} legal stream={stream}"
+            );
+            let body = response.text().await.unwrap();
+            if stream {
+                assert!(body.contains("response.completed"), "{label} legal stream");
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap()["status"],
+                    "completed"
+                );
+            }
+            assert_eq!(counts(), (before.0 + 1, 1), "{label} legal stream={stream}");
+            let requests = f.fixture.requests.lock();
+            let (_, request) = requests.last().unwrap();
+            let tool_call = &request["messages"][1]["tool_calls"][0];
+            assert_eq!(tool_call["id"], "owned-call");
+            assert_eq!(tool_call["function"]["name"], "lookup");
+            assert_eq!(request["messages"][2]["tool_call_id"], "owned-call");
+            assert_eq!(request["messages"][2]["content"], "kept output");
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "ordinary Responses Qoder ingress: {failures:?}"
+    );
+}

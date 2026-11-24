@@ -34,6 +34,7 @@ struct Fixture {
     model_entered: Arc<tokio::sync::Notify>,
     model_release: Arc<tokio::sync::Notify>,
     backup_posts: Arc<AtomicUsize>,
+    retryable_primary_posts: Arc<AtomicUsize>,
     unexpected: Arc<AtomicUsize>,
     region: WorkBuddyRegion,
 }
@@ -634,6 +635,11 @@ async fn backup_completion(State(f): State<Fixture>) -> Json<Value> {
     )
 }
 
+async fn retryable_primary_completion(State(f): State<Fixture>) -> axum::http::StatusCode {
+    f.retryable_primary_posts.fetch_add(1, Ordering::SeqCst);
+    axum::http::StatusCode::BAD_GATEWAY
+}
+
 async fn unexpected_request(State(f): State<Fixture>) -> axum::http::StatusCode {
     f.unexpected.fetch_add(1, Ordering::SeqCst);
     axum::http::StatusCode::NOT_FOUND
@@ -706,6 +712,10 @@ async fn setup_region(region: WorkBuddyRegion) -> Servers {
         .route("/v3/config", get(catalog))
         .route("/v2/chat/completions", post(completion))
         .route("/v1/chat/completions", post(backup_completion))
+        .route(
+            "/primary/v1/chat/completions",
+            post(retryable_primary_completion),
+        )
         .fallback(unexpected_request)
         .with_state(fixture.clone());
     let mock = tokio::spawn(async move {
@@ -786,6 +796,308 @@ async fn setup_region(region: WorkBuddyRegion) -> Servers {
         jobs: vec![mock, server],
     }
 }
+#[tokio::test]
+async fn gateway_workbuddy_rejects_lossy_openai_ingress_in_both_regions() {
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [
+        (WorkBuddyRegion::Global, "global"),
+        (WorkBuddyRegion::Cn, "cn"),
+    ] {
+        let s = setup_region(region).await;
+        let invalid = json!([{"role":"user","content":[
+            {"type":"text","text":"owned question"},
+            {"type":"input_file","file_id":"owned-file"}
+        ]}]);
+        for stream in [false, true] {
+            let before = (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+            );
+            let response = http
+                .post(format!("{}/v1/chat/completions", s.url))
+                .bearer_auth("offline-gateway-key")
+                .json(&json!({"model":"public","stream":stream,"messages":invalid}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let wire = response.text().await.unwrap();
+            let error = serde_json::from_str::<Value>(&wire).unwrap_or(Value::Null);
+            let after = (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+            );
+            if status != axum::http::StatusCode::BAD_REQUEST
+                || !error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("unsupported_account_content_part"))
+                || after != before
+            {
+                failures.push(format!(
+                    "{label} stream={stream}: status={status}, counts={before:?}->{after:?}"
+                ));
+            }
+        }
+        let control = http
+            .post(format!("{}/v1/chat/completions", s.url))
+            .bearer_auth("offline-gateway-key")
+            .json(&json!({"model":"public","messages":[{"role":"user","content":"owned supported question"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(control.status(), axum::http::StatusCode::OK, "{label}");
+        assert!(control.text().await.unwrap().contains("answer"));
+
+        let mut ordinary = s.gateway.providers.read()[0].clone();
+        ordinary.id = "owned-ordinary".into();
+        ordinary.runtime_id = None;
+        ordinary.base_url = format!("{}/v1", s.origin);
+        ordinary.models[0].alias = "owned-ordinary-only".into();
+        repo::upsert_provider(s.gateway.db.pool(), &ordinary)
+            .await
+            .unwrap();
+        s.gateway.reload_providers().await.unwrap();
+        let response = http
+            .post(format!("{}/v1/chat/completions", s.url))
+            .bearer_auth("offline-gateway-key")
+            .json(&json!({"model":"owned-ordinary-only","messages":invalid}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{label}");
+        assert!(response.text().await.unwrap().contains("backup answer"));
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(failures.is_empty(), "lossy WorkBuddy ingress: {failures:?}");
+}
+
+async fn mixed_openai_candidates() -> Servers {
+    let s = setup_region(WorkBuddyRegion::Global).await;
+    let mut ordinary = s.gateway.providers.read()[0].clone();
+    ordinary.id = "owned-mixed-http".into();
+    ordinary.runtime_id = None;
+    ordinary.base_url = format!("{}/v1", s.origin);
+    repo::upsert_provider(s.gateway.db.pool(), &ordinary)
+        .await
+        .unwrap();
+    s.gateway.reload_providers().await.unwrap();
+    s
+}
+
+#[tokio::test]
+async fn mixed_gateway_rejects_lossy_openai_ingress_before_reusing_buffered_reply() {
+    let s = mixed_openai_candidates().await;
+    let mut cfg = s.gateway.cfg_snapshot();
+    cfg.cache.enabled = true;
+    cfg.failover_enabled = true;
+    cfg.max_fallback_attempts = 2;
+    s.gateway.update_cfg(cfg);
+
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let send = |request: Value| {
+        http.post(format!("{}/v1/chat/completions", s.url))
+            .bearer_auth("offline-gateway-key")
+            .json(&request)
+            .send()
+    };
+    let clean = json!({"model":"public","messages":[{"role":"user","content":[
+        {"type":"text","text":"owned cache and route control"}
+    ]}]});
+    let mut lossy = clean.clone();
+    lossy["messages"][0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_file","file_id":"owned-file"}));
+
+    s.gateway.set_active("wb-gateway-provider").unwrap();
+    for cache in ["MISS", "HIT"] {
+        let response = send(clean.clone()).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["x-cache"], cache);
+        assert!(response.text().await.unwrap().contains("answer"));
+    }
+    for stream in [false, true] {
+        let mut request = lossy.clone();
+        request["stream"] = json!(stream);
+        let response = send(request).await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert!(!response.headers().contains_key("x-cache"));
+        let error: Value = response.json().await.unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported_account_content_part"));
+    }
+    assert_eq!(s.gateway.cache.stats().hits, 1);
+    assert_eq!(s.fixture.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(s.fixture.catalog_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 0);
+
+    s.gateway.set_active("owned-mixed-http").unwrap();
+    let response = send(lossy).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-cache"], "MISS");
+    assert!(response.text().await.unwrap().contains("backup answer"));
+    assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 1);
+    assert_eq!(s.fixture.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn mixed_gateway_rejects_lossy_openai_ingress_before_dedup_conflict() {
+    let s = mixed_openai_candidates().await;
+    let mut cfg = s.gateway.cfg_snapshot();
+    cfg.cache.enabled = false;
+    cfg.dedup.mode = crate::proxy::dedup::DedupMode::Enforce;
+    cfg.dedup.window_secs = 60;
+    s.gateway.update_cfg(cfg);
+    s.gateway.set_active("wb-gateway-provider").unwrap();
+
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let send = |request: &Value| {
+        http.post(format!("{}/v1/chat/completions", s.url))
+            .bearer_auth("offline-gateway-key")
+            .json(request)
+            .send()
+    };
+    let clean = json!({"model":"public","messages":[{"role":"user","content":[
+        {"type":"text","text":"owned dedup collision"}
+    ]}]});
+    // Deliberately omit X-Session-Id so each admission sees the same normalized
+    // request without the previous reply in its context.
+    let first = send(&clean).await.unwrap();
+    assert_eq!(first.status(), 200);
+    assert!(first.text().await.unwrap().contains("answer"));
+    let duplicate = send(&clean).await.unwrap();
+    assert_eq!(duplicate.status(), 409);
+    assert_eq!(duplicate.headers()["x-dedup"], "conflict");
+    assert_eq!(s.gateway.dedup.stats().conflicts, 1);
+
+    let mut lossy = clean;
+    lossy["messages"][0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_file","file_id":"owned-file"}));
+    let response = send(&lossy).await.unwrap();
+    let status = response.status();
+    let was_deduplicated = response.headers().contains_key("x-dedup");
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(s.fixture.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(s.fixture.catalog_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 0);
+    assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        status, 400,
+        "lossy account request must reach ingress rejection, got {error}"
+    );
+    assert!(!was_deduplicated);
+    assert_eq!(s.gateway.dedup.stats().conflicts, 1);
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unsupported_account_content_part"));
+}
+
+#[tokio::test]
+async fn account_ingress_fallback_separates_retryable_http_from_lossy_account_dispatch() {
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for stream in [false, true] {
+        for lossy in [false, true] {
+            // Restart the fixture so the 502 cooldown and directory cache cannot
+            // make subsequent requests appear to skip the account.
+            let s = setup_region(WorkBuddyRegion::Global).await;
+            let mut account = s.gateway.providers.read()[0].clone();
+            let mut primary = account.clone();
+            primary.id = "owned-retryable-primary".into();
+            primary.name = "Owned retryable primary".into();
+            primary.runtime_id = None;
+            primary.base_url = format!("{}/primary/v1", s.origin);
+            primary.priority = 1;
+            primary.models[0].upstream = "owned-primary-model".into();
+            account.priority = 2;
+            let mut backup = primary.clone();
+            backup.id = "owned-fallback-sentinel".into();
+            backup.name = "Owned fallback sentinel".into();
+            backup.base_url = format!("{}/v1", s.origin);
+            backup.priority = 3;
+            backup.models[0].upstream = "owned-backup-model".into();
+            for provider in [&primary, &account, &backup] {
+                repo::upsert_provider(s.gateway.db.pool(), provider)
+                    .await
+                    .unwrap();
+            }
+            s.gateway.reload_providers().await.unwrap();
+            let mut cfg = s.gateway.cfg_snapshot();
+            cfg.routing_strategy = crate::config::RoutingStrategy::Priority;
+            cfg.failover_enabled = true;
+            cfg.max_fallback_attempts = 3;
+            cfg.smart_routing.enabled = false;
+            cfg.search.enabled = false;
+            cfg.cache.enabled = false;
+            cfg.dedup.mode = crate::proxy::dedup::DedupMode::Off;
+            s.gateway.update_cfg(cfg);
+            s.gateway.set_active(&primary.id).unwrap();
+
+            let mut parts = vec![json!({"type":"text","text":"owned fallback control"})];
+            if lossy {
+                parts.push(json!({"type":"input_file","file_id":"owned-file"}));
+            }
+            let response = http
+                .post(format!("{}/v1/chat/completions", s.url))
+                .bearer_auth("offline-gateway-key")
+                .json(&json!({
+                    "model":"public","stream":stream,
+                    "messages":[{"role":"user","content":parts}]
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap();
+            let wire = (
+                s.fixture.retryable_primary_posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.backup_posts.load(Ordering::SeqCst),
+                s.fixture.unexpected.load(Ordering::SeqCst),
+            );
+            if lossy {
+                assert_eq!(wire, (1, 0, 0, 0, 0), "stream={stream}: {body}");
+                assert_eq!(status, 400, "stream={stream}: {body}");
+                assert!(!headers.contains_key("x-routed-via"));
+                let error: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(error["error"]["type"], "invalid_request_error");
+                assert!(error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unsupported_account_content_part"));
+            } else {
+                assert_eq!(wire, (1, 1, 1, 0, 0), "stream={stream}: {body}");
+                assert_eq!(status, 200, "stream={stream}: {body}");
+                assert_eq!(headers["x-routed-via"], "wb-gateway-provider/saved-id");
+                assert_eq!(headers["x-fallback-attempts"], "2");
+                assert!(body.contains("answer"), "{body}");
+                if stream {
+                    assert_eq!(
+                        body.lines().filter(|line| *line == "data: [DONE]").count(),
+                        1,
+                        "{body}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn independent_account_gateway_preserves_protocols_usage_and_history() {
     let s = setup().await;
@@ -1176,3 +1488,106 @@ async fn effort_gateway_valid_controls_preserve_exact_wire_finish_and_usage() {
 }
 
 mod subject_receipt_tests;
+
+#[tokio::test]
+async fn ordinary_responses_account_ingress_rejects_lossy_workbuddy() {
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let file_input = json!([{"role":"user","content":[
+        {"type":"input_text","text":"owned question"},
+        {"type":"input_file","file_id":"owned-file"}
+    ]}]);
+    let mut failures = Vec::new();
+    for (region, label) in [
+        (WorkBuddyRegion::Global, "global"),
+        (WorkBuddyRegion::Cn, "cn"),
+    ] {
+        let s = setup_region(region).await;
+        let counts = || {
+            (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+            )
+        };
+        let send = |model: &str, input: Value, stream| {
+            http.post(format!("{}/v1/responses", s.url))
+                .bearer_auth("offline-gateway-key")
+                .json(&json!({"model":model,"input":input,"stream":stream}))
+                .send()
+        };
+        for stream in [false, true] {
+            let before = counts();
+            let response = send("public", file_input.clone(), stream).await.unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            let error = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            let expected_error = error["error"]["type"] == "invalid_request_error"
+                && error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.ends_with("unsupported_account_content_part"));
+            let after = counts();
+            if status != reqwest::StatusCode::BAD_REQUEST || !expected_error || before != after {
+                failures.push(format!(
+                    "{label} stream={stream} input_file: status={}, counts={before:?}->{after:?}, expected_error={expected_error}",
+                    status.as_u16()
+                ));
+            }
+        }
+
+        for stream in [false, true] {
+            let before = counts();
+            let response = send("public", json!("owned supported question"), stream)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::OK,
+                "{label} legal stream={stream}"
+            );
+            let body = response.text().await.unwrap();
+            assert!(body.contains("answer"), "{label} legal stream={stream}");
+            if stream {
+                assert!(body.contains("response.completed"), "{label} legal stream");
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap()["status"],
+                    "completed"
+                );
+            }
+            assert_eq!(counts(), (before.0 + 1, 1), "{label} legal stream={stream}");
+        }
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 0);
+
+        let mut ordinary = s.gateway.providers.read()[0].clone();
+        ordinary.id = "owned-responses-ordinary".into();
+        ordinary.runtime_id = None;
+        ordinary.base_url = format!("{}/v1", s.origin);
+        ordinary.models[0].alias = "owned-responses-ordinary".into();
+        repo::upsert_provider(s.gateway.db.pool(), &ordinary)
+            .await
+            .unwrap();
+        s.gateway.reload_providers().await.unwrap();
+        let before = counts();
+        let response = send("owned-responses-ordinary", file_input.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "{label} ordinary HTTP"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["status"], "completed");
+        assert!(body.to_string().contains("backup answer"));
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counts(),
+            before,
+            "{label} ordinary HTTP never reaches the account"
+        );
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        failures.is_empty(),
+        "ordinary Responses WorkBuddy ingress: {failures:?}"
+    );
+}
