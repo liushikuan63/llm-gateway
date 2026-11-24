@@ -269,6 +269,7 @@ fn openai_tool_calls_round_trip_with_type_not_internal_kind() {
         "gpt-4o",
         &ChatResponse {
             reported_usage_evidence: Default::default(),
+            desktop_usage_observation: None,
             id: "id_1".into(),
             model: "gpt-4o".into(),
             content: String::new(),

@@ -91,6 +91,7 @@ pub(crate) struct RequestWireOptions {
     pub cost_policy: crate::cost_policy::RequestCostPolicy,
     pub normalized_ingress: Option<super::control_modes::ControlSet>,
     pub caller: Option<super::control_modes::CallerControls>,
+    pub account_ingress: crate::protocol::openai::AccountIngressShape,
 }
 
 /// Response decoding and inherited cost policy stay together at passthrough's
@@ -830,7 +831,7 @@ impl UpstreamClient {
             let _free_permit=free_permit;
             let mut budget_report=crate::budget::holds::StreamReport::default();
             let mut buffer = Vec::new();
-            let mut anthropic_empty_inputs = BTreeSet::new();
+            let mut parse_state = StreamParseState::default();
 
             while let Some(chunk) = bytes.next().await {
                 match chunk {
@@ -839,8 +840,8 @@ impl UpstreamClient {
                         if let Some(observer) = &byte_observer { observer.received(chunk.len()); }
                         buffer.extend_from_slice(&chunk);
                         let events = match dialect {
-                            Dialect::Ollama => drain_ollama_lines(&mut buffer, generation.as_ref()),
-                            _ => drain_sse_blocks(dialect, &mut buffer, &mut anthropic_empty_inputs),
+                            Dialect::Ollama => drain_ollama_lines(&mut buffer, generation.as_ref(), &mut parse_state),
+                            _ => drain_sse_blocks(dialect, &mut buffer, &mut parse_state),
                         };
                         for event in events {
                             if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
@@ -861,15 +862,11 @@ impl UpstreamClient {
                 }
             }
 
-            // 有些实现不会在最后一个 SSE 事件后补空行；EOF 时仍需消费完整残留。
+            // EOF 时仍需消费缺少 SSE 或 NDJSON 分隔符的完整残留。
             if !buffer.is_empty() {
                 let events = match dialect {
-                    Dialect::Ollama => parse_ollama_line(&buffer, generation.as_ref()),
-                    _ => parse_sse_block_with_state(
-                        dialect,
-                        &buffer,
-                        Some(&mut anthropic_empty_inputs),
-                    ),
+                    Dialect::Ollama => parse_ollama_line(&buffer, generation.as_ref(), &mut parse_state),
+                    _ => parse_sse_block_with_state(dialect, &buffer, &mut parse_state),
                 };
                 for event in events {
                     if matches!(&event, Ok(UpstreamEvent::Done { .. })) {
@@ -942,11 +939,20 @@ pub enum UpstreamEvent {
     Ping,
 }
 
+/// Parser state belongs to one physical response, including its final undelimited frame.
+#[derive(Default)]
+struct StreamParseState {
+    // Anthropic promises an empty argument object only at the matching block stop.
+    anthropic_empty_inputs: BTreeSet<usize>,
+    // Gemini and Ollama emit whole calls without supplying stream indices.
+    next_tool_index: usize,
+}
+
 /// 从跨网络分块的缓存中取出所有完整 SSE 事件，残留半包继续留给下一次读取。
 fn drain_sse_blocks(
     dialect: Dialect,
     buffer: &mut Vec<u8>,
-    anthropic_empty_inputs: &mut BTreeSet<usize>,
+    parse_state: &mut StreamParseState,
 ) -> Vec<Result<UpstreamEvent>> {
     let mut out = Vec::new();
 
@@ -955,7 +961,7 @@ fn drain_sse_blocks(
         out.extend(parse_sse_block_with_state(
             dialect,
             &event[..end],
-            Some(anthropic_empty_inputs),
+            parse_state,
         ));
     }
     out
@@ -965,11 +971,12 @@ fn drain_sse_blocks(
 fn drain_ollama_lines(
     buffer: &mut Vec<u8>,
     generation: Option<&super::generation::SharedGeneration>,
+    parse_state: &mut StreamParseState,
 ) -> Vec<Result<UpstreamEvent>> {
     let mut out = Vec::new();
     while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
         let line: Vec<u8> = buffer.drain(..=end).collect();
-        out.extend(parse_ollama_line(&line, generation));
+        out.extend(parse_ollama_line(&line, generation, parse_state));
     }
     out
 }
@@ -988,13 +995,13 @@ fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
 
 /// 解析一段完整 SSE 事件。JSON 解码失败时不 panic；上游偶发的非 JSON 心跳直接忽略。
 pub fn parse_sse_block(dialect: Dialect, bytes: &[u8]) -> Vec<Result<UpstreamEvent>> {
-    parse_sse_block_with_state(dialect, bytes, None)
+    parse_sse_block_with_state(dialect, bytes, &mut StreamParseState::default())
 }
 
 fn parse_sse_block_with_state(
     dialect: Dialect,
     bytes: &[u8],
-    anthropic_empty_inputs: Option<&mut BTreeSet<usize>>,
+    parse_state: &mut StreamParseState,
 ) -> Vec<Result<UpstreamEvent>> {
     let text = String::from_utf8_lossy(bytes);
     let mut event_name: Option<&str> = None;
@@ -1025,12 +1032,13 @@ fn parse_sse_block_with_state(
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    parse_event_value(dialect, event_name, v, anthropic_empty_inputs)
+    parse_event_value(dialect, event_name, v, parse_state)
 }
 
 fn parse_ollama_line(
     bytes: &[u8],
     generation: Option<&super::generation::SharedGeneration>,
+    parse_state: &mut StreamParseState,
 ) -> Vec<Result<UpstreamEvent>> {
     let text = String::from_utf8_lossy(bytes);
     let line = text.trim();
@@ -1042,7 +1050,7 @@ fn parse_ollama_line(
             if let Some(generation) = generation {
                 generation.observe(&v);
             }
-            parse_event_value(Dialect::Ollama, None, v, None)
+            parse_event_value(Dialect::Ollama, None, v, parse_state)
         }
         // 截断或厂商自定义诊断行不应导致代理 panic；后续完整行仍可继续输出。
         Err(_) => Vec::new(),
@@ -1053,7 +1061,7 @@ fn parse_event_value(
     dialect: Dialect,
     event_name: Option<&str>,
     v: serde_json::Value,
-    anthropic_empty_inputs: Option<&mut BTreeSet<usize>>,
+    parse_state: &mut StreamParseState,
 ) -> Vec<Result<UpstreamEvent>> {
     // A successful HTTP header is not a successful model result. Native
     // error envelopes must not disappear behind a later DONE/stop/done:true.
@@ -1086,10 +1094,10 @@ fn parse_event_value(
             event_name,
             v,
             &mut out,
-            anthropic_empty_inputs.unwrap_or(&mut BTreeSet::new()),
+            &mut parse_state.anthropic_empty_inputs,
         ),
-        Dialect::Gemini => parse_gemini_chunk(v, &mut out),
-        Dialect::Ollama => parse_ollama_chunk(v, &mut out),
+        Dialect::Gemini => parse_gemini_chunk(v, &mut out, &mut parse_state.next_tool_index),
+        Dialect::Ollama => parse_ollama_chunk(v, &mut out, &mut parse_state.next_tool_index),
     }
     out
 }
@@ -1149,7 +1157,7 @@ fn parse_openai_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
 /// Optional display evidence, never a billing input. Only allowlisted numeric
 /// usage fields cross the desktop boundary; arbitrary upstream error/secret
 /// extensions are not reflected. Missing/invalid counters are not filled in.
-fn desktop_openai_usage(raw: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn desktop_openai_usage(raw: &serde_json::Value) -> serde_json::Value {
     use serde_json::{Map, Value};
     let Some(raw) = raw.as_object() else {
         return Value::Null;
@@ -1201,6 +1209,39 @@ fn desktop_openai_usage(raw: &serde_json::Value) -> serde_json::Value {
         }
     }
     Value::Object(output)
+}
+
+/// A null usage frame is no new report and cannot erase prior known fields.
+/// Merge partial numeric declarations without manufacturing absent counters.
+pub(crate) fn merge_desktop_usage_observation(
+    current: &mut Option<serde_json::Value>,
+    next: serde_json::Value,
+) {
+    use serde_json::Value;
+    if next.is_null() {
+        if current.is_none() {
+            *current = Some(Value::Null);
+        }
+        return;
+    }
+    match (
+        current.as_mut().and_then(Value::as_object_mut),
+        next.as_object(),
+    ) {
+        (Some(current), Some(next)) => {
+            for (key, value) in next {
+                if let (Some(old), Some(new)) = (
+                    current.get_mut(key).and_then(Value::as_object_mut),
+                    value.as_object(),
+                ) {
+                    old.extend(new.iter().map(|(key, value)| (key.clone(), value.clone())));
+                } else {
+                    current.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        _ => *current = Some(next),
+    }
 }
 
 fn openai_usage(v: &serde_json::Value) -> Option<Usage> {
@@ -1497,12 +1538,16 @@ fn anthropic_usage(usage: Option<&serde_json::Value>) -> Option<Usage> {
     Some(Usage::from_anthropic(usage))
 }
 
-fn parse_gemini_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) {
+fn parse_gemini_chunk(
+    v: serde_json::Value,
+    out: &mut Vec<Result<UpstreamEvent>>,
+    next_tool_index: &mut usize,
+) {
     let text = crate::protocol::gemini::extract_stream_text(&v);
     if !text.is_empty() {
         out.push(Ok(UpstreamEvent::Delta(text)));
     }
-    let has_tool_calls = push_gemini_tool_calls(&v, out);
+    let has_tool_calls = push_gemini_tool_calls(&v, out, next_tool_index);
     let usage = gemini_usage(&v);
     let finish_reason = v
         .get("candidates")
@@ -1542,7 +1587,39 @@ fn gemini_usage(v: &serde_json::Value) -> Option<Usage> {
     Some(Usage::from_gemini(usage))
 }
 
-fn parse_ollama_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) {
+/// Ollama's terminal counters for the desktop display. Legacy normalized
+/// usage is computed separately; it cannot prove that either field was sent.
+fn desktop_ollama_usage(raw: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let count = |name| {
+        raw.get(name)
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let prompt = count("prompt_eval_count");
+    let completion = count("eval_count");
+    let mut usage = Map::new();
+    if let Some(tokens) = prompt {
+        usage.insert("prompt_tokens".into(), tokens.into());
+    }
+    if let Some(tokens) = completion {
+        usage.insert("completion_tokens".into(), tokens.into());
+    }
+    if let Some(total) = prompt.zip(completion).and_then(|(a, b)| a.checked_add(b)) {
+        usage.insert("total_tokens".into(), total.into());
+    }
+    if usage.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(usage)
+    }
+}
+
+fn parse_ollama_chunk(
+    v: serde_json::Value,
+    out: &mut Vec<Result<UpstreamEvent>>,
+    next_tool_index: &mut usize,
+) {
     if let Some(t) = v
         .get("message")
         .and_then(|m| m.get("content"))
@@ -1554,7 +1631,7 @@ fn parse_ollama_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
         }
     }
     let done = v.get("done").and_then(|x| x.as_bool()).unwrap_or(false);
-    let has_tool_calls = push_ollama_tool_calls(&v, out);
+    let has_tool_calls = push_ollama_tool_calls(&v, out, next_tool_index);
     if has_tool_calls && !done {
         out.push(Ok(UpstreamEvent::Finish {
             finish_reason: Some("tool_calls".into()),
@@ -1572,6 +1649,11 @@ fn parse_ollama_chunk(v: serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>
             total_tokens: prompt_tokens + completion_tokens,
             ..Default::default()
         });
+        // An explicit null also prevents the desktop observer from falling
+        // back to compatibility counters when neither source count is useful.
+        out.push(Ok(UpstreamEvent::UsageObservation(desktop_ollama_usage(
+            &v,
+        ))));
         out.push(Ok(UpstreamEvent::Done {
             finish_reason: if has_tool_calls {
                 Some("tool_calls".into())
@@ -1647,7 +1729,11 @@ fn normalize_ollama_finish_reason(reason: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn push_gemini_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) -> bool {
+fn push_gemini_tool_calls(
+    v: &serde_json::Value,
+    out: &mut Vec<Result<UpstreamEvent>>,
+    next_tool_index: &mut usize,
+) -> bool {
     let Some(parts) = v
         .get("candidates")
         .and_then(|candidates| candidates.get(0))
@@ -1668,8 +1754,9 @@ fn push_gemini_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEv
             let name = call.get("name").and_then(|name| name.as_str())?;
             Some((name, call))
         })
-        .enumerate()
-        .map(|(index, (name, call))| {
+        .map(|(name, call)| {
+            let index = *next_tool_index;
+            *next_tool_index += 1;
             let id = call
                 .get("id")
                 .and_then(|id| id.as_str())
@@ -1694,7 +1781,11 @@ fn push_gemini_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEv
     }
 }
 
-fn push_ollama_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEvent>>) -> bool {
+fn push_ollama_tool_calls(
+    v: &serde_json::Value,
+    out: &mut Vec<Result<UpstreamEvent>>,
+    next_tool_index: &mut usize,
+) -> bool {
     let Some(calls) = v
         .get("message")
         .and_then(|message| message.get("tool_calls"))
@@ -1714,8 +1805,9 @@ fn push_ollama_tool_calls(v: &serde_json::Value, out: &mut Vec<Result<UpstreamEv
                 .and_then(|name| name.as_str())?;
             Some((call, function, name))
         })
-        .enumerate()
-        .map(|(index, (call, function, name))| {
+        .map(|(call, function, name)| {
+            let index = *next_tool_index;
+            *next_tool_index += 1;
             let id = call
                 .get("id")
                 .or_else(|| function.get("id"))
@@ -1890,10 +1982,26 @@ fn ensure_successful_response(
         Dialect::Ollama => value
             .get("message")
             .is_some_and(|message| message.is_object()),
-        // Responses 成功时必有 `output` 数组（空数组也算成功 ——
-        // 内容被上限截断时就是这样）。这里判「字段在不在」而不是「非空」，
-        // 否则空输出会被误判成上游错误。
-        Dialect::Responses => value.get("output").is_some_and(|o| o.is_array()),
+        // Responses 的缓冲终态必须是已完成或已中断；两者都允许空
+        // `output`（例如输出被上限截断时）。未知或进行中的状态不能
+        // 被当作成功，否则会写入错误的 assistant/200 审计并阻断降级。
+        Dialect::Responses => {
+            let status = value.get("status").and_then(|status| status.as_str());
+            let details_valid = match status {
+                Some("completed") => value
+                    .get("incomplete_details")
+                    .map_or(true, serde_json::Value::is_null),
+                Some("incomplete") => value
+                    .get("incomplete_details")
+                    .and_then(|details| details.get("reason"))
+                    .and_then(|reason| reason.as_str())
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                _ => false,
+            };
+            matches!(status, Some("completed") | Some("incomplete"))
+                && value.get("output").is_some_and(|output| output.is_array())
+                && details_valid
+        }
     };
 
     if application_error || !expected_payload {
@@ -1905,6 +2013,145 @@ fn ensure_successful_response(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod responses_buffer_status_tests {
+    use super::ensure_successful_response;
+    use crate::domain::{Dialect, Provider};
+
+    fn responses_provider() -> Provider {
+        let now = chrono::Utc::now();
+        Provider {
+            id: "owned-responses-status-provider".into(),
+            name: "owned Responses status provider".into(),
+            dialect: Dialect::Responses,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key_enc: String::new(),
+            enabled: true,
+            priority: 1,
+            models: Vec::new(),
+            rpm_limit: 0,
+            intelligence: 0,
+            note: None,
+            runtime_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn buffered_responses_nonterminal_statuses_are_not_success() {
+        let provider = responses_provider();
+        for status in ["failed", "cancelled", "queued", "in_progress", "unknown"] {
+            let value = serde_json::json!({
+                "id": "resp_owned_status",
+                "status": status,
+                "output": [],
+            });
+            assert!(
+                ensure_successful_response(
+                    &value,
+                    &provider,
+                    "owned-responses-model",
+                    &value.to_string(),
+                )
+                .is_err(),
+                "buffered Responses status {status} must not be treated as success"
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_responses_completed_and_incomplete_empty_output_are_successful() {
+        let provider = responses_provider();
+        let completed = serde_json::json!({
+            "id": "resp_owned_status",
+            "status": "completed",
+            "output": [],
+        });
+        assert!(
+            ensure_successful_response(
+                &completed,
+                &provider,
+                "owned-responses-model",
+                &completed.to_string(),
+            )
+            .is_ok(),
+            "buffered completed response with empty output is valid"
+        );
+
+        let incomplete = serde_json::json!({
+            "id": "resp_owned_status",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+        });
+        assert!(
+            ensure_successful_response(
+                &incomplete,
+                &provider,
+                "owned-responses-model",
+                &incomplete.to_string(),
+            )
+            .is_ok(),
+            "buffered incomplete response with a reason and empty output is valid"
+        );
+    }
+
+    #[test]
+    fn buffered_responses_incomplete_details_match_streaming_terminal_rules() {
+        let provider = responses_provider();
+        let malformed = [
+            serde_json::json!({
+                "status": "incomplete",
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": null,
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": ""},
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "  "},
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": 7},
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "completed",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+            }),
+            serde_json::json!({
+                "status": "completed",
+                "incomplete_details": {},
+                "output": [],
+            }),
+        ];
+
+        for value in malformed {
+            assert!(
+                ensure_successful_response(
+                    &value,
+                    &provider,
+                    "owned-responses-model",
+                    &value.to_string(),
+                )
+                .is_err(),
+                "malformed buffered Responses terminal details must be rejected: {value}"
+            );
+        }
+    }
 }
 
 /// 上游错误体是否在说「上下文超了」。

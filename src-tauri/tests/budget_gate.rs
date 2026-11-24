@@ -65,11 +65,15 @@ fn model(alias: &str) -> ModelRef {
 }
 
 fn provider(base_url: String) -> Provider {
+    provider_with_dialect(base_url, Dialect::OpenAI)
+}
+
+fn provider_with_dialect(base_url: String, dialect: Dialect) -> Provider {
     let now = chrono::Utc::now();
     Provider {
         id: "mock".into(),
         name: "mock".into(),
-        dialect: Dialect::OpenAI,
+        dialect,
         base_url,
         api_key_enc: String::new(),
         enabled: true,
@@ -246,6 +250,15 @@ async fn spawn_held(
     mutate: impl FnOnce(&mut AppConfig),
     release: Option<Arc<tokio::sync::Semaphore>>,
 ) -> Harness {
+    spawn_held_with_responses_status(keys, mutate, release, None).await
+}
+
+async fn spawn_held_with_responses_status(
+    keys: Vec<RemoteAccessKey>,
+    mutate: impl FnOnce(&mut AppConfig),
+    release: Option<Arc<tokio::sync::Semaphore>>,
+    responses_status: Option<&'static str>,
+) -> Harness {
     let mock = Mock::default();
     let calls = mock.calls.clone();
     let app = Router::new().fallback(post(move |uri: axum::extract::OriginalUri, Json(_b): Json<serde_json::Value>| {
@@ -269,6 +282,19 @@ async fn spawn_held(
                     "created": 1, "data": [{"b64_json": "bW9jay1pbWFnZQ=="}]
                 })).into_response();
             }
+            if let Some(status) = responses_status.filter(|_| uri.path().ends_with("/responses")) {
+                return Json(serde_json::json!({
+                    "id": "resp-budget-invalid",
+                    "object": "response",
+                    "status": status,
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0
+                    }
+                })).into_response();
+            }
             Json(serde_json::json!({
                 "id": "chatcmpl-budget",
                 "object": "chat.completion",
@@ -286,9 +312,17 @@ async fn spawn_held(
     tokio::time::sleep(Duration::from_millis(60)).await;
 
     let database = db::Db::connect_in_memory().await.unwrap();
-    repo::upsert_provider(database.pool(), &provider(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let dialect = if responses_status.is_some() {
+        Dialect::Responses
+    } else {
+        Dialect::OpenAI
+    };
+    repo::upsert_provider(
+        database.pool(),
+        &provider_with_dialect(format!("http://{addr}"), dialect),
+    )
+    .await
+    .unwrap();
     for key in &keys {
         repo::create_remote_access_key(database.pool(), key)
             .await
@@ -611,6 +645,138 @@ async fn 累计超过预算后返回_429_且_不写_requests_行() {
         after, after_seed,
         "被拒的请求不该写 requests —— 它没产生真实消费"
     );
+}
+
+#[tokio::test]
+async fn responses_budget_nonterminal_failure_is_no_replay_and_keeps_hold_dispatched() {
+    assert_responses_budget_no_replay("failed").await;
+}
+
+#[tokio::test]
+async fn responses_budget_incomplete_without_reason_is_no_replay_and_keeps_hold_dispatched() {
+    assert_responses_budget_no_replay("incomplete").await;
+}
+
+async fn assert_responses_budget_no_replay(primary_status: &'static str) {
+    let h = spawn_held_with_responses_status(
+        vec![access_key(
+            "rk-main",
+            true,
+            (MICROS_PER_UNIT, "USD", vec![]),
+        )],
+        |config| {
+            config.failover_enabled = true;
+            config.max_fallback_attempts = 2;
+        },
+        None,
+        Some(primary_status),
+    )
+    .await;
+
+    let backup_calls = Arc::new(AtomicUsize::new(0));
+    let backup_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut backup = provider_with_dialect(
+        format!("http://{}", backup_listener.local_addr().unwrap()),
+        Dialect::Responses,
+    );
+    backup.id = "responses-backup".into();
+    backup.name = "responses-backup".into();
+    backup.priority = 1;
+    let hits = backup_calls.clone();
+    let backup_task = tokio::spawn(async move {
+        let app = Router::new().fallback(post(move |Json(_): Json<serde_json::Value>| {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async {
+                Json(serde_json::json!({
+                    "id": "resp-budget-backup",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+                }))
+            }
+        }));
+        axum::serve(backup_listener, app).await.unwrap();
+    });
+    repo::upsert_provider(h.db.pool(), &backup).await.unwrap();
+    h.gateway.reload_providers().await.unwrap();
+
+    let body = serde_json::json!({
+        "model": "beta",
+        "input": "budgeted Responses failure",
+        "max_output_tokens": 2,
+    });
+
+    let response = auxiliary_request(&h, "/v1/responses", &body).await;
+    let (status, _code, error_body) = error_code(response).await;
+    assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{primary_status}");
+    assert_eq!(error_body["error"]["type"], "upstream_error");
+    assert!(error_body["error"]["code"].is_null());
+    assert_eq!(
+        h.mock_calls.load(Ordering::SeqCst),
+        1,
+        "an enforced-budget no-replay failure must not send a second request"
+    );
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let (request_id, hold_state, reserved, reported, hold_audit_id) = loop {
+        let request = sqlx::query_as::<_, (i64, Option<i64>, Option<String>, Option<String>, i64, Option<String>, Option<String>, Option<String>, Option<String>)>(
+            "SELECT id,status,routed_provider,routed_model,fallback_attempts,error,attempts_json,access_key_id,trace_id FROM requests WHERE access_key_id='rk-main' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(h.db.pool())
+        .await
+        .unwrap();
+        let hold = sqlx::query_as::<_, (String, String, i64, Option<i64>, Option<i64>)>(
+            "SELECT hold_id,state,reserved_micros,reported_reference_micros,audit_request_id FROM budget_holds WHERE key_id='rk-main' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(h.db.pool())
+        .await
+        .unwrap();
+        if let (Some(request), Some(hold)) = (request, hold) {
+            break (request.0, hold.1, hold.2, hold.3, hold.4);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "budget failure audit must be written"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    let row = sqlx::query_as::<_, (Option<i64>, Option<String>, Option<String>, i64, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT status,routed_provider,routed_model,fallback_attempts,error,attempts_json,access_key_id,trace_id FROM requests WHERE id=?",
+    )
+    .bind(request_id)
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, Some(502));
+    assert_eq!(row.1, None);
+    assert_eq!(row.2, None);
+    assert_eq!(row.3, 0);
+    assert!(row.4.is_some());
+    assert_eq!(row.6.as_deref(), Some("rk-main"));
+    assert!(row.7.as_deref().is_some_and(|trace| !trace.is_empty()));
+    let attempts: serde_json::Value = serde_json::from_str(row.5.as_deref().unwrap()).unwrap();
+    assert_eq!(attempts.as_array().unwrap().len(), 1);
+    assert_eq!(attempts[0]["provider_id"], "mock");
+    assert_eq!(attempts[0]["status"], 502);
+    assert_eq!(attempts[0]["ok"], false);
+    assert_eq!(attempts[0]["retryable"], false);
+
+    assert_eq!(hold_state, "dispatched");
+    assert!(reserved > 0);
+    assert_eq!(reported, None);
+    assert_eq!(hold_audit_id, Some(request_id));
+
+    let usage = sqlx::query_as::<_, (String, String, i64, i64, i64, i64)>(
+        "SELECT provider_id,model,requests,prompt_tokens,completion_tokens,errors FROM usage_daily WHERE provider_id='unknown' AND model='beta' ORDER BY day DESC LIMIT 1",
+    )
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(usage, ("unknown".into(), "beta".into(), 1, 0, 0, 1));
+    backup_task.abort();
 }
 
 #[tokio::test]

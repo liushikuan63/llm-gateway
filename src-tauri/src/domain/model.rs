@@ -190,6 +190,9 @@ pub struct ChatResponse {
     /// Private transport evidence; never changes public wire or persisted cache JSON.
     #[serde(skip)]
     pub reported_usage_evidence: ReportedUsageEvidence,
+    /// Source fields for desktop display only. Cache hits have no new observation.
+    #[serde(skip)]
+    pub desktop_usage_observation: Option<serde_json::Value>,
     pub id: String,
     pub model: String,
     pub content: String,

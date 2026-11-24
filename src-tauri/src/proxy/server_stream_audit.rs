@@ -766,6 +766,7 @@ mod tests {
             decision: None,
             desktop_observation: false,
             wire_options: Default::default(),
+            buffered_cascade: None,
             req: req.clone(),
             new_messages: req.messages.clone(),
             response_session_id: "owned-cache-session".into(),

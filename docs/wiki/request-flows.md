@@ -469,7 +469,7 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 
 
 
-[生产预演](../../src-tauri/src/proxy/server_request_preview.rs) 复用实际媒体承载、能力、输出／工具／协议预留、校准、局部裁剪和排名逻辑；白名单沿现有开关作用于请求模型名。默认仅传入消息参与计算；勾选「包含本机会话历史（只读）」才读取当前聊天会话，按所选已登记 Key ID 的隔离命名空间查询，缺失不创建也不回落到另一命名空间。Key ID 只是模拟条件，不是身份或费用证明。Jev、搜索、改写及远程压缩均不执行。流式账号入口仍遵守实际传输限制；只表示当前条件可参选，不证明登录／上游可用。原生 raw exact 旁路及协议特有最终控制不在该公共 Chat 预演中冒充可用。
+[生产预演](../../src-tauri/src/proxy/server_request_preview.rs) 复用实际媒体承载、能力、输出／工具／协议预留、校准、局部裁剪和排名逻辑；白名单沿现有开关作用于请求模型名。默认仅传入消息参与计算；勾选「包含本机会话历史（只读）」才读取当前聊天会话，按所选已登记 Key ID 的隔离命名空间查询，缺失不创建也不回落到另一命名空间。Key ID 只是模拟条件，不是身份或费用证明。Jev、搜索、改写及远程压缩均不执行。与普通 Chat 共用本地窗口检查：非流式按通过费用筛选的候选计算窗口、预留和校准，运行时不可用的候选仍单独标记排除；流式先排除不支持该传输的候选再计算。存在已知窗口时，裁剪后仍超出最大消息预算的请求显示「上下文窗口不足」，候选保留排除原因且无排名或分数，未知窗口也不能绕过此检查。只有未知窗口时没有可核验的本地上限，预演仍按当前条件排名。流式账号入口仍遵守实际传输限制；只表示当前条件可参选，不证明登录／上游可用。原生 raw exact 旁路及协议特有最终控制不在该公共 Chat 预演中冒充可用。
 
 
 
@@ -509,6 +509,26 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 
 
 
+### R5-P 普通 OpenAI Chat 的账号入站形状
+
+普通 OpenAI Chat 在转换成统一消息前，暂存内容项是否会被转换丢弃或补默认值，以及工具调用是否缺少字符串 ID 或函数名。这两个标志只供本次路由检查，不参与请求序列化、缓存键或去重指纹。
+
+已选 Qoder 或 WorkBuddy 路线遇到不支持的内容项，返回 HTTP 400，原因 `unsupported_account_content_part`；仅 Qoder 另外拒绝不完整的工具调用历史（`invalid_account_tool_history`）。明确只有不兼容账号候选时可在会话预处理前拒绝；混合候选沿既有顺序选择，非流式按实际级联顺序检查后才可读缓存或去重。每次账号派发按解析出的运行时再核验，包括故障转移；拒绝不会读取该账号的供应商目录或向其发送模型请求。现有预算和 FreeOnly 拒绝仍由原判定处理。
+
+普通 HTTP 路线和原生原样透传保持现有入口。自有回环用例覆盖 Qoder／WorkBuddy 各两区的流式和非流式请求、预热缓存及重复请求；不涉及真实账号、其他协议入口或远程压缩。
+
+### R5-P 普通 Responses 的账号入站形状
+
+普通 /v1/responses 在保持兼容转换的同时，记录消息 content 与 function_call_output 的 output 中不能可靠转成内部内容的项。Qoder 和 WorkBuddy 复用账号路线检查，对带此标记的请求返回 HTTP 400（unsupported_account_content_part），并在读取账号模型目录或发送模型请求前停止。普通 HTTP 仍保留原有转换，例如未知文件项转成 JSON 文本；合法工具调用和结果保留标识及内容。
+
+标记只给普通 Responses 的路由使用。显式 compaction_trigger 仍进入原来的远程压缩入口；工具标识校验、其他协议和原生原样透传沿用既有规则。这里的自有回环用例覆盖 Qoder 和 WorkBuddy 两区的流式与非流式模式，不代表真实账号验收。
+
+### R5-P 普通 Ollama Chat 的图片入站形状
+
+普通 Ollama `/api/chat` 在兼容转换前检查 `messages[*].images`。字段缺失、显式 `null` 和空数组继续走原有路径；非空数组及其他非 `null` 的值会被记作转换时无法保留的内容。标记只供现有账号派发检查使用，不传给上游。选中的 Qoder 或 WorkBuddy 账号路线返回 HTTP 400，错误原因是 `unsupported_account_content_part`，不读取账号模型目录，也不向该账号发送模型请求。
+
+自有回环验证了两种账号适配器各两区的流式与非流式拒绝、合法文本和空图片字段的成功对照，以及同一带图片字段的请求走普通 HTTP 路线时沿用原转换行为。流式成功仍输出 Ollama NDJSON 终态；NativeExact 的入口判定仍先执行。这里的保护不提供图片转发能力，也不代表真实账号验收。
+
 ### N4 原生上游的流终态
 
 
@@ -520,6 +540,8 @@ ChatResult 与 TS 消费方新增可选 finish_reason、response_metadata：非�
 Anthropic 的 `message_delta` 只更新结束原因和累计用量，独立的 `message_stop` 才确认流完成；事件顺序依据[官方流式协议](https://platform.claude.com/docs/en/build-with-claude/streaming)，本地夹具不是供应商抓包。[解析器](../../src-tauri/src/proxy/upstream.rs) 将前者投影为已有 `Finish`／`Usage`，后者仍为 `Done`，复用各出口已有结束原因与用量合并。缺少 stop 的 EOF 不再提前输出成功完成帧；沿原不完整流路径记录失败、保留部分正文且不更新成功粘性，不在正文后切换备用重放。正常结束、长度停止及工具结束原因不改含义。协议终态不是 VerifiedEntitlement 或供应商结算凭证，不新增收费单位或政策。
 
 Anthropic 的 `tool_use` 从显式 `input: {}` 开始时，解析器先发送工具标识，等到同索引的 `content_block_stop` 才补出参数 `{}`。非空 `input_json_delta` 仍按原索引拼接为实际参数。缺少 `input` 或在对应块结束前断流时，参数仍未确认。工具块结束只确认该块的参数，消息完成仍由 `message_stop` 确认。
+
+每次物理上游响应使用一份解析状态：Anthropic 只记录等待显式结束的工具块；Gemini 和 Ollama 在同一响应内持续分配工具调用编号。正常分块和最后一段没有分隔符的 EOF 尾帧共用该状态，下一次响应重新计数。工具块关闭后断流仍是失败：已确认的空参数可以保留，但不能形成成功终态。
 
 
 
@@ -553,6 +575,10 @@ Anthropic 的 `tool_use` 从显式 `input: {}` 开始时，解析器先发送工
 
 Responses 的 `response.failed`／`error` 也沿用同一已派发未知保护：旧 Gateway 首正文前确实触发第二次 POST，现以固定 502／`NoReplay` 拒绝重放。直接解析器原先仍携带任意上游 model／message，现不再保留它们；实际目标由可信的分派／尝试元数据归属，不能借错误载荷伪造。既有正文后失败保护本来通过，本批保留该正向事实，不冒充新修复。正常完成、原生 SSE 的工具参数装配以及合法 `response.incomplete` 的 length／usage 终态均保留；未把所有 incomplete 当失败。新增 Gateway 正常／前后正文错误和直接解析器均用自有 fixture，其他畸形或自相矛盾的终态、真实版本及实装继续未验。
 
+缓冲（非流式）Responses 响应只有 `status` 为 `completed` 或 `incomplete` 且 `output` 为数组时才算成功；空数组仍是合法终态。`completed` 的 `incomplete_details` 必须缺失或为 `null`，`incomplete` 必须带有非空字符串 `incomplete_details.reason`，与流式终态校验保持一致。`failed`、`cancelled`、`queued`、`in_progress` 或未知状态会先映射为可回退的 502，并沿真实 attempts 记录失败跳和备用成功跳，避免写入伪造的 assistant／200 审计。已派发且受预算约束的请求仍遵守 `NoReplay`，不会因该校验放宽重放；本地回环已覆盖主 Responses 非终态到备用 Responses 的一次回退、路由头、3/2 用量和审计链，真实供应商与安装版仍未验。
+
+预算约束下的缓冲 Responses 非终态回归继续走同一 `NoReplay` 边界：自有远程 Key 预占并派发后，HTTP 200 的 `status=failed` 空输出即使带 `0/0` usage 也只产生一次上游 POST 和 502 错误审计；不写成功路由，不触发备用或直连重放，`budget_holds` 保持 `dispatched`、报告费用为空，并把错误审计关联回该占用。自有 loopback、内存 SQLite 与合成远程 Key 仅证明本地事务语义，不证明真实供应商、正式库、安装版或账单。
+
 
 
 
@@ -568,6 +594,12 @@ Responses 的 `response.failed`／`error` 也沿用同一已派发未知保护�
 
 
 仅在流式解析事件层，主用量字段缺失、NULL、部分缺失、溢出或 total 自相矛盾时保留 `usage: None`，不把它们补为已知零；完整已知零仍为 `Some(0)`，输入／输出已知且缺 total 时沿既有和数。非流式转换器和普通线协议的既有标量兼容格式保持原字节，不能据此宣称安装版用量 UI 已验或任意供应商的结算可信。16 种畸形包络分别经正文前／后真实自有 Gateway 读回审计／尝试／无重放；内部变体不累加顶层数量。更深的工具／输出语义、其他网络与版本及实装仍保留。
+
+[Gemini → Responses 双工具调用回归](../../src-tauri/tests/protocol_stream_boundaries.rs) 通过实际网关发送 `POST /v1/responses`，由本机夹具在一条 Gemini SSE 帧内发送两个带显式 ID 的完整 `functionCall`。客户端读到 `response.created`、索引 0／1 各自的 item 与参数增量后，才允许上游发送独立的 `STOP`。正常结束检查对应的两对 done 事件和唯一的 `response.completed`，其中输出保留两项原工具调用和 3／2 用量。同一前缀提前 EOF 时仅返回 `error`，保留输入与已发出的两项工具调用，审计为 502。两条路径各派发一次上游 POST。同帧回归继续覆盖以上终态。
+
+Gemini 的完整 `functionCall` 在每次上游派发内按出现顺序编号。常规 SSE 帧与 EOF 时可解析的最后一帧共用这套编号。保留上游显式 ID，缺失时使用对应的 `call_{index}`。Responses 流里的工具项及本地持久化各自保留原调用的 ID、名称和参数。跨帧回归覆盖两帧后收到 `STOP`、缺少 ID 时提前 EOF，以及末帧没有空行时提前 EOF。后两种只发出错误终态，审计为 502。本地夹具验证范围为完整调用，真实供应商、Gemini 参数增量和安装版另验。
+
+[Ollama → Responses 跨记录回归](../../src-tauri/tests/protocol_stream_boundaries.rs) 使用自有 `/api/chat` 夹具。每次派发内，完整的 `tool_calls` 按出现顺序编号，NDJSON 行与 EOF 时可解析的无换行尾行共用编号。保留显式 ID，缺失时使用 `call_{index}`。收到 `done:true` 才成功完成；如果只有 EOF，保留已读完整调用并返回错误。截断的尾行不新增调用，也不产生成功终态。回归核对每个可见工具项的 ID、名称和参数，以及 SQLite 持久化和单次上游派发。真实 Ollama 和安装版仍需单独验证。
 
 
 
@@ -1875,7 +1907,9 @@ S1 能力账本读取与导出使用 `export_capabilities_with_coverage` 的同�
 
 
 
-仅桌面请求启用llmgw_reply_observation私有事件，携带兼容补值之前的结束原因、原生用量是否存在及可用的标准化usage；未启用观测的客户端不会新增私有字段，缺失原因的公开stop兼容默认保留。Ollama非空但未知的done_reason改为原样保留，不再误归一化成stop。通用OpenAI DONE／Anthropic message_stop没有原生原因，Ollama缺done_reason也保持缺失，明确原因仍保留。三平台原生严格终态解析不放宽。stream usage经过既有标准化，完整原始字段／可信结算证据仍unknown，不从200推断stop，不伪造价格／货币或免费资格。零与缺失依现有字段状态区分。
+仅桌面请求启用llmgw_reply_observation私有事件，携带兼容补值之前的结束原因、原生用量是否存在及可用的标准化usage；未启用观测的客户端不会新增私有字段，缺失原因的公开stop兼容默认保留。Ollama非空但未知的done_reason改为原样保留，不再误归一化成stop。通用OpenAI DONE／Anthropic message_stop没有原生原因，Ollama缺done_reason也保持缺失，明确原因仍保留。三平台原生严格终态解析不放宽。stream usage经过既有标准化，完整原始字段／可信结算证据仍unknown，不从200推断stop，不伪造价格／货币或免费资格。零与缺失依现有字段状态区分。Ollama 流式成功终态的桌面私有回执分别保留合法的输入、输出计数（含明确零），单项上报不补另一项或总量；两项都有效且总和可表示时才显示总量。两项均缺失或无效时回执为 `null`。这条观测不改变公开流、兼容用量或结算。
+
+WorkBuddy 国内与国际两区的桌面私有回执，在流式或缓冲回复的有效终态后，只提供上游实际报告的合法计数和 `credit`。缺报的单项不补零，也不推算总量；明确上报的零值（含缓存命中 token 数）保留。完全缺报、仅有无效字段或缓冲缓存命中时，桌面用量为未知且未观测，不复用公开兼容计数。此字段只能用于展示；普通 HTTP 响应、缓存内容、审计和用量结算沿用原有数据。
 
 
 
