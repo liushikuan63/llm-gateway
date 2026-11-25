@@ -22,7 +22,8 @@ export default function ModelCapabilityDeclaration({ model, declaration }: { mod
     <small>旧布尔 false 未区分缺失和否定来源，不等于已实测不支持。</small></>;
   // The view and booleans come from the same provider/alias read snapshot.
   // Never infer a local declaration from a legacy false or a score factor.
-  const fields = ["tools", "thinking", "vision", "audio", "video", "stream"] as const;
+  const extensions = [["parallel_tools", "并行工具"], ["structured_output", "结构化输出"], ["audio_output", "音频输出"]] as const;
+  const fields = ["tools", "thinking", "vision", "audio", "video", "stream", ...extensions.map(([field]) => field)] as const;
   const malformed = declaration?.status === "invalid" || (declaration?.status === "declared" && (
     declaration.read_only || !/^[0-9a-f]{64}$/.test(declaration.binding) || !/^[0-9a-f]{64}$/.test(declaration.revision)
     || !declaration.fields || typeof declaration.fields !== "object" || Array.isArray(declaration.fields)
@@ -31,13 +32,18 @@ export default function ModelCapabilityDeclaration({ model, declaration }: { mod
       const index = fields.indexOf(field as typeof fields[number]);
       return index < 0 || !record || !["supported", "unsupported", "unknown"].includes(record.state)
         || !Number.isSafeInteger(record.recorded_at_ms) || record.recorded_at_ms <= 0
-        || (record.state === "supported") !== (flags[index][0] === true);
+        || (index < flags.length && (record.state === "supported") !== (flags[index][0] === true));
     })
   ));
   const declared = declaration?.status === "declared" && !malformed;
   const declaredStates = declared ? flags.map(([value, label], index) => ({
     value, label, record: declaration.fields[fields[index]],
   })) : [];
+  // Editing advertisement does not invalidate a stored, validated record.
+  const declaredExtensions = declared ? extensions.flatMap(([field, label]) => {
+    const record = declaration.fields[field];
+    return record ? [{ label, state: record.state }] : [];
+  }) : [];
   const current = declared ? <>
     {([['supported', '本地配置声明支持'], ['unsupported', '本地配置声明不支持'], ['unknown', '本地配置未确认']] as const).map(([state, label]) => {
       const names = declaredStates.filter(item => item.record?.state === state).map(item => item.label);
@@ -53,6 +59,10 @@ export default function ModelCapabilityDeclaration({ model, declaration }: { mod
       <small>类型入口不是当前供应商／协议／账号可用保证。</small>
       <details><summary>查看旧配置声明</summary>{raw}</details>
     </>}
+    {usesChatDeclaration(model) && declaredExtensions.length > 0 && <div role="group" aria-label="扩展本地声明">
+      {declaredExtensions.map(({ label, state }) => <small key={label}>{label}：{state === "supported" ? "本地声明支持" : state === "unsupported" ? "本地声明不支持" : "未确认"}</small>)}
+      <small>仅本地声明，未实测；扩展项不参与路由或评分。</small>
+    </div>}
     <small>仅配置资料，未自动探测，不作为额外路由权重。</small>
   </div>;
 }

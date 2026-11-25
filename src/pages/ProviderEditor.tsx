@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AgentRuntime, api, clockToMinutes, Currency, DIALECT_LABEL, DiscoveredModel, formatPricePerMillion, HeaderPair, minutesToClock, ModelOverrides, ModelRef, ModelType, PriceRule, PriceSource, ProviderInput } from "../api";
 import { DEFAULT_CONTEXT_WINDOW, emptyModel, errorText, formatContext, PRESETS, ProviderForm } from "./providerPresets";
 
-import { DECLARATION_FIELDS, declarationFlags, DeclarationDraft, ModelDeclarationFields } from "./ModelDeclarationFields";
+import { DECLARATION_FIELDS, declarationFlags, DeclarationDraft, isEditableDeclarationView, isExtensionAdvertised, ModelDeclarationFields } from "./ModelDeclarationFields";
 import type { ModelDeclarationField, ModelDeclarationPatch, ModelDeclarationState, ModelDeclarationView } from "../api";
 
 type Source = "provider" | "default" | "manual" | "saved";
@@ -229,17 +229,21 @@ export default function ProviderEditor({ initial, runtimeContext, declarationVie
   };
   const s6Applicable = (m: DraftModel) => !fixed && !accountBound && m.model_type === "chat" && (declarationSnapshot !== undefined || !initial.id);
   const declarationInfo = (m: DraftModel) => {
-    const previous = initial.models.find(old => old.alias === m.alias.trim());
-    const view = declarationSnapshot?.[m.alias.trim()];
+    // Keep the row's read identity across alias edits; its draft is not a new model declaration.
+    const previous = m.originalModel ?? initial.models.find(old => old.alias === m.alias.trim());
+    const view = declarationSnapshot?.[previous?.alias ?? m.alias.trim()];
     const changed = !!initial.id && (form.dialect !== initial.dialect || form.base_url.trim() !== initial.base_url.trim()
-      || !!previous && (m.upstream.trim() !== previous.upstream || m.model_type !== previous.model_type || m.upstream_path !== previous.upstream_path));
+      || !!previous && (m.alias.trim() !== previous.alias || m.upstream.trim() !== previous.upstream || m.model_type !== previous.model_type || m.upstream_path !== previous.upstream_path));
     return { view, blocked: changed ? "模型目标已修改，请先保存目标并重新打开，再设置声明。" : previous && !view ? "声明未完整读取，请重新打开配置。" : "" };
   };
   const recordDeclaration = (m: DraftModel, field: ModelDeclarationField, state: ModelDeclarationState) => {
-    if (editingDisabled || !s6Applicable(m) || declarationInfo(m).blocked || declarationInfo(m).view?.read_only) return;
+    const { view, blocked } = declarationInfo(m);
+    if (editingDisabled || !s6Applicable(m) || blocked || (view && !isEditableDeclarationView(view))) return;
     const property = DECLARATION_FIELDS.find(item => item[0] === field)![1];
+    if (property === null && !isExtensionAdvertised(view, field)) return;
     setDeclarationDrafts(previous => ({ ...previous, [m.rowId]: { originalFlags: previous[m.rowId]?.originalFlags ?? declarationFlags(m), fields: { ...previous[m.rowId]?.fields, [field]: state } } }));
-    patchModel(m.rowId, { [property]: state === "supported" });
+    if (property !== null) patchModel(m.rowId, { [property]: state === "supported" });
+    else dirty.current = true;
   };
   const undoDeclaration = (m: DraftModel) => {
     const draft = declarationDrafts[m.rowId]; if (!draft) return;
@@ -283,6 +287,7 @@ export default function ProviderEditor({ initial, runtimeContext, declarationVie
         const remote = incoming[index];
         const fields: Partial<Record<ModelDeclarationField, ModelDeclarationState>> = {};
         for (const [field, property] of DECLARATION_FIELDS) {
+          if (property === null) continue;
           const value = remote[property];
           if (typeof value === "boolean") fields[field] = value ? "supported" : "unsupported";
         }
@@ -454,7 +459,10 @@ export default function ProviderEditor({ initial, runtimeContext, declarationVie
     for (const m of models) {
       const draft = declarationDrafts[m.rowId]; if (!draft || !Object.keys(draft.fields).length) continue;
       const info = declarationInfo(m);
-      if (!s6Applicable(m) || info.blocked || info.view?.read_only) { setMessage({ kind: "err", text: info.blocked || "声明目标已变化，请撤销该行声明改动后再保存。" }); return; }
+      if (!s6Applicable(m) || info.blocked || (info.view && !isEditableDeclarationView(info.view))) { setMessage({ kind: "err", text: info.blocked || "声明目标已变化，请撤销该行声明改动后再保存。" }); return; }
+      if (DECLARATION_FIELDS.some(([field, property]) => property === null && draft.fields[field] !== undefined && !isExtensionAdvertised(info.view, field))) {
+        setMessage({ kind: "err", text: "当前服务未广告该扩展声明，请撤销该行声明改动或重新打开配置。" }); return;
+      }
       const alias = m.alias.trim();
       if (declarations[alias]) { setMessage({ kind: "err", text: "能力声明不能绑定重复别名。" }); return; }
       declarations[alias] = { binding: info.view?.binding ?? "new", revision: info.view?.revision ?? "new", fields: draft.fields };

@@ -511,3 +511,165 @@ async fn s6_new_model_explicit_six_fields_and_unknown_do_not_make_quality_or_fee
     assert!(model.price.is_none());
     assert!(!serde_json::to_string(&v).unwrap().contains("verified"));
 }
+
+#[tokio::test]
+async fn s6_owned_file_v1_to_v2_structured_output_reopens_without_projection() {
+    #[derive(Debug, PartialEq)]
+    struct Evidence {
+        raw: String,
+        model: Value,
+        declaration: Value,
+        field_overrides: String,
+        user_revision: i64,
+    }
+
+    async fn read(db: &Db, id: &str) -> Evidence {
+        let (provider, mut views) = declarations::list_provider_views(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(provider, _)| provider.id == id)
+            .unwrap();
+        assert_eq!(provider.models.len(), 1);
+        assert_eq!(views.len(), 1);
+        let raw = sqlx::query_scalar(
+            "SELECT capability_declarations_json FROM models WHERE provider_id=? AND alias='m'",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let (field_overrides, user_revision) = sqlx::query_as(
+            "SELECT field_overrides_json,user_revision FROM catalog_model_policy WHERE provider_id=? AND alias='m'",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        Evidence {
+            raw,
+            model: serde_json::to_value(&provider.models[0]).unwrap(),
+            declaration: serde_json::to_value(views.remove("m").unwrap()).unwrap(),
+            field_overrides,
+            user_revision,
+        }
+    }
+
+    let path = owned_db_path();
+    let db = Db::connect_path(&path).await.unwrap();
+    let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(journal, "wal");
+    let mut p = provider("owned-s6-v1-v2");
+    p.models[0].supports_stream = false;
+    seed(&db, &p).await;
+    let legacy = view(&db, &p.id).await;
+    assert_eq!(legacy.status, "legacy");
+    assert!(legacy.fields.is_empty());
+    assert!(!repo::list_models_of(db.pool(), &p.id).await.unwrap()[0].supports_stream);
+    p.models[0].supports_stream = true;
+    repo::upsert_provider_config_with_declarations(
+        db.pool(),
+        &p,
+        &patch(&legacy, Field::Stream, State::Supported),
+    )
+    .await
+    .unwrap();
+
+    let v1 = read(&db, &p.id).await;
+    let v1_doc: Value = serde_json::from_str(&v1.raw).unwrap();
+    assert_eq!(v1_doc["version"], 1);
+    assert_eq!(v1_doc["origin"], "local_configuration");
+    assert_eq!(v1_doc["binding"], v1.declaration["binding"]);
+    assert!(uuid::Uuid::parse_str(v1_doc["generation"].as_str().unwrap()).is_ok());
+    assert_eq!(v1_doc["fields"].as_object().unwrap().len(), 1);
+    assert_eq!(v1_doc["fields"]["stream"]["state"], "supported");
+    assert!(
+        v1_doc["fields"]["stream"]["recorded_at_ms"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(v1.declaration["status"], "declared");
+    assert_eq!(v1.declaration["read_only"], false);
+    assert_eq!(v1.declaration["fields"], v1_doc["fields"]);
+    assert_ne!(v1.declaration["revision"], legacy.revision);
+    assert_eq!(v1.model["supports_stream"], true);
+    assert!(v1.model["capabilities"].is_null());
+    assert!(v1.model["price"].is_null());
+    assert_eq!(
+        serde_json::from_str::<Value>(&v1.field_overrides).unwrap(),
+        json!({"supports_stream": true})
+    );
+    db.pool().close().await;
+    drop(db);
+    let db = Db::connect_path(&path).await.unwrap();
+    assert_eq!(read(&db, &p.id).await, v1);
+    eprintln!("S6_V2_LEGACY_CONTROL version=1 field=stream state=supported wal_reopen=true projection=true");
+
+    let changes: Patches = serde_json::from_value(json!({"m": {
+        "binding": &v1.declaration["binding"], "revision": &v1.declaration["revision"],
+        "fields": {"structured_output": "unsupported"}
+    }}))
+    .unwrap_or_else(|error| panic!("S6_V2_WIRE_REJECTED: {error}"));
+    repo::upsert_provider_config_with_declarations(db.pool(), &p, &changes)
+        .await
+        .unwrap();
+
+    let v2 = read(&db, &p.id).await;
+    let v2_doc: Value = serde_json::from_str(&v2.raw).unwrap();
+    assert_eq!(v2_doc["version"], 2);
+    for key in ["origin", "binding", "generation"] {
+        assert_eq!(v2_doc[key], v1_doc[key]);
+    }
+    assert_eq!(v2_doc["fields"].as_object().unwrap().len(), 2);
+    assert_eq!(v2_doc["fields"]["stream"], v1_doc["fields"]["stream"]);
+    let extension = &v2_doc["fields"]["structured_output"];
+    assert_eq!(extension["state"], "unsupported");
+    assert!(extension["recorded_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(v2.declaration["status"], "declared");
+    assert_eq!(v2.declaration["read_only"], false);
+    assert_eq!(v2.declaration["binding"], v1.declaration["binding"]);
+    assert_ne!(v2.declaration["revision"], v1.declaration["revision"]);
+    assert_eq!(v2.declaration["fields"], v2_doc["fields"]);
+    let mut advertised: Vec<_> = v2.declaration["supported_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect();
+    advertised.sort_unstable();
+    assert_eq!(
+        advertised,
+        [
+            "audio",
+            "audio_output",
+            "parallel_tools",
+            "stream",
+            "structured_output",
+            "thinking",
+            "tools",
+            "video",
+            "vision",
+        ]
+    );
+    assert_eq!(v2.model, v1.model);
+    assert_eq!(v2.field_overrides, v1.field_overrides);
+    assert_eq!(v2.user_revision, v1.user_revision + 1);
+
+    assert!(
+        repo::upsert_provider_config_with_declarations(db.pool(), &p, &changes)
+            .await
+            .is_err(),
+        "reusing the v1 revision must not overwrite the v2 winner"
+    );
+    assert_eq!(read(&db, &p.id).await, v2);
+    db.pool().close().await;
+    drop(db);
+    let db = Db::connect_path(&path).await.unwrap();
+    assert_eq!(read(&db, &p.id).await, v2);
+    db.pool().close().await;
+    eprintln!("S6_V2_OWNED_REOPEN version=2 persisted_fields=2 advertised_fields=9 stream_projection=true catalog_revision_delta=1 stale_cas_rejected=true");
+}

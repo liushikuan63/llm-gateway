@@ -16,6 +16,9 @@ pub enum Field {
     Audio,
     Video,
     Stream,
+    ParallelTools,
+    StructuredOutput,
+    AudioOutput,
 }
 
 impl Field {
@@ -27,24 +30,31 @@ impl Field {
         Self::Video,
         Self::Stream,
     ];
-    fn property(self) -> &'static str {
+    pub const EXTENDED: [Self; 3] = [
+        Self::ParallelTools,
+        Self::StructuredOutput,
+        Self::AudioOutput,
+    ];
+    fn property(self) -> Option<&'static str> {
         match self {
-            Self::Tools => "supports_tools",
-            Self::Thinking => "supports_thinking",
-            Self::Vision => "supports_vision",
-            Self::Audio => "supports_audio",
-            Self::Video => "supports_video",
-            Self::Stream => "supports_stream",
+            Self::Tools => Some("supports_tools"),
+            Self::Thinking => Some("supports_thinking"),
+            Self::Vision => Some("supports_vision"),
+            Self::Audio => Some("supports_audio"),
+            Self::Video => Some("supports_video"),
+            Self::Stream => Some("supports_stream"),
+            Self::ParallelTools | Self::StructuredOutput | Self::AudioOutput => None,
         }
     }
-    fn flag(self, m: &ModelRef) -> bool {
+    fn flag(self, m: &ModelRef) -> Option<bool> {
         match self {
-            Self::Tools => m.supports_tools,
-            Self::Thinking => m.supports_thinking,
-            Self::Vision => m.supports_vision,
-            Self::Audio => m.supports_audio,
-            Self::Video => m.supports_video,
-            Self::Stream => m.supports_stream,
+            Self::Tools => Some(m.supports_tools),
+            Self::Thinking => Some(m.supports_thinking),
+            Self::Vision => Some(m.supports_vision),
+            Self::Audio => Some(m.supports_audio),
+            Self::Video => Some(m.supports_video),
+            Self::Stream => Some(m.supports_stream),
+            Self::ParallelTools | Self::StructuredOutput | Self::AudioOutput => None,
         }
     }
 }
@@ -121,6 +131,9 @@ struct Document {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct View {
+    /// Fields recognized by this service; status and read_only still govern editing.
+    /// This advertisement is absent on older DTOs.
+    pub supported_fields: Vec<Field>,
     pub binding: String,
     pub revision: String,
     /// legacy, declared, invalid, or not_applicable. No supplier-proof status.
@@ -211,12 +224,15 @@ fn decode(raw: &str, expected: &str, flags: &BTreeMap<Field, bool>) -> Option<Do
         return None;
     }
     let doc: Document = serde_json::from_str(raw).ok()?;
-    (doc.version == 1
+    (matches!(doc.version, 1 | 2)
+        && (doc.version == 2 || doc.fields.keys().all(|f| f.property().is_some()))
         && doc.origin == "local_configuration"
         && doc.binding == expected
         && uuid::Uuid::parse_str(&doc.generation).is_ok()
         && doc.fields.iter().all(|(field, record)| {
-            record.recorded_at_ms > 0 && flags.get(field) == Some(&record.state.projection())
+            record.recorded_at_ms > 0
+                && (field.property().is_none()
+                    || flags.get(field) == Some(&record.state.projection()))
         }))
     .then_some(doc)
 }
@@ -234,7 +250,7 @@ async fn previous_on(conn: &mut SqliteConnection, id: &str) -> Result<Vec<Previo
             kind: row.get("model_type"),
             flags: Field::ALL
                 .into_iter()
-                .map(|f| (f, row.get::<i64, _>(f.property()) == 1))
+                .filter_map(|f| f.property().map(|key| (f, row.get::<i64, _>(key) == 1)))
                 .collect(),
             raw: row.get("capability_declarations_json"),
         })
@@ -256,6 +272,7 @@ pub async fn list_provider_views(pool: &SqlitePool) -> Result<Vec<(Provider, Vie
         for current in &previous {
             let bound = old_binding(&owner, current)?;
             let mut view = View {
+                supported_fields: Field::ALL.into_iter().chain(Field::EXTENDED).collect(),
                 binding: bound.clone(),
                 revision: revision(&owner, current)?,
                 status: "legacy",
@@ -361,7 +378,7 @@ pub(crate) async fn prepare_on(
         if patch
             .fields
             .iter()
-            .any(|(f, state)| f.flag(m) != state.projection())
+            .any(|(f, state)| f.flag(m).is_some_and(|flag| flag != state.projection()))
         {
             return Err(invalid("能力声明与布尔投影不一致"));
         }
@@ -394,16 +411,18 @@ pub(crate) async fn finish_on(
             if old_binding(owner, row)? == bound {
                 if let Some(raw) = &row.raw {
                     if let Some(mut doc) = decode(raw, &bound, &row.flags) {
-                        // Old bool clients retain unchanged states. A bool edit
-                        // without a declaration invalidates that field's claim.
-                        doc.fields
-                            .retain(|f, _| row.flags.get(f) == Some(&f.flag(m)));
+                        // Old bool clients retain extensions and unchanged legacy states.
+                        // A bool edit without a declaration invalidates only that field.
+                        doc.fields.retain(|f, _| {
+                            !f.flag(m)
+                                .is_some_and(|flag| row.flags.get(f) != Some(&flag))
+                        });
                         document = Some(doc);
                     } else {
-                        if Field::ALL
-                            .iter()
-                            .any(|f| row.flags.get(f) != Some(&f.flag(m)))
-                        {
+                        if Field::ALL.iter().any(|f| {
+                            f.flag(m)
+                                .is_some_and(|flag| row.flags.get(f) != Some(&flag))
+                        }) {
                             return Err(invalid("未知版本声明只读；本次未保存"));
                         }
                         opaque = Some(raw.clone());
@@ -429,20 +448,29 @@ pub(crate) async fn finish_on(
                     },
                 );
             }
-            document = Some(doc);
-            let policy: Option<String> = sqlx::query_scalar("SELECT field_overrides_json FROM catalog_model_policy WHERE provider_id=? AND alias=?")
-                .bind(&provider.id).bind(&m.alias).fetch_optional(&mut *conn).await?;
-            let mut flags: BTreeMap<String, serde_json::Value> = policy
-                .map(|s| serde_json::from_str(&s).map_err(|_| invalid("模型目录覆盖记录无效")))
-                .transpose()?
-                .unwrap_or_default();
-            for field in patch.fields.keys() {
-                flags.insert(field.property().into(), serde_json::Value::Bool(true));
+            if doc.fields.keys().any(|f| f.property().is_none()) {
+                doc.version = 2;
             }
-            let flags =
-                serde_json::to_string(&flags).map_err(|_| invalid("无法编码目录覆盖记录"))?;
-            sqlx::query("INSERT INTO catalog_model_policy(provider_id,alias,upstream_id,managed_by,user_override,user_revision,field_overrides_json,created_at,updated_at) VALUES(?,?,?,'user','none',1,?,?,?) ON CONFLICT(provider_id,alias) DO UPDATE SET managed_by=CASE WHEN catalog_model_policy.upstream_id=excluded.upstream_id THEN catalog_model_policy.managed_by ELSE 'user' END,upstream_id=excluded.upstream_id,user_revision=catalog_model_policy.user_revision+1,field_overrides_json=excluded.field_overrides_json,updated_at=excluded.updated_at")
+            document = Some(doc);
+            // Only a legacy field owns a catalog bool override. The surrounding
+            // provider save still advances its normal catalog revision.
+            if patch.fields.keys().any(|f| f.property().is_some()) {
+                let policy: Option<String> = sqlx::query_scalar("SELECT field_overrides_json FROM catalog_model_policy WHERE provider_id=? AND alias=?")
+                .bind(&provider.id).bind(&m.alias).fetch_optional(&mut *conn).await?;
+                let mut flags: BTreeMap<String, serde_json::Value> = policy
+                    .map(|s| serde_json::from_str(&s).map_err(|_| invalid("模型目录覆盖记录无效")))
+                    .transpose()?
+                    .unwrap_or_default();
+                for field in patch.fields.keys() {
+                    if let Some(property) = field.property() {
+                        flags.insert(property.into(), serde_json::Value::Bool(true));
+                    }
+                }
+                let flags =
+                    serde_json::to_string(&flags).map_err(|_| invalid("无法编码目录覆盖记录"))?;
+                sqlx::query("INSERT INTO catalog_model_policy(provider_id,alias,upstream_id,managed_by,user_override,user_revision,field_overrides_json,created_at,updated_at) VALUES(?,?,?,'user','none',1,?,?,?) ON CONFLICT(provider_id,alias) DO UPDATE SET managed_by=CASE WHEN catalog_model_policy.upstream_id=excluded.upstream_id THEN catalog_model_policy.managed_by ELSE 'user' END,upstream_id=excluded.upstream_id,user_revision=catalog_model_policy.user_revision+1,field_overrides_json=excluded.field_overrides_json,updated_at=excluded.updated_at")
                 .bind(&provider.id).bind(&m.alias).bind(&m.upstream).bind(flags).bind(now).bind(now).execute(&mut *conn).await?;
+            }
         }
         // A nullable legacy row is not backfilled by migration. On a normal
         // save only, an empty envelope carries a server generation, not a field
