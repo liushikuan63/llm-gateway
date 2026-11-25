@@ -2174,3 +2174,51 @@ async fn gemini_account_thought_signature_ingress_rejects_qoder() {
         "R142 Qoder account cases: {failures:?}"
     );
 }
+
+#[tokio::test]
+async fn gemini_account_tool_scheduling_ingress_rejects_qoder() {
+    use crate::proxy::workbuddy_gateway_tests::{
+        assert_owned_gemini_scheduling_projection, check_owned_gemini_scheduling_ingress,
+        start_owned_gemini_http,
+    };
+
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [(Region::Global, "global"), (Region::Cn, "cn")] {
+        let f = setup().await;
+        let g = gateway(&f, region, false).await;
+        // With a declaration, the default fixture requests another tool call.
+        // This scenario needs the same completion with and without declarations.
+        *f.fixture.response.lock() = Some(normal_response());
+        let ordinary = start_owned_gemini_http(&g.state, "qoder-fixture-provider", true).await;
+        check_owned_gemini_scheduling_ingress(
+            (&http, g.url.as_str(), "synthetic-gateway-key"),
+            &format!("Qoder/{label}"),
+            "OK",
+            || {
+                (
+                    f.fixture.posts.load(Ordering::SeqCst),
+                    f.fixture.catalogs.load(Ordering::SeqCst),
+                    ordinary.posts(),
+                )
+            },
+            |expected_result, case| {
+                let requests = f.fixture.requests.lock();
+                let (target, wire) = requests.last().unwrap();
+                assert_eq!(target, label, "{case}");
+                assert_owned_gemini_scheduling_projection(wire, expected_result, case);
+            },
+            &mut failures,
+        )
+        .await;
+        assert_eq!(ordinary.posts(), 0, "Qoder/{label} same-alias fallback");
+    }
+    assert!(
+        failures.is_empty(),
+        "R143 Qoder account cases: {failures:?}"
+    );
+}

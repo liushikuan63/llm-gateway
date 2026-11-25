@@ -3092,3 +3092,247 @@ async fn gemini_account_thought_signature_ingress_rejects_workbuddy() {
         "R142 WorkBuddy account cases: {failures:?}"
     );
 }
+
+const OWNED_R143_GEMINI_REJECTS: [(&str, OwnedGeminiScheduling); 4] = [
+    ("continuing", OwnedGeminiScheduling::Continuing),
+    ("silent", OwnedGeminiScheduling::Silent),
+    ("interrupt", OwnedGeminiScheduling::Interrupt),
+    ("non-blocking", OwnedGeminiScheduling::NonBlocking),
+];
+const OWNED_R143_GEMINI_CONTROLS: [(&str, OwnedGeminiScheduling); 4] = [
+    ("absent", OwnedGeminiScheduling::Absent),
+    ("explicit-default", OwnedGeminiScheduling::ExplicitDefault),
+    ("unspecified", OwnedGeminiScheduling::Unspecified),
+    ("nested-business", OwnedGeminiScheduling::NestedBusiness),
+];
+
+#[derive(Clone, Copy)]
+enum OwnedGeminiScheduling {
+    Continuing,
+    Silent,
+    Interrupt,
+    NonBlocking,
+    Absent,
+    ExplicitDefault,
+    Unspecified,
+    NestedBusiness,
+}
+
+fn owned_gemini_scheduling_schema() -> Value {
+    json!({"type":"object","properties":{"query":{"type":"string"}}})
+}
+
+fn owned_gemini_scheduling_input(kind: OwnedGeminiScheduling) -> Value {
+    let mut body = owned_gemini_signature_history();
+    body["tools"] = json!([{"functionDeclarations":[{
+        "name":"lookup","description":"owned lookup","parameters":owned_gemini_scheduling_schema()
+    }]}]);
+    let mut declaration_behavior = None;
+    let response = &mut body["contents"][2]["parts"][0]["functionResponse"];
+    match kind {
+        OwnedGeminiScheduling::Continuing => response["willContinue"] = json!(true),
+        OwnedGeminiScheduling::Silent => response["scheduling"] = json!("SILENT"),
+        OwnedGeminiScheduling::Interrupt => response["scheduling"] = json!("INTERRUPT"),
+        OwnedGeminiScheduling::NonBlocking => declaration_behavior = Some("NON_BLOCKING"),
+        OwnedGeminiScheduling::Absent => {}
+        OwnedGeminiScheduling::ExplicitDefault => {
+            response["willContinue"] = json!(false);
+            response["scheduling"] = json!("WHEN_IDLE");
+            declaration_behavior = Some("BLOCKING");
+        }
+        OwnedGeminiScheduling::Unspecified => {
+            response["scheduling"] = json!("SCHEDULING_UNSPECIFIED")
+        }
+        OwnedGeminiScheduling::NestedBusiness => {
+            response["response"]["willContinue"] = json!(true);
+            response["response"]["scheduling"] = json!("INTERRUPT");
+            response["response"]["behavior"] = json!("NON_BLOCKING");
+        }
+    }
+    if let Some(behavior) = declaration_behavior {
+        body["tools"][0]["functionDeclarations"][0]["behavior"] = json!(behavior);
+    }
+    body
+}
+
+fn owned_gemini_scheduling_response(input: &Value) -> &Value {
+    &input["contents"][2]["parts"][0]["functionResponse"]["response"]
+}
+
+pub(super) fn assert_owned_gemini_scheduling_projection(
+    wire: &Value,
+    expected_result: &Value,
+    case: &str,
+) {
+    assert_owned_gemini_signature_projection(wire, expected_result, case);
+    let tools = wire["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1, "{case}");
+    let function = &tools[0]["function"];
+    assert_eq!(function["name"], "lookup", "{case}");
+    assert_eq!(function["description"], "owned lookup", "{case}");
+    assert_eq!(
+        function["parameters"],
+        owned_gemini_scheduling_schema(),
+        "{case}"
+    );
+}
+
+pub(super) async fn check_owned_gemini_scheduling_ingress(
+    endpoint: OwnedGeminiEndpoint<'_>,
+    adapter: &str,
+    account_answer: &str,
+    counts: impl Fn() -> (usize, usize, usize),
+    check_projection: impl Fn(&Value, &str),
+    failures: &mut Vec<String>,
+) {
+    assert_eq!(counts(), (0, 0, 0), "{adapter}: start with cold counters");
+    for stream in [false, true] {
+        for (shape, kind) in OWNED_R143_GEMINI_REJECTS {
+            let before = counts();
+            let input = owned_gemini_scheduling_input(kind);
+            let reply = post_owned_gemini(endpoint, "public", &input, stream, shape).await;
+            let status = reply.status().as_u16();
+            let headers = reply.headers().clone();
+            let body = reply.text().await.unwrap();
+            let error = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            let expected_error = headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json"))
+                && !headers.contains_key("x-routed-via")
+                && !headers.contains_key("x-cache")
+                && !body.lines().any(|line| line.starts_with("data:"))
+                && !body.contains("[DONE]")
+                && error["error"]["type"] == "invalid_request_error"
+                && error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.ends_with("unsupported_account_content_part"));
+            let after = counts();
+            let witness = format!(
+                "R143 {adapter} {shape} stream={stream} status={status} physical(post,catalog,http)={before:?}->{after:?} expected_json_error={expected_error}"
+            );
+            eprintln!("{witness}");
+            if status != 400 || after != before || !expected_error {
+                failures.push(witness);
+            }
+        }
+    }
+
+    for stream in [false, true] {
+        for (shape, kind) in OWNED_R143_GEMINI_CONTROLS {
+            let before = counts();
+            let input = owned_gemini_scheduling_input(kind);
+            let case = format!("{adapter} {shape} stream={stream}");
+            let reply = post_owned_gemini(endpoint, "public", &input, stream, shape).await;
+            assert_owned_gemini_reply(reply, stream, account_answer, &case).await;
+            let after = counts();
+            assert_eq!(after, (before.0 + 1, 1, before.2), "{case}");
+            check_projection(owned_gemini_scheduling_response(&input), &case);
+            eprintln!("R143 {case} status=200 physical(post,catalog,http)={before:?}->{after:?} control=ok");
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_account_tool_scheduling_ingress_rejects_workbuddy() {
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (region, label) in [
+        (WorkBuddyRegion::Global, "global"),
+        (WorkBuddyRegion::Cn, "cn"),
+    ] {
+        let s = setup_region(region).await;
+        // Use the existing optional fixture response for plain completion
+        // instead of requesting another tool call whenever tools are declared.
+        *s.fixture.usage_frames.lock() = Some(vec![json!({
+            "prompt_tokens":10,"completion_tokens":3,"total_tokens":13
+        })]);
+        let ordinary = start_owned_gemini_http(&s.gateway, "wb-gateway-provider", true).await;
+        let counts = || {
+            (
+                s.fixture.posts.load(Ordering::SeqCst),
+                s.fixture.catalog_reads.load(Ordering::SeqCst),
+                ordinary.posts(),
+            )
+        };
+        let endpoint = (&http, s.url.as_str(), "offline-gateway-key");
+        check_owned_gemini_scheduling_ingress(
+            endpoint,
+            &format!("WorkBuddy/{label}"),
+            "answer",
+            counts,
+            |expected_result, case| {
+                let requests = s.fixture.requests.lock();
+                assert_owned_gemini_scheduling_projection(
+                    requests.last().unwrap(),
+                    expected_result,
+                    case,
+                );
+            },
+            &mut failures,
+        )
+        .await;
+        assert_eq!(ordinary.posts(), 0, "WorkBuddy/{label} same-alias fallback");
+        if region == WorkBuddyRegion::Global {
+            for stream in [false, true] {
+                for (shape, kind) in OWNED_R143_GEMINI_REJECTS {
+                    let input = owned_gemini_scheduling_input(kind);
+                    let before = counts();
+                    let case = format!("HTTP/global {shape} stream={stream}");
+                    let reply =
+                        post_owned_gemini(endpoint, "owned-gemini-http", &input, stream, shape)
+                            .await;
+                    assert_owned_gemini_reply(reply, stream, "ordinary answer", &case).await;
+                    let after = counts();
+                    assert_eq!(after, (before.0, before.1, before.2 + 1), "{case}");
+                    let requests = ordinary.requests.lock();
+                    let (stream_on_wire, wire) = requests.last().unwrap();
+                    assert_eq!(*stream_on_wire, stream, "{case}");
+                    let parts = wire["contents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|entry| entry["parts"].as_array().unwrap())
+                        .collect::<Vec<_>>();
+                    let call = parts
+                        .iter()
+                        .find_map(|part| part.get("functionCall"))
+                        .unwrap();
+                    assert_eq!(call["name"], "lookup", "{case}");
+                    assert_eq!(call["args"], json!({"query":"owned"}), "{case}");
+                    let result = parts
+                        .iter()
+                        .find_map(|part| part.get("functionResponse"))
+                        .unwrap();
+                    assert_eq!(result["name"], "lookup", "{case}");
+                    assert_eq!(
+                        &result["response"],
+                        owned_gemini_scheduling_response(&input),
+                        "{case}"
+                    );
+                    let declaration = &wire["tools"][0]["functionDeclarations"][0];
+                    assert_eq!(declaration["name"], "lookup", "{case}");
+                    assert_eq!(declaration["description"], "owned lookup", "{case}");
+                    assert_eq!(
+                        declaration["parameters"],
+                        owned_gemini_scheduling_schema(),
+                        "{case}"
+                    );
+                    drop(requests);
+                    eprintln!("R143 {case} status=200 physical(post,catalog,http)={before:?}->{after:?} control=ok");
+                }
+            }
+        }
+        assert_eq!(s.fixture.backup_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.retryable_primary_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(s.fixture.unexpected.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        failures.is_empty(),
+        "R143 WorkBuddy account cases: {failures:?}"
+    );
+}

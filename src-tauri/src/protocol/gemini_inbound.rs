@@ -40,10 +40,10 @@ pub fn strip_models_prefix(raw: &str) -> &str {
 }
 
 pub(crate) fn account_ingress_shape(body: &Value) -> super::openai::AccountIngressShape {
-    // GeminiPart does not keep these code parts or opaque signatures.
+    // Normalization drops code parts, opaque signatures and tool scheduling controls.
     // Record only the loss so account routes can reject before dispatch.
     let mut shape = super::openai::AccountIngressShape::default();
-    if body
+    let unsupported_part = body
         .get("contents")
         .and_then(Value::as_array)
         .into_iter()
@@ -60,8 +60,25 @@ pub(crate) fn account_ingress_shape(body: &Value) -> super::openai::AccountIngre
                         part.get(key)
                             .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
                     })
-        })
-    {
+                || part.get("functionResponse").is_some_and(|response| {
+                    response.get("willContinue").and_then(Value::as_bool) == Some(true)
+                        || matches!(
+                            response.get("scheduling").and_then(Value::as_str),
+                            Some("SILENT" | "INTERRUPT")
+                        )
+                })
+        });
+    let unsupported_declaration = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("functionDeclarations").and_then(Value::as_array))
+        .flatten()
+        .any(|declaration| {
+            declaration.get("behavior").and_then(Value::as_str) == Some("NON_BLOCKING")
+        });
+    if unsupported_part || unsupported_declaration {
         shape.note_unsupported_part();
     }
     shape

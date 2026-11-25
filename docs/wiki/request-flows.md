@@ -553,6 +553,12 @@ NativeExact、动作判定及原请求解析错误保留既有优先级；普通
 
 NativeExact、动作判定和请求解析仍沿用原来的顺序。普通 HTTP 继续使用原有转换；同一输入能够派发，并不表示签名被保真转发。自有回环覆盖两个账号适配器各两区的缓冲和流式拒绝，以及合法工具历史和普通 Gemini HTTP 对照；真实账号续接另行验收。
 
+### R5-P 普通 Gemini 的工具调度控制
+
+普通 Gemini 的 generateContent 和 streamGenerateContent 在兼容转换前识别 `contents[*].parts[*].functionResponse` 直属的 `willContinue: true`（JSON 布尔值）、`scheduling: SILENT` 或 `INTERRUPT`，以及 `tools[*].functionDeclarations[*].behavior: NON_BLOCKING`。转换无法保留这些语义，选中的 Qoder 或 WorkBuddy 账号路线返回 HTTP 400（`unsupported_account_content_part`），不查询该账号的模型目录、不发送模型请求。缺省、`false`、`WHEN_IDLE`、`SCHEDULING_UNSPECIFIED`、`BLOCKING` 和工具结果业务 JSON 中的同名字段不触发此规则。
+
+NativeExact、动作判定和既有解析错误保留原顺序；普通 HTTP 继续使用现有转换。自有回环覆盖两种账号适配器各两区的缓冲和流式请求、合法工具历史及同一输入的普通 Gemini HTTP 对照。普通 HTTP 成功不表示透传了调度控制；真实账号另行验收。
+
 ### N4 原生上游的流终态
 
 
