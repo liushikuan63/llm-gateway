@@ -169,14 +169,35 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
     }
 
     let disposed = false;
-    const version = ++configReadVersionRef.current;
-    const current = () => !disposed && version === configReadVersionRef.current;
-    configReadPendingRef.current = true;
     setConfigState("loading");
     setCopyFeedback(null);
+    const readConfig = () => {
+      const version = ++configReadVersionRef.current;
+      const current = () => !disposed && version === configReadVersionRef.current;
+      configReadPendingRef.current = true;
+      void api.getConfig()
+        .then((next) => {
+          if (!current()) return;
+          setConfig(next);
+          setConfigState("ready");
+          setCopyFeedback(null);
+        })
+        .catch(() => {
+          if (!current()) return;
+          setConfig(null);
+          setConfigState("unavailable");
+        })
+        .finally(() => {
+          if (current()) configReadPendingRef.current = false;
+        });
+    };
     const onConfigChanged = (event: Event) => {
       const next = (event as CustomEvent<AppConfig>).detail;
-      if (!next) return;
+      if (!next) {
+        // A narrow save invalidates the snapshot without supplying a replacement.
+        readConfig();
+        return;
+      }
       // A confirmed newer notification owns this snapshot. An earlier read's
       // success, failure or finally must not overwrite it or revive old state.
       ++configReadVersionRef.current;
@@ -186,20 +207,7 @@ export default function App({ bootWarning = null }: { bootWarning?: string | nul
       setCopyFeedback(null);
     };
     window.addEventListener("llm-gateway-config-changed", onConfigChanged);
-    void api.getConfig()
-      .then((next) => {
-        if (!current()) return;
-        setConfig(next);
-        setConfigState("ready");
-      })
-      .catch(() => {
-        if (!current()) return;
-        setConfig(null);
-        setConfigState("unavailable");
-      })
-      .finally(() => {
-        if (current()) configReadPendingRef.current = false;
-      });
+    readConfig();
     return () => {
       disposed = true;
       ++configReadVersionRef.current;

@@ -3116,6 +3116,12 @@ if (require.main === module) (async () => {
       if(focus==='help-menu-keyboard') {const proof=await require('./help-menu-ui.cjs').verifyHelpMenu(browser,baseUrl,output);assert.equal(proof.passed,true);console.log('UI_FOCUS_OK: help-menu-keyboard');return;}
       if(focus==='stack-overflow') {await require('./stack-overflow-ui.cjs').verifyStackOverflow(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: stack-overflow');return;}
       if(focus==='search-settings-read-state') {await require('./search-settings-read-state-ui.cjs').verifySearchSettingsReadState(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: search-settings-read-state');return;}
+      if (focus === "search-settings-save") {
+        await require("./search-settings-save-ui.cjs").verifySearchSettingsSave(browser, baseUrl, output, errors, fixture);
+        assert.deepEqual(errors, []);
+        console.log("UI_FOCUS_OK: search-settings-save; screenshots=" + output);
+        return;
+      }
       if(focus==='manual-search-cancel') {await require('./manual-search-cancel-ui.cjs').verifyManualSearchCancel(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: manual-search-cancel');return;}
       if(focus==='cli-readback') {await require('./cli-readback-ui.cjs').verifyCliReadback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: cli-readback');return;}
       if(focus==='settings-mutation-recovery') {await require('./settings-mutation-recovery-ui.cjs').verifySettingsMutationRecovery(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: settings-mutation-recovery');return;}
@@ -3282,6 +3288,9 @@ if (require.main === module) (async () => {
     await require('./cli-readback-ui.cjs').verifyCliReadback(browser,baseUrl,output,errors,fixture);
     await require('./manual-search-cancel-ui.cjs').verifyManualSearchCancel(browser,baseUrl,output,errors,fixture);
     await require('./search-settings-read-state-ui.cjs').verifySearchSettingsReadState(browser,baseUrl,output,errors,fixture);
+    if (process.env.LLMGW_UI_ASSETS === "dist") {
+      await require("./search-settings-save-ui.cjs").verifySearchSettingsSave(browser, baseUrl, path.join(output, "search-settings-save"), errors, fixture);
+    }
     await verifyVpnPage(browser, errors);
     await verifyVpnKernel(browser, errors);
     await verifyWorkBuddyLogin(browser, errors);

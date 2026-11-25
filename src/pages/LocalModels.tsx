@@ -99,7 +99,7 @@ export default function LocalModelsPage() {
 
       {tab === "runtimes" && <RuntimesSection cfg={cfg} onSave={saveConfig} />}
       {tab === "smart" && <SmartSection cfg={cfg} onSave={saveConfig} />}
-      {tab === "search" && <SearchSection cfg={cfg} onSave={saveConfig} />}
+      {tab === "search" && <SearchSection />}
     </>
   );
 }
@@ -1052,7 +1052,7 @@ function searchProxyValid(raw:string):boolean {
 
 // Source/deadline/partial-result design: docs/wiki/search.md.
 type SearchProbeJob = { id: string | null; ticket: number; ready: boolean; leaving: boolean; cancelPending: boolean; cancelAccepted: boolean };
-function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig) => Promise<AppConfig> }) {
+function SearchSection() {
   const [settings, setSettings] = useState<SearchSettingsView | null>(null);
   const [readLoading, setReadLoading] = useState(true);
   const [readError, setReadError] = useState<string | null>(null);
@@ -1194,20 +1194,13 @@ function SearchSection({ cfg, onSave }: { cfg: AppConfig; onSave: (c: AppConfig)
       setOutcome(null); setOutcomeInput(null); setOutcomeUnconfirmed(false);
       setKeyInput("");
       setClearKey(false);
-      // 搜索开关与结果条数也影响网关运行时行为，必须落回 config。
-      const nextCfg = await api.getConfig();
-      if(alive.current&&ticket===sequence.current)await setCfgThroughParent(nextCfg);
+      // 专用命令已持久化并发布。只通知读取方刷新，避免把旧整配置写回。
+      window.dispatchEvent(new Event("llm-gateway-config-changed"));
     } catch (error) {
       if(alive.current&&ticket===sequence.current)setMessage({ kind: "err", text: errorMessage(error) });
     } finally {
       saving.current=false;if(alive.current&&ticket===sequence.current)setBusy(false);
     }
-  };
-
-  // 搜索设置有一部分存在 config.toml（开关、后端、条数），有一部分在加密表里。
-  // 保存后要把 config 同步回父组件，路由运行时才拿得到最新值。
-  const setCfgThroughParent = async (next: AppConfig) => {
-    await onSave(next);
   };
 
   const recoverStack = async () => {
