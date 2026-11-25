@@ -3176,6 +3176,12 @@ if (require.main === module) (async () => {
       if(focus==='chat-reply-observation') {await require('./chat-reply-observation-ui.cjs').verifyReplyObservation(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-reply-observation; screenshots=${output}`);return;}
       if(focus==='chat-stream') {await require('./chat-stream-ui.cjs').verifyChatStream(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-stream; screenshots=${output}`);return;}
       if(focus==='chat-cancel') {await require('./chat-cancel-ui.cjs').verifyChatCancellation(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: chat-cancel; screenshots=${output}`);return;}
+      if (focus === "client-usage-table") {
+        await require("./client-usage-table-ui.cjs").verifyClientUsageTable(browser, baseUrl, output, errors, fixture);
+        assert.deepEqual(errors, []);
+        console.log("UI_FOCUS_OK: client-usage-table; screenshots=" + output);
+        return;
+      }
       if (focus === "stats-model-spend") {
         await require("./stats-model-spend-ui.cjs").verifyStatsModelSpend(browser, baseUrl, output, errors, fixture);
         assert.deepEqual(errors, []);
@@ -3268,6 +3274,7 @@ if (require.main === module) (async () => {
     await failedSettingsContext.close();
     if (process.env.LLMGW_UI_ASSETS === "dist") {
       await require("./stats-model-spend-ui.cjs").verifyStatsModelSpend(browser, baseUrl, path.join(output, "stats-model-spend"), errors, fixture);
+      await require("./client-usage-table-ui.cjs").verifyClientUsageTable(browser, baseUrl, path.join(output, "client-usage-table"), errors, fixture);
     }
     await verifyAsyncPages(browser, errors);
     await require('./settings-save-readback-ui.cjs').verifySettingsSaveReadback(browser,baseUrl,output,errors,fixture);

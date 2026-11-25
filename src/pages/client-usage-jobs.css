@@ -4,6 +4,10 @@
 .client-usage-job { margin-top: 12px; overflow-wrap: anywhere; }
 .client-usage-job progress { width: min(100%, 360px); accent-color: var(--accent); }
 .client-usage-panel button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.client-usage-table-scroll { overflow-x: auto; max-inline-size: 100%; margin-top: 16px; }
+.client-usage-table-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.client-usage-table-scroll .client-usage-identifier { display: block; max-inline-size: 28ch; overflow-wrap: break-word; }
+.client-usage-table-scroll .client-usage-fee-column { min-inline-size: 9rem; }
 @media (max-width: 460px) {
   .client-usage-controls > label { width: 100%; }
   .client-usage-controls > button { flex: 1 1 120px; }
