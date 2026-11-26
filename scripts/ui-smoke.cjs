@@ -3209,6 +3209,7 @@ if (require.main === module) (async () => {
       if(focus==='tps-idle-age') {await require('./tps-idle-age-ui.cjs').verifyTpsIdleAge(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: tps-idle-age; screenshots=${output}`);return;}
       if(focus==='capability-explain-state') {await require('./capability-explain-state-ui.cjs').verifyCapabilityExplainState(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: capability-explain-state; screenshots=${output}`);return;}
       if(focus==='conversation-feedback') {await require('./conversation-feedback-ui.cjs').verifyConversationFeedback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: conversation-feedback');return;}
+      if(focus==='conversation-feedback-snapshot') {await require('./conversation-feedback-ui.cjs').verifyConversationFeedbackSnapshot(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: conversation-feedback-snapshot; screenshots='+output);return;}
       if(focus==='s6-declaration-readback') {await require('./s6-declaration-readback-ui.cjs').verifyS6DeclarationReadback(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: s6-declaration-readback');return;}
       if(focus==='request-decision-scoring') {await require('./request-decision-scoring-ui.cjs').verifyRequestDecisionScoring(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log('UI_FOCUS_OK: request-decision-scoring');return;}
       if(focus==='request-decision'||focus==='request-decision-typed'||focus==='request-decision-native'||focus==='request-decision-auxiliary') {await require('./request-decision-ui.cjs').verifyRequestDecision(browser,baseUrl,output,errors,fixture);assert.deepEqual(errors,[]);console.log(`UI_FOCUS_OK: ${focus}; screenshots=${output}`);return;}
@@ -3328,6 +3329,9 @@ if (require.main === module) (async () => {
       await require("./search-settings-save-ui.cjs").verifySearchSettingsSave(browser, baseUrl, path.join(output, "search-settings-save"), errors, fixture);
       await require("./s6-v2-owned-ui.cjs").verifyS6V2Owned(browser, baseUrl, path.join(output, "s6-v2-owned"), errors, fixture);
       await require("./ux5-chat-receipts-ui.cjs").verifyUx5ChatReceipts(browser, baseUrl, path.join(output, "ux5-chat-receipts"), errors, fixture);
+      const conversationSnapshotOutput = path.join(output, "conversation-feedback-snapshot");
+      fs.mkdirSync(conversationSnapshotOutput);
+      await require("./conversation-feedback-ui.cjs").verifyConversationFeedbackSnapshot(browser, baseUrl, conversationSnapshotOutput, errors, fixture);
     }
     await verifyVpnPage(browser, errors);
     await verifyVpnKernel(browser, errors);

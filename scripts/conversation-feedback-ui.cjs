@@ -131,3 +131,228 @@ async function verifyConversationFeedback(browser,baseUrl,output,errors,fixture)
 
 module.exports={verifyConversationFeedback};
 
+
+// R150: one compiled probe for focus and standard smoke; keep the original cases intact.
+async function verifyConversationFeedbackSnapshot(browser,baseUrl,output,errors,fixture){
+ const origin='https://llmgw-fixture.invalid',session='owned-r150-task-a';
+ const changed='2026-10-20T00:00',from=Math.floor(Date.parse(changed+'Z')/1000);
+ const storage='会话统计读取失败，未生成统计。',empty='无可归组会话，不代表没有请求或质量为0。';
+ assert.equal(process.env.LLMGW_UI_ASSETS,'dist','R150 requires compiled assets');
+ assert.equal(baseUrl,origin,'R150 requires the exact fixture origin');
+ const proof={scope:'compiled browser; owned summary and detail IPC only',checks:[],snapshots:{},reads:[],details:[],ipc:[],
+  deniedIPC:[],foreignRequests:[],consoleErrors:[],pageErrors:[],screenshots:[],passed:false,verdict:'invalid'};
+ const result=path.join(output,'conversation-feedback-snapshot-proof.json');
+ assert(!fs.existsSync(result),'R150 receipt already exists');
+ const check=(name,pass)=>{proof.checks.push({name,passed:Boolean(pass)});};
+ const checked=(name,pass)=>{check(name,pass);assert(pass,name);};
+ const errorText=e=>String(e?.message??e);
+ let context,failure,cleanups=0;
+ try{
+  context=await browser.newContext({viewport:{width:1440,height:1100},timezoneId:'UTC',
+   serviceWorkers:'block',acceptDownloads:false});
+  await context.route('**/*',async route=>{
+   const request=route.request();
+   if(new URL(request.url()).origin===origin&&request.method()==='GET')return route.fallback();
+   proof.foreignRequests.push(request.method()+' '+request.url());
+   return route.abort();
+  });
+  await context.routeWebSocket('**/*',ws=>{
+   proof.foreignRequests.push('WS '+ws.url());ws.close({code:1008,reason:'owned fixture'});
+  });
+  let pages=0;
+  context.on('page',page=>{
+   page.on('console',m=>{if(m.type()==='error')proof.consoleErrors.push(m.text());});
+   page.on('pageerror',e=>proof.pageErrors.push(errorText(e)));
+   page.on('download',()=>proof.foreignRequests.push('DOWNLOAD'));
+   if(++pages>1){proof.foreignRequests.push('POPUP');void page.close().catch(()=>{});}
+  });
+  await context.addInitScript('if (location.origin === '+JSON.stringify(origin)+') {('+
+   fixture.toString()+')();('+installConversationFeedbackSnapshot.toString()+')();}');
+  const page=await context.newPage();page.setDefaultTimeout(6000);
+  await page.goto(baseUrl);
+  await page.getByRole('navigation',{name:'主导航'}).getByRole('button',{name:'用量与审计',exact:true}).click();
+  const panel=page.getByRole('region',{name:'完整会话任务'}),read=panel.getByRole('button',{name:'读取会话归组',exact:true});
+  const task=panel.getByRole('row').filter({hasText:session}),marker=panel.getByTestId('conversation-feedback-stale');
+  const notice=panel.getByRole('alert').filter({hasText:storage}),emptyState=panel.getByText(empty,{exact:true});
+  const unread=panel.getByText('尚未读取会话资料。',{exact:true}),busy=panel.getByText('正在读取会话资料…',{exact:true});
+  await unread.waitFor();
+  const state=()=>page.evaluate(()=>structuredClone(window.__r150Snapshot));
+  checked('cold-has-no-implicit-summary-read',(await state()).reads.length===0);
+  const take=async phase=>{
+   const name='conversation-feedback-snapshot-'+phase+'.png';
+   await panel.screenshot({path:path.join(output,name),animations:'disabled'});
+   proof.screenshots.push(name);
+  };
+  const inspect=async phase=>{
+   const facts={task:await task.isVisible(),stale:await marker.isVisible(),staleNodes:await marker.count(),
+    staleText:(await marker.allTextContents()).join(' '),error:await notice.isVisible(),empty:await emptyState.isVisible()};
+   proof.snapshots[phase]=facts;return facts;
+  };
+  const next=panel.getByRole('button',{name:'会话任务下一页',exact:true});
+  const prev=panel.getByRole('button',{name:'会话任务上一页',exact:true});
+  const details=panel.getByRole('region',{name:'会话请求明细',exact:true});
+  const detailButton=panel.getByRole('button',{name:'会话请求 aaaaaaaa',exact:true});
+  const detailTask={session_id:session,group_id:'a'.repeat(64)};
+  const request=async (phase,outcome,expectedFilter={},offset=0,button=read)=>{
+   const start=(await state()).reads.length;
+   const want={filter:expectedFilter,page:{limit:50,offset}};
+   await page.evaluate(expected=>{
+    const s=window.__r150Snapshot;
+    if(s.expected!==null)throw new Error('R150 fixture request already armed');
+    s.expected=expected;
+   },{command:'get_conversation_feedback',phase,outcome,args:want,session});
+   await button.click();
+   await page.waitForFunction(n=>window.__r150Snapshot.reads.length===n,start+1);
+   const after=await state();
+   assert.deepEqual(after.reads[start],{phase,outcome,args:want});
+   assert.equal(after.expected,null);
+   await busy.waitFor({state:'hidden'});
+  };
+  const openDetail=async()=>{
+   const want={task:detailTask,filter:{},afterId:null,limit:100};
+   await page.evaluate(expected=>{
+    const s=window.__r150Snapshot;
+    if(s.expected!==null)throw new Error('R150 fixture request already armed');
+    s.expected=expected;
+   },{command:'get_conversation_requests',phase:'detail-before-failure',outcome:'detail',args:want,session});
+   await detailButton.click();
+   await details.getByText('该范围现存 1 条请求；本页 1 条。',{exact:true}).waitFor();
+   const after=await state();
+   assert.deepEqual(after.details,[{phase:'detail-before-failure',outcome:'detail',args:want}]);
+   assert.equal(after.expected,null);
+  };
+  const blocked=async button=>{
+   const n=await button.count();
+   if(n===0)return true;
+   if(n!==1||!(await button.isDisabled()))return false;
+   // Use native activation; dispatchEvent would bypass disabled-button rules.
+   await button.evaluate(el=>el.click());
+   return true;
+  };
+  try{
+   await request('cold-failure','storage-error');await notice.waitFor();
+   let v=await inspect('cold-failure');
+   checked('cold-error-without-history-or-empty-claim',v.error&&!v.task&&!v.stale&&!v.empty);
+   await request('load-a','task');await task.waitFor();
+   v=await inspect('load-a');
+   checked('legal-a-visible-before-any-reread',v.task&&!v.stale&&!v.error&&!v.empty);
+   checked('a-is-on-page-one',await panel.getByText(/^任务页 1；/).isVisible());
+   await take('loaded');
+
+   await request('next-page','task',{},50,next);
+   await panel.getByText(/^任务页 2；/).waitFor();
+   checked('non-stale-next-acquires-second-page',!(await task.isVisible())&&
+    await panel.getByRole('row').filter({hasText:'owned-r150-task-51'}).isVisible());
+   await request('return-page-one','task',{},0,prev);await task.waitFor();
+   checked('non-stale-previous-reacquires-a',await panel.getByText(/^任务页 1；/).isVisible());
+   await openDetail();
+   checked('non-stale-detail-reads-owned-a',await details.getByText(/^#151 · /).isVisible());
+
+   await request('same-page-failure','storage-error');await notice.waitFor();
+   v=await inspect('same-page-failure');
+   checked('same-page-error-is-safe-and-never-false-empty',v.error&&!v.empty);
+   check('same-page-failure-retains-a',v.task);
+   check('same-page-failure-marks-stale',v.stale&&/上次结果，尚未确认/.test(v.staleText));
+   const detailBlocked=await blocked(detailButton);
+   const nextBlocked=await blocked(next);
+   const prevBlocked=await blocked(prev);
+   const staleCalls=await state();
+   checked('failure-blocks-detail-and-hides-old-details',detailBlocked&&!(await details.isVisible())&&staleCalls.details.length===1);
+   checked('failure-blocks-summary-pagination',nextBlocked&&prevBlocked&&staleCalls.reads.length===5);
+   await take('same-page-error');
+
+   await request('explicit-empty','empty');await emptyState.waitFor();
+   v=await inspect('explicit-empty');
+   checked('legal-empty-replaces-history-and-error',v.empty&&!v.task&&!v.stale&&!v.error);
+   await take('explicit-empty');
+
+   await request('reload-a','task');await task.waitFor();
+   v=await inspect('reload-a');
+   checked('legal-a-can-be-read-again',v.task&&!v.stale&&!v.error&&!v.empty);
+
+   await page.locator('#audit-from-time').fill(changed);await unread.waitFor();
+   checked('changed-effective-time-filter-did-not-auto-read',(await state()).reads.length===7);
+   v=await inspect('changed-scope-before-read');
+   checked('changed-filter-clears-a-before-explicit-read',!v.task&&!v.stale&&!v.error&&!v.empty);
+   await request('changed-scope-failure','storage-error',{from_ts:from,to_ts:null});await notice.waitFor();
+   v=await inspect('changed-scope-failure');
+   checked('changed-filter-failure-never-borrows-a',v.error&&!v.task&&!v.stale&&!v.empty);
+   await take('changed-scope-error');
+  }finally{
+   const final=await state();
+   proof.reads=final.reads;proof.details=final.details;proof.ipc=final.ipc;proof.deniedIPC=final.denied;
+   check('eight-explicit-summary-reads-and-one-detail',final.reads.length===8&&final.details.length===1&&final.expected===null);
+  }
+ }catch(e){failure=e;}
+ if(context){
+  try{await context.close();cleanups++;}catch(e){failure??=e;}
+ }
+ check('no-unowned-ipc-or-extra-reads',proof.deniedIPC.length===0&&proof.reads.length===8&&proof.details.length===1&&
+  proof.ipc.filter(c=>c==='get_conversation_feedback').length===8&&proof.ipc.filter(c=>c==='get_conversation_requests').length===1);
+ check('no-foreign-network-or-popup',proof.foreignRequests.length===0);
+ check('no-page-or-console-errors',proof.pageErrors.length===0&&proof.consoleErrors.length===0);
+ check('one-context-closed-four-new-screenshots',cleanups===1&&proof.screenshots.length===4);
+ const missing=proof.checks.filter(x=>!x.passed).map(x=>x.name);
+ if(!failure&&!missing.length){proof.passed=true;proof.verdict='passed';}
+ else if(!failure&&JSON.stringify(missing)===JSON.stringify([
+  'same-page-failure-retains-a','same-page-failure-marks-stale',
+ ])&&proof.snapshots['same-page-failure'].staleNodes===0){proof.verdict='expected-snapshot-red';}
+ if(failure)proof.failure=errorText(failure);
+ fs.writeFileSync(result,JSON.stringify(proof,null,2)+'\n',{flag:'wx'});
+ console.log('R150_SNAPSHOT '+JSON.stringify({verdict:proof.verdict,reads:proof.reads.length,details:proof.details.length,
+  checks:proof.checks.length,failures:missing,screenshots:proof.screenshots.length}));
+ if(proof.consoleErrors.length||proof.pageErrors.length)errors.push(...proof.consoleErrors,...proof.pageErrors);
+ if(failure)throw failure;
+ assert(proof.passed,proof.verdict+': '+missing.join(', '));
+}
+
+function installConversationFeedbackSnapshot(){
+ const invoke=window.__TAURI_INTERNALS__.invoke;
+ const state=window.__r150Snapshot={expected:null,reads:[],details:[],ipc:[],denied:[]};
+ const reads=new Set([
+  'get_boot_state','get_config','get_current_client_usage_job','list_desktop_chat_receipts','list_agent_runtimes',
+  'list_agent_adapters','catalog_maintenance_status','catalog_inventory','list_providers','pricing_status',
+  'stats_overview_v2','query_requests_v2','usage_stats_v2','list_token_calibrations',
+  'plugin:event|listen','plugin:event|unlisten','plugin:window|is_maximized','plugin:window|is_fullscreen',
+  'plugin:window|theme','plugin:window|inner_size','plugin:window|scale_factor',
+ ]);
+ const deny=command=>{state.denied.push(command);throw new Error('Unexpected owned R150 IPC: '+command);};
+ window.__TAURI_INTERNALS__.invoke=async (command,args)=>{
+  state.ipc.push(command);
+  if(reads.has(command))return invoke(command,args);
+  if(command==='get_feedback_coverage')return {requests:0,annotated:0,class_confirmed:0,met_need:0,
+   did_not_meet_need:0,unsure:0,missing_outcome:0,groups_truncated:false,groups:[]};
+  const expected=state.expected;
+  if(!expected||command!==expected.command)return deny(command);
+  state.expected=null;
+  // Tauri's JS wrapper reaches this hook before native JSON serialization.
+  const wire=JSON.parse(JSON.stringify(args));
+  const sorted=x=>Array.isArray(x)?x.map(sorted):x&&typeof x==='object'
+   ?Object.fromEntries(Object.keys(x).sort().map(k=>[k,sorted(x[k])])):x;
+  if(JSON.stringify(sorted(wire))!==JSON.stringify(sorted(expected.args)))return deny(command);
+  const {phase,outcome,session}=expected;
+  if(command==='get_conversation_requests'){
+   state.details.push({phase,outcome,args:wire});
+   return {task:wire.task,total_requests:1,rows:[{id:151,ts:1792900000,status:200,
+    trace_id:null,routed_provider:'owned-r150-provider',routed_model:'owned-r150-model',
+    confirmed_class:null,outcome:null,feedback_revision:null,feedback_unavailable:false,matches_filter:true}],
+    has_more:false,next_cursor:null};
+  }
+  state.reads.push({phase,outcome,args:wire});
+  if(outcome==='storage-error')throw 'task_storage_failed';
+  const makeTask=outcome==='task',offset=wire.page.offset;
+  const make=(index)=>({task:{session_id:index===0?session:'owned-r150-task-'+(index+1),
+    group_id:index===0?'a'.repeat(64):index.toString(16).padStart(64,'0')},
+   profile_id:'cn-web-raw-v1',region:'cn',caller_scope:'local_key',matching_requests:1,
+   first_ts:1792900000-index,last_ts:1792900000-index,last_request_id:151-index,
+   counts:{requests:1,annotated:0,class_confirmed:0,met_need:0,did_not_meet_need:0,unsure:0,missing_outcome:1,
+    feedback_unavailable:0,http_2xx:1,cancelled:0,errors:0,status_other_unknown:0}});
+  const total=makeTask?51:0;
+  const tasks=Array.from({length:Math.min(50,Math.max(0,total-offset))},(_,i)=>make(offset+i));
+  return {observed_at_unix_ms:1792900000000,matched_requests:total,grouped_matching_requests:total,
+   ungrouped_matching_requests:0,ungrouped_reasons:{},total_tasks:total,total_stored_requests_in_tasks:total,
+   offset,limit:50,has_more:offset+tasks.length<total,tasks};
+ };
+}
+
+module.exports.verifyConversationFeedbackSnapshot=verifyConversationFeedbackSnapshot;

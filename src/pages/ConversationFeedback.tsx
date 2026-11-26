@@ -41,51 +41,78 @@ const reason:Record<string,string>={missing_session:"缺少会话关联",invalid
 
 /** Explicit read only: the regular audit poll never scans task histories. */
 export default function ConversationFeedback({filter}:{filter:AuditFilter}){
- const [value,setValue]=useState<ConversationSummary|null>(null),[error,setError]=useState<string|null>(null),[busy,setBusy]=useState(false);
+ // Audit table pagination does not change the conversation filter. A different
+ // filter owns a new view, even if a read from the old view is still pending.
+ const scope=JSON.stringify([
+  filter.from_ts??null,filter.to_ts??null,filter.provider??null,filter.model??null,filter.status??null,
+  filter.currency??null,filter.min_cost??null,filter.max_cost??null,filter.only_errors===true,filter.only_fallbacks===true,
+ ]);
+ return <ConversationFeedbackView key={scope} filter={filter}/>;
+}
+
+function ConversationFeedbackView({filter}:{filter:AuditFilter}){
+ const [{value,error,offset},setSummary]=useState<{value:ConversationSummary|null;error:string|null;offset:number}>({value:null,error:null,offset:0});
+ const [busy,setBusy]=useState(false);
  const [selected,setSelected]=useState<ConversationTaskRef|null>(null),[detail,setDetail]=useState<ConversationRequestPage|null>(null),[detailError,setDetailError]=useState<string|null>(null);
- const alive=useRef(false),flight=useRef(false),generation=useRef(0),currentScope=useRef("");
- const scope=JSON.stringify({...filter,limit:undefined,offset:undefined});currentScope.current=scope;
+ const alive=useRef(false),flight=useRef(false),generation=useRef(0);
+ const stale=value!==null&&error!==null;
  useEffect(()=>{alive.current=true;return()=>{alive.current=false;generation.current++;};},[]);
- useEffect(()=>{generation.current++;setValue(null);setError(null);setSelected(null);setDetail(null);setDetailError(null);},[scope]);
- const read=async(offset=0)=>{
-  if(flight.current)return;flight.current=true;setBusy(true);const job=++generation.current,owned=scope;
-  try{const result=await api.getConversationFeedback({...filter,limit:undefined,offset:undefined},{limit:50,offset});
-   if(!alive.current||generation.current!==job||currentScope.current!==owned)return;
-   if(!validSummary(result,offset))throw Error("invalid_projection");setValue(result);setError(null);setSelected(null);setDetail(null);setDetailError(null);
-  }catch(e){if(alive.current&&generation.current===job&&currentScope.current===owned){setValue(null);setError(message(e));setSelected(null);setDetail(null);}}
-  finally{flight.current=false;if(alive.current)setBusy(false);}
+ const ownsRead=(job:number)=>alive.current&&generation.current===job;
+ const read=async(pageOffset:number)=>{
+  if(flight.current)return;
+  flight.current=true;setBusy(true);const job=++generation.current;
+  try{
+   const result=await api.getConversationFeedback({...filter,limit:undefined,offset:undefined},{limit:50,offset:pageOffset});
+   if(!ownsRead(job))return;
+   if(!validSummary(result,pageOffset))throw Error("invalid_projection");
+   setSummary({value:result,error:null,offset:pageOffset});
+  }catch(e){
+   if(ownsRead(job)){
+    const error=message(e);
+    setSummary(previous=>({value:previous.value?.offset===pageOffset?previous.value:null,error,offset:pageOffset}));
+   }
+  }finally{
+   if(ownsRead(job)){
+    setSelected(null);setDetail(null);setDetailError(null);
+    flight.current=false;setBusy(false);
+   }
+  }
+ };
+ const readPage=(pageOffset:number)=>{
+  if(!stale&&value)void read(pageOffset);
  };
  const readRequests=async(task:ConversationTaskRef,after?:number)=>{
-  if(flight.current)return;flight.current=true;setBusy(true);setSelected(task);setDetail(null);setDetailError(null);const job=++generation.current,owned=scope;
+  if(flight.current||stale||!value)return;flight.current=true;setBusy(true);setSelected(task);setDetail(null);setDetailError(null);const job=++generation.current;
   try{const result=await api.getConversationRequests(task,{...filter,limit:undefined,offset:undefined},after??null,100);
-   if(!alive.current||generation.current!==job||currentScope.current!==owned)return;
+   if(!ownsRead(job))return;
    if(!validRows(result,task,after))throw Error("invalid_projection");setDetail(result);
-  }catch(e){if(alive.current&&generation.current===job&&currentScope.current===owned)setDetailError(message(e));}
-  finally{flight.current=false;if(alive.current)setBusy(false);}
+  }catch(e){if(ownsRead(job))setDetailError(message(e));}
+  finally{if(ownsRead(job)){flight.current=false;setBusy(false);}}
  };
  return <section aria-label="完整会话任务" data-testid="conversation-feedback">
   <h3>完整会话任务（现存审计）</h3>
   <p>筛选选择会话，统计包含该会话当前保留的全部请求，不只当前时间窗或审计页。按内部会话、访问范围及发送时主体／区域回执隔离；缺少依据的历史明确未归组，不用当前账号补证。</p>
   <p>仅带有效发送时身份回执的 Trae 原生或 WorkBuddy／Qoder 模型路径可归组；新回执按本机会话和用途隔离，旧记录／缺失回执保持未知，不回填。请求级反馈不是会话最终结果，不生成质量分或模型版本结论；HTTP／reported usage 不证明费用或免费资格。</p>
-  <button type="button" disabled={busy} onClick={()=>void read()}>读取会话归组</button>
+  <button type="button" disabled={busy} onClick={()=>void read(offset)}>读取会话归组</button>
   {busy&&<p role="status">正在读取会话资料…</p>}{error&&<p role="alert">{error}</p>}
+  {stale&&<p data-testid="conversation-feedback-stale">上次结果，尚未确认。请重新读取这一页后再查看明细或翻页。</p>}
   {!value&&!error&&!busy&&<p>尚未读取会话资料。</p>}
   {value&&<>
    <p>筛选命中 {value.matched_requests} 条请求；可归组 {value.grouped_matching_requests} 条；未归组 {value.ungrouped_matching_requests} 条。选中 {value.total_tasks} 个会话任务，包含现存 {value.total_stored_requests_in_tasks} 条请求。</p>
    <p>读取时刻 {time(value.observed_at_unix_ms/1000)}；不表示会话已结束或审计留存完整。</p>
    {value.ungrouped_matching_requests>0&&<ul aria-label="未归组原因">{Object.entries(value.ungrouped_reasons).map(([key,n])=><li key={key}>{ownText(reason,key,"隔离依据不可确认")}：{n}</li>)}</ul>}
-   {value.total_tasks===0?<p>无可归组会话，不代表没有请求或质量为0。</p>:<div style={{overflowX:"auto"}} tabIndex={0} role="region" aria-label="会话任务表格"><table><thead><tr><th>会话与范围</th><th>请求记录</th><th>请求级人工反馈</th><th>请求状态</th><th>追溯</th></tr></thead><tbody>{value.tasks.map(t=><tr key={t.task.group_id}>
+   {value.total_tasks===0?<p>{stale?"上次读取时无可归组会话。":"无可归组会话，不代表没有请求或质量为0。"}</p>:<div style={{overflowX:"auto"}} tabIndex={0} role="region" aria-label="会话任务表格"><table><thead><tr><th>会话与范围</th><th>请求记录</th><th>请求级人工反馈</th><th>请求状态</th><th>追溯</th></tr></thead><tbody>{value.tasks.map(t=><tr key={t.task.group_id}>
     <td>{t.task.session_id}<small style={{display:"block"}}>{t.region} · {t.profile_id} · {t.caller_scope==="remote_key"?"远程Key隔离":"本机Key范围"}</small><small>主体组 {t.task.group_id.slice(0,8)}；不是模型版本</small></td>
     <td>匹配 {t.matching_requests} / 现存 {t.counts.requests}<small style={{display:"block"}}>{time(t.first_ts)} — {time(t.last_ts)}</small></td>
     <td>已标注 {t.counts.annotated}；满足 {t.counts.met_need}；未满足 {t.counts.did_not_meet_need}；不确定 {t.counts.unsure}；未评价 {t.counts.missing_outcome}{t.counts.feedback_unavailable>0&&<small>反馈不可用 {t.counts.feedback_unavailable}</small>}</td>
     <td>HTTP2xx {t.counts.http_2xx}；取消499 {t.counts.cancelled}；错误4xx/5xx {t.counts.errors}；其他／未知 {t.counts.status_other_unknown}</td>
-    <td><button type="button" disabled={busy} aria-label={`会话请求 ${t.task.group_id.slice(0,8)}`} onClick={()=>void readRequests(t.task)}>读取请求明细</button></td>
+    <td><button type="button" disabled={busy||stale} aria-label={`会话请求 ${t.task.group_id.slice(0,8)}`} onClick={()=>void readRequests(t.task)}>读取请求明细</button></td>
    </tr>)}</tbody></table></div>}
    <p>任务页 {Math.floor(value.offset/50)+1}；会话页与下方审计请求页独立。后续读取是新快照，并发写入可能改变页边界。</p>
-   <button type="button" disabled={busy||value.offset===0} onClick={()=>void read(Math.max(0,value.offset-50))}>会话任务上一页</button>
-   <button type="button" disabled={busy||!value.has_more} onClick={()=>void read(value.offset+50)}>会话任务下一页</button>
+   <button type="button" disabled={busy||stale||value.offset===0} onClick={()=>readPage(Math.max(0,value.offset-50))}>会话任务上一页</button>
+   <button type="button" disabled={busy||stale||!value.has_more} onClick={()=>readPage(value.offset+50)}>会话任务下一页</button>
   </>}
-  {selected&&<section aria-label="会话请求明细"><h4>会话请求明细：{selected.session_id}</h4><p>每个审计ID仅计一次；同trace的不同请求保留，不把上游重试次数算成新任务。原审计明细及原始回执仍保留，未改写。</p>
+  {!stale&&selected&&<section aria-label="会话请求明细"><h4>会话请求明细：{selected.session_id}</h4><p>每个审计ID仅计一次；同trace的不同请求保留，不把上游重试次数算成新任务。原审计明细及原始回执仍保留，未改写。</p>
    {detailError&&<p role="alert">{detailError}</p>}
    {detail&&<><p>该范围现存 {detail.total_requests} 条请求；本页 {detail.rows.length} 条。</p><div style={{overflowX:"auto"}} tabIndex={0} role="region" aria-label="会话请求表格"><table><thead><tr><th>请求ID / 时间</th><th>配置目标</th><th>状态</th><th>人工反馈</th><th>筛选关系</th></tr></thead><tbody>{detail.rows.map(r=><tr key={r.id}><td>#{r.id} · {time(r.ts)}<small style={{display:"block"}}>trace {r.trace_id??"未知"}</small></td><td>{r.routed_provider??"未知"} / {r.routed_model??"未知"}</td><td>{r.status??"未知"}</td><td>{r.feedback_unavailable?"反馈不可用":r.outcome==="met_need"?"满足":r.outcome==="did_not_meet_need"?"未满足":r.outcome==="unsure"?"不确定":"未评价"}；修订 {r.feedback_revision??"未记录"}</td><td>{r.matches_filter?"匹配当前筛选":"会话上下文（筛选外）"}</td></tr>)}</tbody></table></div>
     <button type="button" disabled={busy} onClick={()=>void readRequests(selected)}>会话请求首页</button><button type="button" disabled={busy||!detail.has_more} onClick={()=>void readRequests(selected,detail.next_cursor??undefined)}>会话请求下一页</button>
