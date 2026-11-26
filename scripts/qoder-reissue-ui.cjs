@@ -45,7 +45,7 @@ async function verifyQoderReissue(browser, baseUrl, output, errors, fixture) {
     await page.setViewportSize({width:390,height:844});await page.getByRole("button",{name:"切换到深色主题",exact:true}).click();
     await cn.screenshot({path:path.join(output,"qoder-reissue-blocked-narrow.png")});proof.screenshots.push("qoder-reissue-blocked-narrow.png");
     assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
-    assert.deepEqual((await page.evaluate(()=>window.__fixtureCalls)).filter(c=>/^(desktop_chat|test_provider|claim_benefit_now|qoder_login_(start|poll|refresh))$/.test(c)),[]);
+    assert.deepEqual((await page.evaluate(()=>window.__fixtureCalls)).filter(c=>/^(desktop_chat(?:_v2)?|test_provider|claim_benefit_now|qoder_login_(start|poll|refresh))$/.test(c)),[]);
     assert.deepEqual(errors,[]);proof.checks.push("narrow-dark-zero-model-login-refresh-claim");proof.passed=true;
     console.log(`QODER_REISSUE_UI_OK: ${proof.checks.length} checks; ${proof.screenshots.length} screenshots; fixture-only`);
   } finally {

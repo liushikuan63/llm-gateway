@@ -8,7 +8,7 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
   const context = await browser.newContext({viewport:{width:1180,height:900}});
   await context.addInitScript(fixture);
   const page = await context.newPage();
-  const proof = {scope:'Source browser with isolated IPC fixture; not installed/native acceptance',checks:[],foreign_requests:0,passed:false};
+  const proof = {scope:'Source browser with isolated legacy streaming IPC fixture; not installed/native acceptance',checks:[],foreign_requests:0,passed:false};
   await context.route('**/*',async route=>{
     if(new URL(route.request().url()).origin===new URL(baseUrl).origin)return route.fallback();
     proof.foreign_requests++;await route.abort();
@@ -25,24 +25,40 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
       window.__fixtureCancelJobs = new Map();
       window.__fixtureCancelInputs = [];
       window.__fixtureCancelCalls = [];
+      window.__fixtureCancelV2Calls = 0;
       window.__fixtureCancelReadyHold = true;
       window.__fixtureCancelClosedOnce = true;
       const reply = input=>({content:'owned completed response',reasoning:null,refusal:null,model:'owned-model',routed_via:'owned/provider',session_id:input.session_id,trace_id:'owned-trace',fallback_attempts:0,latency_ms:1,usage:null,cached:false});
       window.__TAURI_INTERNALS__.invoke = async (command,args)=>{
+        if(command==='list_desktop_chat_receipts') {
+          if(args?.before!==null || Object.keys(args).length!==1)throw Error('unexpected receipt list input in legacy stream fixture');
+          return [];
+        }
+        if(command==='desktop_chat_v2') {
+          window.__fixtureCancelV2Calls++;
+          throw Error('explicit streaming must not send desktop_chat_v2');
+        }
         if(command==='desktop_chat') {
+          const id=args.requestId, readyId=args.onReady?.id, eventId=args.onEvent?.id;
+          const readyChannel=window[`_${readyId}`], eventChannel=window[`_${eventId}`];
+          if(!/^[0-9a-f-]{36}$/.test(id??'') || args.input.personal_test || !Number.isInteger(readyId) ||
+             !Number.isInteger(eventId) || readyId===eventId || typeof readyChannel!=='function' || typeof eventChannel!=='function')
+            throw Error('synthetic cancellation requires an ordinary stream with distinct real Tauri Channels');
           if(window.__fixtureCancelClosedOnce) {
             window.__fixtureCancelClosedOnce=false;
             window.__fixtureCancelClosedSession=args.input.session_id;
-            const channel=args.onReady;
-            if(channel&&Number.isInteger(channel.id))window[`_${channel.id}`]({index:0,end:true});
+            readyChannel({index:0,end:true});eventChannel({index:0,end:true});
             throw 'LLM 网关服务未开启，请在设置页或托盘开启后发送';
           }
-          const id=args.requestId??'legacy-no-control';
           window.__fixtureCancelInputs.push({id,input:structuredClone(args.input)});
           return new Promise((resolve,reject)=>{
-            const channel=args.onReady;
-            const ready=()=>{if(channel&&Number.isInteger(channel.id)){const callback=window[`_${channel.id}`];callback({index:0,message:{request_id:id,trace_id:id.replaceAll('-','')}});callback({index:1,end:true});}};
-            const job={ready,resolve:()=>{window.__fixtureCancelJobs.delete(id);resolve(reply(args.input));},reject:()=>{window.__fixtureCancelJobs.delete(id);reject('desktop_chat_cancelled');}};
+            let index=0;
+            const result=reply(args.input);
+            const ready=()=>{readyChannel({index:0,message:{request_id:id,trace_id:id.replaceAll('-','')}});readyChannel({index:1,end:true});};
+            const emit=text=>{eventChannel({index,message:{request_id:id,session_id:args.input.session_id,requested_model:args.input.model,
+              routed_via:result.routed_via,sequence:index+1,kind:'content',text}});index++;};
+            const end=()=>{eventChannel({index,end:true});window.__fixtureCancelJobs.delete(id);};
+            const job={ready,emit,resolve:()=>{emit(result.content);end();resolve(result);},reject:()=>{end();reject('desktop_chat_cancelled');}};
             window.__fixtureCancelJobs.set(id,job);
             window.__fixtureCancelCurrent=id;
             if(!window.__fixtureCancelReadyHold)ready();
@@ -64,6 +80,8 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
     await chat.locator('#chat-model:not(:disabled)').waitFor();
     const send=chat.getByRole('button',{name:'发送消息',exact:true});
     const isolate=chat.getByRole('button',{name:'保留草稿并建立隔离会话',exact:true});
+    const stream=chat.getByTestId('chat-stream-toggle');
+    assert(!(await stream.isChecked()),'streaming starts disabled');await stream.check();
     await prompt.fill('owned draft must survive cancellation');
     await send.click();
     await chat.getByRole('alert').getByText('LLM 网关服务未开启，请在设置页或托盘开启后发送',{exact:true}).waitFor();
@@ -71,7 +89,7 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
     assert(!(await prompt.isDisabled()));assert.equal(await chat.getByTestId('chat-cancel').count(),0);
     await page.waitForFunction(()=>!document.querySelector('[data-testid="chat-page"] button[type=submit]').disabled);
     assert.equal(await isolate.count(),0,'ordinary exact closed-gateway rejection does not require isolation');
-    assert.deepEqual(await page.evaluate(()=>({cleanup:window.__fixtureCancelCleanup,requests:window.__fixtureCancelInputs.length,cancels:window.__fixtureCancelCalls.length})),{cleanup:1,requests:0,cancels:0});
+    assert.deepEqual(await page.evaluate(()=>({cleanup:window.__fixtureCancelCleanup,requests:window.__fixtureCancelInputs.length,cancels:window.__fixtureCancelCalls.length})),{cleanup:2,requests:0,cancels:0});
     proof.checks.push('closed gateway fixture ends channel without ready, retains draft and permits explicit retry');
     await chat.getByRole('button',{name:'发送消息',exact:true}).click();
     await page.waitForFunction(()=>window.__fixtureCancelJobs.size===1);
@@ -84,6 +102,9 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
     await cancel.waitFor({state:'visible'});
     await page.waitForFunction(()=>!document.querySelector('[data-testid="chat-cancel"]').disabled);
     assert.equal(await cancel.getAttribute('type'),'button');
+    await page.evaluate(()=>window.__fixtureCancelJobs.get(window.__fixtureCancelCurrent).emit('owned partial before cancellation'));
+    await chat.getByTestId('chat-stream-content').filter({hasText:'owned partial before cancellation'}).waitFor();
+    assert.equal(await chat.locator('.chat-turn:not([data-testid="chat-stream-preview"])').count(),0,'pending stream is not committed');
     const pendingFile=path.join(output,'chat-cancel-pending.png');
     await page.screenshot({path:pendingFile,fullPage:true});
     proof.pending_screenshot={path:pendingFile,sha256:crypto.createHash('sha256').update(fs.readFileSync(pendingFile)).digest('hex')};
@@ -120,11 +141,9 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
       window.__fixtureCancelJobs.get(window.__fixtureCancelCurrent).resolve();
       document.querySelector('[data-testid="chat-cancel"]').click();
     });
-    await chat.getByText('owned completed response',{exact:true}).waitFor();
+    await chat.locator('.chat-turn.assistant:not([data-testid="chat-stream-preview"])').getByText('owned completed response',{exact:true}).waitFor();
     await page.waitForFunction(()=>!document.querySelector('#chat-prompt').disabled);
     assert.equal(await prompt.inputValue(),'');assert.equal(await chat.locator('.chat-turn').count(),2);
-    const ids=await page.evaluate(()=>window.__fixtureCancelInputs.map(row=>row.id));
-    assert.equal(new Set(ids).size,3);assert(ids.every(id=>/^[0-9a-f-]{36}$/.test(id)));
     const confirmedSession=await page.evaluate(()=>window.__fixtureCancelInputs[2].input.session_id);
     assert.notEqual(confirmedSession,secondSession,'manual send after the completed cancel again uses a new session');
     proof.checks.push('completed result wins late cancellation and each manual send has a new operation identity');
@@ -147,6 +166,13 @@ async function verifyChatCancellation(browser, baseUrl, output, errors, fixture)
     proof.sessions=await page.evaluate(()=>({closed:window.__fixtureCancelClosedSession,sends:window.__fixtureCancelInputs.map(row=>row.input.session_id)}));
     assert.equal(proof.sessions.sends.length,4);
     assert.equal(proof.sessions.sends[3],confirmedSession,'known success keeps the session for the next manual turn');
+    proof.legacy_stream=await page.evaluate(()=>({requests:window.__fixtureCancelInputs.map(row=>row.id),
+      cancellations:window.__fixtureCancelCalls,v2Calls:window.__fixtureCancelV2Calls,channelCleanup:window.__fixtureCancelCleanup,
+      pending:window.__fixtureCancelJobs.size}));
+    const {requests:[a,b,c,d],cancellations,v2Calls,channelCleanup,pending}=proof.legacy_stream;
+    assert.equal(new Set([a,b,c,d]).size,4);assert([a,b,c,d].every(id=>/^[0-9a-f-]{36}$/.test(id)));
+    assert.deepEqual(cancellations,[a,b,b,c,d],'cancel retry only targets its ready request; late and accepted races target their own request');
+    assert.deepEqual({v2Calls,channelCleanup,pending},{v2Calls:0,channelCleanup:10,pending:0});
     const file=path.join(output,'chat-cancel-ui.png');await page.screenshot({path:file,fullPage:true});
     proof.screenshot={path:file,sha256:crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')};proof.passed=true;
   } catch(error) {

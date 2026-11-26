@@ -20,6 +20,9 @@ mod s6_declaration_ipc_tests;
 #[path = "provider_connection_ipc_tests.rs"]
 mod provider_connection_ipc_tests;
 
+#[path = "ux5_chat_receipts_ipc_tests.rs"]
+mod ux5_chat_receipts_ipc_tests;
+
 #[test]
 fn saved_trae_names_are_projected_by_production_list_providers_ipc_readonly() {
     use crate::proxy::trae::{catalog::web::selector, profile::*};
@@ -207,6 +210,9 @@ impl OwnedIpc {
             std::env::temp_dir().join(format!("llmgw-owned-feedback-ipc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let db = tauri::async_runtime::block_on(Db::connect_in_memory()).unwrap();
+        Self::with_owned_db(root, db, configure)
+    }
+    fn with_owned_db(root: PathBuf, db: Db, configure: impl FnOnce(&mut GatewayState)) -> Self {
         let mut gateway = GatewayState::new(db.clone(), AppConfig::default());
         configure(&mut gateway);
         let gateway = Arc::new(gateway);
@@ -291,6 +297,8 @@ impl OwnedIpc {
                 export_capabilities_with_coverage,
                 price_observations,
                 list_sessions_page,
+                crate::desktop_chat_receipts::desktop_chat_v2,
+                crate::desktop_chat_receipts::list_desktop_chat_receipts,
                 list_client_usage_reviewable,
             ])
             .build(mock_context(noop_assets()))

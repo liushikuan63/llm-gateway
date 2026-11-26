@@ -596,14 +596,16 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
     message(4, "assistant", "这里是最新的完整答复。\n\n" + "长文本应保留换行，在有限宽度内自然换行；工具调用记录可单独展开。\n".repeat(24)),
   ];
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
-  // Shared synthetic chat reply. Both the channel command (`desktop_chat`) and
-  // the buffered one (`desktop_chat_v2`) must record __fixtureChatInputs and
-  // honour the same hold/failure hooks, otherwise a scenario that switches
-  // transport silently starts asserting against a different fixture.
-  const fixtureChatReply = async (args) => {
+  // Both transports share the hold and input recorder. Only a real buffered
+  // attempt has a keyed outcome; the legacy streaming/personal ABI stays V1.
+  const fixtureChatReply = async (args, buffered = false) => {
     (window.__fixtureChatInputs ??= []).push(structuredClone(args.input));
     if (window.__fixtureChatHold) await new Promise(resolve => { window.__fixtureChatRelease = resolve; });
-    if (window.__fixtureChatFailure) throw new Error("HTTP 503：模拟上游不可用");
+    if (window.__fixtureChatFailure) {
+      const message = "HTTP 503：模拟上游不可用";
+      if (buffered) return { kind: "unknown", operation_id: args.requestId, message };
+      throw new Error(message);
+    }
     return { content: "收到，模型已接入。", reasoning: window.__fixtureChatReasoning ?? null, model: "fixture-model", routed_via: "workbuddy/fixture-model",
       session_id: args.input.session_id, trace_id: "fixture-trace", fallback_attempts: 0, latency_ms: 27,
       usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }, cached: false, ...(window.__fixtureChatReplyMetadata ?? {}) };
@@ -751,13 +753,11 @@ async function fixture({ empty = false, configFailure = false, providerFailure =
         return (window.__fixtureReceiptPage ?? []);
       }
       case "desktop_chat_v2": {
-        // Non-streaming chat goes through the versioned buffered command, not
-        // the channel-based `desktop_chat`. Build the reply with the same
-        // helper so hold/failure hooks and __fixtureChatInputs recording behave
-        // identically; calling back into invoke() instead would push
-        // `desktop_chat` into __fixtureCalls and make the "opening chat never
-        // dispatches" assertions lie.
-        const reply = await fixtureChatReply(args);
+        (window.__fixtureBufferedChatCalls ??= []).push({
+          operationId: args?.requestId, keys: Object.keys(args ?? {}).sort(),
+        });
+        const reply = await fixtureChatReply(args, true);
+        if (reply.kind === "unknown") return reply;
         return { kind: "reply", operation_id: args.requestId, receipt: window.__fixtureChatReceipt ?? "recorded", result: reply };
       }
       case "desktop_chat": {
@@ -1713,6 +1713,27 @@ async function verifyAsyncPages(browser, errors) {
   await pollContext.close();
 }
 
+async function assertBufferedChatDispatches(page, count) {
+  const { calls, buffered } = await page.evaluate(() => ({
+    calls: window.__fixtureCalls,
+    buffered: window.__fixtureBufferedChatCalls ?? [],
+  }));
+  const sends = calls.filter(c => /^desktop_chat(?:_v2)?$/.test(c));
+  assert.deepEqual(sends, Array(count).fill("desktop_chat_v2"), "ordinary buffered chat sends exactly once per action, only through V2");
+  if (count === 0) return;
+  const firstRead = calls.indexOf("list_desktop_chat_receipts");
+  assert(firstRead >= 0 && firstRead < calls.indexOf("desktop_chat_v2"), "receipt readiness must precede ordinary send");
+  assert.equal(buffered.length, count);
+  const ids = new Set();
+  const operationUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  for (const { operationId, keys } of buffered) {
+    assert.deepEqual(keys, ["input", "requestId"], "buffered V2 has no legacy readiness/event channel");
+    assert.match(operationId, operationUUID);
+    assert(!ids.has(operationId), "separate actions must not reuse an operation id");
+    ids.add(operationId);
+  }
+}
+
 async function verifyChatPage(browser, errors) {
   const context = await browser.newContext({ viewport: { width: 1180, height: 900 } });
   await context.addInitScript(fixture);
@@ -1738,7 +1759,7 @@ async function verifyChatPage(browser, errors) {
   await nav.getByRole("button", { name: "聊天测试", exact: true }).click();
   const chat = page.getByTestId("chat-page");
   await chat.locator("#chat-model:not(:disabled)").waitFor();
-  assert.equal(await page.evaluate(() => window.__fixtureCalls.filter(c => c === "desktop_chat").length), 0, "opening chat does not spend model quota");
+  await assertBufferedChatDispatches(page, 0); // Opening chat must not spend model quota.
   assert.equal(await chat.locator('option[value$="disabled-fixture"]').count(), 0);
   await chat.locator(".chat-scores summary").click();
   assert((await chat.innerText()).includes("0.7500"), "display backend score without recomputing it");
@@ -1870,6 +1891,7 @@ async function verifyChatPage(browser, errors) {
     {role: "user", content: followup},
   ]);
   assert.deepEqual(await turns.allTextContents(), [...confirmed, followup, confirmed[1]]);
+  await assertBufferedChatDispatches(page, 6);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: path.join(output, "chat-narrow.png"), fullPage: true });
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 2), "chat must fit narrow layouts");
@@ -1884,6 +1906,7 @@ async function verifyChatPage(browser, errors) {
   await emptyPage.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "聊天测试", exact: true }).click();
   await emptyPage.getByText("没有已启用的聊天模型", { exact: false }).waitFor();
   assert(await emptyPage.getByRole("button", { name: "发送消息", exact: true }).isDisabled());
+  await assertBufferedChatDispatches(emptyPage, 0);
   await emptyPage.screenshot({ path: path.join(output, "chat-empty.png"), fullPage: true });
   await empty.close();
   assert.equal(foreignRequests, 0, "chat fixture must not contact a real origin");
@@ -2048,6 +2071,7 @@ async function verifyChatEnhancements(browser, errors) {
   await prompt.press("Control+Enter");
   await chat.locator(".chat-turn.assistant").waitFor();
   assert.equal(await page.evaluate(() => window.__fixtureChatInputs.length), 3, "normal shortcut still submits once after composition");
+  await assertBufferedChatDispatches(page, 3);
   await page.setViewportSize({ width: 390, height: 844 });
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 2));
   await page.screenshot({ path: path.join(output, "chat-export-ime-narrow.png"), fullPage: true });
@@ -2225,7 +2249,7 @@ async function verifyQoderLogin(browser, errors) {
     await page.getByRole("button", { name: "切换到深色主题", exact: true }).click();
     await cn.screenshot({ path: path.join(output, "qoder-cn-login-narrow-dark.png") });
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
-    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => /^(desktop_chat|test_provider|claim_benefit_now)$/.test(c)), []);
+    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => /^(desktop_chat(?:_v2)?|test_provider|claim_benefit_now)$/.test(c)), []);
     console.log("QODER_LOGIN_UI_OK: login and model registration; isolated fixtures, two regions, invalid account, authentication failure, catalog recovery, late registration, explicit open, keyboard, cancellation, deadline, responsive theme, zero model/claim");
   } catch (error) {
     await page.screenshot({ path: path.join(output, "qoder-login-failure.png"), fullPage: true });
@@ -2245,7 +2269,7 @@ async function verifyWorkBuddyLogin(browser, errors) {
     const account = login.getByLabel("本机账号名称");
     const button = name => login.getByRole("button", { name, exact: true });
     await page.waitForFunction(() => window.__fixtureCalls.includes("workbuddy_login_status"));
-    const forbidden = /^(workbuddy_login_start|workbuddy_login_poll|workbuddy_login_refresh|register_workbuddy_provider|qoder_job_prepare|qoder_job_refresh|qoder_job_reissue|register_qoder_provider|desktop_chat|test_provider|claim_benefit_now)$/;
+    const forbidden = /^(workbuddy_login_start|workbuddy_login_poll|workbuddy_login_refresh|register_workbuddy_provider|qoder_job_prepare|qoder_job_refresh|qoder_job_reissue|register_qoder_provider|desktop_chat(?:_v2)?|test_provider|claim_benefit_now)$/;
     assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => forbidden.test(c)), [], "page entry must read only local status");
     assert(await button("接入模型").isDisabled());
     await button("网页登录").click();
@@ -2310,7 +2334,7 @@ async function verifyWorkBuddyLogin(browser, errors) {
     await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
     await login.screenshot({ path: path.join(output, "workbuddy-login-narrow-dark.png") });
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), "login must fit narrow viewport");
-    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => /^(desktop_chat|test_provider|claim_benefit_now)$/.test(c)), []);
+    assert.deepEqual((await page.evaluate(() => window.__fixtureCalls)).filter(c => /^(desktop_chat(?:_v2)?|test_provider|claim_benefit_now)$/.test(c)), []);
   } finally { await context.close(); }
 }
 
@@ -3122,6 +3146,12 @@ if (require.main === module) (async () => {
         console.log("UI_FOCUS_OK: s6-v2-owned; screenshots=" + output);
         return;
       }
+      if (focus === "ux5-chat-receipts") {
+        await require("./ux5-chat-receipts-ui.cjs").verifyUx5ChatReceipts(browser, baseUrl, output, errors, fixture);
+        assert.deepEqual(errors, []);
+        console.log("UI_FOCUS_OK: ux5-chat-receipts; screenshots=" + output);
+        return;
+      }
       if (focus === "search-settings-save") {
         await require("./search-settings-save-ui.cjs").verifySearchSettingsSave(browser, baseUrl, output, errors, fixture);
         assert.deepEqual(errors, []);
@@ -3297,6 +3327,7 @@ if (require.main === module) (async () => {
     if (process.env.LLMGW_UI_ASSETS === "dist") {
       await require("./search-settings-save-ui.cjs").verifySearchSettingsSave(browser, baseUrl, path.join(output, "search-settings-save"), errors, fixture);
       await require("./s6-v2-owned-ui.cjs").verifyS6V2Owned(browser, baseUrl, path.join(output, "s6-v2-owned"), errors, fixture);
+      await require("./ux5-chat-receipts-ui.cjs").verifyUx5ChatReceipts(browser, baseUrl, path.join(output, "ux5-chat-receipts"), errors, fixture);
     }
     await verifyVpnPage(browser, errors);
     await verifyVpnKernel(browser, errors);

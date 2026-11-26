@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { api, AgentRuntime, CandidateExplanation, DesktopChatMessage, DesktopChatResult, DesktopChatTranscript, PersonalTestFailure, PersonalTestOutcome, PersonalTestStatus, ProviderView } from "../api";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { api, AgentRuntime, CandidateExplanation, DesktopChatMessage, DesktopChatReceipt, DesktopChatResult, DesktopChatTranscript, PersonalTestFailure, PersonalTestOutcome, PersonalTestStatus, ProviderView } from "../api";
 import { errorText } from "./providerPresets";
 import "./chat.css";
 import { modelDisplayLabel } from "./model-labels";
@@ -26,6 +26,73 @@ function reportedToken(result: DesktopChatResult, field: string): string {
   return typeof count === "number" && Number.isSafeInteger(count) && count >= 0 ? String(count) : "未知";
 }
 
+const receiptPageSize = 50; // Match the descending, exclusive SQLite rowid page.
+const operationUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const unconfirmedReply = "本次回复未能确认；请核对原请求。";
+const gatewayNotStarted = "LLM 网关服务未开启，请在设置页或托盘开启后发送";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function receiptPage(value: unknown, before: number | null): DesktopChatReceipt[] {
+  if (!Array.isArray(value) || value.length > receiptPageSize) throw new Error("invalid_receipt_page");
+  const ids = new Set<string>();
+  let previous = before;
+  return value.map((row: unknown) => {
+    if (!isRecord(row)) throw new Error("invalid_receipt_row");
+    const { cursor, operation_id, state } = row;
+    if (Object.keys(row).length !== 3 || typeof cursor !== "number" ||
+        !Number.isSafeInteger(cursor) || cursor <= 0 || (previous !== null && cursor >= previous) ||
+        typeof operation_id !== "string" || !operationUuid.test(operation_id) || ids.has(operation_id) ||
+        (state !== "claimed" && state !== "completed")) throw new Error("invalid_receipt_row");
+    previous = cursor;
+    ids.add(operation_id);
+    return { cursor, operation_id, state };
+  });
+}
+
+async function readReceiptPage(before: number | null) {
+  let timer: number | undefined;
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = window.setTimeout(() => reject(new Error("receipt_read_timeout")), 5000);
+    });
+    return receiptPage(await Promise.race([api.listDesktopChatReceipts(before), timeout]), before);
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer);
+  }
+}
+
+function replyDiagnostic(value: unknown): string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= 512 &&
+    !/[\u0000-\u001f\u007f-\u009f]/.test(value) ? value : unconfirmedReply;
+}
+
+function isBufferedResult(value: unknown, sessionId: string): value is DesktopChatResult {
+  if (!isRecord(value)) return false;
+  const nullableText = (v: unknown) => v === null || typeof v === "string";
+  const optionalText = (v: unknown) => v === undefined || nullableText(v);
+  const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  const fieldState = (v: unknown) => v === "reported" || v === "unavailable" || v === "invalid";
+  const metadata = value.response_metadata;
+  // Raw usage observation can intentionally be invalid JSON shape. The existing
+  // presentation guards it separately; invalid usage cannot discard a real reply.
+  return value.session_id === sessionId && typeof value.content === "string" &&
+    nullableText(value.reasoning) && optionalText(value.refusal) &&
+    (value.content !== "" || (typeof value.reasoning === "string" && value.reasoning !== "") ||
+      (typeof value.refusal === "string" && /\P{White_Space}/u.test(value.refusal))) &&
+    typeof value.model === "string" && nullableText(value.routed_via) && nullableText(value.trace_id) &&
+    count(value.fallback_attempts) && count(value.latency_ms) && typeof value.cached === "boolean" &&
+    optionalText(value.finish_reason) && Object.prototype.hasOwnProperty.call(value, "usage") &&
+    value.personal_test_outcome === undefined &&
+    (metadata === undefined || metadata === null || (isRecord(metadata) &&
+      fieldState(metadata.finish_reason) && fieldState(metadata.usage) &&
+      (metadata.usage_evidence === undefined || metadata.usage_evidence === "unobserved" ||
+        metadata.usage_evidence === "unknown" || metadata.usage_evidence === "complete")));
+}
+
+type ReceiptView = { phase: "loading" | "ready" | "failed"; rows: DesktopChatReceipt[] };
 type Turn = DesktopChatMessage & { result?: DesktopChatResult; copied?: true };
 function replayTurn({role,content,result}:Turn):DesktopChatMessage {
   return {role,content,...(role === "assistant" && result?.reasoning != null ? {reasoning_content:result.reasoning} : {})};
@@ -94,6 +161,9 @@ export default function ChatPage({ active }: { active: boolean }) {
   const generation = useRef(0);
   const mounted = useRef(true);
   const pending = useRef<PendingRequest | null>(null);
+  const receiptGeneration = useRef(0);
+  const receiptReady = useRef(false);
+  const [receiptView, setReceiptView] = useState<ReceiptView>({ phase: "loading", rows: [] });
   const promptInput = useRef<HTMLTextAreaElement>(null);
   const modelFilterInput = useRef<HTMLInputElement>(null);
   const end = useRef<HTMLDivElement>(null);
@@ -113,6 +183,31 @@ export default function ChatPage({ active }: { active: boolean }) {
   const otherMatches = matchedChoices.filter(c => !isFavorite(c));
   const selectedOutsideFilter = selectedChoice && !matchedChoices.some(c => c.id === model);
   const selectableMatches = matchedChoices.filter(c => !personal.enabled || c.personal).length;
+  const bufferedOrdinary = !streaming && !personal.enabled;
+
+  const readReceipts = async (before: number | null = null) => {
+    if (!active) return;
+    const current = ++receiptGeneration.current;
+    receiptReady.current = false;
+    setReceiptView({ phase: "loading", rows: [] });
+    try {
+      const rows = await readReceiptPage(before);
+      if (receiptGeneration.current !== current) return;
+      receiptReady.current = true;
+      setReceiptView({ phase: "ready", rows });
+    } catch {
+      if (receiptGeneration.current !== current) return;
+      setReceiptView({ phase: "failed", rows: [] });
+    }
+  };
+
+  // The Chat page stays mounted when hidden. A completion from a previous
+  // visit cannot replace the current view or unlock a buffered send.
+  useLayoutEffect(() => {
+    if (!active) return;
+    void readReceipts();
+    return () => { receiptGeneration.current++; receiptReady.current = false; };
+  }, [active]);
 
   const refresh = async () => {
     const id = ++generation.current;
@@ -200,7 +295,9 @@ export default function ChatPage({ active }: { active: boolean }) {
   };
 
   const send = async () => {
-    if (sending.current || blockedSession.current || sessionBlocked || copyInFlight.current || personalChange.current || composing.current || loading || !prompt.trim() || !choices.length) return;
+    if ((bufferedOrdinary && !receiptReady.current) || sending.current || blockedSession.current ||
+        sessionBlocked || copyInFlight.current || personalChange.current || composing.current ||
+        loading || !prompt.trim() || !choices.length) return;
     if (personal.enabled && (personal.target !== model || !choices.some(c => c.id === model && c.personal))) { setError("个人测试只能发送到本窗口明确选择的单个 Codex CLI 目标。"); return; }
     if (model !== "auto" && !choices.some(c => c.id === model)) {
       setError("所选供应商模型已停用或移除，请刷新并重新选择。"); return;
@@ -220,22 +317,38 @@ export default function ChatPage({ active }: { active: boolean }) {
     pending.current = current;
     sending.current = true; setBusy(true); setError(null); setNotice(null); setCanCancel(false); setCancelling(false);
     try {
-      const result = await api.desktopChat({ model, messages, session_id: current.sessionId, max_tokens: maxTokens, ...(personal.enabled ? { personal_test: true } : {}) }, {
-        requestId: current.id,
-        ...(current.streaming ? { onEvent: (event: import("../api").DesktopChatStreamEvent) => {
-          if (!mounted.current || pending.current !== current || current.cancelAccepted || session.current !== current.sessionId) return;
-          const next = appendStreamEvent(current.preview, {requestId: current.id, sessionId: current.sessionId, model: current.model}, event);
-          if (next !== current.preview) { current.preview = next; setPreview(next); }
-        } } : {}),
-        onReady: ready => {
-          if (!mounted.current || pending.current !== current || ready.request_id !== current.id) return;
-          current.ready = true; current.trace = ready.trace_id ?? null; setCanCancel(true);
-        },
-      });
+      const input = { model, messages, session_id: current.sessionId, max_tokens: maxTokens, ...(personal.enabled ? { personal_test: true } : {}) };
+      let result: DesktopChatResult;
+      let recordingUnconfirmed = false;
+      if (bufferedOrdinary) {
+        // One operation UUID, one v2 invoke. Only the legacy command has ready
+        // and event Channels; an uncertain v2 outcome never falls back to v1.
+        const outcome: unknown = await api.desktopChatV2(input, current.id);
+        if (!isRecord(outcome) || outcome.operation_id !== current.id) throw new Error(unconfirmedReply);
+        if (outcome.kind === "unknown") throw new Error(replyDiagnostic(outcome.message));
+        if (outcome.kind !== "reply" || (outcome.receipt !== "recorded" && outcome.receipt !== "unknown") ||
+            !isBufferedResult(outcome.result, current.sessionId)) throw new Error(unconfirmedReply);
+        result = outcome.result;
+        recordingUnconfirmed = outcome.receipt === "unknown";
+      } else {
+        result = await api.desktopChat(input, {
+          requestId: current.id,
+          ...(current.streaming ? { onEvent: (event: import("../api").DesktopChatStreamEvent) => {
+            if (!mounted.current || pending.current !== current || current.cancelAccepted || session.current !== current.sessionId) return;
+            const next = appendStreamEvent(current.preview, {requestId: current.id, sessionId: current.sessionId, model: current.model}, event);
+            if (next !== current.preview) { current.preview = next; setPreview(next); }
+          } } : {}),
+          onReady: ready => {
+            if (!mounted.current || pending.current !== current || ready.request_id !== current.id) return;
+            current.ready = true; current.trace = ready.trace_id ?? null; setCanCancel(true);
+          },
+        });
+      }
       if (!mounted.current || pending.current !== current) return;
       if (result.session_id !== current.sessionId) throw new Error("desktop_chat_session_mismatch");
       // Cancellation acknowledgement is provisional; a known reply may win.
-      setNotice(null); setError(null);
+      setNotice(recordingUnconfirmed ? "回复已收到；操作回执保存未确认，请核对本机操作记录。" : null);
+      setError(null);
       session.current = result.session_id;
       setTurns([...turns, user, { role: "assistant", content: result.content, result }]);
       setPrompt("");
@@ -244,12 +357,11 @@ export default function ChatPage({ active }: { active: boolean }) {
     } catch (e) {
       if (mounted.current && pending.current === current) {
         const failure = personalFailure(e);
-        const cancelled = (failure?.message ?? errorText(e)) === "desktop_chat_cancelled";
-        const bufferedOrdinary = !current.streaming && !personal.enabled;
-        // This exact desktop command error is produced before gateway dispatch.
-        // A missing ready callback on its own doesn't establish that boundary.
-        const gatewayClosed = !current.ready && e === "LLM 网关服务未开启，请在设置页或托盘开启后发送";
-        const isolated = current.streaming || (bufferedOrdinary && cancelled);
+        const cancelled = !bufferedOrdinary && (failure?.message ?? errorText(e)) === "desktop_chat_cancelled";
+        // Only the exact IPC rejection string establishes pre-dispatch here.
+        // A typed v2 unknown with this text (or no ready Channel) does not.
+        const gatewayClosed = !current.ready && e === gatewayNotStarted;
+        const isolated = current.streaming && !gatewayClosed;
         if (isolated) {
           session.current = crypto.randomUUID();
           if (!cancelled) setNotice("本次未确认完成的会话已隔离。保留完整对话和草稿；下次手动发送使用新会话，不会自动重发。请核对原请求审计及用量。");
@@ -262,7 +374,12 @@ export default function ChatPage({ active }: { active: boolean }) {
         if (cancelled) {
           setError(null);
           setNotice(`已取消当前请求，输入已保留。${isolated ? "未确认完成的旧会话已隔离；下次手动发送使用新会话。" : ""}${failure ? personalOutcome[failure.outcome] : "已发出的请求可能仍有用量，请在用量与审计中核对。"}${current.trace ? ` 追踪：${current.trace}` : ""}`);
-        } else { setError(failure ? `${personalOutcome[failure.outcome]}：${failure.message}` : errorText(e), current); void refresh(); }
+        } else {
+          const message = bufferedOrdinary ? replyDiagnostic(e instanceof Error ? e.message : e)
+            : failure ? `${personalOutcome[failure.outcome]}：${failure.message}` : errorText(e);
+          setError(message, current);
+          void refresh();
+        }
       }
     }
     finally {
@@ -417,6 +534,23 @@ export default function ChatPage({ active }: { active: boolean }) {
       <label><input type="checkbox" data-testid="chat-stream-toggle" checked={streaming && !personal.enabled} disabled={busy || personal.enabled || changingPersonal} onChange={e => setStreaming(e.target.checked)} /> 增量显示回复</label>
       <p className="sub">按网关实际分片显示，分片不一定是一个字。上游须支持流式；个人测试暂不支持。中断或取消后的片段不作为完整回复续接，重启后不自动恢复或重发；请核对审计中的派发与用量。</p>
     </div>
+    <section className="card" aria-labelledby="chat-receipts-heading" aria-busy={receiptView.phase === "loading"}>
+      <h3 id="chat-receipts-heading">本机聊天操作记录</h3>
+      <p className="sub">记录只显示操作标识和状态，不含对话正文。列表按次读取；没有找到记录不能证明请求未派发或未产生用量。</p>
+      {receiptView.phase === "loading" && <p role="status">正在读取本机操作记录。</p>}
+      {receiptView.phase === "failed" && <p role="alert">暂时无法读取本机操作记录，普通非流式发送已暂停。</p>}
+      {receiptView.phase === "ready" && receiptView.rows.length === 0 && <p className="sub">当前范围没有操作记录。</p>}
+      <button type="button" disabled={receiptView.phase === "loading"} onClick={() => void readReceipts()}>
+        {receiptView.phase === "failed" ? "重试读取操作记录" : "刷新最新操作记录"}
+      </button>
+      {receiptView.rows.length > 0 && <ul>
+        {receiptView.rows.map(row => <li className="chat-text" key={row.operation_id} data-testid="desktop-chat-receipt">
+          <code>{row.operation_id}</code>：{row.state === "completed" ? "已记录结果" : "结果未确认"}
+        </li>)}
+      </ul>}
+      {receiptView.rows.length === receiptPageSize &&
+        <button type="button" onClick={() => void readReceipts(receiptView.rows[receiptView.rows.length - 1].cursor)}>读取更早操作记录</button>}
+    </section>
     <RequestPreview revision={generation.current} sessionId={session.current} request={{model,messages:[...turns.map(replayTurn),...(prompt.trim()?[{role:"user",content:prompt.trim()}]:[])],max_tokens:maxTokens,stream:streaming && !personal.enabled}}/>
     <section className="card chat-history" aria-label="聊天记录" aria-busy={busy}>
       {!turns.length && <p className="muted">输入一条消息，检查模型是否能通过网关正常回复。当前支持文本聊天，可选择增量显示回复。</p>}
@@ -439,7 +573,9 @@ export default function ChatPage({ active }: { active: boolean }) {
         {preview.reasoning && <details><summary>生成中的推理</summary><div className="chat-text">{preview.reasoning}</div></details>}
         {preview.refusal && <div className="chat-text">{preview.refusal}</div>}
       </article>}
-      {busy && <p role="status">{cancelling ? "正在取消当前请求，等待结果确认…" : "模型生成中，可取消当前请求；切换页面不会重复发送请求。"}</p>}
+      {busy && <p role="status">{cancelling ? "正在取消当前请求，等待结果确认…" :
+        canCancel ? "模型生成中，可取消当前请求；切换页面不会重复发送请求。" :
+          "模型生成中；切换页面不会重复发送请求。"}</p>}
       <div ref={end}/>
     </section>
     <form className="card chat-compose" onSubmit={e => { e.preventDefault(); void send(); }}>
@@ -447,8 +583,8 @@ export default function ChatPage({ active }: { active: boolean }) {
         onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }}
         onKeyDown={e => { if (!composing.current && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229 && (e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); void send(); } }}/>
       <div className="row"><span className="sub">Ctrl + Enter 发送。失败后保留输入；不自动重试。</span>
-        {busy && <button type="button" data-testid="chat-cancel" aria-label="取消当前请求" disabled={!canCancel || cancelling} onClick={() => void cancelCurrent()}>{cancelling ? "正在取消…" : "取消当前请求"}</button>}
-        <button type="submit" className="primary" disabled={busy || sessionBlocked || copyBusy || loading || changingPersonal || !choices.length || !prompt.trim()}>{busy ? "生成中…" : "发送消息"}</button></div>
+        {busy && !bufferedOrdinary && <button type="button" data-testid="chat-cancel" aria-label="取消当前请求" disabled={!canCancel || cancelling} onClick={() => void cancelCurrent()}>{cancelling ? "正在取消…" : "取消当前请求"}</button>}
+        <button type="submit" className="primary" disabled={(bufferedOrdinary && receiptView.phase !== "ready") || busy || sessionBlocked || copyBusy || loading || changingPersonal || !choices.length || !prompt.trim()}>{busy ? "生成中…" : "发送消息"}</button></div>
     </form>
   </div>;
 }

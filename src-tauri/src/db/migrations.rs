@@ -249,6 +249,7 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
         .chain(super::benefit_principal_schema::SCHEMA.iter())
         .chain(super::request_feedback_schema::SCHEMA.iter())
         .chain(super::budget_schema::SCHEMA.iter())
+        .chain(super::desktop_chat_receipt_schema::SCHEMA.iter())
     {
         sqlx::raw_sql(sql)
             .execute(pool)

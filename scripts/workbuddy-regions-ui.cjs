@@ -102,7 +102,7 @@ async function verifyWorkbuddyRegions(browser, baseUrl, output, errors, fixture)
     assert.deepEqual(entry.calls.map(call => [call.cmd, call.args.region]).sort(),
       [["workbuddy_login_status", "cn"], ["workbuddy_login_status", "global"]]);
     assert.deepEqual(await page.evaluate(() => window.__fixtureCalls.filter(cmd =>
-      /^(workbuddy_login_(start|poll|refresh)|register_workbuddy_provider|qoder_job_(prepare|refresh)|register_qoder_provider|desktop_chat|test_provider|claim_benefit_now)$/.test(cmd))), []);
+      /^(workbuddy_login_(start|poll|refresh)|register_workbuddy_provider|qoder_job_(prepare|refresh)|register_qoder_provider|desktop_chat(?:_v2)?|test_provider|claim_benefit_now)$/.test(cmd))), []);
     assert.equal(await button(global, "接入模型").isDisabled(), true);
     assert.equal(await button(cn, "接入模型").isDisabled(), true);
     checks.push("entry reads only both regional statuses; same account name and separate cards");
@@ -263,7 +263,7 @@ async function verifyWorkbuddyRegions(browser, baseUrl, output, errors, fixture)
     await cn.getByText("已取消本次网页登录。需要时可重新登录。", { exact: true }).waitFor();
     checks.push("late-start cancellation failure survives unmount/remount; only explicit regional retry clears it, with no automatic retry or CN interference");
     assert.deepEqual(await page.evaluate(() => window.__fixtureCalls.filter(cmd =>
-      /^(desktop_chat|test_provider|claim_benefit_now|launch_bridge_client|start_client_bridge)$/.test(cmd))), [],
+      /^(desktop_chat(?:_v2)?|test_provider|claim_benefit_now|launch_bridge_client|start_client_bridge)$/.test(cmd))), [],
     "Fixture regression must not invoke models, rewards, or client processes");
     assert.deepEqual(pageErrors, []); assert.deepEqual(consoleErrors, []); assert.deepEqual(blockedRequests, []);
     const proof = { scope: "compiled React with isolated IPC fixtures; no native, real authorization, model, reward, or client calls", checks, screenshots,

@@ -27,7 +27,7 @@ async function verifyQoderModelNames(browser,baseUrl,output,errors,fixture){
   await page.getByRole('textbox',{name:'搜索供应商',exact:true}).fill('Qwen3.8-Flash');
   assert.equal(await page.locator('.provider-card').count(),2);proof.checks.push('provider-search-matches-official-name');
   await page.screenshot({path:path.join(output,'qoder-model-names-provider.png'),fullPage:true});proof.screenshots.push('qoder-model-names-provider.png');
-  assert.deepEqual((await page.evaluate(()=>window.__fixtureCalls)).filter(c=>/^(desktop_chat|test_provider|qoder_login_(start|poll|refresh)|qoder_job_(prepare|refresh|reissue)|claim_benefit_now)$/.test(c)),[]);
+  assert.deepEqual((await page.evaluate(()=>window.__fixtureCalls)).filter(c=>/^(desktop_chat(?:_v2)?|test_provider|qoder_login_(start|poll|refresh)|qoder_job_(prepare|refresh|reissue)|claim_benefit_now)$/.test(c)),[]);
   assert.deepEqual(errors,[]);proof.checks.push('metadata-only-ui-zero-model-auth-or-claim');proof.passed=true;
   console.log(`QODER_MODEL_NAMES_UI_OK: ${proof.checks.length} checks; ${proof.screenshots.length} screenshots; fixture-only`);
  }finally{fs.writeFileSync(path.join(output,'qoder-model-names-proof.json'),JSON.stringify(proof,null,2)+'\n');await context.close();}

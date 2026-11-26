@@ -27,6 +27,7 @@ pub mod cost_policy;
 pub mod crypto;
 pub mod db;
 pub mod desktop_chat;
+mod desktop_chat_receipts;
 pub mod diagnostics;
 pub mod domain;
 pub mod entitlement;
@@ -497,6 +498,8 @@ pub fn run() {
             commands::list_models,
             commands::register_client_bridge,
             commands::desktop_chat,
+            desktop_chat_receipts::desktop_chat_v2,
+            desktop_chat_receipts::list_desktop_chat_receipts,
             commands::cancel_desktop_chat,
             commands::get_personal_test,
             commands::set_personal_test,

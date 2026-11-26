@@ -8,6 +8,7 @@ mod budget_schema;
 mod capability_declaration_schema;
 mod catalog_schema;
 pub mod client_usage_journal_schema;
+mod desktop_chat_receipt_schema;
 mod entitlement_schema;
 pub mod migrations;
 pub mod repo;

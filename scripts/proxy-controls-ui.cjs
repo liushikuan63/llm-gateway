@@ -229,7 +229,7 @@ async function verifyProxyControls(browser, baseUrl, output, errors, fixture) {
     await screenshot("proxy-controls-390.png");
     checks.push("390px Settings and proxy card fit their containers");
     assert.deepEqual(await page.evaluate(() => window.__fixtureCalls.filter((cmd) =>
-      /^(desktop_chat|test_provider|claim_benefit_now|start_client_bridge|start_vpn|start_xray)$/.test(cmd))), [],
+      /^(desktop_chat(?:_v2)?|test_provider|claim_benefit_now|start_client_bridge|start_vpn|start_xray)$/.test(cmd))), [],
     "Proxy UI regression must not issue model, claim, client-launch, or tunnel commands");
     assert.deepEqual(pageErrors, []);
     return { passed: true, checks, screenshots, page_errors: pageErrors,
