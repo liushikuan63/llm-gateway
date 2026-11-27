@@ -1000,3 +1000,138 @@ async fn n2_window_ollama_buffered_preview_matches_dispatch() {
     .await;
     f.finish(result).await;
 }
+
+#[tokio::test]
+async fn n2_window_anthropic_buffered_preview_matches_dispatch() {
+    let f = Owned::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let providers = repo::list_providers(f.state.db.pool()).await.unwrap();
+        let mut target = providers.iter().find(|p| p.id == "text").unwrap().clone();
+        assert!(target.enabled && target.runtime_id.is_none());
+        assert_eq!(target.models.len(), 1);
+        for mut provider in providers {
+            if provider.id != target.id {
+                provider.enabled = false;
+                repo::upsert_provider(f.state.db.pool(), &provider)
+                    .await
+                    .unwrap();
+            }
+        }
+        {
+            let mut cfg = f.state.cfg.write();
+            cfg.smart_routing.enabled = false;
+            cfg.smart_routing.prompt_refine.enabled = false;
+            cfg.search.enabled = false;
+            cfg.failover_enabled = false;
+            cfg.compact_threshold_tokens = u32::MAX;
+            cfg.compact_keep_recent = 1_000;
+        }
+
+        let body = json!({
+            "model":"owned-model",
+            "stream":false,
+            "messages":[{"role":"user","content":"x".repeat(8192)}],
+            "max_tokens":16
+        });
+        let wire = serde_json::to_vec(&body).unwrap();
+        let request =
+            serde_json::from_slice::<llm_gateway_lib::protocol::anthropic::AnthropicRequest>(&wire)
+                .unwrap()
+                .to_internal()
+                .unwrap();
+        assert_eq!(request.max_tokens, Some(16));
+        assert!(!request.stream);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        for (window, gate, expected_status, expected_posts) in [
+            (
+                1024,
+                Some("context_window_insufficient"),
+                reqwest::StatusCode::BAD_REQUEST,
+                0,
+            ),
+            (32_768, None, reqwest::StatusCode::OK, 1),
+        ] {
+            target.models[0].context_window = window;
+            repo::upsert_provider(f.state.db.pool(), &target)
+                .await
+                .unwrap();
+            f.state.reload_providers().await.unwrap();
+
+            let before = f.counts().await;
+            assert_eq!(before[2], 0, "owned case must have no persisted messages");
+            let health =
+                || serde_json::to_value(f.state.health.get("text", "text-physical")).unwrap();
+            let before_health = health();
+            deny_preview_writes(&f, true).await;
+            let preview = f
+                .state
+                .preview_routing_request(RequestPreviewInput {
+                    request: request.clone(),
+                    access_key_id: None,
+                    strategy: None,
+                    include_session: false,
+                    session_id: None,
+                })
+                .await;
+            deny_preview_writes(&f, false).await;
+            let preview = preview.unwrap();
+            assert_eq!(f.counts().await, before, "preview mutated owned SQLite");
+            assert_eq!(health(), before_health, "preview changed target health");
+            assert!(f.calls.lock().unwrap().is_empty(), "preview sent a POST");
+
+            assert_eq!(preview.gate_issue, gate, "window={window}");
+            assert_eq!(preview.trimmed_messages, 0);
+            assert_eq!(preview.rows.len(), 1);
+            let row = &preview.rows[0];
+            assert_eq!(row.provider_id, "text");
+            assert_eq!(row.exclusion_reason, gate);
+            assert_eq!(row.eligible, gate.is_none());
+            assert_eq!(row.ordinal, gate.is_none().then_some(1));
+
+            let response = client
+                .post(format!("{}/v1/messages", f.base))
+                .header("x-api-key", "owned-preview-key")
+                .header("anthropic-version", "2023-06-01")
+                .header("x-session-id", "owned-r151-n2-anthropic-window")
+                .header("content-type", "application/json")
+                .body(wire.clone())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let response: Value = response.json().await.unwrap();
+            assert_eq!(status, expected_status, "window={window}: {response}");
+            let calls = f.calls.lock().unwrap();
+            assert_eq!(calls.len(), expected_posts, "window={window}");
+            if gate.is_some() {
+                assert_eq!(response["error"]["type"], "context_length_exceeded");
+            } else {
+                assert_eq!(response["type"], "message");
+                assert_eq!(response["role"], "assistant");
+                assert_eq!(response["stop_reason"], "end_turn");
+                assert_eq!(
+                    response["content"],
+                    json!([{"type":"text","text":"owned preview reply"}])
+                );
+                assert_eq!(calls[0].0, "text");
+                assert_eq!(calls[0].1["model"], "text-physical");
+                assert_eq!(calls[0].1["messages"], body["messages"]);
+                assert_eq!(calls[0].1["max_tokens"], 16);
+            }
+            eprintln!(
+                concat!(
+                    "R151_N2_ANTHROPIC_WINDOW window={} preview_gate={} preview_posts=0 ",
+                    "guarded_sqlite_tables=4 preview_mutations=0 status={} physical_posts={}"
+                ),
+                window,
+                preview.gate_issue.unwrap_or("none"),
+                status.as_u16(),
+                calls.len()
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    f.finish(result).await;
+}
