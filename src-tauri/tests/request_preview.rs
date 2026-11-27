@@ -1135,3 +1135,171 @@ async fn n2_window_anthropic_buffered_preview_matches_dispatch() {
     .await;
     f.finish(result).await;
 }
+
+#[tokio::test]
+async fn n2_window_ollama_streaming_preview_matches_dispatch() {
+    // These are Ollama ingress/egress checks against the owned OpenAI SSE peer.
+    // Fresh fixtures keep dispatch health/history from affecting the next case.
+    for (window, supports_stream, exclusion, error_type) in [
+        (
+            32_768,
+            false,
+            Some("stream_transport_unsupported"),
+            Some("model_capability_unavailable"),
+        ),
+        (
+            1024,
+            true,
+            Some("context_window_insufficient"),
+            Some("context_length_exceeded"),
+        ),
+        (32_768, true, None, None),
+    ] {
+        let f = Owned::new().await;
+        let result = std::panic::AssertUnwindSafe(async {
+            let providers = repo::list_providers(f.state.db.pool()).await.unwrap();
+            let mut target = providers.iter().find(|p| p.id == "text").unwrap().clone();
+            assert!(target.enabled && target.runtime_id.is_none());
+            assert_eq!(target.models.len(), 1);
+            for mut provider in providers {
+                if provider.id != target.id {
+                    provider.enabled = false;
+                    repo::upsert_provider(f.state.db.pool(), &provider)
+                        .await
+                        .unwrap();
+                }
+            }
+            target.models[0].context_window = window;
+            target.models[0].supports_stream = supports_stream;
+            repo::upsert_provider(f.state.db.pool(), &target)
+                .await
+                .unwrap();
+            f.state.reload_providers().await.unwrap();
+            {
+                let mut cfg = f.state.cfg.write();
+                cfg.smart_routing.enabled = false;
+                cfg.smart_routing.prompt_refine.enabled = false;
+                cfg.search.enabled = false;
+                cfg.failover_enabled = false;
+                cfg.compact_threshold_tokens = u32::MAX;
+                cfg.compact_keep_recent = 1_000;
+            }
+            let body = json!({
+                "model":"owned-model",
+                "stream":true,
+                "messages":[{"role":"user","content":"x".repeat(8192)}],
+                "options":{"num_predict":16}
+            });
+            let request =
+                llm_gateway_lib::protocol::ollama::ollama_request_to_internal(&body).unwrap();
+            assert_eq!(request.max_tokens, Some(16));
+            assert!(request.stream);
+            let before = f.counts().await;
+            assert!(before.iter().all(|count| *count == 0));
+            let before_health =
+                serde_json::to_value(f.state.health.get("text", "text-physical")).unwrap();
+            deny_preview_writes(&f, true).await;
+            let preview = f
+                .state
+                .preview_routing_request(RequestPreviewInput {
+                    request,
+                    access_key_id: None,
+                    strategy: None,
+                    include_session: false,
+                    session_id: None,
+                })
+                .await;
+            deny_preview_writes(&f, false).await;
+            let preview = preview.unwrap();
+            assert_eq!(f.counts().await, before, "preview mutated owned SQLite");
+            assert_eq!(
+                serde_json::to_value(f.state.health.get("text", "text-physical")).unwrap(),
+                before_health,
+                "preview changed target health"
+            );
+            assert!(f.calls.lock().unwrap().is_empty(), "preview sent a POST");
+            assert_eq!(preview.trimmed_messages, 0);
+            assert_eq!(preview.rows.len(), 1);
+            let row = &preview.rows[0];
+            assert_eq!(row.provider_id, "text");
+            assert_eq!(row.exclusion_reason, exclusion);
+            assert_eq!(row.eligible, exclusion.is_none());
+            assert_eq!(row.ordinal, exclusion.is_none().then_some(1));
+            if exclusion.is_some() {
+                assert!(row.score.is_none());
+                assert!(row.breakdown.is_none());
+            }
+            assert_eq!(
+                preview.gate_issue,
+                (window == 1024).then_some("context_window_insufficient")
+            );
+
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap()
+                .post(format!("{}/api/chat", f.base))
+                .bearer_auth("owned-preview-key")
+                .header("x-session-id", "owned-r153-n2-ollama-stream-window")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let content_type = response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let raw = response.text().await.unwrap();
+            let calls = f.calls.lock().unwrap();
+            if let Some(error_type) = error_type {
+                assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{raw}");
+                let error: Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(error["error"]["type"], error_type);
+                assert!(calls.is_empty(), "rejected request reached the peer");
+            } else {
+                assert_eq!(status, reqwest::StatusCode::OK, "{raw}");
+                assert_eq!(content_type, "application/x-ndjson; charset=utf-8");
+                let frames: Vec<Value> = raw
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert!(frames.len() >= 2, "{raw}");
+                assert!(frames.iter().all(|frame| frame.get("error").is_none()));
+                let (last, deltas) = frames.split_last().unwrap();
+                assert_eq!(last["done"], true);
+                assert_eq!(last["message"]["role"], "assistant");
+                assert_eq!(last["message"]["content"], "");
+                let mut text = String::new();
+                for delta in deltas {
+                    assert_eq!(delta["done"], false);
+                    assert_eq!(delta["message"]["role"], "assistant");
+                    text.push_str(delta["message"]["content"].as_str().unwrap());
+                }
+                assert_eq!(text, "owned preview reply");
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].0, "text");
+                assert_eq!(calls[0].1["model"], "text-physical");
+                assert_eq!(calls[0].1["messages"], body["messages"]);
+                assert_eq!(calls[0].1["max_tokens"], 16);
+                assert_eq!(calls[0].1["stream"], true);
+            }
+            eprintln!(
+                concat!(
+                    "R153_N2_OLLAMA_STREAM window={} supports_stream={} exclusion={} ",
+                    "preview_posts=0 guarded_sqlite_tables=4 preview_mutations=0 ",
+                    "status={} physical_posts={}"
+                ),
+                window,
+                supports_stream,
+                exclusion.unwrap_or("none"),
+                status.as_u16(),
+                calls.len()
+            );
+        })
+        .catch_unwind()
+        .await;
+        f.finish(result).await;
+    }
+}
