@@ -21,6 +21,19 @@ npm run verify:release
 
 适用完整回归沿 `scripts/ci-local.ps1` 及当前测试清单安排。`live_*` 和真实账号步骤先检查授权、服务及副作用；未执行、ignored、提前返回和夹具必须分别记录。不得为得到全绿自动消耗新模型额度。共享 Cargo target、dist、发布资源、包、安装及原生探针保持一套流水线。
 
+## 安装载荷的 DLL 合同
+
+`scripts/verify-installed-package.cjs` 比较当前 checkout 的 release EXE、DLL 和资源与已提取或已安装目录，只读取文件，不执行载荷。候选准备入口须把 DLL 合同与最终提交、源码树、输入清单、检查器摘要、安装器 SHA256 和对应载荷目录一并冻结，再显式传入：
+
+```powershell
+node scripts/verify-installed-package.cjs --bundle msi --dir 'D:/owned-candidate/msi-payload' --dll absent
+node scripts/verify-installed-package.cjs --bundle nsis --dir 'D:/owned-candidate/nsis-payload' --dll required
+```
+
+这里的路径与合同只是调用示例；具体候选应先核对其实际 EXE 依赖和两种容器载荷，不能按文件是否存在自动选合同。`required` 要求 release 根与载荷根的 `llm_gateway_lib.dll` 均为普通文件且字节相同；`absent` 要求两处路径均不存在，目录、链接及断链也会拒绝。省略 `--dll` 时保留历史 `legacy` 行为：MSI 必须带 DLL，NSIS 不强制带，但只要载荷有 DLL 就须与 release 普通文件逐字节相同。未知、空值、重复或 `optional` 参数均拒绝；JSON 结果的 `dll_policy` 记录实际合同，`dll_verified` 仍表示是否核对了 DLL 字节。
+
+两种显式合同都保留单一 Tauri EXE 标记差异和原有资源清单／字节校验。`npm run verify:scripts` 包含真实 CLI 调用的自有临时载荷正反例；这些合成 EXE、DLL 和资源只验证检查器，不能作为真实构建、安装、启动或原生流程通过的证据。`INSTALLED_PACKAGE_VERIFIED` 也仅证明所传目录与当前 checkout 的字节合同成立，不单独证明来源可信、安装成功或产品可运行。
+
 ## S3 可选命令桥接测试
 
 锁定 Tauri 2.11.5 的 `test` feature 仅通过非默认 `ipc-tests` 启用，无新增依赖。测试模块还要求 cfg(test)，不增加产品 fixture 或 IPC。编译入口为 `cargo test --manifest-path src-tauri/Cargo.toml --offline --locked --jobs 1 --features ipc-tests --lib commands::feedback_ipc_tests --no-run`，Cargo 前仍使用环境脚本并返回仓库根。

@@ -18,18 +18,19 @@ function requireCondition(condition, message) {
 }
 
 function parseArguments(args) {
-  const usage = "Usage: node scripts/verify-installed-package.cjs --bundle nsis|msi --dir <absolute-payload-directory>";
-  requireCondition(args.length === 4, usage);
+  const usage = "Usage: node scripts/verify-installed-package.cjs --bundle nsis|msi --dir <absolute-payload-directory> [--dll required|absent]";
+  requireCondition(args.length === 4 || args.length === 6, usage);
   const options = {};
   for (let index = 0; index < args.length; index += 2) {
     const key = args[index];
-    requireCondition(key === "--bundle" || key === "--dir", usage);
+    requireCondition(key === "--bundle" || key === "--dir" || key === "--dll", usage);
     requireCondition(!Object.hasOwn(options, key), usage);
     options[key] = args[index + 1];
   }
   requireCondition(Object.hasOwn(bundleMarkers, options["--bundle"]), usage);
   requireCondition(typeof options["--dir"] === "string" && path.isAbsolute(options["--dir"]), usage);
-  return { bundle: options["--bundle"], directory: options["--dir"] };
+  requireCondition(!Object.hasOwn(options, "--dll") || ["required", "absent"].includes(options["--dll"]), usage);
+  return { bundle: options["--bundle"], directory: options["--dir"], dllPolicy: options["--dll"] ?? "legacy" };
 }
 
 function readRegularFile(filename, label) {
@@ -51,7 +52,13 @@ function fileList(directory, prefix = "") {
   return files.sort();
 }
 
-function verifyPayload({ bundle, directory }) {
+function pathEntryExists(filename) {
+  try { fs.lstatSync(filename); return true; }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+}
+
+function verifyPayload({ bundle, directory, dllPolicy = "legacy" }) {
+  requireCondition(["legacy", "required", "absent"].includes(dllPolicy), "Unknown DLL policy");
   requireCondition(fs.lstatSync(directory).isDirectory(), "Payload root must be a regular directory");
   const builtExe = readRegularFile(path.join(release, "llm-gateway.exe"), "Release EXE");
   const payloadExe = readRegularFile(path.join(directory, "llm-gateway.exe"), "Payload EXE");
@@ -65,15 +72,23 @@ function verifyPayload({ bundle, directory }) {
   unknownMarker.copy(normalized, offset);
   requireCondition(normalized.equals(builtExe), "Payload EXE differs beyond the single permitted Tauri bundle marker");
 
+  const releaseDll = path.join(release, "llm_gateway_lib.dll");
   const payloadDll = path.join(directory, "llm_gateway_lib.dll");
-  let dllPresent = false;
-  try { fs.lstatSync(payloadDll); dllPresent = true; }
-  catch (error) { if (error.code !== "ENOENT") throw error; }
-  requireCondition(bundle !== "msi" || dllPresent, "MSI payload is missing llm_gateway_lib.dll");
-  if (dllPresent) {
-    const expected = readRegularFile(path.join(release, "llm_gateway_lib.dll"), "Release DLL");
-    const actual = readRegularFile(payloadDll, "Payload DLL");
-    requireCondition(actual.equals(expected), "Payload DLL differs from release");
+  const dllPresent = pathEntryExists(payloadDll);
+  // The frozen candidate chooses the policy; missing files never select it.
+  // lstat also detects dangling links, which must not satisfy an absent contract.
+  if (dllPolicy === "absent") {
+    requireCondition(!pathEntryExists(releaseDll), "Release DLL must be absent under the absent contract");
+    requireCondition(!dllPresent, "Payload DLL must be absent under the absent contract");
+  } else {
+    if (dllPolicy === "legacy") {
+      requireCondition(bundle !== "msi" || dllPresent, "MSI payload is missing llm_gateway_lib.dll");
+    }
+    if (dllPolicy === "required" || dllPresent) {
+      const expected = readRegularFile(releaseDll, "Release DLL");
+      const actual = readRegularFile(payloadDll, "Payload DLL");
+      requireCondition(actual.equals(expected), "Payload DLL differs from release");
+    }
   }
 
   const payloadResources = path.join(directory, "resources", "mihomo");
@@ -108,6 +123,7 @@ function verifyPayload({ bundle, directory }) {
     bundle,
     bundle_marker_offset: offset,
     normalized_exe_sha256: createHash("sha256").update(normalized).digest("hex"),
+    dll_policy: dllPolicy,
     dll_verified: dllPresent,
     resource_files_verified: expectedFiles.length + integratedFiles,
   };
