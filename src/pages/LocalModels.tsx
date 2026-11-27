@@ -43,51 +43,115 @@ function errorMessage(error: unknown): string {
 export default function LocalModelsPage() {
   const [cfg, setCfg] = useState<AppConfig | null>(null);
   const [tab, setTab] = useState<Tab>("runtimes");
+  const [configState, setConfigState] = useState<"loading" | "ready" | "error">("loading");
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const mounted = useRef(false);
+  const configVersion = useRef(0);
+  const configStateRef = useRef<"loading" | "ready" | "error">("loading");
+  const savingRef = useRef(false);
+  const retryFocus = useRef(false);
+  const activeTab = useRef<HTMLButtonElement | null>(null);
 
   const reloadConfig = useCallback(async () => {
+    if (!mounted.current) return;
+    const version = ++configVersion.current;
+    const current = () => mounted.current && version === configVersion.current;
+    configStateRef.current = "loading";
+    setConfigState("loading");
+    setConfigError(null);
     try {
-      setCfg(await api.getConfig());
+      const next = await api.getConfig();
+      if (!current()) return;
+      setCfg(next);
+      configStateRef.current = "ready";
+      setConfigState("ready");
     } catch (error) {
-      setCfg(null);
+      if (!current()) return;
+      // 保留上次快照和已挂载子页，父级刷新失败不能清掉搜索草稿。
+      configStateRef.current = "error";
+      setConfigState("error");
+      setConfigError(errorMessage(error));
       console.warn("读取配置失败", errorMessage(error));
     }
   }, []);
 
   useEffect(() => {
+    mounted.current = true;
     void reloadConfig();
-  }, [reloadConfig]);
-
-  // 其它页面改动路由策略后回到本页时，配置要跟着刷新。
-  useEffect(() => {
+    // 窄接口通知不带整份配置；总是从实际来源重新读取。
     const handler = () => void reloadConfig();
     window.addEventListener("llm-gateway-config-changed", handler);
-    return () => window.removeEventListener("llm-gateway-config-changed", handler);
+    return () => {
+      mounted.current = false;
+      ++configVersion.current;
+      window.removeEventListener("llm-gateway-config-changed", handler);
+    };
   }, [reloadConfig]);
+
+  useEffect(() => {
+    if (configState !== "ready" || !retryFocus.current) return;
+    retryFocus.current = false;
+    // 重试按钮移除时恢复键盘位置；用户已回到草稿则不抢焦点。
+    if (document.activeElement === document.body) activeTab.current?.focus();
+  }, [configState]);
 
   const saveConfig = useCallback(
     async (next: AppConfig) => {
-      const result = await api.updateConfig(next);
-      setCfg(result.config);
-      window.dispatchEvent(new CustomEvent("llm-gateway-config-changed", { detail: result.config }));
-      return result.config;
+      if (!mounted.current || configStateRef.current !== "ready" || savingRef.current) {
+        throw new Error("本地配置尚未确认或正在保存，请等待完成后再修改。");
+      }
+      savingRef.current = true;
+      setSaving(true);
+      const version = ++configVersion.current;
+      try {
+        const result = await api.updateConfig(next);
+        const current = mounted.current && version === configVersion.current;
+        if (current) setCfg(result.config);
+        // 旧保存回执不能把更晚的读取快照广播回旧值；让监听者重新读取。
+        window.dispatchEvent(current
+          ? new CustomEvent("llm-gateway-config-changed", { detail: result.config })
+          : new Event("llm-gateway-config-changed"));
+        return result.config;
+      } finally {
+        savingRef.current = false;
+        if (mounted.current) setSaving(false);
+      }
     },
     []
   );
 
-  if (cfg === null) {
-    return (
-      <div className="card">
-        <div className="empty">正在读取配置…</div>
-      </div>
-    );
-  }
+  const notice = configState !== "ready" && (
+    <div className="card" role={configState === "error" ? "alert" : "status"}>
+      <p>{configState === "loading" ? "正在读取配置…" : `读取本地配置失败：${configError}`}</p>
+      {cfg && <p className="sub">保留上次成功读取的内容；当前配置尚未确认，恢复读取后可编辑本地运行时与智能配置。搜索设置独立读取，草稿会保留。</p>}
+      <button
+        type="button"
+        className="button ghost"
+        disabled={configState === "loading" || saving}
+        onClick={(event) => {
+          if (configStateRef.current === "loading" || savingRef.current) return;
+          retryFocus.current = document.activeElement === event.currentTarget;
+          void reloadConfig();
+        }}
+      >
+        重试读取本地配置
+      </button>
+    </div>
+  );
+
+  if (cfg === null) return notice;
+  const configDisabled = configState !== "ready" || saving;
 
   return (
     <>
+      {notice}
       <div className="local-tabbar">
         {TABS.map((item) => (
           <button
+            type="button"
             key={item.id}
+            ref={tab === item.id ? activeTab : undefined}
             className={`local-tab ${tab === item.id ? "active" : ""}`}
             onClick={() => setTab(item.id)}
           >
@@ -97,8 +161,16 @@ export default function LocalModelsPage() {
         ))}
       </div>
 
-      {tab === "runtimes" && <RuntimesSection cfg={cfg} onSave={saveConfig} />}
-      {tab === "smart" && <SmartSection cfg={cfg} onSave={saveConfig} />}
+      {tab === "runtimes" && (
+        <fieldset className="local-config-controls" aria-label="本地运行时配置" disabled={configDisabled}>
+          <RuntimesSection cfg={cfg} onSave={saveConfig} />
+        </fieldset>
+      )}
+      {tab === "smart" && (
+        <fieldset className="local-config-controls" aria-label="智能模式配置" disabled={configDisabled}>
+          <SmartSection cfg={cfg} onSave={saveConfig} />
+        </fieldset>
+      )}
       {tab === "search" && <SearchSection />}
     </>
   );

@@ -199,3 +199,9 @@ textarea {
 .calib-matrix details {
   margin-top: 4px;
 }
+.local-config-controls {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
