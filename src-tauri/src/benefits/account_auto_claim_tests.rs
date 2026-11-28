@@ -152,10 +152,30 @@ async fn headless_owner_skips_disabled_slot_before_any_daily_receipt_or_transpor
         .lock()
         .iter()
         .all(|(token, _)| !token.ends_with("synthetic-a")));
-    db.pool().close().await;
     drop(center);
+    // SQLx 0.8.6 can return from close while a late return task leaves an idle connection.
+    // The first close collects every permit; a second explicit drain closes that connection.
+    let first_size = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        db.pool().close().await;
+        let first_size = db.pool().size();
+        if first_size != 0 {
+            db.pool().close().await;
+        }
+        assert!(db.pool().is_closed());
+        assert_eq!(
+            db.pool().size(),
+            0,
+            "owned receipt fixture must release SQLite"
+        );
+        first_size
+    })
+    .await
+    .expect("owned receipt fixture close exceeded 10 seconds");
+    eprintln!("R157_FIXTURE_DIAGNOSTIC case=benefits first_size={first_size} final_size=0");
     drop(db);
-    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(&root)
+        .unwrap_or_else(|error| panic!("owned receipt fixture cleanup {root:?}: {error}"));
+    eprintln!("R157_FIXTURE_CLOSE case=benefits final_size=0 cleanup=complete");
 }
 
 #[tokio::test]

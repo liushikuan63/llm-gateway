@@ -384,9 +384,28 @@ mod tests {
                 .to_string(),
             RAW_EXPORT_UNAVAILABLE
         );
-        db.pool().close().await;
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir(owned).unwrap();
+        // SQLx 0.8.6 may enqueue a late idle connection during the first close.
+        // With all permits returned, a second close explicitly shuts down that worker.
+        let first_size = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            db.pool().close().await;
+            let first_size = db.pool().size();
+            if first_size != 0 {
+                db.pool().close().await;
+            }
+            assert!(db.pool().is_closed());
+            assert_eq!(db.pool().size(), 0, "owned WAL fixture must release SQLite");
+            first_size
+        })
+        .await
+        .expect("owned WAL fixture close exceeded 10 seconds");
+        eprintln!("R157_FIXTURE_DIAGNOSTIC case=audit first_size={first_size} final_size=0");
+        drop(db);
+        std::fs::remove_file(&path)
+            .unwrap_or_else(|error| panic!("owned WAL fixture cleanup {path:?}: {error}"));
+        std::fs::remove_dir(&owned).unwrap_or_else(|error| {
+            panic!("owned WAL fixture directory cleanup {owned:?}: {error}")
+        });
+        eprintln!("R157_FIXTURE_CLOSE case=audit final_size=0 cleanup=complete");
     }
 
     #[tokio::test]
